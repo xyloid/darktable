@@ -658,6 +658,107 @@ static void test_feed_zero_length_input_is_a_no_op(void **state)
   dt_remote_frame_parser_clear(&p);
 }
 
+/* ---------------------------------------------------------------------- */
+/* feed: re-entrancy protection                                            */
+/* ---------------------------------------------------------------------- */
+
+typedef struct
+{
+  dt_remote_frame_parser_t *parser;
+  gboolean nested_call_returned;
+  gboolean nested_return_value;
+  guint critical_count;
+} reentrant_test_data_t;
+
+static void _log_handler_count_critical(const gchar *log_domain, GLogLevelFlags log_level,
+                                       const gchar *message, gpointer user_data)
+{
+  (void)log_domain;
+  (void)message;
+  // Count any CRITICAL level message
+  if(log_level & G_LOG_LEVEL_CRITICAL)
+  {
+    reentrant_test_data_t *data = (reentrant_test_data_t *)user_data;
+    data->critical_count++;
+  }
+}
+
+static gboolean _reentrant_callback(GBytes *payload, gpointer user_data)
+{
+  (void)payload;  // unused
+  reentrant_test_data_t *data = (reentrant_test_data_t *)user_data;
+
+  // Install a handler to count CRITICAL messages from g_return_val_if_fail.
+  // Use G_LOG_LEVEL_MASK to catch all levels including CRITICAL with any flags.
+  guint handler_id = g_log_set_handler(NULL, G_LOG_LEVEL_MASK,
+                                       _log_handler_count_critical, data);
+
+  // Build and try to feed a small valid frame from within the callback
+  const uint8_t nested_payload[2] = { 0xAA, 0xBB };
+  GByteArray *nested_frame = _build_frame(nested_payload, sizeof(nested_payload));
+
+  collector_t nested_collector;
+  _collector_init(&nested_collector, -1);
+  GError *nested_error = NULL;
+
+  // This nested feed should fail due to re-entrancy guard
+  data->nested_return_value = dt_remote_frame_feed(data->parser, nested_frame->data,
+                                                    nested_frame->len, _collect_cb,
+                                                    &nested_collector, &nested_error);
+  data->nested_call_returned = TRUE;
+
+  // Clean up: remove the log handler
+  g_log_remove_handler(NULL, handler_id);
+  _collector_clear(&nested_collector);
+  g_byte_array_unref(nested_frame);
+  g_clear_error(&nested_error);
+
+  // Return TRUE to allow the outer feed to continue (should still be idle)
+  return TRUE;
+}
+
+static void test_feed_reentrant_call_from_on_frame_rejected(void **state)
+{
+  (void)state;
+  const uint8_t payload[3] = { 0x11, 0x22, 0x33 };
+  GByteArray *frame = _build_frame(payload, sizeof(payload));
+
+  dt_remote_frame_parser_t p = { 0 };
+  reentrant_test_data_t test_data = {
+    .parser = &p,
+    .nested_call_returned = FALSE,
+    .nested_return_value = TRUE,  // default assume it succeeded (wrong)
+    .critical_count = 0,
+  };
+
+  GError *error = NULL;
+
+  // Feed a single valid frame; the callback will try to feed again
+  gboolean outer_result = dt_remote_frame_feed(&p, frame->data, frame->len,
+                                                _reentrant_callback, &test_data, &error);
+
+  // Outer feed should still return TRUE (success)
+  assert_true(outer_result);
+  assert_null(error);
+
+  // Nested call should have been attempted
+  assert_true(test_data.nested_call_returned);
+
+  // Nested call should have returned FALSE (re-entrancy guard rejected it)
+  assert_false(test_data.nested_return_value);
+
+  // At least one CRITICAL message should have been emitted (from g_return_val_if_fail)
+  assert_int_equal(test_data.critical_count, 1);
+
+  // Parser should be idle again (not corrupted by the nested attempt)
+  assert_int_equal((int)p.header_filled, 0);
+  assert_null(p.body);
+  assert_false(p.failed);
+
+  g_byte_array_unref(frame);
+  dt_remote_frame_parser_clear(&p);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -688,6 +789,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_parser_clear_is_null_safe),
 
     cmocka_unit_test(test_feed_zero_length_input_is_a_no_op),
+
+    cmocka_unit_test(test_feed_reentrant_call_from_on_frame_rejected),
   };
 
   return cmocka_run_group_tests(tests, NULL, NULL);

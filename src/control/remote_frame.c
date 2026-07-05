@@ -42,10 +42,16 @@ gboolean dt_remote_frame_feed(dt_remote_frame_parser_t *p,
   g_return_val_if_fail(data != NULL || len == 0, FALSE);
   g_return_val_if_fail(on_frame != NULL, FALSE);
 
+  // feed() must not be re-entered from the on_frame callback: nested calls
+  // interleave two byte streams through one parser state
+  g_return_val_if_fail(!p->in_feed, FALSE);
+  p->in_feed = TRUE;
+
   if(p->failed)
   {
     g_set_error(error, DT_REMOTE_FRAME_ERROR, DT_REMOTE_FRAME_ERROR_FAILED,
                "frame parser is in a failed state; discard the connection");
+    p->in_feed = FALSE;
     return FALSE;
   }
 
@@ -73,6 +79,7 @@ gboolean dt_remote_frame_feed(dt_remote_frame_parser_t *p,
         p->failed = TRUE;
         g_set_error(error, DT_REMOTE_FRAME_ERROR, DT_REMOTE_FRAME_ERROR_ZERO_LENGTH,
                    "zero-length frame is not permitted");
+        p->in_feed = FALSE;
         return FALSE;
       }
       if(body_len > DT_REMOTE_MAX_FRAME)
@@ -81,6 +88,7 @@ gboolean dt_remote_frame_feed(dt_remote_frame_parser_t *p,
         g_set_error(error, DT_REMOTE_FRAME_ERROR, DT_REMOTE_FRAME_ERROR_TOO_LARGE,
                    "frame length %u exceeds the %u byte maximum",
                    body_len, (unsigned)DT_REMOTE_MAX_FRAME);
+        p->in_feed = FALSE;
         return FALSE;
       }
 
@@ -115,9 +123,14 @@ gboolean dt_remote_frame_feed(dt_remote_frame_parser_t *p,
     const gboolean keep_going = on_frame(payload, ud);
     g_bytes_unref(payload);  // callback only borrowed it
 
-    if(!keep_going) return TRUE;  // caller-requested early stop; not an error
+    if(!keep_going)
+    {
+      p->in_feed = FALSE;
+      return TRUE;  // caller-requested early stop; not an error
+    }
   }
 
+  p->in_feed = FALSE;
   return TRUE;
 }
 

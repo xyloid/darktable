@@ -77,6 +77,7 @@ typedef struct dt_remote_frame_parser_t
   GByteArray *body;        // allocated only after header validates
   uint32_t body_expected;
   gboolean failed;
+  gboolean in_feed;        // reentrancy guard, private
 } dt_remote_frame_parser_t;
 
 /** releases any body buffer the parser is holding and resets it to the
@@ -92,6 +93,8 @@ void dt_remote_frame_parser_clear(dt_remote_frame_parser_t *p);
 // dt_remote_frame_feed() call; returning FALSE stops extraction early for
 // this call (any remaining unconsumed bytes in `data` are discarded, not
 // buffered -- a caller that returns FALSE must be prepared for that).
+// MUST NOT call dt_remote_frame_feed() on this parser from within the
+// callback; the parser rejects re-entrant feeds (g_return_val_if_fail).
 typedef gboolean (*dt_remote_frame_cb)(GBytes *payload, gpointer user_data);
 
 /** feeds `len` newly-arrived bytes into the parser, invoking `on_frame`
@@ -110,6 +113,10 @@ typedef gboolean (*dt_remote_frame_cb)(GBytes *payload, gpointer user_data);
  * to do if the caller is also discarding the underlying byte stream,
  * e.g. closing the connection) -- feed() never tries to resynchronize on
  * a corrupt header.
+ *
+ * If on_frame returns FALSE, extraction stops early; any remaining bytes
+ * in `data` are discarded, permanently desynchronizing the logical stream.
+ * A FALSE return must be followed by abandoning the connection.
  *
  * Returns TRUE on success (including "consumed some header/body bytes,
  * still waiting for more" -- that is not an error, just incompleteness).
