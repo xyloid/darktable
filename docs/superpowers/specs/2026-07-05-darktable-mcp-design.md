@@ -653,6 +653,10 @@ agree at every step.
   compare-and-undo operation for the most recent remote revision
 - Whether schema presentation metadata should be generated from Bauhaus widget
   bindings in v1.x to add GUI units and recommended increments
+- Whether scalar leaves inside nested params structs (e.g. dither's
+  `random.damping`, vignette's `center`) are exposed under introspection's
+  dotted names in v1 or deferred with the other non-scalar types (the
+  supported-operations reference marks the affected modules)
 
 These questions do not change the core architecture: a transport-neutral C
 editing service, an authenticated loopback transport, and an external MCP
