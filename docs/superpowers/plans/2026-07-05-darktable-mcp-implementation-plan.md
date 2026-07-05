@@ -97,6 +97,8 @@ First tests:
 - operation/instance lookup selects exactly one live module;
 - missing darkroom/image/module/instance errors are stable;
 - every supported scalar type converts to the expected neutral value type;
+- scalar leaves in nested structs appear under their dotted introspection
+  names (e.g. `random.damping`) and resolve to the correct offsets;
 - unsupported introspection types are read-only or omitted;
 - schema field names, ranges, defaults, and enum members are preserved;
 - repeated calls do not retain pointers into module parameter storage.

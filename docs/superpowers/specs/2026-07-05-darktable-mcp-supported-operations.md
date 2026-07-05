@@ -15,10 +15,12 @@ editable, which are excluded and why.
 ## How support is determined
 
 The design spec limits `set_module_params` v1 to finite scalar `float`,
-`double`, integer, Boolean, and enum fields. Arrays, strings, curves,
-coordinate blobs, nested structures, and opaque data are reported
-`writable: false` or omitted. A module's tier follows from what fraction of
-its user-facing controls survive that rule:
+`double`, integer, Boolean, and enum fields, including scalar leaves inside
+plainly nested structs, which are addressed by introspection's dotted names
+(`random.damping`, `center.x`). Arrays, strings, curves, coordinate blobs,
+unions, and opaque data are reported `writable: false` or omitted. A
+module's tier follows from what fraction of its user-facing controls survive
+that rule:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
   scalar/enum/bool. The model can drive the module exactly as a user would.
@@ -26,8 +28,8 @@ its user-facing controls survive that rule:
   `writable: false` — see the appendix.)
 - **Tier 2 — partial support.** The core controls are supported scalars, but
   some user-facing state lives in unsupported field types (arrays, curves,
-  strings, nested structs) or has stored values whose meaning differs from
-  the GUI presentation. The MCP exposes the supported subset.
+  strings) or has stored values whose meaning differs from the GUI
+  presentation. The MCP exposes the supported subset.
 - **Tier 3 — parameter editing excluded.** The module's essence is
   unsupported data (curve nodes, drawn shapes, file paths, embedded LUTs,
   acquired histograms). `set_module_params` is useless or dangerous;
@@ -46,7 +48,7 @@ with `instance_not_supported` (column "multi" below).
 Blending and mask parameters (`blendop`) are out of scope for every module,
 per the design spec's non-goals.
 
-## Tier 1 — full support (40 modules)
+## Tier 1 — full support (42 modules)
 
 | op | display name | multi | notes |
 |---|---|---|---|
@@ -68,6 +70,7 @@ per the design spec's non-goals.
 | `defringe` | defringe | yes | radius/threshold + mode enum |
 | `demosaic` | demosaic | no | raw only; method enums + capture-sharpen scalars |
 | `diffuse` | diffuse or sharpen | yes | fully parametric anisotropic diffusion; pairs with presets |
+| `dither` | dither or posterize | yes | method enum + `random.damping` (dotted nested field); `palette`, `random.radius`, `random.range` reserved (appendix) |
 | `enlargecanvas` | enlarge canvas | yes | per-side percentages + color enum |
 | `exposure` | exposure | yes | flagship; EV exposure + black level; mode enum (manual/deflicker) |
 | `filmicrgb` | filmic rgb | yes | full scene-referred curve as scalars/enums |
@@ -90,8 +93,9 @@ per the design spec's non-goals.
 | `splittoning` | split-toning | yes | shadow/highlight hue+saturation, balance, compress |
 | `toneequal` | tone equalizer | yes | nine named EV-band scalars — the natural target for "lift the shadows" |
 | `velvia` | velvia | yes | strength + mid-tones bias |
+| `vignette` | vignetting | yes | scale/falloff/brightness/saturation/shape + `center.x`/`center.y` (dotted, rangeless — finiteness-only validation); `unbound` internal |
 
-## Tier 2 — partial support (20 modules)
+## Tier 2 — partial support (18 modules)
 
 | op | display name | multi | supported | unsupported / caveats |
 |---|---|---|---|---|
@@ -104,7 +108,6 @@ per the design spec's non-goals.
 | `colorin` | input color profile | no | profile `type`/`intent`/`normalize` enums (caution: pipeline-level change) | ICC `filename` strings |
 | `colorout` | output color profile | no | profile `type`/`intent` enums (caution) | ICC `filename` string |
 | `denoiseprofile` | denoise (profiled) | yes | `strength`, `radius`, `nbhood`, `shadows`, `bias`, `scattering`, mode enums | wavelet band curves `x`/`y`, noise-fit `a[3]`/`b[3]` (auto-set from camera profile) |
-| `dither` | dither or posterize | yes | `dither_type` enum; `random.damping` if nested-struct leaves are exposed as dotted names | nested `random` struct depends on schema policy for struct leaves; `palette` reserved |
 | `lens` | lens correction | yes | `method`/`modify_flags`/`target_geom` enums, `scale`, TCA overrides, fine-tune scalars | `camera[128]`/`lens[128]` strings; EXIF-derived `crop`/`focal`/`aperture`/`distance` (appendix) |
 | `lowlight` | lowlight vision | yes | `blueness` | band arrays `transition_x`/`transition_y` |
 | `monochrome` | monochrome | yes | `size`, `highlights` | `a`/`b` are unranged Lab filter coordinates set by GUI drag/picker |
@@ -113,7 +116,6 @@ per the design spec's non-goals.
 | `rawdenoise` | raw denoise | yes | `threshold` | wavelet band arrays `x`/`y` |
 | `rawprepare` | raw black/white point | no | crop scalars, `raw_white_point`, flat-field enum — **caution: sensor-level values; wrong edits break the image** | `raw_black_level_separate[4]` array |
 | `temperature` | white balance | no | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
-| `vignette` | vignetting | yes | scale/falloff/brightness/saturation/shape scalars, dithering enum | `center` nested 2-D vector (dotted-name policy applies) |
 | `watermark` | watermark | yes | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums | `filename`/`text`/`font` strings, `color[3]` array |
 
 ## Tier 3 — parameter editing excluded (11 modules)
@@ -197,6 +199,7 @@ heuristic verified per module):
 | `colorzones` | `splines_version` | internal versioning |
 | `crop` | `ratio_n`, `ratio_d` | GUI aspect-preset state; writable only with care |
 | `denoiseprofile` | `a[3]`, `b[3]` (arrays), `fix_anscombe_and_nlmeans_norm`, `use_new_vst`, `wb_adaptive_anscombe` | camera-profile fit; backward-compat switches |
+| `dither` | `palette`, `random.radius`, `random.range` | reserved for future extensions |
 | `filmicrgb` | `version`, `spline_version` | color-science compat enums; changing them alters interpretation of other fields |
 | `highlights` | `blendL`, `blendC` | marked unused in source |
 | `lens` | `crop`, `focal`, `aperture`, `distance`, `has_been_set`, `md_version`, `reserved` | EXIF-derived / bookkeeping |
@@ -206,6 +209,7 @@ heuristic verified per module):
 | `shadhi` | `reserved2`, `flags`, `low_approximation` | legacy/unbound flags |
 | `temperature` | `preset` | GUI preset bookkeeping |
 | `tonecurve` | `tonecurve_preset`, `tonecurve_unbound_ab` | preset bookkeeping |
+| `vignette` | `unbound` | legacy clipping flag |
 
 ## Maintenance
 

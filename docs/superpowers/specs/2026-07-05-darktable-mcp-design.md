@@ -299,6 +299,14 @@ and enum fields. Enum values use stable introspection names plus their integer
 representation. Arrays, unions, strings, coordinates, curves, blobs, opaque
 fields, and complex numbers are returned as `writable: false` or omitted.
 
+Supported scalar leaves inside plainly nested params structs are writable and
+addressed by introspection's dotted names (for example dither's
+`random.damping` and vignette's `center.x`) — the same names darktable's own
+widget binding uses, so the remote schema stays aligned with introspection
+rather than defining a flatter subset. Unions and arrays of structs remain
+excluded. Nested leaves without `$MIN`/`$MAX` tags are validated for
+finiteness only, like any other untagged scalar.
+
 Introspection ranges describe stored parameter values, not necessarily the
 GUI's presentation units. A later metadata layer may add presentation units
 and semantic aliases. The v1 MCP server should prefer modules and fields for
@@ -653,10 +661,6 @@ agree at every step.
   compare-and-undo operation for the most recent remote revision
 - Whether schema presentation metadata should be generated from Bauhaus widget
   bindings in v1.x to add GUI units and recommended increments
-- Whether scalar leaves inside nested params structs (e.g. dither's
-  `random.damping`, vignette's `center`) are exposed under introspection's
-  dotted names in v1 or deferred with the other non-scalar types (the
-  supported-operations reference marks the affected modules)
 
 These questions do not change the core architecture: a transport-neutral C
 editing service, an authenticated loopback transport, and an external MCP
