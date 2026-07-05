@@ -108,6 +108,66 @@ typedef struct dt_remote_module_ref_t
   int instance;              // multi_priority; 0 = default
 } dt_remote_module_ref_t;
 
+// The result structs below mirror the wire shapes in the protocol
+// reference field-for-field; the dispatcher serializes them 1:1.
+
+typedef struct dt_remote_state_t   // ← get_state
+{
+  char *view;                   // owned; current view name
+  gboolean has_image;           // FALSE → image fields undefined, wire null
+  int32_t image_id;
+  char *image_filename;         // owned; basename only
+  int width, height;
+  char *maker, *model, *lens;   // owned; "" when unknown
+  float iso, aperture, exposure_time, focal_length;  // 0 when unknown
+  uint64_t revision;
+} dt_remote_state_t;
+
+typedef struct dt_remote_module_t  // ← list_modules entries
+{
+  char *op;                     // owned; stable identifier
+  int instance;                 // multi_priority
+  char *instance_name;          // owned; translated, "" for default
+  char *display_name;           // owned; translated, presentation only
+  gboolean enabled;
+  gboolean deprecated;
+  gboolean supports_multiple_instances;
+} dt_remote_module_t;
+
+typedef struct dt_remote_module_schema_t  // ← get_module_schema
+{
+  char *op;                     // owned
+  char *display_name;           // owned
+  int params_version;           // module class version()
+  gboolean deprecated;
+  gboolean supports_multiple_instances;
+  GPtrArray *fields;            // dt_remote_field_t
+} dt_remote_module_schema_t;
+
+typedef struct dt_remote_history_item_t  // ← get_history items
+{
+  int seq;                      // history stack position
+  char *op;                     // owned
+  int instance;
+  char *display_name;           // owned
+  char *instance_name;          // owned
+  gboolean enabled;
+} dt_remote_history_item_t;
+
+// Shared by every mutation (set/enable/reset/create): all members are
+// read back from live state after commit, inside the same main-context
+// dispatch — the caller never echoes what it sent.
+typedef struct dt_remote_mutation_result_t
+{
+  char *op;                     // owned
+  int instance;                 // the new instance for create_module_instance
+  char *instance_name;          // owned; meaningful after create
+  gboolean enabled;
+  GPtrArray *values;            // dt_remote_patch_entry_t, read back; NULL
+                                // for enable/create (no values on the wire)
+  uint64_t revision;
+} dt_remote_mutation_result_t;
+
 typedef struct dt_remote_patch_entry_t
 {
   char *name;
@@ -133,30 +193,42 @@ errors are heap-allocated by the callee into `dt_remote_error_t **error`
 out-params and freed by the caller; no function retains pointers into
 `module->params` beyond its own call (values are copied out).
 
-Read API (plan step 1) and mutation API (step 7) keep the plan's shapes:
+Read API (plan step 1) and mutation API (step 7) — these signatures are
+normative; the plan carries excerpts:
 
 ```c
 gboolean dt_remote_get_state(dt_remote_state_t **out, dt_remote_error_t **err);
-gboolean dt_remote_list_modules(GPtrArray **out, dt_remote_error_t **err);
-gboolean dt_remote_get_module_schema(const char *op, GPtrArray **out,
+gboolean dt_remote_list_modules(GPtrArray **out /* dt_remote_module_t */,
+                                dt_remote_error_t **err);
+gboolean dt_remote_get_module_schema(const char *op,
+                                     dt_remote_module_schema_t **out,
                                      dt_remote_error_t **err);
 gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
                                      GPtrArray **out /* patch entries */,
                                      dt_remote_error_t **err);
 gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
-                                     const GPtrArray *patch,
-                                     const int *enable /* nullable tri-state */,
+                                     const dt_remote_patch_t *patch,
                                      const uint64_t *expected_revision,
                                      dt_remote_mutation_result_t **out,
                                      dt_remote_error_t **err);
-gboolean dt_remote_set_module_enabled(...);
-gboolean dt_remote_reset_module(...);
+// enable/disable travels inside dt_remote_patch_t (has_enable/enable);
+// there is no separate enable argument.
+gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,
+                                      gboolean enabled,
+                                      const uint64_t *expected_revision,
+                                      dt_remote_mutation_result_t **out,
+                                      dt_remote_error_t **err);
+gboolean dt_remote_reset_module(const dt_remote_module_ref_t *ref,
+                                const uint64_t *expected_revision,
+                                dt_remote_mutation_result_t **out,
+                                dt_remote_error_t **err);
 gboolean dt_remote_create_module_instance(const char *op, int source_instance,
                                           gboolean copy_params,
                                           const uint64_t *expected_revision,
                                           dt_remote_mutation_result_t **out,
                                           dt_remote_error_t **err);
-gboolean dt_remote_get_history(int limit, GPtrArray **out,
+gboolean dt_remote_get_history(int limit,
+                               GPtrArray **out /* dt_remote_history_item_t */,
                                dt_remote_error_t **err);
 gboolean dt_remote_undo(uint64_t expected_revision, uint64_t *new_revision,
                         dt_remote_error_t **err);
@@ -292,6 +364,29 @@ typedef struct dt_remote_method_t
   JsonNode *(*handler)(JsonObject *params, dt_remote_session_t *session,
                        dt_remote_pending_t *pending /* async only */);
 } dt_remote_method_t;
+```
+
+The two transport types the handlers see (owned by `remote_server`, opaque
+to `remote_edit`):
+
+```c
+typedef struct dt_remote_session_t   // one per accepted connection
+{
+  GSocketConnection *connection;     // ref held
+  enum { DT_REMOTE_SESSION_AWAIT_HELLO,
+         DT_REMOTE_SESSION_READY } auth_state;
+  int auth_failures;                 // closes at MAX_AUTH_FAILURES
+  int pending_requests;              // rejected busy at MAX_PENDING
+  dt_remote_frame_parser_t frame;    // per-connection streaming parser
+  struct dt_remote_server_t *server; // back-pointer: revision tracker, limits
+} dt_remote_session_t;
+
+typedef struct dt_remote_pending_t   // one per in-flight async request
+{
+  dt_remote_session_t *session;      // connection ref held via session
+  gint64 request_id;
+  GCancellable *cancellable;         // fired on disconnect; job checks it
+} dt_remote_pending_t;
 ```
 
 A static array of 13 entries is the allowlist; lookup by `g_str_equal`.

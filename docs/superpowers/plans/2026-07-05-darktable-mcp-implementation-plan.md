@@ -69,17 +69,20 @@ typedef struct dt_remote_field_t { ... } dt_remote_field_t;
 
 gboolean dt_remote_get_state(dt_remote_state_t **out,
                              dt_remote_error_t **error);
-gboolean dt_remote_list_modules(GPtrArray **out,
+gboolean dt_remote_list_modules(GPtrArray **out /* dt_remote_module_t */,
                                 dt_remote_error_t **error);
 gboolean dt_remote_get_module_schema(const char *op,
-                                     int instance,
-                                     GPtrArray **out,
+                                     dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error);
-gboolean dt_remote_get_module_params(const char *op,
-                                     int instance,
-                                     GHashTable **out,
+gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
+                                     GPtrArray **out /* patch entries */,
                                      dt_remote_error_t **error);
 ```
+
+Schemas are per-op — instances of one module share a schema (protocol
+reference decision), so `get_module_schema` takes no instance. The struct
+contents, ownership rules, and full type set are normative in the
+remote-edit internals document §2; the shapes here are excerpts.
 
 The v1 parameter classes are fixed by the remote-edit internals document §2
 and are normative for this step:
