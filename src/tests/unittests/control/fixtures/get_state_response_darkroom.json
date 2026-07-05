@@ -1,0 +1,23 @@
+{
+  "id": 2,
+  "ok": true,
+  "result": {
+    "view": "darkroom",
+    "image": {
+      "id": 172,
+      "filename": "IMG_4021.CR3",
+      "width": 6000,
+      "height": 4000,
+      "exif": {
+        "maker": "Canon",
+        "model": "EOS R6",
+        "lens": "RF35mm F1.8",
+        "iso": 800,
+        "aperture": 2.8,
+        "exposure_time": 0.005,
+        "focal_length": 35.0
+      }
+    },
+    "revision": 31
+  }
+}

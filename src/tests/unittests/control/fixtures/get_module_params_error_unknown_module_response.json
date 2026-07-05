@@ -1,0 +1,9 @@
+{
+  "id": 5,
+  "ok": false,
+  "error": {
+    "code": "unknown_module",
+    "message": "unknown module 'nonexistent_op'",
+    "retryable": false
+  }
+}

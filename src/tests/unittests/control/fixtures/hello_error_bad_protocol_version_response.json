@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "unsupported protocol_version 99",
+    "retryable": false
+  }
+}

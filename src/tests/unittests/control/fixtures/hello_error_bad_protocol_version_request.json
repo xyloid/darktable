@@ -1,0 +1,9 @@
+{
+  "id": 1,
+  "method": "hello",
+  "params": {
+    "protocol_version": 99,
+    "token": "dGVzdC10b2tlbg",
+    "client": "darktable-mcp-test/0.1.0"
+  }
+}

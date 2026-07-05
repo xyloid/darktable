@@ -1,0 +1,9 @@
+{
+  "id": 7,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "unknown method 'frobnicate'",
+    "retryable": false
+  }
+}

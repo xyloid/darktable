@@ -1,0 +1,5 @@
+{
+  "id": 8,
+  "method": "get_module_schema",
+  "params": "not-an-object"
+}

@@ -1,0 +1,18 @@
+{
+  "id": 3,
+  "ok": true,
+  "result": {
+    "revision": 31,
+    "modules": [
+      {
+        "op": "exposure",
+        "instance": 0,
+        "instance_name": "",
+        "display_name": "exposure",
+        "enabled": true,
+        "deprecated": false,
+        "supports_multiple_instances": true
+      }
+    ]
+  }
+}

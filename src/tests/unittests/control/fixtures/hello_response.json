@@ -1,0 +1,10 @@
+{
+  "id": 1,
+  "ok": true,
+  "result": {
+    "protocol_version": 1,
+    "darktable_version": "5.x",
+    "pid": 12345,
+    "capabilities": []
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "id": 2,
+  "method": "get_state",
+  "params": { "unexpected": "garbage", "another": 123 }
+}

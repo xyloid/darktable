@@ -1,0 +1,33 @@
+{
+  "id": 4,
+  "ok": true,
+  "result": {
+    "module": "exposure",
+    "display_name": "exposure",
+    "params_version": 7,
+    "deprecated": false,
+    "supports_multiple_instances": true,
+    "fields": [
+      {
+        "name": "exposure",
+        "description": "exposure correction",
+        "type": "float",
+        "minimum": -18.0,
+        "maximum": 18.0,
+        "default": 0.0,
+        "writable": true
+      },
+      {
+        "name": "mode",
+        "description": "mode",
+        "type": "enum",
+        "default": "EXPOSURE_MODE_MANUAL",
+        "writable": true,
+        "enum_values": [
+          { "name": "EXPOSURE_MODE_MANUAL", "value": 0, "description": "manual" },
+          { "name": "EXPOSURE_MODE_DEFLICKER", "value": 1, "description": "automatic" }
+        ]
+      }
+    ]
+  }
+}

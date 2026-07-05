@@ -1,0 +1,9 @@
+{
+  "id": 3,
+  "ok": false,
+  "error": {
+    "code": "not_in_darkroom",
+    "message": "not in darkroom view",
+    "retryable": false
+  }
+}

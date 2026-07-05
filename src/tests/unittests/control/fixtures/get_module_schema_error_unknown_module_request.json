@@ -1,0 +1,5 @@
+{
+  "id": 4,
+  "method": "get_module_schema",
+  "params": { "module": "nonexistent_op" }
+}

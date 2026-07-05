@@ -1,0 +1,5 @@
+{
+  "id": 3,
+  "method": "list_modules",
+  "params": { "unexpected": "garbage" }
+}
