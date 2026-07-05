@@ -658,10 +658,12 @@ agree at every step.
 
 - Whether the preference should enable the server persistently or require
   confirmation for each darktable session
-- Which existing export/pixelpipe helper provides the cleanest bounded
-  in-memory JPEG path on all platforms
-- How much of the existing GUI scope implementations should move into a shared
-  computation layer versus introducing parallel data-only implementations
+- ~~Which export helper for the in-memory preview~~ — resolved in
+  `2026-07-05-darktable-mcp-remote-edit-internals.md` §8: the export path
+  with a synthetic in-memory format sink, sRGB output, background job
+- ~~Scope computation layer factoring~~ — resolved in the same internals
+  document §9: this fork's scopes plugins already separate compute from
+  drawing; the kernels move to a statically-linkable `src/common/scopes.c`
 - Whether schema presentation metadata should be generated from Bauhaus widget
   bindings in v1.x to add GUI units and recommended increments
 

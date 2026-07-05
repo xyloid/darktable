@@ -401,10 +401,13 @@ pixelpipe behavior as their native darktable equivalents.
 
 ### 9. Implement bounded preview rendering
 
-Before coding, identify the existing image export or pixelpipe helper that can
-render the active image to memory without exposing a caller-selected path.
-Document the selected helper in the design doc if it changes threading or
-color-management semantics.
+The helper question is resolved in
+`docs/superpowers/specs/2026-07-05-darktable-mcp-remote-edit-internals.md`
+§8: `dt_imageio_export_with_flags` with a synthetic in-memory format sink
+(precedents: `_preview_write_image`, the HDR-merge job), `display_byteorder
+= FALSE`, `icc_type = DT_COLORSPACE_SRGB`, then `dt_imageio_jpeg_compress`,
+on a `DT_JOB_QUEUE_SYSTEM_BG` job, with a mandatory `dt_dev_write_history`
+flush on the main thread before queueing.
 
 Add an asynchronous remote operation returning:
 
