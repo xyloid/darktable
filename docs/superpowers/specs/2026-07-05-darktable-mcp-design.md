@@ -304,6 +304,11 @@ GUI's presentation units. A later metadata layer may add presentation units
 and semantic aliases. The v1 MCP server should prefer modules and fields for
 which stored values have clear meanings.
 
+`2026-07-05-darktable-mcp-supported-operations.md` is the companion
+reference: a complete per-module inventory of every IOP operation with its
+support tier, the writable field subset for partially supported modules, and
+the internal fields that must be marked `writable: false`.
+
 ## Mutation semantics
 
 `set_module_params` implements a transaction over one module instance:
