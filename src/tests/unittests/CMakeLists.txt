@@ -1,3 +1,4 @@
+add_subdirectory(control)
 add_subdirectory(iop)
 
 if(USE_AI)

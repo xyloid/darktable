@@ -107,6 +107,7 @@ FILE(GLOB SOURCE_FILES
   "control/jobs/image_jobs.c"
   "control/jobs/sidecar_jobs.c"
   "control/progress.c"
+  "control/remote_edit.c"
   "control/signal.c"
   "develop/blend.c"
   "develop/blend_gui.c"
