@@ -81,6 +81,22 @@ gboolean dt_remote_get_module_params(const char *op,
                                      dt_remote_error_t **error);
 ```
 
+The v1 parameter classes are fixed by the remote-edit internals document §2
+and are normative for this step:
+
+- `float` — introspection FLOAT and DOUBLE fields;
+- `int` — all signed/unsigned integer widths (CHAR through ULONG);
+- `bool` — BOOL fields;
+- `enum` — ENUM fields, members exposed by stable introspection name;
+- everything else (arrays, non-leaf structs, unions, opaque, float-complex)
+  appears in the schema with `writable: false` — never omitted, never
+  serialized from raw memory.
+
+Scalar leaves inside nested structs belong to the four writable classes and
+are addressed by their full dotted introspection names. Semantic classes
+(curves and friends, per the curve-classes design) are post-v1 and out of
+scope for this step.
+
 Implementation requirements:
 
 - Fail with `not_in_darkroom` unless the current view is darkroom.
