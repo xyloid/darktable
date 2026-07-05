@@ -108,6 +108,7 @@ FILE(GLOB SOURCE_FILES
   "control/jobs/sidecar_jobs.c"
   "control/progress.c"
   "control/remote_edit.c"
+  "control/remote_frame.c"
   "control/remote_protocol.c"
   "control/signal.c"
   "develop/blend.c"
