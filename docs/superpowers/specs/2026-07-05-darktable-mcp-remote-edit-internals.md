@@ -358,7 +358,11 @@ comparisons also require the stamped `imgid` to equal the live image.
 typedef struct dt_remote_method_t
 {
   const char *name;
-  gboolean needs_darkroom;   // pre-checked before handler runs
+  gboolean needs_darkroom;   // metadata only: the precondition is enforced
+                             // inside the remote_edit functions (plan step 1
+                             // mandates the checks there); dispatch does not
+                             // duplicate it — kept for scheduling and
+                             // documentation in later steps
   gboolean is_mutation;      // serialized; rejected while another runs
   gboolean is_async;         // render_preview, compute_scopes
   JsonNode *(*handler)(JsonObject *params, dt_remote_session_t *session,

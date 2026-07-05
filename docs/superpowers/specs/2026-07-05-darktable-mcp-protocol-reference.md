@@ -19,6 +19,8 @@ when they disagree, this file wins until amended.
   `params` may be omitted when a method takes no parameters.
 - Success: `{"id", "ok": true, "result": <object>}`. Error:
   `{"id", "ok": false, "error": {"code", "message", "details"?, "retryable"}}`.
+  If a request's `id` is missing or not an unsigned integer, the error
+  response carries `"id": null` (the request cannot be correlated).
 - **Strict params.** Unknown keys in `params` are rejected with
   `invalid_value`. The sidecar and server are versioned together; forward
   compatibility is handled by the protocol version and the `capabilities`

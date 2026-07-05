@@ -61,8 +61,10 @@ typedef struct dt_remote_pending_t dt_remote_pending_t;
 typedef struct dt_remote_method_t
 {
   const char *name;
-  gboolean needs_darkroom;   // documents the precondition; not yet enforced
-                            // here (see remote_protocol.c for why)
+  gboolean needs_darkroom;   // metadata only: the precondition is enforced
+                             // inside the remote_edit functions (plan step 1
+                             // mandates the checks there); dispatch does not
+                             // duplicate it
   gboolean is_mutation;      // serialized; rejected while another runs
   gboolean is_async;         // render_preview, compute_scopes
   JsonNode *(*handler)(JsonObject *params, dt_remote_session_t *session,
