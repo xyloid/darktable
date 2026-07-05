@@ -232,57 +232,57 @@ gboolean dt_remote_value_validate_and_write(const dt_introspection_field_t *f,
   {
     case DT_INTROSPECTION_TYPE_FLOAT:
       if(v->type != DT_REMOTE_VALUE_FLOAT) goto invalid_type;
-      if(v->v.f < f->Float.Min || v->v.f > f->Float.Max) goto out_of_range;
+      if(!(v->v.f >= f->Float.Min && v->v.f <= f->Float.Max)) goto out_of_range;
       *(float *)base = (float)v->v.f;
       return TRUE;
     case DT_INTROSPECTION_TYPE_DOUBLE:
       if(v->type != DT_REMOTE_VALUE_FLOAT) goto invalid_type;
-      if(v->v.f < f->Double.Min || v->v.f > f->Double.Max) goto out_of_range;
+      if(!(v->v.f >= f->Double.Min && v->v.f <= f->Double.Max)) goto out_of_range;
       *(double *)base = v->v.f;
       return TRUE;
     case DT_INTROSPECTION_TYPE_CHAR:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->Char.Min || v->v.i > f->Char.Max) goto out_of_range;
+      if(!(v->v.i >= f->Char.Min && v->v.i <= f->Char.Max)) goto out_of_range;
       *(char *)base = (char)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_INT8:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->Int8.Min || v->v.i > f->Int8.Max) goto out_of_range;
+      if(!(v->v.i >= f->Int8.Min && v->v.i <= f->Int8.Max)) goto out_of_range;
       *(int8_t *)base = (int8_t)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_UINT8:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->UInt8.Min || v->v.i > f->UInt8.Max) goto out_of_range;
+      if(!(v->v.i >= f->UInt8.Min && v->v.i <= f->UInt8.Max)) goto out_of_range;
       *(uint8_t *)base = (uint8_t)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_SHORT:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->Short.Min || v->v.i > f->Short.Max) goto out_of_range;
+      if(!(v->v.i >= f->Short.Min && v->v.i <= f->Short.Max)) goto out_of_range;
       *(short *)base = (short)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_USHORT:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->UShort.Min || v->v.i > f->UShort.Max) goto out_of_range;
+      if(!(v->v.i >= f->UShort.Min && v->v.i <= f->UShort.Max)) goto out_of_range;
       *(unsigned short *)base = (unsigned short)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_INT:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->Int.Min || v->v.i > f->Int.Max) goto out_of_range;
+      if(!(v->v.i >= f->Int.Min && v->v.i <= f->Int.Max)) goto out_of_range;
       *(int *)base = (int)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_UINT:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->UInt.Min || v->v.i > f->UInt.Max) goto out_of_range;
+      if(!(v->v.i >= f->UInt.Min && v->v.i <= f->UInt.Max)) goto out_of_range;
       *(unsigned int *)base = (unsigned int)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_LONG:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < f->Long.Min || v->v.i > f->Long.Max) goto out_of_range;
+      if(!(v->v.i >= f->Long.Min && v->v.i <= f->Long.Max)) goto out_of_range;
       *(long *)base = (long)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_ULONG:
       if(v->type != DT_REMOTE_VALUE_INT) goto invalid_type;
-      if(v->v.i < 0 || (unsigned long)v->v.i > f->ULong.Max) goto out_of_range;
+      if(!(v->v.i >= 0 && (unsigned long)v->v.i <= f->ULong.Max)) goto out_of_range;
       *(unsigned long *)base = (unsigned long)v->v.i;
       return TRUE;
     case DT_INTROSPECTION_TYPE_BOOL:
@@ -519,10 +519,12 @@ GPtrArray *dt_remote_schema_from_introspection(const dt_introspection_field_t *l
 /* live-module traversal (read API)                                        */
 /* ---------------------------------------------------------------------- */
 
-// Shared precondition for the whole read API: the sidecar can only
-// inspect the image currently loaded in the darkroom (internals doc §1,
-// plan step-1 implementation requirements). `dev_out`, if non-NULL,
-// receives darktable.develop on success.
+// Precondition for the read API calls that inspect the live darkroom
+// image (list_modules, get_module_params): the sidecar can only walk
+// module instances of the image currently loaded in the darkroom
+// (internals doc §1, plan step-1 implementation requirements). get_state
+// and get_module_schema do not gate on this -- see their own comments.
+// `dev_out`, if non-NULL, receives darktable.develop on success.
 static gboolean dt_remote_require_darkroom_image(dt_develop_t **dev_out, dt_remote_error_t **error)
 {
   if(dt_view_get_current() != DT_VIEW_DARKROOM)
@@ -546,28 +548,46 @@ static gboolean dt_remote_require_darkroom_image(dt_develop_t **dev_out, dt_remo
   return TRUE;
 }
 
+// stable, untranslated identifier for the wire `view` field -- the view's
+// own module_name (e.g. "darkroom", "lighttable"), never a display string.
+static const char *dt_remote_current_view_name(void)
+{
+  const dt_view_t *cv = darktable.view_manager
+    ? dt_view_manager_get_current_view(darktable.view_manager)
+    : NULL;
+  return (cv && *cv->module_name) ? cv->module_name : "none";
+}
+
+// get_state has no domain errors in the protocol reference's error matrix:
+// it always succeeds, reporting has_image:FALSE (and zeroed/NULL image
+// fields) when not in darkroom or no image is open, rather than gating on
+// dt_remote_require_darkroom_image() like the module-inspection calls do.
 gboolean dt_remote_get_state(dt_remote_state_t **out, dt_remote_error_t **error)
 {
-  dt_develop_t *dev = NULL;
-  if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
-
   dt_remote_state_t *state = g_malloc0(sizeof(dt_remote_state_t));
-  state->view = g_strdup(_("darkroom"));
-  state->has_image = TRUE;
-  state->image_id = dev->image_storage.id;
-  state->image_filename = g_strdup(dev->image_storage.filename);
-  state->width = dev->image_storage.width;
-  state->height = dev->image_storage.height;
-  state->maker = g_strdup(dev->image_storage.exif_maker);
-  state->model = g_strdup(dev->image_storage.exif_model);
-  state->lens = g_strdup(dev->image_storage.exif_lens);
-  state->iso = dev->image_storage.exif_iso;
-  state->aperture = dev->image_storage.exif_aperture;
-  state->exposure_time = dev->image_storage.exif_exposure;
-  state->focal_length = dev->image_storage.exif_focal_length;
-  // Placeholder until the dedicated revision tracker (internals doc §5)
-  // lands; history_end is a reasonable monotonic proxy in the meantime.
-  state->revision = (uint64_t)dev->history_end;
+  state->view = g_strdup(dt_remote_current_view_name());
+
+  dt_develop_t *dev = darktable.develop;
+  if(dt_view_get_current() == DT_VIEW_DARKROOM && dev && dt_is_valid_imgid(dev->image_storage.id))
+  {
+    state->has_image = TRUE;
+    state->image_id = dev->image_storage.id;
+    state->image_filename = g_strdup(dev->image_storage.filename);
+    state->width = dev->image_storage.width;
+    state->height = dev->image_storage.height;
+    state->maker = g_strdup(dev->image_storage.exif_maker);
+    state->model = g_strdup(dev->image_storage.exif_model);
+    state->lens = g_strdup(dev->image_storage.exif_lens);
+    state->iso = dev->image_storage.exif_iso;
+    state->aperture = dev->image_storage.exif_aperture;
+    state->exposure_time = dev->image_storage.exif_exposure;
+    state->focal_length = dev->image_storage.exif_focal_length;
+    // Placeholder until the dedicated revision tracker (internals doc §5)
+    // lands; history_end is a reasonable monotonic proxy in the meantime.
+    state->revision = (uint64_t)dev->history_end;
+  }
+  // else: has_image stays FALSE and every image_* field stays at its
+  // g_malloc0() zero/NULL value -- no error, per the protocol reference.
 
   *out = state;
   return TRUE;
@@ -608,12 +628,16 @@ gboolean dt_remote_list_modules(GPtrArray **out, dt_remote_error_t **error)
   return TRUE;
 }
 
+// Schemas are derived from the loaded module .so alone (op name, flags,
+// introspection descriptor) -- they are per-op and cacheable per
+// (darktable version, op), independent of any open image or active view,
+// so unlike list_modules/get_module_params this does not gate on
+// dt_remote_require_darkroom_image(); the protocol reference's error
+// matrix allows only unknown_module/invalid_value here.
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error)
 {
-  if(!dt_remote_require_darkroom_image(NULL, error)) return FALSE;
-
   if(!op || !*op)
   {
     if(error) *error = dt_remote_error_new(DT_REMOTE_ERR_UNKNOWN_MODULE, _("no operation given"));

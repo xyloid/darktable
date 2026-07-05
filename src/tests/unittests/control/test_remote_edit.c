@@ -28,6 +28,7 @@
  * Please see README.md for more detailed documentation.
  */
 #include <limits.h>
+#include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -270,6 +271,23 @@ static void test_validate_and_write_float_out_of_range_rejected(void **state)
   dt_remote_error_free(err);
 }
 
+static void test_validate_and_write_float_nan_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  params.amount = 0.5f;
+  dt_remote_value_t v = { .type = DT_REMOTE_VALUE_FLOAT, .v.f = NAN };
+  dt_remote_error_t *err = NULL;
+
+  // `v.v.f < min || v.v.f > max` would accept NaN (both comparisons are
+  // false); the range check must instead require `>= min && <= max` so
+  // NaN is rejected as out-of-range/invalid.
+  assert_false(dt_remote_value_validate_and_write(&fixture_linear[FIXTURE_IDX_AMOUNT], &v, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_float_equal(params.amount, 0.5, 1e-9);  // untouched on rejection
+  dt_remote_error_free(err);
+}
+
 static void test_validate_and_write_wrong_value_type_rejected(void **state)
 {
   fixture_params_t params = { 0 };
@@ -471,6 +489,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_repeated_calls_do_not_alias_params_memory),
     cmocka_unit_test(test_validate_and_write_float_in_range),
     cmocka_unit_test(test_validate_and_write_float_out_of_range_rejected),
+    cmocka_unit_test(test_validate_and_write_float_nan_rejected),
     cmocka_unit_test(test_validate_and_write_wrong_value_type_rejected),
     cmocka_unit_test(test_validate_and_write_enum_valid_and_invalid),
     cmocka_unit_test(test_validate_and_write_unsupported_field_rejected),

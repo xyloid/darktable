@@ -155,7 +155,10 @@ typedef struct dt_remote_denylist_t
 
 typedef struct dt_remote_state_t   // <- get_state
 {
-  char *view;                   // owned; current view name
+  char *view;                   // owned; stable, untranslated identifier
+                               // for the current view (e.g. "darkroom",
+                               // "lighttable", "none"); never a display
+                               // string
   gboolean has_image;           // FALSE -> image fields undefined, wire null
   int32_t image_id;
   char *image_filename;         // owned; basename only
@@ -287,8 +290,11 @@ gboolean dt_remote_value_validate_and_write(const dt_introspection_field_t *f,
 /* read API (live-module traversal)                                        */
 /* ---------------------------------------------------------------------- */
 
-/** snapshots the current view/image state. Fails with
- * DT_REMOTE_ERR_NOT_IN_DARKROOM unless the current view is darkroom. */
+/** snapshots the current view/image state. Always succeeds: `view` is the
+ * current view's stable (untranslated) identifier, and when not in
+ * darkroom or no image is open, `has_image` is FALSE with every image_*
+ * field left at its zero/NULL value -- no domain errors, per the
+ * protocol reference's error matrix. */
 gboolean dt_remote_get_state(dt_remote_state_t **out,
                              dt_remote_error_t **error);
 
@@ -299,7 +305,8 @@ gboolean dt_remote_list_modules(GPtrArray **out /* dt_remote_module_t */,
                                 dt_remote_error_t **error);
 
 /** returns the per-op parameter schema (shared by all instances of that
- * op). Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is not loaded. */
+ * op), from the loaded module .so alone -- no darkroom/image needed.
+ * Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is not loaded. */
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error);
