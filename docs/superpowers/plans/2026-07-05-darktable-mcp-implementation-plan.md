@@ -334,6 +334,11 @@ Implement in this order:
 Do not clamp silently. The schema tells callers the range, and an invalid patch
 returns `invalid_value` without changing live state.
 
+Keep the transaction generic over a prepared params block rather than coupled
+to scalar fields: the patch struct carries a reserved `semantic_values` slot
+(see the curve-classes low-level design) so future semantic parameter classes
+extend the same copy/validate/commit path instead of forking it.
+
 Do not automatically enable a disabled module merely because parameters were
 set. If combined enable-and-patch behavior is desired, add an explicit
 `enable` member to the request and still create one history record.

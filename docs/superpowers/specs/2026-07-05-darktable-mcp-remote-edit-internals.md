@@ -113,7 +113,19 @@ typedef struct dt_remote_patch_entry_t
   char *name;
   dt_remote_value_t value;
 } dt_remote_patch_entry_t;
-// a patch is a GPtrArray of entries; duplicates rejected at protocol layer
+
+typedef struct dt_remote_patch_t
+{
+  GPtrArray *scalar_values;    // dt_remote_patch_entry_t
+  GPtrArray *semantic_values;  // reserved: semantic-class patches (curves
+                               // etc., see the curve-classes design); NULL
+                               // and unused in v1, but the transaction is
+                               // written against this struct so semantic
+                               // support extends it without a rewrite
+  gboolean has_enable;
+  gboolean enable;
+} dt_remote_patch_t;
+// duplicates rejected at protocol layer
 ```
 
 Ownership rules: every returned object has a paired `dt_remote_*_free()`;

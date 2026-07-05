@@ -12,6 +12,9 @@ always `get_module_schema` — this document is the planning and review
 reference: which modules the model can usefully edit, which are partially
 editable, which are excluded and why.
 
+Parameter storage shapes, semantic coupling, and candidate future parameter
+classes are tracked in `2026-07-05-darktable-mcp-parameter-class-investigation.md`.
+
 ## How support is determined
 
 The design spec limits `set_module_params` v1 to finite scalar `float`,
@@ -65,7 +68,7 @@ per the design spec's non-goals.
 | `colorcontrast` | color contrast | yes | a/b steepness; offsets internal |
 | `colorequal` | color equalizer | yes | per-hue-band saturation/hue/brightness as named scalars — ideal for "make the greens less yellow" |
 | `colorize` | colorize | yes | hue/saturation/lightness; `version` internal |
-| `colorreconstruction` | color reconstruction | yes | threshold/spatial/range scalars |
+| `colorreconstruct` | color reconstruction | yes | threshold/spatial/range scalars; op is the CMake/plugin name (`colorreconstruction.c` is the source filename) |
 | `crop` | crop | no | normalized cx/cy/cw/ch; ratio ints are GUI aspect presets (caution) |
 | `defringe` | defringe | yes | radius/threshold + mode enum |
 | `demosaic` | demosaic | no | raw only; method enums + capture-sharpen scalars |
@@ -216,5 +219,8 @@ heuristic verified per module):
 Regenerate the inventory when modules are added or params structs change:
 the raw data comes from `DT_MODULE_INTROSPECTION` declarations, params
 structs, `flags()` implementations, and `name()` strings in `src/iop/*.c`
-and `src/iop/*.cc`. Cross-check any tier change against the design spec's
-supported-type list before moving a module between tiers.
+and `src/iop/*.cc`. Derive operation identifiers from the first argument to
+`add_iop()` in `src/iop/CMakeLists.txt`, not from source filenames; notably,
+the `colorreconstruct` operation is implemented by `colorreconstruction.c`.
+Cross-check any tier change against the design spec's supported-type list
+before moving a module between tiers.
