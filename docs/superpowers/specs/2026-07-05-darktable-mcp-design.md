@@ -246,6 +246,11 @@ Protocol v1 permits multiple requests in flight, but responses may arrive out
 of order. Mutation execution is serialized on darktable's GUI/main context.
 The sidecar initially issues one mutation at a time.
 
+`2026-07-05-darktable-mcp-protocol-reference.md` is the companion reference
+defining every method's request and response schema, the error-code matrix,
+and the message-level conventions (strict params, enum encoding, revision
+semantics). Dispatcher validation and client fixtures derive from it.
+
 ## Remote-edit operations
 
 The private protocol exposes these methods:
@@ -657,8 +662,6 @@ agree at every step.
   in-memory JPEG path on all platforms
 - How much of the existing GUI scope implementations should move into a shared
   computation layer versus introducing parallel data-only implementations
-- Whether `undo(steps)` should allow undoing user edits or only expose a
-  compare-and-undo operation for the most recent remote revision
 - Whether schema presentation metadata should be generated from Bauhaus widget
   bindings in v1.x to add GUI units and recommended increments
 

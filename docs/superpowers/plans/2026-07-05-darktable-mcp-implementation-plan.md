@@ -143,6 +143,9 @@ It does not own authentication, framing, sockets, or GUI-thread scheduling.
 
 Tests must cover missing IDs/methods, unknown methods, wrong JSON types,
 overlong strings, non-finite numbers, and stable success/error envelopes.
+Request/response fixtures are authored from the protocol reference
+(`2026-07-05-darktable-mcp-protocol-reference.md`) and shared with the Python
+client tests.
 
 Acceptance gate: feed JSON fixtures directly to the dispatcher and validate
 responses without creating a socket.
@@ -384,9 +387,10 @@ Instance-creation tests:
 - history and undo behavior matches the GUI new-instance button (undo removes
   the created instance);
 - the revision advances and subsequent `list_modules` reflects the instance.
-Define and test the policy for undo before exposing `steps > 1`. The safest v1
-surface is `undo(expected_revision)` for the latest state transition; broader
-multi-step undo can follow after behavior for interleaved user edits is clear.
+
+The undo contract is fixed by the protocol reference: compare-and-undo with a
+required `expected_revision`, one transition per call, `revision_conflict` on
+any mismatch. Broader multi-step undo is future work.
 
 History responses should be model-oriented: sequence, module operation,
 instance, display name, enabled state, and revision-related metadata. Do not
@@ -494,12 +498,13 @@ checkpoint.
 The read-only vertical slice can proceed without these decisions, but Phase 2
 must resolve them:
 
-1. Whether the first undo tool may undo an interleaved user edit or only a
-   matching latest remote revision.
+1. ~~Undo policy~~ — resolved in the protocol reference: compare-and-undo
+   with a required `expected_revision`; no multi-step undo in v1.
 2. Whether setting parameters may explicitly enable a module in the same
-   request.
-3. Whether unsupported schema fields are included with `writable: false` or
-   omitted by default with an opt-in `include_unsupported` flag.
+   request. (The protocol reference specifies an explicit `enable` member;
+   confirm during implementation.)
+3. ~~Unsupported schema fields~~ — resolved in the protocol reference:
+   always included with `writable: false`, no opt-in flag.
 4. Which platform API supplies cryptographic random bytes for the minimum GLib
    versions supported by darktable.
 5. Which existing pixelpipe/export path provides a bounded in-memory preview
