@@ -29,6 +29,8 @@ to an explicitly enabled darktable instance on Linux, macOS, and Windows and:
 - detect stale writes through a process-local revision;
 - retrieve history and undo an edit;
 - return a bounded JPEG preview as MCP image content;
+- return photographic scopes (numeric summaries and rendered images) that all
+  derive from one buffer and carry one revision;
 - reject unauthenticated, malformed, oversized, or unsupported requests;
 - recover cleanly when darktable exits or restarts.
 
@@ -215,9 +217,11 @@ second, contradictory preference path.
 
 Server behavior:
 
-- generate 32 random bytes with GLib's cryptographically suitable platform
-  source; if the chosen GLib API is not guaranteed cryptographic on all target
-  versions, add a small OS-specific random-byte wrapper;
+- generate 32 random bytes with a new `dt_crypto_random_bytes` wrapper
+  (`src/common/crypto_random.[ch]`: `getrandom(2)` with `/dev/urandom`
+  fallback, `BCryptGenRandom`, `SecRandomCopyBytes`) — nothing in GLib at
+  darktable's 2.56 floor is specified as CSPRNG-backed (see the remote-edit
+  internals document §7);
 - bind `GSocketService` to `127.0.0.1` and port 0;
 - accept asynchronously on the GLib main context;
 - require `hello` as the first frame;
@@ -434,7 +438,58 @@ Requirements:
 Acceptance gate: a known visible parameter edit changes preview pixels, undo
 restores them within an image-comparison tolerance, and memory remains bounded.
 
-### 10. Cross-platform packaging and documentation
+### 10. Implement scopes computation
+
+The design is resolved in the remote-edit internals document §9: this fork's
+scopes plugins (`src/libs/scopes/*.c`) already separate `process` from
+`draw_*`, so the kernels factor into a statically-linkable
+`src/common/scopes.[ch]` with POD output structs, and the lib's `*_process`
+functions become thin adapters over the shared implementation.
+
+Create:
+
+```text
+src/common/scopes.h
+src/common/scopes.c
+src/tests/unittests/common/test_scopes.c
+```
+
+Modify:
+
+```text
+src/libs/scopes/histogram.c
+src/libs/scopes/waveform.c
+src/libs/scopes/vectorscope.c
+src/libs/histogram.c
+```
+
+Remote capture and the `compute_scopes` method:
+
+- register at the same preview-pixelpipe gamma hook the GUI uses and retain
+  a copy of the latest pushed buffer plus the revision stamped at push time,
+  behind a mutex;
+- run requested kernels over the retained buffer on a background job, never
+  on the GUI thread;
+- all scopes in one response derive from that single buffer and carry its
+  single revision by construction;
+- rendered scope images are composited without cairo drawing code from the
+  lib (new colorizers over the A8 rasters) and PNG-encoded via
+  `cairo_surface_write_to_png_stream` into memory;
+- an empty capture slot (fresh darkroom, no preview run yet) returns
+  `scope_failed` with a retryable hint;
+- the histogram color profile conversion is shared with the GUI path so both
+  produce identical numbers.
+
+Tests: kernel outputs over fixture buffers (histogram bins, waveform raster
+dimensions and orientation, vectorscope hue positions for known primaries),
+GUI-adapter equivalence on one fixture, and revision coherence across a
+multi-scope response.
+
+Acceptance gate: after a visible exposure edit, remote histogram statistics
+shift in the expected direction, and the GUI scopes panel and
+`compute_scopes` agree on the same buffer.
+
+### 11. Cross-platform packaging and documentation
 
 Document:
 
@@ -482,7 +537,8 @@ Prefer reviewable commits that leave the tree buildable:
 6. `remote_edit`: revisions and atomic mutations
 7. `remote_edit`: enable/reset/instance-creation/history/undo
 8. `remote_edit`: asynchronous preview
-9. packaging, platform documentation, and end-to-end CI
+9. `scopes`: shared kernels in `src/common/scopes.c` and `compute_scopes`
+10. packaging, platform documentation, and end-to-end CI
 
 Do not combine the initial C control API, networking, Python sidecar, and
 mutation code into one change. The read-only vertical slice is the architectural
@@ -513,10 +569,14 @@ must resolve them:
    confirm during implementation.)
 3. ~~Unsupported schema fields~~ — resolved in the protocol reference:
    always included with `writable: false`, no opt-in flag.
-4. Which platform API supplies cryptographic random bytes for the minimum GLib
-   versions supported by darktable.
-5. Which existing pixelpipe/export path provides a bounded in-memory preview
-   with identical color-management behavior on all three platforms.
+4. ~~Cryptographic random source~~ — resolved in the remote-edit internals
+   document §7: new `dt_crypto_random_bytes` wrapper
+   (getrandom/BCryptGenRandom/SecRandomCopyBytes); no suitable in-tree or
+   GLib-floor API exists.
+5. ~~Preview path~~ — resolved in the remote-edit internals document §8:
+   `dt_imageio_export_with_flags` with a synthetic in-memory format sink,
+   sRGB, `dt_imageio_jpeg_compress`, on a background job after a main-thread
+   history flush.
 
 ## First implementation checkpoint
 
