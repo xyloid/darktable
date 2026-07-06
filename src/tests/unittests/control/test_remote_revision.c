@@ -274,6 +274,79 @@ static void test_concurrent_bumps_are_not_lost(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* dt_remote_revision_commit_history_change(): plan step 7's synchronous   */
+/* counterpart to the asynchronous DEVELOP_HISTORY_CHANGE signal delivery  */
+/* (see the function's header comment for the race it closes).            */
+/* ---------------------------------------------------------------------- */
+
+static void test_commit_history_change_bumps_singleton_immediately(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  const uint64_t rev = dt_remote_revision_commit_history_change();
+
+  assert_int_equal((int)rev, 1);
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
+}
+
+// The redundant, later DEVELOP_HISTORY_CHANGE delivery this same mutation
+// eventually triggers must be swallowed, not double-counted -- otherwise
+// a client holding the revision this call returned would see the counter
+// have silently moved on by the time its next request arrives.
+static void test_simulated_signal_after_commit_is_suppressed_not_double_counted(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  const uint64_t rev = dt_remote_revision_commit_history_change();
+  assert_int_equal((int)rev, 1);
+
+  // The signal this mutation's dt_dev_add_history_item() raised is still
+  // "in flight" (async, idle-priority) -- simulate it landing now.
+  dt_remote_revision_test_simulate_history_change_signal();
+
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
+}
+
+// An unrelated history change (no preceding commit -- e.g. the user
+// editing directly via the GUI) must still bump normally: suppression is
+// strictly one-shot per commit, never a blanket "ignore the signal".
+static void test_unpaired_simulated_signal_still_bumps(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  dt_remote_revision_test_simulate_history_change_signal();
+
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
+}
+
+// Suppression slots are counted, not a single flag: two commits in a row
+// (e.g. two rapid mutations) before either of their signals drains must
+// still each be paired off correctly against the two eventual deliveries.
+static void test_multiple_commits_suppress_matching_number_of_signals(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  dt_remote_revision_commit_history_change();  // counter -> 1, 1 slot armed
+  dt_remote_revision_commit_history_change();  // counter -> 2, 2 slots armed
+
+  dt_remote_revision_test_simulate_history_change_signal();  // consumes a slot
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 2);
+
+  dt_remote_revision_test_simulate_history_change_signal();  // consumes the last slot
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 2);
+
+  // no slots left: a third delivery is a genuine, unrelated change.
+  dt_remote_revision_test_simulate_history_change_signal();
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 3);
+
+  dt_remote_revision_test_reset_singleton();
+}
+
+/* ---------------------------------------------------------------------- */
 /* dt_remote_revision_current(): no server running                         */
 /* ---------------------------------------------------------------------- */
 
@@ -387,6 +460,11 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_matches_stale_after_wrap_is_still_rejected),
 
     cmocka_unit_test(test_concurrent_bumps_are_not_lost),
+
+    cmocka_unit_test(test_commit_history_change_bumps_singleton_immediately),
+    cmocka_unit_test(test_simulated_signal_after_commit_is_suppressed_not_double_counted),
+    cmocka_unit_test(test_unpaired_simulated_signal_still_bumps),
+    cmocka_unit_test(test_multiple_commits_suppress_matching_number_of_signals),
 
     cmocka_unit_test(test_current_is_null_when_never_connected),
 

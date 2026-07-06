@@ -202,6 +202,66 @@ void dt_remote_revision_connect(void);
  * off, per the file header's "Ownership" paragraph. */
 void dt_remote_revision_disconnect(void);
 
+/** Plan step 7's mutation-engine counterpart to a signal-driven bump.
+ *
+ * `dt_control_signal_raise()` delivers DT_SIGNAL_DEVELOP_HISTORY_CHANGE
+ * asynchronously: its `synchronous` flag is FALSE for that signal (see
+ * `_signal_description` in src/control/signal.c), so even when
+ * `dt_dev_add_history_item()` is called from the GTK main thread, the
+ * resulting `_on_history_change()` bump is queued via
+ * `g_main_context_invoke_full(NULL, G_PRIORITY_HIGH_IDLE, ...)` and does
+ * NOT run before the calling function returns -- it runs on a later
+ * iteration of the main loop, which (since the client only ever sees the
+ * response after the socket write goes out through that same main loop)
+ * reliably happens *before* the client's next request arrives. A mutation
+ * handler that simply returned `dt_remote_revision_get(...)` after calling
+ * `dt_dev_add_history_item()` would therefore report a revision that is
+ * stale by the time it is read (still one behind), or -- worse -- if it
+ * waited and read again, would race the client's next `expected_revision`
+ * against a counter that a redundant queued bump is about to advance out
+ * from under it (spurious `revision_conflict` on a request that changed
+ * nothing else).
+ *
+ * The fix: the mutation engine calls this function immediately after
+ * `dt_dev_add_history_item()` lands its one history item, to bump the
+ * singleton's counter *synchronously* and use the returned value as the
+ * resulting revision. To keep the later, now-redundant
+ * DT_SIGNAL_DEVELOP_HISTORY_CHANGE delivery from double-counting the same
+ * mutation, this call also arms one slot of "expect one more signal
+ * delivery for a change already accounted for" -- `_on_history_change()`
+ * consumes one such slot instead of bumping again when one is armed. Any
+ * *other* history change (e.g. the user editing via the GUI while a
+ * client is connected) still arrives with no slot armed and bumps
+ * normally, exactly once. Monotonicity is preserved either way: this is
+ * strictly additive bookkeeping around the same counter, never a reset or
+ * a rewind.
+ *
+ * Always operates on the process-wide singleton directly (like the real
+ * signal handler and the test-only simulation seam below), independent of
+ * whether `dt_remote_revision_current()` currently returns non-NULL -- see
+ * the "Ownership" paragraph: the singleton's storage is bumped regardless
+ * of connection state. In production this is only reachable through the
+ * live mutation engine, which itself is only reachable while a server is
+ * connected, so the distinction is moot there. Returns the new counter
+ * value directly, so a call site never needs a separate
+ * `dt_remote_revision_get()` afterwards. Call this exactly once per
+ * mutation, after the single `dt_dev_add_history_item()` call that commits
+ * it, on the main thread. */
+uint64_t dt_remote_revision_commit_history_change(void);
+
+/** Test-only: runs the exact logic dt_remote_revision_connect()'s
+ * DEVELOP_HISTORY_CHANGE handler runs -- including the one-shot
+ * suppression check dt_remote_revision_commit_history_change() arms --
+ * without requiring a live signal connection (this tree's unit tests never
+ * initialize darktable.signals; see the note in remote_revision.c and in
+ * test_remote_revision.c). This is how tests verify the two functions pair
+ * up correctly: a commit followed by one simulated signal delivery must
+ * consume exactly one suppression slot and leave the counter unchanged;
+ * an unpaired simulated delivery (no preceding commit) must still bump the
+ * counter normally. Always operates on the process-wide singleton (see
+ * dt_remote_revision_test_singleton()). Not used by production code. */
+void dt_remote_revision_test_simulate_history_change_signal(void);
+
 /** Returns the process-wide singleton if dt_remote_revision_connect() has
  * been called and not yet matched by dt_remote_revision_disconnect(), or
  * NULL otherwise -- e.g. `security/enable_remote_control` is off, or in

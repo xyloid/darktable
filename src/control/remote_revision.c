@@ -118,11 +118,36 @@ static dt_remote_revision_t _singleton;
 // themselves still must run on the main context, same as always.
 static gboolean _connected = FALSE;
 
+// Number of upcoming DEVELOP_HISTORY_CHANGE deliveries to treat as already
+// accounted for (guarded by the same lock as _singleton/_connected). See
+// dt_remote_revision_commit_history_change()'s header comment for why this
+// exists: the signal is delivered asynchronously even from the main
+// thread, so the mutation engine bumps synchronously itself and arms one
+// slot here per commit, and _on_history_change() consumes (rather than
+// double-counts) exactly that many redundant deliveries.
+static guint _suppress_history_change = 0;
+
+// Shared by the real signal callback and the test-only simulation seam
+// (dt_remote_revision_test_simulate_history_change_signal()) so both run
+// identical logic.
+static void _history_change_bump_or_suppress(void)
+{
+  G_LOCK(remote_revision);
+  if(_suppress_history_change > 0)
+  {
+    _suppress_history_change--;
+    G_UNLOCK(remote_revision);
+    return;
+  }
+  G_UNLOCK(remote_revision);
+  dt_remote_revision_bump(&_singleton);
+}
+
 static void _on_history_change(gpointer instance, gpointer user_data)
 {
   (void)instance;
   (void)user_data;
-  dt_remote_revision_bump(&_singleton);
+  _history_change_bump_or_suppress();
 }
 
 static void _on_image_changed(gpointer instance, gpointer user_data)
@@ -171,6 +196,33 @@ const dt_remote_revision_t *dt_remote_revision_current(void)
   return connected ? &_singleton : NULL;
 }
 
+uint64_t dt_remote_revision_commit_history_change(void)
+{
+  // Deliberately unconditional (no `_connected` gate): this always
+  // operates on the singleton's storage, same as the real
+  // DEVELOP_HISTORY_CHANGE handler and the test-only simulation seam below
+  // -- the file header's "Ownership" paragraph already establishes that
+  // the singleton's counter is bumped independent of whether a server is
+  // currently connected (see test_singleton_survives_disconnect_reconnect_
+  // cycle in test_remote_revision.c, which bumps it directly while
+  // disconnected). In production this is only ever reachable through the
+  // live mutation engine, which itself is only reachable while a server
+  // is connected, so the distinction is moot there; unconditional
+  // behavior here is what keeps this function testable without requiring
+  // a live darktable.signals connection.
+  G_LOCK(remote_revision);
+  _singleton.counter++;  // synchronous: see header comment for why
+  _suppress_history_change++;
+  const uint64_t value = _singleton.counter;
+  G_UNLOCK(remote_revision);
+  return value;
+}
+
+void dt_remote_revision_test_simulate_history_change_signal(void)
+{
+  _history_change_bump_or_suppress();
+}
+
 /* ---------------------------------------------------------------------- */
 /* test-only singleton access (see remote_revision.h)                      */
 /* ---------------------------------------------------------------------- */
@@ -185,6 +237,7 @@ void dt_remote_revision_test_reset_singleton(void)
   dt_remote_revision_init(&_singleton);
   G_LOCK(remote_revision);
   _connected = FALSE;
+  _suppress_history_change = 0;
   G_UNLOCK(remote_revision);
 }
 
