@@ -94,26 +94,41 @@ void dt_remote_revision_test_set_counter(dt_remote_revision_t *rev, const uint64
 }
 
 /* ---------------------------------------------------------------------- */
-/* signal wiring                                                           */
+/* process-wide singleton                                                  */
 /* ---------------------------------------------------------------------- */
 
-// The single process-wide "currently running server's tracker", set by
-// dt_remote_revision_connect() and cleared by dt_remote_revision_disconnect().
-// Only ever touched on the main context (connect/disconnect run there,
-// same as everything else in this subsystem), so it needs no lock of its
-// own -- unlike the counter/imgid pair above, which a background job's
-// completion path could in principle read from off the main thread.
-static dt_remote_revision_t *_active_revision = NULL;
+// The one, process-lifetime instance of the tracker (file header's
+// "Ownership" paragraph). Relies on C's static zero-initialization to
+// start in exactly the state dt_remote_revision_init() would produce
+// (counter 0, imgid NO_IMGID == 0) -- production code deliberately never
+// calls dt_remote_revision_init() on this instance, since doing so on
+// every dt_remote_server_start() is the bug this file fixes: the counter
+// must survive a stop/start cycle within one process.
+static dt_remote_revision_t _singleton;
+
+// TRUE between a dt_remote_revision_connect() and its matching
+// dt_remote_revision_disconnect() -- i.e. "a remote server is currently
+// wired up to _singleton". Guarded by the same lock as _singleton's
+// counter/imgid so connect()/disconnect() can be checked-and-set
+// atomically; this is what makes both idempotent (a second connect()
+// before a disconnect() does not double-subscribe the signal handlers,
+// and a disconnect() with no matching connect() is a safe no-op) without
+// relying on an undocumented "only ever called from the main context"
+// convention for the flag itself. The signal (dis)connect calls
+// themselves still must run on the main context, same as always.
+static gboolean _connected = FALSE;
 
 static void _on_history_change(gpointer instance, gpointer user_data)
 {
   (void)instance;
-  dt_remote_revision_bump((dt_remote_revision_t *)user_data);
+  (void)user_data;
+  dt_remote_revision_bump(&_singleton);
 }
 
 static void _on_image_changed(gpointer instance, gpointer user_data)
 {
   (void)instance;
+  (void)user_data;
   // darktable.develop is the only source of truth for "the current
   // image" -- read synchronously, on the same main context the signal
   // was raised from (internals §1).
@@ -121,28 +136,56 @@ static void _on_image_changed(gpointer instance, gpointer user_data)
     (darktable.develop && dt_is_valid_imgid(darktable.develop->image_storage.id))
     ? darktable.develop->image_storage.id
     : NO_IMGID;
-  dt_remote_revision_stamp_image((dt_remote_revision_t *)user_data, imgid);
+  dt_remote_revision_stamp_image(&_singleton, imgid);
 }
 
-void dt_remote_revision_connect(dt_remote_revision_t *rev)
+void dt_remote_revision_connect(void)
 {
-  if(!rev) return;
-  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _on_history_change, rev);
-  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _on_image_changed, rev);
-  _active_revision = rev;
+  G_LOCK(remote_revision);
+  const gboolean already_connected = _connected;
+  _connected = TRUE;
+  G_UNLOCK(remote_revision);
+  if(already_connected) return;  // idempotent: never double-subscribe
+
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_CHANGE, _on_history_change, NULL);
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _on_image_changed, NULL);
 }
 
-void dt_remote_revision_disconnect(dt_remote_revision_t *rev)
+void dt_remote_revision_disconnect(void)
 {
-  if(!rev) return;
-  DT_CONTROL_SIGNAL_DISCONNECT(_on_history_change, rev);
-  DT_CONTROL_SIGNAL_DISCONNECT(_on_image_changed, rev);
-  if(_active_revision == rev) _active_revision = NULL;
+  G_LOCK(remote_revision);
+  const gboolean was_connected = _connected;
+  _connected = FALSE;
+  G_UNLOCK(remote_revision);
+  if(!was_connected) return;  // idempotent: nothing to tear down
+
+  DT_CONTROL_SIGNAL_DISCONNECT(_on_history_change, NULL);
+  DT_CONTROL_SIGNAL_DISCONNECT(_on_image_changed, NULL);
 }
 
 const dt_remote_revision_t *dt_remote_revision_current(void)
 {
-  return _active_revision;
+  G_LOCK(remote_revision);
+  const gboolean connected = _connected;
+  G_UNLOCK(remote_revision);
+  return connected ? &_singleton : NULL;
+}
+
+/* ---------------------------------------------------------------------- */
+/* test-only singleton access (see remote_revision.h)                      */
+/* ---------------------------------------------------------------------- */
+
+dt_remote_revision_t *dt_remote_revision_test_singleton(void)
+{
+  return &_singleton;
+}
+
+void dt_remote_revision_test_reset_singleton(void)
+{
+  dt_remote_revision_init(&_singleton);
+  G_LOCK(remote_revision);
+  _connected = FALSE;
+  G_UNLOCK(remote_revision);
 }
 
 // clang-format off

@@ -41,11 +41,13 @@ struct dt_remote_server_t
                                 // lifetime is managed explicitly (see
                                 // _session_free_now()), never by the array itself
   char *discovery_path;         // owned; full path of the written discovery record
-  dt_remote_revision_t revision; // process-local revision tracker (internals §5);
-                                // storage lives here, connected/disconnected in
-                                // start()/stop(); read through
-                                // dt_remote_revision_current(), not this field
-                                // directly -- see control/remote_revision.h
+  // No revision-tracker field here: the process-local revision tracker
+  // (internals §5) is a process-wide singleton owned by
+  // control/remote_revision.c, not per-server storage -- it outlives any
+  // single dt_remote_server_t so its counter survives a stop/start cycle
+  // within one process. start()/stop() below only connect/disconnect the
+  // signal handlers that feed it; read access is always through
+  // dt_remote_revision_current() -- see control/remote_revision.h.
 };
 
 /* ---------------------------------------------------------------------- */
@@ -606,7 +608,6 @@ dt_remote_server_t *dt_remote_server_start(void)
   server->port = port;
   server->token_b64 = token_b64;
   server->sessions = g_ptr_array_new();
-  dt_remote_revision_init(&server->revision);
 
   char config_dir[PATH_MAX] = { 0 };
   dt_loc_get_user_config_dir(config_dir, sizeof(config_dir));
@@ -625,7 +626,7 @@ dt_remote_server_t *dt_remote_server_start(void)
   }
 
   g_signal_connect(service, "incoming", G_CALLBACK(_on_incoming), server);
-  dt_remote_revision_connect(&server->revision);
+  dt_remote_revision_connect();
 
   dt_print(DT_DEBUG_CONTROL, "[remote-edit] listening on 127.0.0.1:%u", (unsigned)port);
 
@@ -636,7 +637,7 @@ void dt_remote_server_stop(dt_remote_server_t *server)
 {
   if(!server) return;
 
-  dt_remote_revision_disconnect(&server->revision);
+  dt_remote_revision_disconnect();
 
   g_socket_service_stop(server->service);
 

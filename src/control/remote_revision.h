@@ -25,16 +25,25 @@
 // `revision` number so a client can detect "something changed under me"
 // and, for mutations, request compare-and-swap semantics via
 // `expected_revision`. The counter is NOT a database history number
-// (dt_dev_history_end survives across restarts via the database;
-// this counter is process-local and resets to 0 every time darktable
-// starts) and is never persisted.
+// (dt_dev_history_end survives across restarts via the database; this
+// counter is process-local, is never persisted to disk, and starts at 0
+// the first time this process touches it) -- but unlike an earlier
+// revision of this design, it does NOT reset every time a remote server
+// instance starts: see "Ownership" below.
 //
-// Ownership: the storage for the single, process-wide tracker instance
-// lives on `dt_remote_server_t` (embedded field), created/connected in
-// dt_remote_server_start() and disconnected/torn down in
-// dt_remote_server_stop() -- see control/remote_server.c. This header
-// intentionally has no dependency on remote_server.h/remote_protocol.h
-// (gio, json-glib): remote_edit.c reaches the live tracker only through
+// Ownership: the storage for the single, process-wide tracker instance is
+// a static singleton inside remote_revision.c -- it exists for the
+// entire lifetime of the darktable process, not just while a remote
+// server happens to be running. dt_remote_server_start()/_stop() only
+// connect/disconnect the two signal handlers that feed it (see
+// control/remote_server.c); they never create, destroy, or reset its
+// storage. This matters if a remote server is ever stopped and
+// restarted within one process (e.g. a future live toggle of
+// `security/enable_remote_control`): a client holding a pre-toggle
+// `expected_revision` must not be able to false-match against a counter
+// that quietly went back to 0. This header intentionally has no
+// dependency on remote_server.h/remote_protocol.h (gio, json-glib):
+// remote_edit.c reaches the live tracker only through
 // dt_remote_revision_current(), so the read layer never needs to know
 // about the server's socket/session machinery.
 //
@@ -88,7 +97,14 @@ typedef struct dt_remote_revision_t
 
 /** Resets `rev` to its process-start state: counter 0, imgid NO_IMGID.
  * Not synchronized -- call only before `rev` is reachable from more than
- * one thread (i.e. before dt_remote_revision_connect()). */
+ * one thread. This is a pure fixture helper: tests use it to initialize
+ * their own local `dt_remote_revision_t` instances. Production code does
+ * NOT call this on the process-wide singleton -- that instance is a
+ * static with process lifetime, whose all-zero initial state already
+ * equals what this function would set (counter 0, NO_IMGID == 0), and it
+ * is intentionally never re-run, so a stopped-and-restarted remote
+ * server does not reset the counter. See the file header's "Ownership"
+ * paragraph. */
 void dt_remote_revision_init(dt_remote_revision_t *rev);
 
 /* ---------------------------------------------------------------------- */
@@ -139,32 +155,62 @@ gboolean dt_remote_revision_matches(const dt_remote_revision_t *rev,
  * makes the intent unambiguous at every call site. */
 void dt_remote_revision_test_set_counter(dt_remote_revision_t *rev, uint64_t value);
 
+/** Test-only: direct access to the process-wide singleton storage that
+ * dt_remote_revision_connect()/_disconnect()/_current() manage, bypassing
+ * the "connected" gate -- dt_remote_revision_current() only, so tests can
+ * bump/inspect it (e.g. via dt_remote_revision_bump()/_get() above) even
+ * when no server is "connected". This is the seam unit tests use to
+ * simulate a dt_remote_server_start()/_stop()/_start() cycle and assert
+ * the counter is not reset by it, without requiring a live
+ * darktable.signals (this tree's unit tests never initialize one -- see
+ * the note in remote_revision.c). Never NULL. Not used by production
+ * code. */
+dt_remote_revision_t *dt_remote_revision_test_singleton(void);
+
+/** Test-only: resets the process-wide singleton back to its process-start
+ * state (counter 0, imgid NO_IMGID, "disconnected") so test cases don't
+ * leak state into one another through the shared static. Not used by
+ * production code -- the whole point of the singleton is that nothing
+ * production-side ever does this. */
+void dt_remote_revision_test_reset_singleton(void);
+
 /* ---------------------------------------------------------------------- */
 /* signal wiring (main-thread only; not unit-tested -- see remote_server.c */
 /* and the note in remote_revision.c; covered by later integration tests)  */
 /* ---------------------------------------------------------------------- */
 
-/** Connects `rev` to DT_SIGNAL_DEVELOP_HISTORY_CHANGE (bump) and
+/** Connects the process-wide singleton (see the file header's "Ownership"
+ * paragraph) to DT_SIGNAL_DEVELOP_HISTORY_CHANGE (bump) and
  * DT_SIGNAL_DEVELOP_IMAGE_CHANGED (bump + re-stamp imgid from
- * darktable.develop), and registers `rev` as the tracker
- * dt_remote_revision_current() returns. Call once, on the main context,
- * after the signal system and darktable.develop both exist -- i.e. from
- * dt_remote_server_start(), mirroring the connect pattern at
- * src/libs/history.c:165. */
-void dt_remote_revision_connect(dt_remote_revision_t *rev);
+ * darktable.develop), and makes it the tracker dt_remote_revision_current()
+ * returns. Call once per dt_remote_server_start(), on the main context,
+ * after the signal system and darktable.develop both exist, mirroring the
+ * connect pattern at src/libs/history.c:165. Idempotent: a second call
+ * before a matching dt_remote_revision_disconnect() is a no-op (it does
+ * NOT double-subscribe the signal handlers) -- this guards against a
+ * future start()-without-stop() bug turning every history change into a
+ * double bump. Does not touch the singleton's counter/imgid: connecting
+ * (or reconnecting) never resets them. */
+void dt_remote_revision_connect(void);
 
 /** Disconnects everything dt_remote_revision_connect() wired up, and
- * clears dt_remote_revision_current() if `rev` was the registered
- * tracker. NULL-safe. Call from dt_remote_server_stop(), before `rev`'s
- * storage is freed. */
-void dt_remote_revision_disconnect(dt_remote_revision_t *rev);
+ * clears dt_remote_revision_current() (back to NULL) until the next
+ * connect(). NULL-safe to call when never connected (a no-op). Call from
+ * dt_remote_server_stop(). Does not touch the singleton's counter/imgid
+ * -- the storage survives disconnect() by construction, so a subsequent
+ * dt_remote_revision_connect() picks up exactly where the counter left
+ * off, per the file header's "Ownership" paragraph. */
+void dt_remote_revision_disconnect(void);
 
-/** Returns the tracker most recently passed to
- * dt_remote_revision_connect() (and not yet disconnected), or NULL if no
- * remote server is currently running -- e.g. `security/enable_remote_control`
- * is off, or in unit tests, which never call connect() at all. This is
- * how remote_edit.c's read handlers reach the live revision without
- * taking a dependency on remote_server.h's session/server types. */
+/** Returns the process-wide singleton if dt_remote_revision_connect() has
+ * been called and not yet matched by dt_remote_revision_disconnect(), or
+ * NULL otherwise -- e.g. `security/enable_remote_control` is off, or in
+ * unit tests, which never call connect() at all. This is how
+ * remote_edit.c's read handlers reach the live revision without taking a
+ * dependency on remote_server.h's session/server types. Note this is
+ * about whether a server is *currently* connected, not whether the
+ * counter has ever moved: the underlying storage persists across
+ * disconnect()/connect() cycles even while this returns NULL. */
 const dt_remote_revision_t *dt_remote_revision_current(void);
 
 G_END_DECLS

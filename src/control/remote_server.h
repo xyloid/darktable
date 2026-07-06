@@ -132,14 +132,18 @@ struct dt_remote_pending_t   // one per in-flight async request
  * (bind, discovery write, ...) is logged with the token redacted and
  * returns NULL -- never aborts the caller. Call once, from the GLib
  * main context darktable.c wants the server to run on, after control/
- * signals/config/GUI are ready. Also initializes the process-local
- * revision tracker (internals §5) and connects it to
- * DT_SIGNAL_DEVELOP_HISTORY_CHANGE/DT_SIGNAL_DEVELOP_IMAGE_CHANGED --
- * see control/remote_revision.h; remote_edit.c reads it via
- * dt_remote_revision_current(), not through this server object. */
+ * signals/config/GUI are ready. Also connects the process-wide revision
+ * tracker (internals §5; owned by control/remote_revision.c, and
+ * outliving this server object -- see the "Ownership" note in
+ * control/remote_revision.h) to
+ * DT_SIGNAL_DEVELOP_HISTORY_CHANGE/DT_SIGNAL_DEVELOP_IMAGE_CHANGED;
+ * remote_edit.c reads it via dt_remote_revision_current(), not through
+ * this server object. Connecting never resets the tracker's counter --
+ * it survives a stop()/start() cycle within one process by design. */
 dt_remote_server_t *dt_remote_server_start(void);
 
-/** Stops `server`: disconnects the revision tracker, closes the
+/** Stops `server`: disconnects the revision tracker (its counter is
+ * untouched -- see dt_remote_server_start()'s comment), closes the
  * listener (no further connections accepted), drops every live session
  * (cancels in-flight I/O, unrefs
  * connections), deletes the discovery record, and frees all state.

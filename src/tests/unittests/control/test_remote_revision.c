@@ -280,10 +280,86 @@ static void test_concurrent_bumps_are_not_lost(void **state)
 // No test in this file ever calls dt_remote_revision_connect() (that
 // requires darktable.signals -- see the file header comment), so the
 // registered tracker starts and stays NULL throughout this whole suite.
+//
+// Reset the process-wide singleton first: it is shared static storage,
+// and a prior test in this same binary (see the "process-scoped
+// singleton" section below) may have left it "connected".
 static void test_current_is_null_when_never_connected(void **state)
 {
   (void)state;
+  dt_remote_revision_test_reset_singleton();
   assert_null(dt_remote_revision_current());
+}
+
+/* ---------------------------------------------------------------------- */
+/* process-scoped singleton: survives a stop/start cycle                   */
+/*                                                                          */
+/* Regression coverage for the bug this file's storage model fixes: the    */
+/* tracker used to live embedded in dt_remote_server_t and got             */
+/* re-initialized (counter -> 0) on every dt_remote_server_start(). If     */
+/* start()/stop() ever ran more than once per process, a client holding    */
+/* a pre-restart expected_revision could false-match against a counter     */
+/* that quietly went back to 0. Storage is now a static singleton in       */
+/* remote_revision.c with process lifetime, and dt_remote_server_start()  */
+/* no longer touches it at all -- see the "Ownership" paragraph in        */
+/* remote_revision.h.                                                      */
+/*                                                                          */
+/* dt_remote_revision_connect() itself cannot run in this suite (it        */
+/* requires a live darktable.signals, which this tree's control unit       */
+/* tests deliberately never initialize -- see the file header comment      */
+/* above and test_remote_server.c's own note on why socket/signal-level    */
+/* behavior is integration-only). dt_remote_revision_disconnect() *can*    */
+/* run here, because it is idempotent and, when nothing is connected,      */
+/* never reaches the signal macros -- exercised below alongside the       */
+/* test-only dt_remote_revision_test_singleton() seam, which stands in    */
+/* for the "history changes happened while a server was running" half of  */
+/* a start/stop/start cycle.                                              */
+/* ---------------------------------------------------------------------- */
+
+static void test_disconnect_when_never_connected_is_a_safe_noop(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  dt_remote_revision_disconnect();  // must not crash -- no connect() preceded it
+  dt_remote_revision_disconnect();  // double-disconnect is equally safe
+
+  assert_null(dt_remote_revision_current());
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 0);
+}
+
+static void test_singleton_survives_disconnect_reconnect_cycle(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  // "First session": a server ran and some history changes/image
+  // switches happened, bumping the singleton (simulating what
+  // _on_history_change()/_on_image_changed() would do via a live signal).
+  dt_remote_revision_t *singleton = dt_remote_revision_test_singleton();
+  dt_remote_revision_bump(singleton);
+  dt_remote_revision_bump(singleton);
+  dt_remote_revision_stamp_image(singleton, 42);
+  assert_int_equal((int)dt_remote_revision_get(singleton), 3);
+  assert_int_equal(dt_remote_revision_get_imgid(singleton), 42);
+
+  // "Stop": dt_remote_server_stop() calls dt_remote_revision_disconnect().
+  // This must not reset the counter/imgid -- the whole point of
+  // process-scoped storage is that it outlives any one server instance.
+  dt_remote_revision_disconnect();
+  assert_null(dt_remote_revision_current());  // no server currently connected...
+  assert_int_equal((int)dt_remote_revision_get(singleton), 3);  // ...but the count is untouched
+  assert_int_equal(dt_remote_revision_get_imgid(singleton), 42);
+
+  // "Start again": in production this calls dt_remote_revision_connect(),
+  // which no longer initializes anything (see remote_revision.h) -- so
+  // the "second session" simply continues bumping from where the first
+  // one left off, never restarting at 0/1.
+  dt_remote_revision_bump(singleton);
+  assert_int_equal((int)dt_remote_revision_get(singleton), 4);
+  assert_int_equal(dt_remote_revision_get_imgid(singleton), 42);
+
+  dt_remote_revision_test_reset_singleton();  // leave a clean slate for later tests
 }
 
 int main(int argc, char *argv[])
@@ -313,6 +389,9 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_concurrent_bumps_are_not_lost),
 
     cmocka_unit_test(test_current_is_null_when_never_connected),
+
+    cmocka_unit_test(test_disconnect_when_never_connected_is_a_safe_noop),
+    cmocka_unit_test(test_singleton_survives_disconnect_reconnect_cycle),
   };
 
   return cmocka_run_group_tests(tests, NULL, NULL);

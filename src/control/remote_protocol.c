@@ -18,7 +18,7 @@
 
 #include "control/remote_protocol.h"
 
-#include "common/darktable.h"
+#include "common/darktable.h"  // for the _() gettext macro
 
 #include <math.h>
 #include <string.h>
