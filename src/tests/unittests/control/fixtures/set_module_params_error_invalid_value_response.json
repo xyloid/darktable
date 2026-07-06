@@ -1,0 +1,9 @@
+{
+  "id": 21,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "value out of range for field 'exposure'",
+    "retryable": false
+  }
+}

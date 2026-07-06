@@ -42,6 +42,7 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .list_modules = dt_remote_list_modules,
   .get_module_schema = dt_remote_get_module_schema,
   .get_module_params = dt_remote_get_module_params,
+  .set_module_params = dt_remote_set_module_params,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -49,6 +50,7 @@ static dt_remote_protocol_calls_t s_calls = {
   .list_modules = dt_remote_list_modules,
   .get_module_schema = dt_remote_get_module_schema,
   .get_module_params = dt_remote_get_module_params,
+  .set_module_params = dt_remote_set_module_params,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -339,11 +341,13 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   json_builder_add_int_value(b, (gint64)getpid());
   json_builder_set_member_name(b, "capabilities");
   json_builder_begin_array(b);
-  // Empty for now: every named capability ("params", "instances",
-  // "history", "preview", "scopes") gates a mutation/async method that
-  // does not have a handler yet -- see the allowlist below. Add the
-  // matching string here in the same commit that gives its method a
-  // real handler.
+  // Each named capability ("params", "instances", "history", "preview",
+  // "scopes") is advertised in the same commit that gives its gating
+  // method a real handler in the allowlist below. "params" = parameter
+  // mutation (set_module_params, plan step 7). Still pending: "instances"
+  // (create_module_instance), "history" (get_history/undo), "preview"
+  // (render_preview), "scopes" (compute_scopes).
+  json_builder_add_string_value(b, "params");
   json_builder_end_array(b);
   json_builder_end_object(b);
 
@@ -620,21 +624,295 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   return result;
 }
 
+// Converts one raw JSON value into a dt_remote_value_t matched to `field`'s
+// declared type -- this is where "enum by stable name and integer
+// representation" (plan step 7's test list) is resolved: a JSON string is
+// looked up by name against field->enum_values, a JSON integer is looked
+// up by value; either produces a fully-formed {value, name} pair before
+// dt_remote_patch_apply()/dt_remote_value_validate_and_write() ever sees
+// it (that pure layer only compares the numeric value, never the name --
+// see remote_edit.c). `field` must be non-NULL (the caller looks it up
+// by name first and reports DT_REMOTE_ERR_UNKNOWN_FIELD itself if absent).
+static gboolean _json_value_to_remote_value(JsonNode *node, const dt_remote_field_t *field,
+                                            dt_remote_value_t *out, dt_remote_error_t **err)
+{
+  if(!field->writable)
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD, _("field '%s' is not writable"), field->name);
+    return FALSE;
+  }
+
+  if(!g_strcmp0(field->type_name, "float"))
+  {
+    if(!node || !JSON_NODE_HOLDS_VALUE(node)) goto bad_type;
+    GType t = json_node_get_value_type(node);
+    double d;
+    if(t == G_TYPE_DOUBLE) d = json_node_get_double(node);
+    else if(t == G_TYPE_INT64) d = (double)json_node_get_int(node);
+    else goto bad_type;
+    // non-finite numbers (e.g. a 1e400 literal overflowing to +Inf on
+    // parse) are rejected here at the protocol boundary, per the protocol
+    // reference -- the engine's range check would also catch them, but
+    // the handler must not depend on that through the test seam.
+    if(!isfinite(d))
+    {
+      if(err)
+        *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                          _("value for field '%s' must be finite"), field->name);
+      return FALSE;
+    }
+    out->type = DT_REMOTE_VALUE_FLOAT;
+    out->v.f = d;
+    return TRUE;
+  }
+
+  if(!g_strcmp0(field->type_name, "int") || !g_strcmp0(field->type_name, "uint"))
+  {
+    gint64 i;
+    if(!node || !_json_node_get_integer(node, &i)) goto bad_type;
+    out->type = DT_REMOTE_VALUE_INT;
+    out->v.i = i;
+    return TRUE;
+  }
+
+  if(!g_strcmp0(field->type_name, "bool"))
+  {
+    if(!node || !JSON_NODE_HOLDS_VALUE(node) || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+      goto bad_type;
+    out->type = DT_REMOTE_VALUE_BOOL;
+    out->v.b = json_node_get_boolean(node);
+    return TRUE;
+  }
+
+  if(!g_strcmp0(field->type_name, "enum"))
+  {
+    if(node && JSON_NODE_HOLDS_VALUE(node) && json_node_get_value_type(node) == G_TYPE_STRING)
+    {
+      const char *name = json_node_get_string(node);
+      for(guint i = 0; field->enum_values && i < field->enum_values->len; i++)
+      {
+        dt_remote_enum_value_t *e = g_ptr_array_index(field->enum_values, i);
+        if(!g_strcmp0(e->name, name))
+        {
+          out->type = DT_REMOTE_VALUE_ENUM;
+          out->v.e.value = e->value;
+          out->v.e.name = g_strdup(e->name);
+          return TRUE;
+        }
+      }
+      if(err)
+        *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'%s' is not a member of enum field '%s'"),
+                          name, field->name);
+      return FALSE;
+    }
+
+    gint64 i;
+    if(node && _json_node_get_integer(node, &i))
+    {
+      for(guint j = 0; field->enum_values && j < field->enum_values->len; j++)
+      {
+        dt_remote_enum_value_t *e = g_ptr_array_index(field->enum_values, j);
+        if(e->value == (int)i)
+        {
+          out->type = DT_REMOTE_VALUE_ENUM;
+          out->v.e.value = e->value;
+          out->v.e.name = g_strdup(e->name);
+          return TRUE;
+        }
+      }
+      if(err)
+        *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                          _("%" G_GINT64_FORMAT " is not a member of enum field '%s'"), i, field->name);
+      return FALSE;
+    }
+    goto bad_type;
+  }
+
+  // array/string/struct/opaque: a known field, but the wrong shape for a
+  // v1 scalar patch entry -- surfaced the same as writable:false.
+  if(err)
+    *err = _error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD, _("field '%s' is not a writable scalar field"),
+                      field->name);
+  return FALSE;
+
+bad_type:
+  if(err)
+    *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("value type does not match field '%s'"), field->name);
+  return FALSE;
+}
+
+static const char *const SET_MODULE_PARAMS_KEYS[] =
+  { "module", "instance", "values", "expected_revision", "enable", NULL };
+
+static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_session_t *session,
+                                            dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, SET_MODULE_PARAMS_KEYS, &err)) return _handler_fail(err);
+
+  const char *module = NULL;
+  if(!_require_string(params, "module", &module, &err)) return _handler_fail(err);
+
+  gint64 instance = 0;
+  if(!_optional_int_default(params, "instance", 0, &instance, &err)) return _handler_fail(err);
+
+  // "values must be non-empty, contain no duplicate or unknown fields"
+  // (wire contract) -- duplicates cannot occur once parsed into a
+  // JsonObject (keys are already unique); unknown/non-empty are checked
+  // here and per-entry below.
+  if(!params || !json_object_has_member(params, "values"))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("missing required parameter 'values'")));
+  JsonNode *values_node = json_object_get_member(params, "values");
+  if(!values_node || !JSON_NODE_HOLDS_OBJECT(values_node))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'values' must be an object")));
+  JsonObject *values_obj = json_node_get_object(values_node);
+  GList *value_keys = json_object_get_members(values_obj);
+  if(!value_keys)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'values' must be non-empty")));
+
+  gboolean have_expected_revision = FALSE;
+  gint64 expected_revision = 0;
+  if(json_object_has_member(params, "expected_revision"))
+  {
+    if(!_require_int(params, "expected_revision", &expected_revision, &err))
+    {
+      g_list_free(value_keys);
+      return _handler_fail(err);
+    }
+    if(expected_revision < 0)
+    {
+      g_list_free(value_keys);
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("'expected_revision' must not be negative")));
+    }
+    have_expected_revision = TRUE;
+  }
+
+  gboolean have_enable = FALSE;
+  gboolean enable_value = FALSE;
+  if(json_object_has_member(params, "enable"))
+  {
+    JsonNode *enable_node = json_object_get_member(params, "enable");
+    if(!enable_node || !JSON_NODE_HOLDS_VALUE(enable_node)
+       || json_node_get_value_type(enable_node) != G_TYPE_BOOLEAN)
+    {
+      g_list_free(value_keys);
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'enable' must be a boolean")));
+    }
+    enable_value = json_node_get_boolean(enable_node);
+    have_enable = TRUE;
+  }
+
+  // Resolve field types via the schema -- needed to interpret each raw
+  // JSON value (e.g. distinguish an enum's stable-name/int form from a
+  // plain int field).
+  dt_remote_module_schema_t *schema = NULL;
+  if(!s_calls.get_module_schema(module, &schema, &err))
+  {
+    g_list_free(value_keys);
+    return _handler_fail(err);
+  }
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  patch.has_enable = have_enable;
+  patch.enable = enable_value;
+
+  dt_remote_error_t *convert_err = NULL;
+  for(GList *k = value_keys; k; k = k->next)
+  {
+    const char *name = k->data;
+    JsonNode *node = json_object_get_member(values_obj, name);
+
+    dt_remote_field_t *field = NULL;
+    if(schema->fields)
+      for(guint i = 0; i < schema->fields->len; i++)
+      {
+        dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+        if(!g_strcmp0(f->name, name)) { field = f; break; }
+      }
+
+    if(!field)
+    {
+      convert_err = _error_new(DT_REMOTE_ERR_UNKNOWN_FIELD, _("unknown field '%s'"), name);
+      break;
+    }
+
+    dt_remote_value_t value;
+    if(!_json_value_to_remote_value(node, field, &value, &convert_err)) break;
+
+    dt_remote_patch_entry_t *entry = g_malloc0(sizeof(dt_remote_patch_entry_t));
+    entry->name = g_strdup(name);
+    entry->value = value;
+    g_ptr_array_add(patch.scalar_values, entry);
+  }
+  g_list_free(value_keys);
+  dt_remote_module_schema_free(schema);
+
+  if(convert_err)
+  {
+    g_ptr_array_unref(patch.scalar_values);
+    return _handler_fail(convert_err);
+  }
+
+  const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  dt_remote_mutation_result_t *result = NULL;
+  gboolean ok = s_calls.set_module_params(&ref, &patch, have_expected_revision ? &expected_u64 : NULL,
+                                          &result, &err);
+  g_ptr_array_unref(patch.scalar_values);
+
+  if(!ok) return _handler_fail(err);
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "module");
+  json_builder_add_string_value(b, result->op ? result->op : module);
+  json_builder_set_member_name(b, "instance");
+  json_builder_add_int_value(b, result->instance);
+  json_builder_set_member_name(b, "enabled");
+  json_builder_add_boolean_value(b, result->enabled);
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_object(b);
+  if(result->values)
+    for(guint i = 0; i < result->values->len; i++)
+    {
+      dt_remote_patch_entry_t *e = g_ptr_array_index(result->values, i);
+      json_builder_set_member_name(b, e->name);
+      json_builder_add_value(b, _value_to_json(&e->value));
+    }
+  json_builder_end_object(b);
+  json_builder_set_member_name(b, "revision");
+  json_builder_add_int_value(b, (gint64)result->revision);
+  json_builder_end_object(b);
+
+  JsonNode *result_node = json_builder_get_root(b);
+  g_object_unref(b);
+  dt_remote_mutation_result_free(result);
+  return result_node;
+}
+
 /* ---------------------------------------------------------------------- */
 /* allowlist (internals §6: 13 entries, static, looked up by g_str_equal)  */
 /* ---------------------------------------------------------------------- */
 
-// Only hello + the four read methods have a handler so far (plan step 2).
-// The remaining eight rows carry their internals-§6 flags now so later
-// steps only add a handler, never touch this table's shape. A NULL
-// handler dispatches to DT_REMOTE_ERR_INTERNAL rather than crashing.
+// hello, the four read methods, and set_module_params (plan step 7) have a
+// handler so far. The remaining seven rows carry their internals-§6 flags
+// now so later steps only add a handler, never touch this table's shape.
+// A NULL handler dispatches to DT_REMOTE_ERR_INTERNAL rather than
+// crashing.
 static const dt_remote_method_t g_methods[] = {
   { "hello",                  FALSE, FALSE, FALSE, _handler_hello },
   { "get_state",              FALSE, FALSE, FALSE, _handler_get_state },
   { "list_modules",           TRUE,  FALSE, FALSE, _handler_list_modules },
   { "get_module_schema",      FALSE, FALSE, FALSE, _handler_get_module_schema },
   { "get_module_params",      TRUE,  FALSE, FALSE, _handler_get_module_params },
-  { "set_module_params",      TRUE,  TRUE,  FALSE, NULL },
+  { "set_module_params",      TRUE,  TRUE,  FALSE, _handler_set_module_params },
   { "set_module_enabled",     TRUE,  TRUE,  FALSE, NULL },
   { "reset_module",           TRUE,  TRUE,  FALSE, NULL },
   { "create_module_instance", TRUE,  TRUE,  FALSE, NULL },

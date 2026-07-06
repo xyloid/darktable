@@ -1,0 +1,11 @@
+{
+  "id": 20,
+  "ok": true,
+  "result": {
+    "module": "exposure",
+    "instance": 0,
+    "enabled": true,
+    "values": { "exposure": 0.7, "black": -0.002 },
+    "revision": 32
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": 22,
+  "method": "set_module_params",
+  "params": {
+    "module": "exposure",
+    "instance": 0,
+    "values": { "exposure": 0.7 },
+    "expected_revision": 30
+  }
+}

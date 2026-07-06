@@ -1,5 +1,5 @@
 {
   "id": 9,
-  "method": "set_module_params",
-  "params": { "module": "exposure", "instance": 0, "values": { "exposure": 0.7 } }
+  "method": "set_module_enabled",
+  "params": { "module": "exposure", "instance": 0, "enabled": false }
 }

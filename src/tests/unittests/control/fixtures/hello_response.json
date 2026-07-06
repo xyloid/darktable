@@ -5,6 +5,8 @@
     "protocol_version": 1,
     "darktable_version": "5.x",
     "pid": 12345,
-    "capabilities": []
+    "capabilities": [
+      "params"
+    ]
   }
 }

@@ -1,0 +1,9 @@
+{
+  "id": 22,
+  "ok": false,
+  "error": {
+    "code": "revision_conflict",
+    "message": "expected revision 30 does not match current state",
+    "retryable": true
+  }
+}

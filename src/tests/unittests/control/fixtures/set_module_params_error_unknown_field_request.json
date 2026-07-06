@@ -1,0 +1,9 @@
+{
+  "id": 23,
+  "method": "set_module_params",
+  "params": {
+    "module": "exposure",
+    "instance": 0,
+    "values": { "no_such_field": 1.0 }
+  }
+}

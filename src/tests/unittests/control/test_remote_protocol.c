@@ -360,6 +360,184 @@ static gboolean stub_get_module_params_unknown_module(const dt_remote_module_ref
   return FALSE;
 }
 
+/* --- set_module_params stubs (plan step 7) ------------------------------ */
+
+// Like stub_get_module_schema_exposure but with the "black" field the wire
+// contract's set_module_params example patches alongside "exposure" -- kept
+// separate so the get_module_schema fixture diff stays untouched.
+static gboolean stub_get_module_schema_exposure_full(const char *op, dt_remote_module_schema_t **out,
+                                                     dt_remote_error_t **error)
+{
+  dt_remote_module_schema_t *schema = NULL;
+  if(!stub_get_module_schema_exposure(op, &schema, error)) return FALSE;
+
+  dt_remote_field_t *black = _make_field("black", "black level correction", "float", TRUE);
+  black->has_range = TRUE;
+  black->minimum = -0.1;
+  black->maximum = 0.1;
+  black->has_default = TRUE;
+  black->default_value.type = DT_REMOTE_VALUE_FLOAT;
+  black->default_value.v.f = 0.0;
+  g_ptr_array_add(schema->fields, black);
+
+  // a known-but-not-writable field, for the unsupported_field path.
+  g_ptr_array_add(schema->fields, _make_field("curve", "tone curve points", "array", FALSE));
+
+  *out = schema;
+  return TRUE;
+}
+
+static const dt_remote_patch_entry_t *_find_patch_entry(const dt_remote_patch_t *patch, const char *name)
+{
+  for(guint i = 0; patch->scalar_values && i < patch->scalar_values->len; i++)
+  {
+    const dt_remote_patch_entry_t *e = g_ptr_array_index(patch->scalar_values, i);
+    if(!g_strcmp0(e->name, name)) return e;
+  }
+  return NULL;
+}
+
+static dt_remote_patch_entry_t *_make_result_entry(const char *name, dt_remote_value_t value)
+{
+  dt_remote_patch_entry_t *e = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  e->name = g_strdup(name);
+  e->value = value;
+  return e;
+}
+
+// Success stub for the wire-contract example: asserts the handler decoded
+// the request into exactly the neutral patch the engine must receive
+// (values, expected_revision, enable tri-state), then answers with a canned
+// "read back from live state" result matching set_module_params_response.json.
+static gboolean stub_set_module_params_contract(const dt_remote_module_ref_t *ref,
+                                                const dt_remote_patch_t *patch,
+                                                const uint64_t *expected_revision,
+                                                dt_remote_mutation_result_t **out,
+                                                dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+
+  assert_non_null(patch);
+  assert_non_null(patch->scalar_values);
+  assert_int_equal(patch->scalar_values->len, 2);
+  const dt_remote_patch_entry_t *exposure = _find_patch_entry(patch, "exposure");
+  const dt_remote_patch_entry_t *black = _find_patch_entry(patch, "black");
+  assert_non_null(exposure);
+  assert_non_null(black);
+  assert_int_equal(exposure->value.type, DT_REMOTE_VALUE_FLOAT);
+  assert_float_equal(exposure->value.v.f, 0.7, 1e-9);
+  assert_int_equal(black->value.type, DT_REMOTE_VALUE_FLOAT);
+  assert_float_equal(black->value.v.f, -0.002, 1e-9);
+
+  assert_non_null(expected_revision);
+  assert_int_equal((int)*expected_revision, 31);
+  assert_true(patch->has_enable);
+  assert_true(patch->enable);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 0;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(result->values, _make_result_entry("exposure", (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.7 }));
+  g_ptr_array_add(result->values, _make_result_entry("black", (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_FLOAT, .v.f = -0.002 }));
+  result->revision = 32;
+
+  *out = result;
+  return TRUE;
+}
+
+// Asserts the handler resolved the enum member (by stable name or by
+// integer -- the two request spellings both funnel into this) to a fully
+// formed {value, name} pair, and that expected_revision/enable were absent.
+static gboolean stub_set_module_params_enum_deflicker(const dt_remote_module_ref_t *ref,
+                                                      const dt_remote_patch_t *patch,
+                                                      const uint64_t *expected_revision,
+                                                      dt_remote_mutation_result_t **out,
+                                                      dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_null(expected_revision);
+  assert_false(patch->has_enable);
+
+  assert_int_equal(patch->scalar_values->len, 1);
+  const dt_remote_patch_entry_t *mode = _find_patch_entry(patch, "mode");
+  assert_non_null(mode);
+  assert_int_equal(mode->value.type, DT_REMOTE_VALUE_ENUM);
+  assert_int_equal(mode->value.v.e.value, 1);
+  assert_string_equal(mode->value.v.e.name, "EXPOSURE_MODE_DEFLICKER");
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 0;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(result->values, _make_result_entry("mode", (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_ENUM, .v.e = { 1, g_strdup("EXPOSURE_MODE_DEFLICKER") } }));
+  result->revision = 33;
+
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_set_module_params_invalid_value(const dt_remote_module_ref_t *ref,
+                                                     const dt_remote_patch_t *patch,
+                                                     const uint64_t *expected_revision,
+                                                     dt_remote_mutation_result_t **out,
+                                                     dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)patch;
+  (void)expected_revision;
+  (void)out;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE,
+                         g_strdup("value out of range for field 'exposure'"));
+  return FALSE;
+}
+
+static gboolean stub_set_module_params_revision_conflict(const dt_remote_module_ref_t *ref,
+                                                         const dt_remote_patch_t *patch,
+                                                         const uint64_t *expected_revision,
+                                                         dt_remote_mutation_result_t **out,
+                                                         dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)patch;
+  (void)out;
+  assert_non_null(expected_revision);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_REVISION_CONFLICT,
+                         g_strdup_printf("expected revision %d does not match current state",
+                                         (int)*expected_revision));
+  return FALSE;
+}
+
+// For handler-side rejection paths (unknown field, bad value shape, bad
+// params): the engine must never be reached -- whole-patch atomicity starts
+// at the protocol boundary.
+static gboolean stub_set_module_params_must_not_be_called(const dt_remote_module_ref_t *ref,
+                                                          const dt_remote_patch_t *patch,
+                                                          const uint64_t *expected_revision,
+                                                          dt_remote_mutation_result_t **out,
+                                                          dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)patch;
+  (void)expected_revision;
+  (void)out;
+  (void)error;
+  fail_msg("set_module_params engine call must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
 /* ---------------------------------------------------------------------- */
 /* hello                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -387,7 +565,8 @@ static void test_hello_success(void **state)
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 0);
+  assert_int_equal(json_array_get_length(caps), 1);
+  assert_string_equal(json_array_get_string_element(caps, 0), "params");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -708,6 +887,237 @@ static void test_get_module_params_error_fractional_instance(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* set_module_params (plan step 7)                                          */
+/* ---------------------------------------------------------------------- */
+
+// Dispatches an inline JSON request text and returns the response node
+// (caller unrefs). For malformed-input cases that aren't wire-contract
+// shapes worth a fixture file, mirroring the get_module_params tests above.
+static JsonNode *_dispatch_inline(const char *json_text)
+{
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, json_text, -1, NULL));
+  JsonObject *request = json_node_get_object(json_parser_get_root(parser));
+  JsonNode *actual = dt_remote_protocol_dispatch(request, NULL);
+  assert_non_null(actual);
+  g_object_unref(parser);
+  return actual;
+}
+
+static void _assert_inline_error(const char *json_text, const char *expected_code)
+{
+  JsonNode *actual = _dispatch_inline(json_text);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  assert_string_equal(json_object_get_string_member(json_object_get_object_member(resp, "error"), "code"),
+                      expected_code);
+  json_node_unref(actual);
+}
+
+// The wire-contract example round trip: the request fixture is decoded into
+// the exact neutral patch (stub-asserted), and the stub's read-back result
+// is serialized into the exact response fixture.
+static void test_set_module_params_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_contract,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_request.json", "set_module_params_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// enum by stable name and by integer representation (plan step 7's test
+// list): both spellings must reach the engine as the same resolved
+// {value, name} pair -- stub_set_module_params_enum_deflicker asserts it.
+static void test_set_module_params_enum_by_name(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_enum_deflicker,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":30,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"mode\":\"EXPOSURE_MODE_DEFLICKER\"}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  assert_string_equal(json_object_get_string_member(json_object_get_object_member(result, "values"), "mode"),
+                      "EXPOSURE_MODE_DEFLICKER");
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_params_enum_by_int(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_enum_deflicker,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":31,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"mode\":1}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  assert_string_equal(json_object_get_string_member(json_object_get_object_member(result, "values"), "mode"),
+                      "EXPOSURE_MODE_DEFLICKER");
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// invalid_value surfaced from the engine (range checks live in
+// remote_edit's pure core, not the handler): mapped 1:1 onto the wire
+// envelope, retryable false.
+static void test_set_module_params_error_invalid_value(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_invalid_value,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_invalid_value_request.json",
+                           "set_module_params_error_invalid_value_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// revision_conflict is the one retryable domain error -- the response
+// fixture pins "retryable": true.
+static void test_set_module_params_error_revision_conflict(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_revision_conflict,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_revision_conflict_request.json",
+                           "set_module_params_error_revision_conflict_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// unknown_field is rejected at the protocol boundary (schema lookup), and
+// the engine must never be reached.
+static void test_set_module_params_error_unknown_field(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_unknown_field_request.json",
+                           "set_module_params_error_unknown_field_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// a known field whose schema row says writable:false -> unsupported_field,
+// engine never reached.
+static void test_set_module_params_error_unsupported_field(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":32,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"curve\":1.0}}}",
+    "unsupported_field");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// handler-side shape rejections: every one must leave the engine untouched.
+static void test_set_module_params_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // missing values
+  _assert_inline_error(
+    "{\"id\":33,\"method\":\"set_module_params\",\"params\":{\"module\":\"exposure\"}}",
+    "invalid_value");
+  // empty values
+  _assert_inline_error(
+    "{\"id\":34,\"method\":\"set_module_params\",\"params\":{\"module\":\"exposure\",\"values\":{}}}",
+    "invalid_value");
+  // values not an object
+  _assert_inline_error(
+    "{\"id\":35,\"method\":\"set_module_params\",\"params\":{\"module\":\"exposure\",\"values\":3}}",
+    "invalid_value");
+  // wrong JSON type for a float field
+  _assert_inline_error(
+    "{\"id\":36,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"exposure\":\"bright\"}}}",
+    "invalid_value");
+  // non-finite float value (1e400 overflows to +Inf on parse)
+  _assert_inline_error(
+    "{\"id\":43,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"exposure\":1e400}}}",
+    "invalid_value");
+  // unknown enum member name
+  _assert_inline_error(
+    "{\"id\":37,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"mode\":\"NO_SUCH_MODE\"}}}",
+    "invalid_value");
+  // unknown enum integer value
+  _assert_inline_error(
+    "{\"id\":38,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"mode\":99}}}",
+    "invalid_value");
+  // enable must be a boolean
+  _assert_inline_error(
+    "{\"id\":39,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"exposure\":0.5},\"enable\":1}}",
+    "invalid_value");
+  // negative expected_revision
+  _assert_inline_error(
+    "{\"id\":40,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"exposure\":0.5},\"expected_revision\":-1}}",
+    "invalid_value");
+  // unknown top-level key (strict-params rule)
+  _assert_inline_error(
+    "{\"id\":41,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{\"exposure\":0.5},\"bogus\":true}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// an unknown module fails at the schema-resolution step with the same
+// error unknown ops produce everywhere else.
+static void test_set_module_params_error_unknown_module(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_unknown,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":42,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"nonexistent_op\",\"values\":{\"exposure\":0.5}}}",
+    "unknown_module");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* ---------------------------------------------------------------------- */
 /* dispatch-level envelope validation                                      */
 /* ---------------------------------------------------------------------- */
 
@@ -770,7 +1180,11 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
   assert_true(set_params->needs_darkroom);
   assert_true(set_params->is_mutation);
   assert_false(set_params->is_async);
-  assert_null(set_params->handler);  // not implemented until its own step
+  assert_non_null(set_params->handler);  // implemented in plan step 7
+
+  const dt_remote_method_t *set_enabled = dt_remote_protocol_lookup_method("set_module_enabled");
+  assert_true(set_enabled->is_mutation);
+  assert_null(set_enabled->handler);  // not implemented until its own step (8)
 
   const dt_remote_method_t *preview = dt_remote_protocol_lookup_method("render_preview");
   assert_true(preview->needs_darkroom);
@@ -804,6 +1218,16 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),
     cmocka_unit_test(test_get_module_params_error_fractional_instance),
+
+    cmocka_unit_test(test_set_module_params_success),
+    cmocka_unit_test(test_set_module_params_enum_by_name),
+    cmocka_unit_test(test_set_module_params_enum_by_int),
+    cmocka_unit_test(test_set_module_params_error_invalid_value),
+    cmocka_unit_test(test_set_module_params_error_revision_conflict),
+    cmocka_unit_test(test_set_module_params_error_unknown_field),
+    cmocka_unit_test(test_set_module_params_error_unsupported_field),
+    cmocka_unit_test(test_set_module_params_error_bad_shapes),
+    cmocka_unit_test(test_set_module_params_error_unknown_module),
 
     cmocka_unit_test(test_error_missing_id),
     cmocka_unit_test(test_error_invalid_id_type),
