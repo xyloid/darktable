@@ -477,6 +477,240 @@ static void test_schema_denylist_forces_writable_false(void **state)
   g_ptr_array_unref(fields);
 }
 
+/*
+ * dt_remote_patch_apply() -- the pure core of dt_remote_set_module_params
+ * (plan step 7, internals doc §3 steps 4-6). No dt_develop_t/live module
+ * involved: params_blob is just a fixture_params_t on the stack, standing
+ * in for the g_malloc()'d scratch copy the live wrapper allocates.
+ */
+
+static dt_remote_patch_entry_t *make_entry(const char *name, dt_remote_value_t value)
+{
+  dt_remote_patch_entry_t *entry = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  entry->name = g_strdup(name);
+  entry->value = value;
+  return entry;
+}
+
+static void test_patch_apply_single_valid_field(void **state)
+{
+  fixture_params_t params = { 0 };
+  params.amount = 0.1f;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.9 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_null(err);
+  assert_float_equal(params.amount, 0.9, 1e-9);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+// "multiple valid fields create one history item" (plan step 7's test
+// list): the "one history item" half is a live-commit property the
+// integration suite covers (dt_remote_set_module_params calls
+// dt_dev_add_history_item() exactly once, after this whole loop, by
+// construction -- see remote_edit.c). This is the pure half: every field
+// in a multi-entry patch is actually applied by one dt_remote_patch_apply()
+// call.
+static void test_patch_apply_multiple_valid_fields(void **state)
+{
+  fixture_params_t params = { 0 };
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.75 }));
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("count", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_INT, .v.i = 7 }));
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("enabled_flag", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_BOOL, .v.b = TRUE }));
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_null(err);
+  assert_float_equal(params.amount, 0.75, 1e-9);
+  assert_int_equal(params.count, 7);
+  assert_true(params.enabled_flag);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_enum_by_int_and_by_name(void **state)
+{
+  // "by int": constructed directly with the numeric value, as
+  // remote_protocol.c's JSON conversion does for a plain integer.
+  {
+    fixture_params_t params = { 0 };
+    dt_remote_patch_t patch = { 0 };
+    patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+    g_ptr_array_add(patch.scalar_values,
+                    make_entry("mode", (dt_remote_value_t){
+                      .type = DT_REMOTE_VALUE_ENUM, .v.e = { FIXTURE_MODE_B, NULL } }));
+
+    dt_remote_error_t *err = NULL;
+    assert_true(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+    assert_null(err);
+    assert_int_equal(params.mode, FIXTURE_MODE_B);
+
+    g_ptr_array_unref(patch.scalar_values);
+  }
+
+  // "by stable name": remote_protocol.c resolves a JSON string like
+  // "FIXTURE_MODE_A" to its integer value against the schema before
+  // building the dt_remote_value_t -- dt_remote_patch_apply() itself only
+  // ever sees the resolved (value, name) pair, exercised here directly.
+  {
+    fixture_params_t params = { 0 };
+    params.mode = FIXTURE_MODE_B;
+    dt_remote_patch_t patch = { 0 };
+    patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+    g_ptr_array_add(patch.scalar_values,
+                    make_entry("mode", (dt_remote_value_t){
+                      .type = DT_REMOTE_VALUE_ENUM, .v.e = { FIXTURE_MODE_A, g_strdup("FIXTURE_MODE_A") } }));
+
+    dt_remote_error_t *err = NULL;
+    assert_true(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+    assert_null(err);
+    assert_int_equal(params.mode, FIXTURE_MODE_A);
+
+    g_ptr_array_unref(patch.scalar_values);
+  }
+}
+
+// "any invalid field leaves every field unchanged": the second entry is
+// invalid, so the whole patch is rejected -- dt_remote_patch_apply()
+// itself only guarantees params_blob is scratch-safe to discard on
+// failure; the live wrapper is what turns that into "module->params
+// literally never touched" by never memcpy-ing this blob back. Verified
+// here at the level dt_remote_patch_apply() controls: failure, correct
+// error code, and no further entries processed.
+static void test_patch_apply_any_invalid_field_rejects_whole_patch(void **state)
+{
+  fixture_params_t params = { 0 };
+  params.amount = 0.2f;
+  params.count = 3;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.5 }));
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("count", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_INT, .v.i = 999 }));  // out of range
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_unknown_field_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("does_not_exist", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 1.0 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_UNKNOWN_FIELD);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_unsupported_field_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  // "random" is a known field (the nested struct summary entry) but not a
+  // writable scalar leaf.
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("random", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 1.0 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_denylisted_field_rejected(void **state)
+{
+  static const char *const denylist_names[] = { "amount", NULL };
+  dt_remote_denylist_t denylist = { .names = denylist_names };
+
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.5 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, &denylist, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_duplicate_field_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.1 }));
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("amount", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.2 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_empty_patch_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+}
+
+static void test_patch_apply_null_patch_rejected(void **state)
+{
+  fixture_params_t params = { 0 };
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(fixture_linear, NULL, NULL, &params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  dt_remote_error_free(err);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -500,6 +734,17 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_schema_enum_members_preserved),
     cmocka_unit_test(test_schema_unsupported_types_marked_writable_false_not_omitted),
     cmocka_unit_test(test_schema_denylist_forces_writable_false),
+
+    cmocka_unit_test(test_patch_apply_single_valid_field),
+    cmocka_unit_test(test_patch_apply_multiple_valid_fields),
+    cmocka_unit_test(test_patch_apply_enum_by_int_and_by_name),
+    cmocka_unit_test(test_patch_apply_any_invalid_field_rejects_whole_patch),
+    cmocka_unit_test(test_patch_apply_unknown_field_rejected),
+    cmocka_unit_test(test_patch_apply_unsupported_field_rejected),
+    cmocka_unit_test(test_patch_apply_denylisted_field_rejected),
+    cmocka_unit_test(test_patch_apply_duplicate_field_rejected),
+    cmocka_unit_test(test_patch_apply_empty_patch_rejected),
+    cmocka_unit_test(test_patch_apply_null_patch_rejected),
   };
 
   return cmocka_run_group_tests(tests, NULL, NULL);

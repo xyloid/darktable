@@ -286,6 +286,54 @@ gboolean dt_remote_value_validate_and_write(const dt_introspection_field_t *f,
                                             void *params_blob,
                                             dt_remote_error_t **err);
 
+/** The pure core of dt_remote_set_module_params (plan step 7, internals §3
+ * steps 4-6): resolves, validates, and writes every entry of
+ * `patch->scalar_values` into `params_blob`, which must already be a
+ * scratch copy of the module's params the caller allocated and populated
+ * (e.g. via g_malloc(module->params_size) + memcpy from module->params) --
+ * this function never sees or touches live module state, only the copy it
+ * is handed, so a caller that discards `params_blob` on failure has by
+ * construction changed nothing observable.
+ *
+ * `linear` is a get_introspection_linear()-style array (NONE-terminated);
+ * `denylist` is the same per-module forced-writable:false table
+ * dt_remote_schema_from_introspection() takes (NULL denies nothing).
+ *
+ * Processes entries in order, writing each one immediately via
+ * dt_remote_value_validate_and_write() before moving to the next (not a
+ * separate validate-then-write pass) -- this matches the normative
+ * sequence exactly; it is safe because the whole block is scratch, per
+ * above. Returns FALSE on the first rejected entry and leaves later
+ * entries unprocessed:
+ *
+ *  - patch is NULL, or scalar_values is NULL/empty -> DT_REMOTE_ERR_INVALID_VALUE
+ *    ("values must be non-empty", the wire contract's own requirement,
+ *    enforced here too as a second line of defense);
+ *  - an entry's name does not match any field in `linear` ->
+ *    DT_REMOTE_ERR_UNKNOWN_FIELD;
+ *  - an entry's name repeats an earlier entry in the same patch ->
+ *    DT_REMOTE_ERR_INVALID_VALUE ("duplicate field"); the protocol layer
+ *    cannot itself produce this (JSON object keys are already unique by
+ *    the time they reach here), but a future non-JSON caller could, so
+ *    this pure core still guards against it directly;
+ *  - the field is denylisted -> DT_REMOTE_ERR_UNSUPPORTED_FIELD;
+ *  - dt_remote_value_validate_and_write() rejects the value (wrong type,
+ *    out of range/non-finite, unrecognized enum member, or a known
+ *    non-scalar field type) -> whatever it sets (DT_REMOTE_ERR_INVALID_VALUE
+ *    or DT_REMOTE_ERR_UNSUPPORTED_FIELD).
+ *
+ * `patch->semantic_values` is reserved/unused in v1 (see dt_remote_patch_t)
+ * and is ignored here -- "step 6, validate the completed parameter block"
+ * is a no-op for v1's scalar-only patches (every field is already
+ * individually checked above, with no cross-field constraints in the v1
+ * schema); this is the extension point future semantic-value classes
+ * (curves etc.) hook into instead of forking the transaction. */
+gboolean dt_remote_patch_apply(const dt_introspection_field_t *linear,
+                               const dt_remote_denylist_t *denylist,
+                               const dt_remote_patch_t *patch,
+                               void *params_blob,
+                               dt_remote_error_t **error);
+
 /* ---------------------------------------------------------------------- */
 /* read API (live-module traversal)                                        */
 /* ---------------------------------------------------------------------- */
@@ -317,6 +365,40 @@ gboolean dt_remote_get_module_schema(const char *op,
  * DT_REMOTE_ERR_UNKNOWN_INSTANCE as appropriate. */
 gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
                                      GPtrArray **out /* dt_remote_patch_entry_t */,
+                                     dt_remote_error_t **error);
+
+/* ---------------------------------------------------------------------- */
+/* mutation API (plan step 7)                                              */
+/* ---------------------------------------------------------------------- */
+
+/** Atomically applies `patch` to a live module instance, per the mutation
+ * engine sequence (internals doc §3, normative): checks the darkroom/
+ * image precondition and, if `expected_revision` is non-NULL, the
+ * compare-and-swap precondition against the current image
+ * (DT_REMOTE_ERR_REVISION_CONFLICT on mismatch); locates the instance
+ * (DT_REMOTE_ERR_UNKNOWN_MODULE / DT_REMOTE_ERR_UNKNOWN_INSTANCE); copies
+ * the whole params block to scratch and runs dt_remote_patch_apply() over
+ * it (any rejection there is returned unchanged, with live state
+ * untouched -- the scratch copy is freed, never written back); on success,
+ * copies the scratch block over the live params, applies
+ * `patch->has_enable`'s tri-state to module->enabled in the same
+ * transaction (parameters never implicitly enable a disabled module), and
+ * commits with the preset-apply idiom (`dt_iop_gui_update()` then exactly
+ * one `dt_dev_add_history_item()` call -- see internals doc §1's binding
+ * rules and src/gui/presets.c's precedent). The resulting revision is
+ * captured via dt_remote_revision_commit_history_change() (see that
+ * function's header comment for why a plain post-commit
+ * dt_remote_revision_get() would be racy here) and `*out`'s fields are all
+ * read back from the now-live module state, never echoed from `patch`.
+ *
+ * `expected_revision` may be NULL (no compare-and-swap: apply
+ * unconditionally). Must be called on the GTK main thread (internals §1).
+ * This is the live half of the transaction; dt_remote_patch_apply() above
+ * is the pure half that unit tests exercise directly. */
+gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
+                                     const dt_remote_patch_t *patch,
+                                     const uint64_t *expected_revision,
+                                     dt_remote_mutation_result_t **out,
                                      dt_remote_error_t **error);
 
 G_END_DECLS
