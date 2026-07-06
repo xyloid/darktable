@@ -19,6 +19,7 @@
 #include "control/remote_edit.h"
 
 #include "common/darktable.h"
+#include "control/remote_revision.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "views/view.h"
@@ -582,9 +583,14 @@ gboolean dt_remote_get_state(dt_remote_state_t **out, dt_remote_error_t **error)
     state->aperture = dev->image_storage.exif_aperture;
     state->exposure_time = dev->image_storage.exif_exposure;
     state->focal_length = dev->image_storage.exif_focal_length;
-    // Placeholder until the dedicated revision tracker (internals doc §5)
-    // lands; history_end is a reasonable monotonic proxy in the meantime.
-    state->revision = (uint64_t)dev->history_end;
+    // Real process-local revision tracker (internals doc §5): NOT the
+    // database's history_end (that survives restarts and is not
+    // monotonic across undo -- see dt_remote_revision_t's own header
+    // comment). dt_remote_revision_current() is NULL when no remote
+    // server is running (e.g. this call from a unit test), in which case
+    // dt_remote_revision_get() answers 0, matching "revision zero is
+    // valid at process start."
+    state->revision = dt_remote_revision_get(dt_remote_revision_current());
   }
   // else: has_image stays FALSE and every image_* field stays at its
   // g_malloc0() zero/NULL value -- no error, per the protocol reference.

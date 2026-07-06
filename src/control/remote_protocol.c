@@ -430,10 +430,9 @@ static JsonNode *_handler_list_modules(JsonObject *params, dt_remote_session_t *
   if(!s_calls.list_modules(&modules, &err)) return _handler_fail(err);
 
   // list_modules doesn't carry its own revision (only dt_remote_state_t
-  // does, currently a placeholder proxy per remote_edit.c until the
-  // dedicated tracker of internals §5 lands) -- fetch it from get_state,
-  // which always succeeds, so this is a genuine internal inconsistency
-  // if it ever fails.
+  // does) -- fetch it from get_state, which reads the real tracker
+  // (internals §5, control/remote_revision.h) and always succeeds, so
+  // this is a genuine internal inconsistency if it ever fails.
   dt_remote_state_t *state = NULL;
   dt_remote_error_t *state_err = NULL;
   if(!s_calls.get_state(&state, &state_err))
