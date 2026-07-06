@@ -62,6 +62,7 @@
 #include "control/jobs/control_jobs.h"
 #include "control/jobs/film_jobs.h"
 #include "control/jobs/sidecar_jobs.h"
+#include "control/remote_server.h"
 #include "control/signal.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
@@ -2071,6 +2072,17 @@ int dt_init(int argc,
     // finally set the cursor to be the default.
     // for some reason this is needed on some systems to pick up the correctly themed cursor
     dt_control_change_cursor("default");
+
+    // Start the MCP remote-edit loopback server, if the user has opted
+    // in (security/enable_remote_control) -- disabled by default. This
+    // must run after control/signals/config/GUI are all up (session
+    // handlers read darktable.develop and the view manager synchronously
+    // on this same thread), which is why it is here and not at the
+    // earlier D-Bus init point above (darktable.dbus = dt_dbus_init()),
+    // which runs before any of that state exists. A bind/discovery
+    // failure only disables the feature for this run; it never aborts
+    // startup. See src/control/remote_server.h.
+    darktable.remote_server = dt_remote_server_start();
   }
   free(config_info);
 
@@ -2169,6 +2181,14 @@ void dt_cleanup()
 
   if(init_gui)
   {
+    // Stop the MCP remote-edit server before any of the GUI teardown or
+    // dt_control_shutdown() below: its session handlers read
+    // darktable.develop and the view manager synchronously on this same
+    // (GTK main) thread, so it must not outlive them. NULL-safe if it
+    // was never started (disabled, or startup failed).
+    dt_remote_server_stop(darktable.remote_server);
+    darktable.remote_server = NULL;
+
     // hide main window and do rest of the cleanup in the background
     gtk_widget_hide(dt_ui_main_window(darktable.gui->ui));
     dt_gui_process_events();

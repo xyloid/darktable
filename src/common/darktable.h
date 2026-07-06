@@ -456,6 +456,10 @@ typedef struct darktable_t
   struct dt_imageio_t *imageio;
   struct dt_opencl_t *opencl;
   struct dt_dbus_t *dbus;
+  struct dt_remote_server_t *remote_server;  // MCP remote-edit loopback server;
+                                             // GUI-only, NULL unless
+                                             // security/enable_remote_control is
+                                             // set -- see control/remote_server.h
   struct dt_undo_t *undo;
   struct dt_colorspaces_t *color_profiles;
   struct dt_l10n_t *l10n;

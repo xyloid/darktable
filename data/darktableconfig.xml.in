@@ -3120,6 +3120,13 @@
     <shortdescription>auto login to storage server</shortdescription>
     <longdescription>automatically login to the configured storage server. this requires that a password storage backend is set.</longdescription>
   </dtconfig>
+  <dtconfig prefs="security" section="other" restart="true">
+    <name>security/enable_remote_control</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>allow remote control (MCP)</shortdescription>
+    <longdescription>listen on a loopback-only, token-authenticated local port so an external tool (e.g. an MCP sidecar) can inspect and edit the current darkroom image. disabled by default; only another process running as you can connect, using a random per-session token darktable writes to a private file. takes effect on restart.</longdescription>
+  </dtconfig>
   <dtconfig>
     <name>plugins/lighttable/export/icctype</name>
     <type>int</type>
