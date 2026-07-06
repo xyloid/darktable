@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "darktable-mcp"
+version = "0.1.0"
+description = "Read-only MCP sidecar for darktable's private remote-edit protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "darktable developers" }]
+
+# `mcp` version range: floor is the exact version this package was
+# developed and tested against (1.28.1); ceiling excludes the next major,
+# since the SDK's own versioning policy is not documented as strictly
+# semver-stable across majors. Bump the floor deliberately, in the same
+# commit as any code changes the newer SDK requires.
+dependencies = [
+  "mcp>=1.28.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+darktable-mcp = "darktable_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
