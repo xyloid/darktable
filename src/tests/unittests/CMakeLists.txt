@@ -1,3 +1,4 @@
+add_subdirectory(common)
 add_subdirectory(control)
 add_subdirectory(iop)
 
