@@ -418,8 +418,11 @@ if the connection drops before the job completes.
   mismatch position (simple constant-time loop; no early exit).
 - **First networking code in the tree** (verified: zero `GSocket*` usage
   today), so no in-tree pattern to follow; the design is stock GIO:
-  `g_socket_service_new` + `g_socket_listener_add_inet_port` on
-  `127.0.0.1:0`, `g_object_get(listener, "port", ...)` for the OS-assigned
+  `g_socket_service_new` + `g_socket_listener_add_address` with an explicit
+  `127.0.0.1` `GInetSocketAddress` and port 0 (NOT
+  `g_socket_listener_add_inet_port`, which binds all interfaces and would
+  violate the loopback-only constraint), the effective address from
+  `g_socket_listener_add_address`'s out parameter for the OS-assigned
   port, async `g_input_stream_read_async` loops feeding the frame parser.
 - **Random bytes: new `src/common/crypto_random.[ch]`** —
   `gboolean dt_crypto_random_bytes(void *buf, size_t len)`; Linux
