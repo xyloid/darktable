@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import DiscoveryError
@@ -61,7 +61,12 @@ class DiscoveryRecord:
     pid: int
     host: str
     port: int
-    token: str
+    # repr=False so a stray `print(record)`/log line/traceback never leaks
+    # the session token; the attribute itself is unchanged (still a plain
+    # required `str`, still assigned positionally/by-keyword like any
+    # other field -- `field()` without a `default` does not turn this into
+    # an optional field or require reordering the fields around it).
+    token: str = field(repr=False)
     started_at: str
 
 

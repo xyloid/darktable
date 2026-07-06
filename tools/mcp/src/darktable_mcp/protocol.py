@@ -312,7 +312,22 @@ class ProtocolClient:
         `RequestOutcomeUnknown` (outcome undetermined -- do not retry
         automatically), or `TransportError` (a connection problem
         determined *before* the request could have had any effect,
-        e.g. the initial connect was refused)."""
+        e.g. the initial connect was refused).
+
+        Calls are serialized end-to-end by design: `self._lock` is held
+        for the whole round trip (connect-if-needed, send, await the
+        matching response), so at most one request from this client is
+        ever in flight at a time, and concurrent callers queue up rather
+        than interleave. This is deliberate, not an oversight -- the
+        server enforces its own pending-request limit and today's tool
+        set has no mutation whose semantics would benefit from
+        interleaved in-flight requests, so genuine concurrency would add
+        complexity for no v1 payoff. `_Connection` itself *does* support
+        multiple concurrent in-flight requests (it correlates responses
+        by id independent of arrival order); a caller that genuinely
+        needs concurrent requests to one darktable session must drive a
+        `_Connection` directly rather than go through `ProtocolClient`.
+        """
         async with self._lock:
             conn = await self._ensure_connected()
             try:

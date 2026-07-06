@@ -223,3 +223,23 @@ def test_select_record_raises_when_nothing_found(tmp_path):
 
 def test_default_darktable_config_dir_ends_in_darktable():
     assert discovery.default_darktable_config_dir().name == "darktable"
+
+
+def test_discovery_record_repr_and_str_do_not_leak_token():
+    secret = "s3cr3t-token-do-not-leak"
+    record = discovery.DiscoveryRecord(
+        path=Path("/tmp/session-1.json"),
+        protocol="org.darktable.remote-edit",
+        protocol_version=1,
+        darktable_version="5.x",
+        pid=12345,
+        host="127.0.0.1",
+        port=43127,
+        token=secret,
+        started_at="2026-07-05T15:04:05Z",
+    )
+
+    assert secret not in repr(record)
+    assert secret not in str(record)
+    # A non-secret field is still visible, proving repr isn't just empty.
+    assert "43127" in repr(record)
