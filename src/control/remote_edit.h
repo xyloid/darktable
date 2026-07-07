@@ -409,6 +409,91 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
                                      dt_remote_mutation_result_t **out,
                                      dt_remote_error_t **error);
 
+/* ---------------------------------------------------------------------- */
+/* mutation API (plan step 8)                                             */
+/* ---------------------------------------------------------------------- */
+
+/** Enables or disables a live module instance through the same path the
+ * on/off header toggle uses (module->enabled = value, then exactly one
+ * dt_dev_add_history_item()), sharing the whole revision/CAS/main-thread
+ * discipline of dt_remote_set_module_params(): self-heal the tracker's
+ * image identity, compare-and-swap against `expected_revision` when
+ * non-NULL (DT_REMOTE_ERR_REVISION_CONFLICT on mismatch, nothing changed),
+ * locate the instance (DT_REMOTE_ERR_UNKNOWN_MODULE /
+ * DT_REMOTE_ERR_UNKNOWN_INSTANCE), toggle, commit, and read the resulting
+ * revision back. `*out`'s `values` is NULL (enable carries no values on the
+ * wire); `enabled` is read back from live state. Enabling is explicit and
+ * always its own single history item -- it never rides on a params patch.
+ * Must be called on the GTK main thread. */
+gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,
+                                      gboolean enabled,
+                                      const uint64_t *expected_revision,
+                                      dt_remote_mutation_result_t **out,
+                                      dt_remote_error_t **error);
+
+/** Restores a live module instance to its defaults through darktable's
+ * normal reset lifecycle (the same core the reset-button callback runs:
+ * drop any drawn mask, dt_iop_reload_defaults() to reload image-specific
+ * default params + blend params, dt_iop_gui_reset()/dt_iop_gui_update() to
+ * resync the widgets, then exactly one dt_dev_add_history_item()). Shares
+ * the revision/CAS/main-thread discipline of the other mutations. `*out`'s
+ * `values` holds the post-reset scalar values of every supported field
+ * (matching the wire result), `enabled` is read back from live state. Must
+ * be called on the GTK main thread. */
+gboolean dt_remote_reset_module(const dt_remote_module_ref_t *ref,
+                                const uint64_t *expected_revision,
+                                dt_remote_mutation_result_t **out,
+                                dt_remote_error_t **error);
+
+/** Creates a new instance of a multi-instance module by delegating to the
+ * native darkroom helper dt_iop_gui_duplicate(base, copy_params), which
+ * builds the module, places its GUI expander, records BOTH history entries,
+ * rebuilds the pixelpipe, and focuses it -- exactly the GUI new-instance /
+ * duplicate button. `ref` addresses the source instance (its op, and
+ * `instance` = source multi_priority). Rejects a module flagged
+ * IOP_FLAGS_ONE_INSTANCE with DT_REMOTE_ERR_INSTANCE_NOT_SUPPORTED (nothing
+ * created); an unknown op/source instance fails with
+ * DT_REMOTE_ERR_UNKNOWN_MODULE / DT_REMOTE_ERR_UNKNOWN_INSTANCE. Shares the
+ * revision/CAS/main-thread discipline of the other mutations; the returned
+ * revision reflects the final state after both history entries. `*out`
+ * carries the NEW instance's multi_priority (`instance`), read-back
+ * multi_name (`instance_name`), and `enabled`; `values` is NULL (create
+ * carries no values on the wire). Must be called on the GTK main thread. */
+gboolean dt_remote_create_module_instance(const dt_remote_module_ref_t *ref,
+                                          gboolean copy_params,
+                                          const uint64_t *expected_revision,
+                                          dt_remote_mutation_result_t **out,
+                                          dt_remote_error_t **error);
+
+/** Reads the darkroom history stack as model-oriented metadata only: one
+ * dt_remote_history_item_t per entry (seq = stack position, op, instance,
+ * translated display_name/instance_name, enabled) -- NO binary param
+ * blobs. Items are ordered oldest -> newest; when the stack is longer than
+ * `limit`, only the newest `limit` entries are returned (each keeping its
+ * true stack position in `seq`). `limit` must already be clamped to
+ * [1,100] by the caller. `*revision_out` receives the current coherent
+ * revision (self-healed, like get_state). Fails with
+ * DT_REMOTE_ERR_NOT_IN_DARKROOM / DT_REMOTE_ERR_NO_IMAGE_OPEN as
+ * appropriate. Must be called on the GTK main thread. */
+gboolean dt_remote_get_history(int limit,
+                               GPtrArray **items_out /* dt_remote_history_item_t */,
+                               uint64_t *revision_out,
+                               dt_remote_error_t **error);
+
+/** Compare-and-undo: if the live revision equals `expected_revision`, undo
+ * exactly one history transition through darktable's undo system (the same
+ * dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP) entry point as Ctrl+Z),
+ * otherwise fail with DT_REMOTE_ERR_REVISION_CONFLICT and change nothing.
+ * `expected_revision` is required (there is no unconditional undo over the
+ * protocol). Self-heals the tracker's image identity first, like every
+ * mutation. `*revision_out` receives the new post-undo revision (undo is
+ * itself a history change). Fails with DT_REMOTE_ERR_NOT_IN_DARKROOM /
+ * DT_REMOTE_ERR_NO_IMAGE_OPEN as appropriate. Must be called on the GTK
+ * main thread. */
+gboolean dt_remote_undo(uint64_t expected_revision,
+                        uint64_t *revision_out,
+                        dt_remote_error_t **error);
+
 G_END_DECLS
 
 // clang-format off

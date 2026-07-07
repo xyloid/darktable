@@ -19,10 +19,12 @@
 #include "control/remote_edit.h"
 
 #include "common/darktable.h"
+#include "common/undo.h"
 #include "control/control.h"
 #include "control/remote_revision.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/masks.h"
 #include "views/view.h"
 
 #include <pthread.h>
@@ -960,6 +962,276 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   result->revision = new_revision;
 
   *out = result;
+  return TRUE;
+}
+
+/* ---------------------------------------------------------------------- */
+/* mutation API (plan step 8)                                             */
+/* ---------------------------------------------------------------------- */
+
+// The shared front half of every step-8 mutation, identical to
+// set_module_params' steps 1-2: assert main thread, require a darkroom
+// image, self-heal the tracker's image identity, then the compare-and-swap
+// against `expected_revision` (NULL = unconditional). On success returns
+// TRUE with `*dev_out` set; on any failure allocates `*error` and returns
+// FALSE having changed nothing. See dt_remote_set_module_params()'s inline
+// comments for why each step is ordered this way (they are the normative
+// source; this helper only de-duplicates them).
+static gboolean dt_remote_mutation_precheck(const uint64_t *expected_revision,
+                                            dt_develop_t **dev_out,
+                                            dt_remote_error_t **error)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
+
+  dt_remote_revision_observe_image(dev->image_storage.id);
+  if(expected_revision
+     && !dt_remote_revision_matches(dt_remote_revision_current(), *expected_revision,
+                                    dev->image_storage.id))
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_REVISION_CONFLICT,
+                                   _("expected revision %" PRIu64 " does not match current state"),
+                                   *expected_revision);
+    return FALSE;
+  }
+
+  if(dev_out) *dev_out = dev;
+  return TRUE;
+}
+
+// Reads the tracker's counter after a darktable op that was expected to
+// raise DEVELOP_HISTORY_CHANGE (delivered synchronously on this thread, so
+// the counter has normally already advanced past `pre_revision`); if it did
+// NOT advance -- develop.c has gated raise paths -- account for the change
+// with a plain unpaired bump. Identical fallback rule to
+// dt_remote_set_module_params() step 10; see dt_remote_revision_force_bump()
+// for why redundant-bump (spurious retryable conflict) beats swallowed-bump
+// (silent clobber).
+static uint64_t dt_remote_read_new_revision(uint64_t pre_revision)
+{
+  uint64_t new_revision = dt_remote_revision_get(dt_remote_revision_current());
+  if(new_revision == pre_revision) new_revision = dt_remote_revision_force_bump();
+  return new_revision;
+}
+
+gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,
+                                      gboolean enabled,
+                                      const uint64_t *expected_revision,
+                                      dt_remote_mutation_result_t **out,
+                                      dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+
+  dt_iop_module_t *module = dt_remote_find_module(dev, ref, error);
+  if(!module) return FALSE;
+
+  // Toggle through the same two operations the on/off header callback
+  // performs (_gui_off_callback: set module->enabled, then exactly one
+  // dt_dev_add_history_item()); dt_iop_gui_update() resyncs the header's
+  // enable button, matching the preset-apply idiom used by
+  // set_module_params. Enabling is always its own single history item.
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  module->enabled = enabled ? TRUE : FALSE;
+  dt_iop_gui_update(module);
+  dt_dev_add_history_item(dev, module, FALSE);
+  if(module->widget) gtk_widget_queue_draw(module->widget);
+
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(module->op);
+  result->instance = module->multi_priority;
+  result->instance_name =
+    dt_remote_instance_name_is_default(module) ? g_strdup("") : g_strdup(module->multi_name);
+  result->enabled = module->enabled;
+  result->values = NULL;  // enable carries no values on the wire
+  result->revision = new_revision;
+
+  *out = result;
+  return TRUE;
+}
+
+gboolean dt_remote_reset_module(const dt_remote_module_ref_t *ref,
+                                const uint64_t *expected_revision,
+                                dt_remote_mutation_result_t **out,
+                                dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+
+  dt_iop_module_t *module = dt_remote_find_module(dev, ref, error);
+  if(!module) return FALSE;
+
+  // The reset-button lifecycle (_gui_reset_callback's reset branch, minus
+  // the Ctrl auto-preset shortcut): drop any drawn mask first (before
+  // reload_defaults resets the blend params that name it), reload the
+  // image-specific default params + blend params
+  // (dt_iop_reload_defaults -> dt_iop_load_default_params), let the module
+  // reset its own gui, resync the widgets, then exactly one history item.
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+
+  if(dt_is_valid_maskid(module->blend_params->mask_id))
+  {
+    dt_masks_form_t *grp = dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(grp) dt_masks_form_remove(module, NULL, grp);
+  }
+  dt_iop_reload_defaults(module);
+  dt_iop_gui_reset(module);
+  dt_iop_gui_update(module);
+  dt_dev_add_history_item(dev, module, TRUE);
+  if(module->widget) gtk_widget_queue_draw(module->widget);
+
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(module->op);
+  result->instance = module->multi_priority;
+  result->instance_name =
+    dt_remote_instance_name_is_default(module) ? g_strdup("") : g_strdup(module->multi_name);
+  result->enabled = module->enabled;
+
+  // Post-reset scalar values of every supported field, read back from live
+  // params (never echoed) -- same read-back walk as get_module_params.
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  dt_introspection_field_t *linear = module->so->get_introspection_linear();
+  for(const dt_introspection_field_t *f = linear;
+      linear && f->header.type != DT_INTROSPECTION_TYPE_NONE;
+      f++)
+  {
+    dt_remote_value_t value;
+    if(!dt_remote_value_from_field(f, module->params, &value)) continue;
+    dt_remote_patch_entry_t *entry = g_malloc0(sizeof(dt_remote_patch_entry_t));
+    entry->name = g_strdup(f->header.name);
+    entry->value = value;
+    g_ptr_array_add(result->values, entry);
+  }
+  result->revision = new_revision;
+
+  *out = result;
+  return TRUE;
+}
+
+gboolean dt_remote_create_module_instance(const dt_remote_module_ref_t *ref,
+                                          gboolean copy_params,
+                                          const uint64_t *expected_revision,
+                                          dt_remote_mutation_result_t **out,
+                                          dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+
+  // `ref` addresses the source (base) instance to duplicate.
+  dt_iop_module_t *base = dt_remote_find_module(dev, ref, error);
+  if(!base) return FALSE;
+
+  if(base->flags() & IOP_FLAGS_ONE_INSTANCE)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INSTANCE_NOT_SUPPORTED,
+                                   _("module '%s' does not support multiple instances"), base->op);
+    return FALSE;
+  }
+
+  // dt_iop_gui_duplicate() adds two history items (the base's current state
+  // and the new instance's creation) -- both raise DEVELOP_HISTORY_CHANGE
+  // synchronously, so the tracker advances twice; the fallback only fires
+  // if the counter did not move at all.
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  dt_iop_module_t *module = dt_iop_gui_duplicate(base, copy_params);
+  if(!module)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("could not create a new instance of module '%s'"), base->op);
+    return FALSE;
+  }
+
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(module->op);
+  result->instance = module->multi_priority;
+  result->instance_name =
+    dt_remote_instance_name_is_default(module) ? g_strdup("") : g_strdup(module->multi_name);
+  result->enabled = module->enabled;
+  result->values = NULL;  // create carries no values on the wire
+  result->revision = new_revision;
+
+  *out = result;
+  return TRUE;
+}
+
+gboolean dt_remote_get_history(int limit,
+                               GPtrArray **items_out,
+                               uint64_t *revision_out,
+                               dt_remote_error_t **error)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
+
+  // Model-oriented metadata only: no param blobs. Items are ordered
+  // oldest->newest (pipe/history-list order); with more entries than
+  // `limit`, only the newest `limit` are returned, each keeping its true
+  // stack position in `seq`. `limit` is already clamped to [1,100] by the
+  // caller; guard defensively anyway.
+  if(limit < 1) limit = 1;
+  if(limit > 100) limit = 100;
+
+  const int total = (int)g_list_length(dev->history);
+  const int skip = (total > limit) ? (total - limit) : 0;
+
+  GPtrArray *items = g_ptr_array_new_with_free_func(dt_remote_history_item_free);
+  int seq = 0;
+  for(GList *h = dev->history; h; h = g_list_next(h), seq++)
+  {
+    if(seq < skip) continue;
+    const dt_dev_history_item_t *hist = h->data;
+
+    dt_remote_history_item_t *item = g_malloc0(sizeof(dt_remote_history_item_t));
+    item->seq = seq;
+    item->op = g_strdup(hist->op_name);
+    item->instance = hist->multi_priority;
+    item->display_name = g_strdup(hist->module ? hist->module->name() : hist->op_name);
+    // multi_name[0] empty (or legacy "0") == the default, unnamed instance,
+    // same convention dt_remote_instance_name_is_default() applies to a
+    // live module.
+    item->instance_name =
+      (hist->multi_name[0] == '\0' || !strcmp(hist->multi_name, "0")) ? g_strdup("")
+                                                                      : g_strdup(hist->multi_name);
+    item->enabled = hist->enabled;
+    g_ptr_array_add(items, item);
+  }
+
+  if(revision_out) *revision_out = dt_remote_revision_observe_image(dev->image_storage.id);
+  *items_out = items;
+  return TRUE;
+}
+
+gboolean dt_remote_undo(uint64_t expected_revision,
+                        uint64_t *revision_out,
+                        dt_remote_error_t **error)
+{
+  // expected_revision is required for undo (compare-and-undo); pass it as a
+  // non-NULL pointer to the shared precheck so a mismatch is the standard
+  // revision_conflict, and nothing is undone.
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(&expected_revision, &dev, error)) return FALSE;
+
+  // The same undo entry point as Ctrl+Z in the darkroom
+  // (_darkroom_undo_callback): one transition, scoped to develop. It raises
+  // DEVELOP_HISTORY_CHANGE synchronously, so the tracker advances; the
+  // fallback covers the gated-raise case.
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+
+  if(revision_out) *revision_out = new_revision;
   return TRUE;
 }
 
