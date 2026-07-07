@@ -1045,8 +1045,8 @@ gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,
   dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
   result->op = g_strdup(module->op);
   result->instance = module->multi_priority;
-  result->instance_name =
-    dt_remote_instance_name_is_default(module) ? g_strdup("") : g_strdup(module->multi_name);
+  // enable's wire result omits instance_name (with_instance_name=FALSE), so
+  // leave result->instance_name NULL -- mutation_result_free tolerates it.
   result->enabled = module->enabled;
   result->values = NULL;  // enable carries no values on the wire
   result->revision = new_revision;
@@ -1090,8 +1090,8 @@ gboolean dt_remote_reset_module(const dt_remote_module_ref_t *ref,
   dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
   result->op = g_strdup(module->op);
   result->instance = module->multi_priority;
-  result->instance_name =
-    dt_remote_instance_name_is_default(module) ? g_strdup("") : g_strdup(module->multi_name);
+  // reset's wire result omits instance_name (with_instance_name=FALSE), so
+  // leave result->instance_name NULL -- mutation_result_free tolerates it.
   result->enabled = module->enabled;
 
   // Post-reset scalar values of every supported field, read back from live

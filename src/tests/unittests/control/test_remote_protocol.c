@@ -1282,6 +1282,37 @@ static void test_set_module_enabled_error_bad_shapes(void **state)
   dt_remote_protocol_set_calls(NULL);
 }
 
+static gboolean stub_set_module_enabled_unknown_module(const dt_remote_module_ref_t *ref,
+                                                       gboolean enabled,
+                                                       const uint64_t *expected_revision,
+                                                       dt_remote_mutation_result_t **out,
+                                                       dt_remote_error_t **error)
+{
+  (void)enabled;
+  (void)expected_revision;
+  (void)out;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_UNKNOWN_MODULE,
+                         g_strdup_printf("unknown module '%s'", ref->op));
+  return FALSE;
+}
+
+// an unknown op fails inside the engine; the dispatcher maps
+// DT_REMOTE_ERR_UNKNOWN_MODULE onto the "unknown_module" wire envelope.
+static void test_set_module_enabled_error_unknown_module(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .set_module_enabled = stub_set_module_enabled_unknown_module
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":69,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"nonexistent_op\",\"enabled\":true}}",
+    "unknown_module");
+  dt_remote_protocol_set_calls(NULL);
+}
+
 /* --- reset_module --- */
 
 static gboolean stub_reset_module_ok(const dt_remote_module_ref_t *ref,
@@ -1374,6 +1405,36 @@ static void test_reset_module_error_bad_shapes(void **state)
   _assert_inline_error(
     "{\"id\":68,\"method\":\"reset_module\",\"params\":{\"module\":\"exposure\",\"bogus\":1}}",
     "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static gboolean stub_reset_module_unknown_instance(const dt_remote_module_ref_t *ref,
+                                                   const uint64_t *expected_revision,
+                                                   dt_remote_mutation_result_t **out,
+                                                   dt_remote_error_t **error)
+{
+  (void)expected_revision;
+  (void)out;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_UNKNOWN_INSTANCE,
+                         g_strdup_printf("module '%s' has no instance %d", ref->op, ref->instance));
+  return FALSE;
+}
+
+// an existing module but a nonexistent multi-instance fails inside the
+// engine; the dispatcher maps DT_REMOTE_ERR_UNKNOWN_INSTANCE onto the
+// "unknown_instance" wire envelope.
+static void test_reset_module_error_unknown_instance(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .reset_module = stub_reset_module_unknown_instance
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":72,\"method\":\"reset_module\","
+    "\"params\":{\"module\":\"exposure\",\"instance\":9}}",
+    "unknown_instance");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -1853,10 +1914,12 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_enabled_success),
     cmocka_unit_test(test_set_module_enabled_error_revision_conflict),
     cmocka_unit_test(test_set_module_enabled_error_bad_shapes),
+    cmocka_unit_test(test_set_module_enabled_error_unknown_module),
 
     cmocka_unit_test(test_reset_module_success),
     cmocka_unit_test(test_reset_module_error_revision_conflict),
     cmocka_unit_test(test_reset_module_error_bad_shapes),
+    cmocka_unit_test(test_reset_module_error_unknown_instance),
 
     cmocka_unit_test(test_create_module_instance_success),
     cmocka_unit_test(test_create_module_instance_copy_params_true),

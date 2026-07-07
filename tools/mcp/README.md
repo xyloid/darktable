@@ -1,11 +1,13 @@
 # darktable-mcp
 
-A read-only [MCP](https://modelcontextprotocol.io) sidecar for darktable's
+An [MCP](https://modelcontextprotocol.io) sidecar for darktable's
 private remote-edit protocol. It lets an MCP client (an LLM agent, the
 [MCP inspector](https://github.com/modelcontextprotocol/inspector), etc.)
-introspect a running darktable darkroom session: the current image, the
-live processing-module stack, and each module's parameter schema and
-current values.
+introspect *and* edit a running darktable darkroom session: read the
+current image, the live processing-module stack, and each module's
+parameter schema and current values; and mutate the edit by enabling or
+resetting a module, creating a new module instance, inspecting the history
+stack, and undoing the last change.
 
 This is the sidecar for plan step 5 of
 `docs/superpowers/plans/2026-07-05-darktable-mcp-implementation-plan.md`.
@@ -37,16 +39,26 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
+| `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
+| `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
+| `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
+| `get_history` | `get_history` | the active edit-history stack (metadata only, no param blobs) |
+| `undo` | `undo` | compare-and-undo the last change (requires `expected_revision`) |
 
-All four are read-only and require darktable to be running with
+All nine require darktable to be running with
 `security/enable_remote_control` set to true. The darkroom-scoped tools
-(`list_modules`, `get_module_params`) fail with a `not_in_darkroom` or
+(everything except `get_current_image`) fail with a `not_in_darkroom` or
 `no_image_open` error (surfaced as an MCP tool error with an actionable
 hint, see `errors.py`) unless an image is currently open in the darkroom.
 
-This step only implements the four read-only tools from the plan; the
-mutating methods already documented in the protocol reference
-(`set_module_params`, `undo`, `render_preview`, ...) are for a later step.
+The four read tools (`get_current_image`, `list_modules`,
+`get_module_schema`, `get_module_params`) never change the edit. The
+mutating tools (`set_module_enabled`, `reset_module`,
+`create_module_instance`, `undo`) advance the session revision; each
+mutating call may take an `expected_revision` for compare-and-swap so a
+stale client can't clobber a concurrent edit. Other protocol methods
+documented in the reference (`set_module_params`, `render_preview`, ...)
+are exposed elsewhere or reserved for a later step.
 
 ## Setup
 
@@ -133,7 +145,8 @@ ambiguous -- the connection dropped or the deadline passed while a
 response was in flight -- the client never retries that request
 automatically (darktable may or may not have processed it); it raises
 `errors.RequestOutcomeUnknown` and drops the dead connection so the *next*
-call reconnects cleanly. For today's read-only tools, replaying a failed
-call by hand is always safe; this policy exists because `protocol.py` is
-shared infrastructure for the mutating methods a later plan step will add,
-where blind retries would risk double-applying an edit.
+call reconnects cleanly. For the read tools, replaying a failed call by
+hand is always safe; for the mutating tools (`set_module_enabled`,
+`reset_module`, `create_module_instance`, `undo`) this matters more, since
+a blind retry would risk double-applying an edit -- which is exactly why
+those methods take an `expected_revision` for compare-and-swap.
