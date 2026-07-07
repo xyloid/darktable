@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from conftest import load_fixture
+from conftest import WireError, load_fixture
 from darktable_mcp.server import build_server
 
 
@@ -150,6 +150,191 @@ async def test_get_module_params_defaults_instance_to_zero(tmp_path, fake_server
     assert seen_params == {"module": "exposure", "instance": 0}
 
 
+async def test_set_module_enabled_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("set_module_enabled_response.json")
+    server.handle_from_fixture("set_module_enabled", "set_module_enabled_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(
+        app, "set_module_enabled", {"module": "exposure", "enabled": True}
+    )
+
+    assert result == fixture["result"]
+
+
+async def test_set_module_enabled_threads_params(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {"module": params["module"], "instance": params["instance"], "enabled": False, "revision": 5}
+
+    server.handle("set_module_enabled", handler)
+
+    app = await _built_server(tmp_path, server)
+    # expected_revision omitted -> must not appear in the wire params;
+    # instance defaults to 0.
+    await app.call_tool("set_module_enabled", {"module": "exposure", "enabled": False})
+
+    assert seen == {"module": "exposure", "instance": 0, "enabled": False}
+
+
+async def test_set_module_enabled_includes_expected_revision_when_given(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {"module": params["module"], "instance": params["instance"], "enabled": True, "revision": 9}
+
+    server.handle("set_module_enabled", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_enabled",
+        {"module": "exposure", "enabled": True, "instance": 2, "expected_revision": 8},
+    )
+
+    assert seen == {"module": "exposure", "instance": 2, "enabled": True, "expected_revision": 8}
+
+
+async def test_set_module_enabled_revision_conflict_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+
+    def handler(_params):
+        raise WireError(
+            "revision_conflict", "expected revision 30 does not match current state", retryable=True
+        )
+
+    server.handle("set_module_enabled", handler)
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("set_module_enabled", {"module": "exposure", "enabled": True})
+
+    message = str(excinfo.value)
+    assert "revision_conflict" in message
+    assert "re-read state and retry" in message  # the actionable hint text
+
+
+async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("reset_module_response.json")
+    server.handle_from_fixture("reset_module", "reset_module_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "reset_module", {"module": "exposure"})
+
+    assert result == fixture["result"]
+    # reset returns post-reset values (not instance_name).
+    assert "values" in result
+
+
+async def test_create_module_instance_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("create_module_instance_response.json")
+    server.handle_from_fixture("create_module_instance", "create_module_instance_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "create_module_instance", {"module": "exposure"})
+
+    assert result == fixture["result"]
+
+
+async def test_create_module_instance_threads_copy_params(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {"module": params["module"], "instance": 1, "instance_name": "1", "enabled": True, "revision": 7}
+
+    server.handle("create_module_instance", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "create_module_instance", {"module": "exposure", "copy_params": True, "source_instance": 3}
+    )
+
+    assert seen == {"module": "exposure", "source_instance": 3, "copy_params": True}
+
+
+async def test_create_module_instance_not_supported_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    server.handle_from_fixture(
+        "create_module_instance",
+        "create_module_instance_error_instance_not_supported_response.json",
+    )
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("create_module_instance", {"module": "demosaic"})
+
+    message = str(excinfo.value)
+    assert "instance_not_supported" in message
+    assert "multiple instances" in message  # the actionable hint text
+
+
+async def test_get_history_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("get_history_response.json")
+    server.handle_from_fixture("get_history", "get_history_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "get_history", {"limit": 20})
+
+    assert result == fixture["result"]
+    # model-oriented metadata only: no parameter blobs in the items.
+    for item in result["items"]:
+        assert "params" not in item
+        assert "values" not in item
+
+
+async def test_get_history_defaults_limit_to_twenty(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {"revision": 1, "items": []}
+
+    server.handle("get_history", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool("get_history", {})
+
+    assert seen == {"limit": 20}
+
+
+async def test_undo_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("undo_response.json")
+    server.handle_from_fixture("undo", "undo_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "undo", {"expected_revision": 33})
+
+    assert result == fixture["result"]
+
+
+async def test_undo_revision_conflict_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    server.handle_from_fixture("undo", "undo_error_revision_conflict_response.json")
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("undo", {"expected_revision": 30})
+
+    message = str(excinfo.value)
+    assert "revision_conflict" in message
+    assert "re-read state and retry" in message
+
+
 async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     app = await _built_server(tmp_path, server)
@@ -162,6 +347,11 @@ async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_ser
         "list_modules",
         "get_module_schema",
         "get_module_params",
+        "set_module_enabled",
+        "reset_module",
+        "create_module_instance",
+        "get_history",
+        "undo",
     }
 
 

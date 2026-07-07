@@ -2,10 +2,15 @@
 
 This is the only file in the package allowed to import the `mcp` SDK
 (`discovery.py`, `protocol.py`, and `errors.py` stay SDK-free so the
-transport client is reusable outside an MCP context). It exposes four
-read-only tools, named per the implementation plan:
+transport client is reusable outside an MCP context). It exposes the
+read-only introspection tools, named per the implementation plan:
 
     get_current_image, list_modules, get_module_schema, get_module_params
+
+plus the darkroom mutation tools (plan steps 7-8):
+
+    set_module_enabled, reset_module, create_module_instance,
+    get_history, undo
 
 Each tool is a thin shape-conversion layer over one wire method call
 through `protocol.ProtocolClient`; wire results are already compact and
@@ -29,11 +34,14 @@ from .protocol import ProtocolClient
 
 SERVER_NAME = "darktable-mcp"
 SERVER_INSTRUCTIONS = (
-    "Read-only introspection into a running darktable darkroom session: "
+    "Inspect and edit a running darktable darkroom session: read the "
     "current image/view, live processing modules, and their parameter "
-    "schemas and values. All tools require a darktable instance running "
-    "with remote control enabled and, for darkroom-scoped tools, an image "
-    "open in the darkroom."
+    "schemas and values; and mutate the edit -- enable/disable and reset "
+    "modules, create new module instances, read the history stack, and "
+    "undo. All tools require a darktable instance running with remote "
+    "control enabled and, for darkroom-scoped tools, an image open in the "
+    "darkroom. Mutations accept an optional `expected_revision` for "
+    "compare-and-swap against concurrent user edits."
 )
 
 
@@ -105,5 +113,94 @@ def build_server(
         (0 for the default/only instance -- see `list_modules`)."""
         client = await _client()
         return await client.call("get_module_params", {"module": module, "instance": instance})
+
+    @app.tool()
+    async def set_module_enabled(
+        module: str,
+        enabled: bool,
+        instance: int = 0,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Switch one module instance on or off -- the explicit equivalent
+        of its darkroom on/off toggle, recorded as one history step.
+        `module` is the internal op name, `instance` its `multi_priority`.
+        Pass `expected_revision` (from a prior read) for compare-and-swap:
+        the call fails with `revision_conflict` (retryable) if the darkroom
+        history changed since then, changing nothing. Returns the module,
+        instance, resulting `enabled` state, and new `revision`."""
+        params: dict[str, Any] = {"module": module, "instance": instance, "enabled": enabled}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        return await client.call("set_module_enabled", params)
+
+    @app.tool()
+    async def reset_module(
+        module: str,
+        instance: int = 0,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Reset one module instance to its defaults through darktable's
+        normal reset lifecycle (the same as the module's reset button),
+        recorded as one history step. `module` is the internal op name,
+        `instance` its `multi_priority`. Pass `expected_revision` for
+        compare-and-swap (see `set_module_enabled`). Returns the module,
+        instance, resulting `enabled` state, the post-reset `values`, and
+        the new `revision`."""
+        params: dict[str, Any] = {"module": module, "instance": instance}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        return await client.call("reset_module", params)
+
+    @app.tool()
+    async def create_module_instance(
+        module: str,
+        source_instance: int = 0,
+        copy_params: bool = False,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a new instance of a multi-instance module, exactly like
+        the darkroom's new-instance / duplicate button. `module` is the
+        internal op name and `source_instance` the `multi_priority` of the
+        instance to base it on. `copy_params` true duplicates the source's
+        parameters; false yields defaults. A single-instance module fails
+        with `instance_not_supported`, creating nothing. Pass
+        `expected_revision` for compare-and-swap (see `set_module_enabled`).
+        Returns the module, the new `instance` number, its `instance_name`,
+        `enabled` state, and the new `revision`."""
+        params: dict[str, Any] = {
+            "module": module,
+            "source_instance": source_instance,
+            "copy_params": copy_params,
+        }
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        return await client.call("create_module_instance", params)
+
+    @app.tool()
+    async def get_history(limit: int = 20) -> dict[str, Any]:
+        """Return the darkroom edit-history stack as model-oriented
+        metadata only (no parameter blobs -- use `get_module_params` for
+        values). Each item carries its stack position `seq`, the module
+        `op`, `instance`, translated `display_name`/`instance_name`, and
+        `enabled` state, ordered oldest to newest. `limit` (default 20) is
+        clamped to the server's [1, 100] window. Returns the current
+        `revision` and the `items` list."""
+        client = await _client()
+        return await client.call("get_history", {"limit": limit})
+
+    @app.tool()
+    async def undo(expected_revision: int) -> dict[str, Any]:
+        """Undo exactly one darkroom history transition through darktable's
+        undo system (the same as Ctrl+Z). `expected_revision` is REQUIRED
+        and enforced as compare-and-undo: the undo happens only if it
+        matches the live revision, otherwise the call fails with
+        `revision_conflict` (retryable) and nothing changes -- so read the
+        current revision first and never undo a state you have not
+        observed. Returns the new post-undo `revision`."""
+        client = await _client()
+        return await client.call("undo", {"expected_revision": expected_revision})
 
     return app
