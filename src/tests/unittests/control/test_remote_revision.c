@@ -38,12 +38,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <cmocka.h>
 
 #include "../util/assert.h"
 
 #include "control/remote_revision.h"
+#include "develop/develop.h"  // dt_develop_t: fixture for darktable.develop
+                              // in the history-change stamping tests
 
 #ifdef _WIN32
 #include "win/main_wrapper.h"
@@ -274,74 +277,161 @@ static void test_concurrent_bumps_are_not_lost(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
-/* dt_remote_revision_commit_history_change(): plan step 7's synchronous   */
-/* counterpart to the asynchronous DEVELOP_HISTORY_CHANGE signal delivery  */
-/* (see the function's header comment for the race it closes).            */
+/* DEVELOP_HISTORY_CHANGE handler contract (fix round 2 of plan step 7):   */
+/* exactly one bump per delivery -- no suppression bookkeeping. The       */
+/* delivery is synchronous on the mutation path (g_main_context_invoke_    */
+/* full runs the handler directly when the GTK main thread owns the       */
+/* default context), so the earlier commit+suppress pairing was counting   */
+/* the same change twice and then swallowing the next genuine one; see    */
+/* _history_change_bump_and_stamp() in remote_revision.c.                 */
 /* ---------------------------------------------------------------------- */
 
-static void test_commit_history_change_bumps_singleton_immediately(void **state)
+// Every delivery is a genuine state change: one bump each, always --
+// whether it originates from a remote mutation's dt_dev_add_history_item()
+// or from the user editing directly via the GUI, the handler cannot and
+// must not tell them apart.
+static void test_history_change_signal_bumps_once_per_delivery(void **state)
 {
   (void)state;
   dt_remote_revision_test_reset_singleton();
 
-  const uint64_t rev = dt_remote_revision_commit_history_change();
+  for(int i = 1; i <= 3; i++)
+  {
+    dt_remote_revision_test_simulate_history_change_signal();
+    assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), i);
+  }
 
-  assert_int_equal((int)rev, 1);
-  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
+  dt_remote_revision_test_reset_singleton();
 }
 
-// The redundant, later DEVELOP_HISTORY_CHANGE delivery this same mutation
-// eventually triggers must be swallowed, not double-counted -- otherwise
-// a client holding the revision this call returned would see the counter
-// have silently moved on by the time its next request arrives.
-static void test_simulated_signal_after_commit_is_suppressed_not_double_counted(void **state)
+// With no live darkroom (darktable.develop NULL -- the default in this
+// suite), a delivery bumps but leaves the stamped imgid untouched: the
+// handler must never *unlearn* an image identity it already has.
+static void test_history_change_signal_without_dev_keeps_imgid(void **state)
 {
   (void)state;
   dt_remote_revision_test_reset_singleton();
+  dt_remote_revision_stamp_image(dt_remote_revision_test_singleton(), 7);  // counter=1, imgid=7
 
-  const uint64_t rev = dt_remote_revision_commit_history_change();
-  assert_int_equal((int)rev, 1);
-
-  // The signal this mutation's dt_dev_add_history_item() raised is still
-  // "in flight" (async, idle-priority) -- simulate it landing now.
+  darktable.develop = NULL;
   dt_remote_revision_test_simulate_history_change_signal();
 
-  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
-}
-
-// An unrelated history change (no preceding commit -- e.g. the user
-// editing directly via the GUI) must still bump normally: suppression is
-// strictly one-shot per commit, never a blanket "ignore the signal".
-static void test_unpaired_simulated_signal_still_bumps(void **state)
-{
-  (void)state;
-  dt_remote_revision_test_reset_singleton();
-
-  dt_remote_revision_test_simulate_history_change_signal();
-
-  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
-}
-
-// Suppression slots are counted, not a single flag: two commits in a row
-// (e.g. two rapid mutations) before either of their signals drains must
-// still each be paired off correctly against the two eventual deliveries.
-static void test_multiple_commits_suppress_matching_number_of_signals(void **state)
-{
-  (void)state;
-  dt_remote_revision_test_reset_singleton();
-
-  dt_remote_revision_commit_history_change();  // counter -> 1, 1 slot armed
-  dt_remote_revision_commit_history_change();  // counter -> 2, 2 slots armed
-
-  dt_remote_revision_test_simulate_history_change_signal();  // consumes a slot
   assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 2);
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 7);
 
-  dt_remote_revision_test_simulate_history_change_signal();  // consumes the last slot
-  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 2);
+  dt_remote_revision_test_reset_singleton();
+}
 
-  // no slots left: a third delivery is a genuine, unrelated change.
+// With a live darkroom image, a history-change delivery re-stamps the
+// imgid too (fix for the liveness bug: DEVELOP_IMAGE_CHANGED raised
+// before dt_control_running() is dropped, so a startup-loaded image may
+// never stamp through that path -- the first history change must heal it).
+static void test_history_change_signal_stamps_current_dev_image(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  static dt_develop_t fake_dev;  // static: too large for the stack; zeroed
+  memset(&fake_dev, 0, sizeof(fake_dev));
+  fake_dev.image_storage.id = 7;
+  darktable.develop = &fake_dev;
+
   dt_remote_revision_test_simulate_history_change_signal();
-  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 3);
+
+  assert_int_equal((int)dt_remote_revision_get(dt_remote_revision_test_singleton()), 1);
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 7);
+  // ...and the (revision, imgid) pair it produced is CAS-consistent.
+  assert_true(dt_remote_revision_matches(dt_remote_revision_test_singleton(), 1, 7));
+
+  darktable.develop = NULL;
+  dt_remote_revision_test_reset_singleton();
+}
+
+/* ---------------------------------------------------------------------- */
+/* dt_remote_revision_observe_image(): self-healing reads. Protocol        */
+/* invariant under test: any revision the server hands out (get_state /    */
+/* mutation results, all of which observe first) CAS-matches against       */
+/* unchanged state -- even when no signal ever stamped the image.         */
+/* ---------------------------------------------------------------------- */
+
+static void test_observe_image_heals_mismatch_and_then_matches(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();  // counter=0, imgid=NO_IMGID
+
+  // the startup-loaded-image scenario: no DEVELOP_IMAGE_CHANGED was ever
+  // delivered, and a request handler observes image 5 for the first time.
+  const uint64_t rev = dt_remote_revision_observe_image(5);
+  assert_int_equal((int)rev, 1);  // healing stamps, and a stamp bumps
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 5);
+
+  // the invariant: the revision just handed out matches unchanged state.
+  assert_true(dt_remote_revision_matches(dt_remote_revision_test_singleton(), rev, 5));
+
+  dt_remote_revision_test_reset_singleton();
+}
+
+static void test_observe_image_same_image_is_a_plain_read(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  const uint64_t first = dt_remote_revision_observe_image(5);
+  // repeated observations of an unchanged state must not manufacture
+  // revisions -- otherwise every get_state would invalidate every CAS.
+  assert_int_equal((int)dt_remote_revision_observe_image(5), (int)first);
+  assert_int_equal((int)dt_remote_revision_observe_image(5), (int)first);
+
+  dt_remote_revision_test_reset_singleton();
+}
+
+static void test_observe_image_switch_heals_again(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+
+  const uint64_t rev5 = dt_remote_revision_observe_image(5);
+  const uint64_t rev9 = dt_remote_revision_observe_image(9);  // missed image switch
+  assert_int_equal((int)rev9, (int)rev5 + 1);
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 9);
+  // the pre-switch pair no longer matches; the healed one does.
+  assert_false(dt_remote_revision_matches(dt_remote_revision_test_singleton(), rev5, 5));
+  assert_true(dt_remote_revision_matches(dt_remote_revision_test_singleton(), rev9, 9));
+
+  dt_remote_revision_test_reset_singleton();
+}
+
+static void test_observe_image_invalid_imgid_never_stamps(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+  dt_remote_revision_stamp_image(dt_remote_revision_test_singleton(), 5);  // counter=1
+
+  // NO_IMGID (and anything invalid) degrades to a plain read: no bump,
+  // no unlearning of the stamped image.
+  assert_int_equal((int)dt_remote_revision_observe_image(NO_IMGID), 1);
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 5);
+
+  dt_remote_revision_test_reset_singleton();
+}
+
+/* ---------------------------------------------------------------------- */
+/* dt_remote_revision_force_bump(): the mutation engine's defensive        */
+/* fallback for a skipped/postponed HISTORY_CHANGE raise -- a plain,      */
+/* deliberately unpaired bump (fail toward a spurious retryable conflict, */
+/* never toward a swallowed change).                                       */
+/* ---------------------------------------------------------------------- */
+
+static void test_force_bump_increments_and_returns_new_value(void **state)
+{
+  (void)state;
+  dt_remote_revision_test_reset_singleton();
+  dt_remote_revision_stamp_image(dt_remote_revision_test_singleton(), 5);  // counter=1
+
+  assert_int_equal((int)dt_remote_revision_force_bump(), 2);
+  assert_int_equal((int)dt_remote_revision_force_bump(), 3);
+  // a force bump is a history-change substitute: counter only, imgid kept.
+  assert_int_equal(dt_remote_revision_get_imgid(dt_remote_revision_test_singleton()), 5);
 
   dt_remote_revision_test_reset_singleton();
 }
@@ -461,10 +551,16 @@ int main(int argc, char *argv[])
 
     cmocka_unit_test(test_concurrent_bumps_are_not_lost),
 
-    cmocka_unit_test(test_commit_history_change_bumps_singleton_immediately),
-    cmocka_unit_test(test_simulated_signal_after_commit_is_suppressed_not_double_counted),
-    cmocka_unit_test(test_unpaired_simulated_signal_still_bumps),
-    cmocka_unit_test(test_multiple_commits_suppress_matching_number_of_signals),
+    cmocka_unit_test(test_history_change_signal_bumps_once_per_delivery),
+    cmocka_unit_test(test_history_change_signal_without_dev_keeps_imgid),
+    cmocka_unit_test(test_history_change_signal_stamps_current_dev_image),
+
+    cmocka_unit_test(test_observe_image_heals_mismatch_and_then_matches),
+    cmocka_unit_test(test_observe_image_same_image_is_a_plain_read),
+    cmocka_unit_test(test_observe_image_switch_heals_again),
+    cmocka_unit_test(test_observe_image_invalid_imgid_never_stamps),
+
+    cmocka_unit_test(test_force_bump_increments_and_returns_new_value),
 
     cmocka_unit_test(test_current_is_null_when_never_connected),
 

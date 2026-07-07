@@ -118,36 +118,59 @@ static dt_remote_revision_t _singleton;
 // themselves still must run on the main context, same as always.
 static gboolean _connected = FALSE;
 
-// Number of upcoming DEVELOP_HISTORY_CHANGE deliveries to treat as already
-// accounted for (guarded by the same lock as _singleton/_connected). See
-// dt_remote_revision_commit_history_change()'s header comment for why this
-// exists: the signal is delivered asynchronously even from the main
-// thread, so the mutation engine bumps synchronously itself and arms one
-// slot here per commit, and _on_history_change() consumes (rather than
-// double-counts) exactly that many redundant deliveries.
-static guint _suppress_history_change = 0;
-
 // Shared by the real signal callback and the test-only simulation seam
 // (dt_remote_revision_test_simulate_history_change_signal()) so both run
-// identical logic.
-static void _history_change_bump_or_suppress(void)
+// identical logic: exactly one bump per delivery, re-stamping the imgid
+// from the live darkroom when one is valid.
+//
+// One bump per delivery -- no suppression bookkeeping -- is correct
+// because the delivery IS synchronous on the mutation path:
+// DT_SIGNAL_DEVELOP_HISTORY_CHANGE's `synchronous` flag is FALSE
+// (src/control/signal.c), so dt_control_signal_raise() goes through
+// g_main_context_invoke_full(NULL, ...) -- and GLib's documented
+// behavior for g_main_context_invoke_full() is to call the function
+// *directly* when the calling thread owns the target context. Remote
+// mutations (and every GUI edit) run on the GTK main thread, which owns
+// the default main context, so this handler has already run -- and the
+// counter has already advanced -- by the time dt_dev_add_history_item()
+// returns to its caller. An earlier design assumed the delivery was
+// queued even from the main thread and paired every mutation with a
+// "suppress the next delivery" slot; live testing proved that
+// assumption false: the mutation double-bumped, and the armed slot
+// leaked and later swallowed a *genuine* change (an undo), which would
+// have let a stale CAS silently clobber a user edit. See
+// dt_remote_revision_force_bump()'s header comment for the one
+// deliberately unpaired fallback bump the mutation engine may add.
+//
+// Re-stamping the imgid here (and not only on DEVELOP_IMAGE_CHANGED) is
+// half of the fix for a liveness bug: a darkroom image loaded during
+// startup raises DEVELOP_IMAGE_CHANGED before dt_control_running() is
+// true, and dt_control_signal_raise() drops signals raised that early,
+// so the tracker could otherwise carry imgid == NO_IMGID forever and
+// fail every CAS (dt_remote_revision_observe_image() below is the other
+// half). A history change always concerns the image currently in the
+// darkroom, so it is a safe place to (re)learn it. When no valid
+// darkroom image exists (defensive; a history change without one should
+// not happen in production, and unit tests leave darktable.develop NULL
+// unless a case installs a fixture), the imgid is left untouched and
+// the delivery still counts as one bump.
+static void _history_change_bump_and_stamp(void)
 {
+  const gboolean have_image =
+    darktable.develop && dt_is_valid_imgid(darktable.develop->image_storage.id);
+  const dt_imgid_t imgid = have_image ? darktable.develop->image_storage.id : NO_IMGID;
+
   G_LOCK(remote_revision);
-  if(_suppress_history_change > 0)
-  {
-    _suppress_history_change--;
-    G_UNLOCK(remote_revision);
-    return;
-  }
+  _singleton.counter++;
+  if(have_image) _singleton.imgid = imgid;
   G_UNLOCK(remote_revision);
-  dt_remote_revision_bump(&_singleton);
 }
 
 static void _on_history_change(gpointer instance, gpointer user_data)
 {
   (void)instance;
   (void)user_data;
-  _history_change_bump_or_suppress();
+  _history_change_bump_and_stamp();
 }
 
 static void _on_image_changed(gpointer instance, gpointer user_data)
@@ -196,23 +219,43 @@ const dt_remote_revision_t *dt_remote_revision_current(void)
   return connected ? &_singleton : NULL;
 }
 
-uint64_t dt_remote_revision_commit_history_change(void)
+uint64_t dt_remote_revision_observe_image(const dt_imgid_t imgid)
 {
   // Deliberately unconditional (no `_connected` gate): this always
-  // operates on the singleton's storage, same as the real
-  // DEVELOP_HISTORY_CHANGE handler and the test-only simulation seam below
-  // -- the file header's "Ownership" paragraph already establishes that
-  // the singleton's counter is bumped independent of whether a server is
-  // currently connected (see test_singleton_survives_disconnect_reconnect_
-  // cycle in test_remote_revision.c, which bumps it directly while
-  // disconnected). In production this is only ever reachable through the
-  // live mutation engine, which itself is only reachable while a server
-  // is connected, so the distinction is moot there; unconditional
-  // behavior here is what keeps this function testable without requiring
-  // a live darktable.signals connection.
+  // operates on the singleton's storage, same as the real signal
+  // handlers and the test-only simulation seam below -- the file
+  // header's "Ownership" paragraph already establishes that the
+  // singleton is written independent of whether a server is currently
+  // connected. In production this is only reachable through the live
+  // request handlers, which are only reachable while a server is
+  // connected, so the distinction is moot there; unconditional behavior
+  // here is what keeps this function testable without requiring a live
+  // darktable.signals connection.
+  const gboolean valid = dt_is_valid_imgid(imgid);
   G_LOCK(remote_revision);
-  _singleton.counter++;  // synchronous: see header comment for why
-  _suppress_history_change++;
+  if(valid && _singleton.imgid != imgid)
+  {
+    // The tracker missed a state change (e.g. the startup-loaded image
+    // whose DEVELOP_IMAGE_CHANGED was raised before dt_control_running()
+    // and dropped); observing it now is itself a state change, so this
+    // stamps exactly like the signal handler would: bump + set imgid.
+    _singleton.counter++;
+    _singleton.imgid = imgid;
+  }
+  const uint64_t value = _singleton.counter;
+  G_UNLOCK(remote_revision);
+  return value;
+}
+
+uint64_t dt_remote_revision_force_bump(void)
+{
+  // Same unconditional-singleton rationale as
+  // dt_remote_revision_observe_image() above. No suppression pairs with
+  // this bump, by design -- see the header comment: a redundant bump
+  // only costs a spurious retryable revision_conflict; a swallowed one
+  // would let a stale CAS clobber a user edit.
+  G_LOCK(remote_revision);
+  _singleton.counter++;
   const uint64_t value = _singleton.counter;
   G_UNLOCK(remote_revision);
   return value;
@@ -220,7 +263,7 @@ uint64_t dt_remote_revision_commit_history_change(void)
 
 void dt_remote_revision_test_simulate_history_change_signal(void)
 {
-  _history_change_bump_or_suppress();
+  _history_change_bump_and_stamp();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -237,7 +280,6 @@ void dt_remote_revision_test_reset_singleton(void)
   dt_remote_revision_init(&_singleton);
   G_LOCK(remote_revision);
   _connected = FALSE;
-  _suppress_history_change = 0;
   G_UNLOCK(remote_revision);
 }
 
