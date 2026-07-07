@@ -1183,12 +1183,20 @@ gboolean dt_remote_get_history(int limit,
   if(limit < 1) limit = 1;
   if(limit > 100) limit = 100;
 
-  const int total = (int)g_list_length(dev->history);
+  // Only the first `history_end` entries are the currently-active edit chain:
+  // a history-panel "jump to an earlier point" sets dev->history_end without
+  // truncating dev->history, so "future" (redoable) entries linger past the
+  // active boundary. Clamping keeps get_history's items/seq coherent with the
+  // revision that describes the live state. Defensively cap to the real list
+  // length so a transiently-larger history_end can't over-run the walk.
+  const int list_len = (int)g_list_length(dev->history);
+  int total = list_len;
+  if(dev->history_end >= 0 && dev->history_end < total) total = dev->history_end;
   const int skip = (total > limit) ? (total - limit) : 0;
 
   GPtrArray *items = g_ptr_array_new_with_free_func(dt_remote_history_item_free);
   int seq = 0;
-  for(GList *h = dev->history; h; h = g_list_next(h), seq++)
+  for(GList *h = dev->history; h && seq < total; h = g_list_next(h), seq++)
   {
     if(seq < skip) continue;
     const dt_dev_history_item_t *hist = h->data;
