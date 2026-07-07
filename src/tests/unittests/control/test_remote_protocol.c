@@ -520,6 +520,25 @@ static gboolean stub_set_module_params_revision_conflict(const dt_remote_module_
   return FALSE;
 }
 
+// unknown_instance comes from the engine (schema resolution already
+// succeeded for the op; only the live darkroom knows which multi-instances
+// exist), so unlike unknown_module this stub *is* reached.
+static gboolean stub_set_module_params_unknown_instance(const dt_remote_module_ref_t *ref,
+                                                        const dt_remote_patch_t *patch,
+                                                        const uint64_t *expected_revision,
+                                                        dt_remote_mutation_result_t **out,
+                                                        dt_remote_error_t **error)
+{
+  (void)patch;
+  (void)expected_revision;
+  (void)out;
+  assert_non_null(ref);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_UNKNOWN_INSTANCE,
+                         g_strdup_printf("module '%s' has no instance %d", ref->op, ref->instance));
+  return FALSE;
+}
+
 // For handler-side rejection paths (unknown field, bad value shape, bad
 // params): the engine must never be reached -- whole-patch atomicity starts
 // at the protocol boundary.
@@ -1117,6 +1136,24 @@ static void test_set_module_params_error_unknown_module(void **state)
   dt_remote_protocol_set_calls(NULL);
 }
 
+// an existing module but a nonexistent multi-instance fails inside the
+// engine; the dispatcher maps DT_REMOTE_ERR_UNKNOWN_INSTANCE onto the
+// "unknown_instance" wire envelope.
+static void test_set_module_params_error_unknown_instance(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure_full,
+    .set_module_params = stub_set_module_params_unknown_instance,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":43,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"instance\":3,\"values\":{\"exposure\":0.5}}}",
+    "unknown_instance");
+  dt_remote_protocol_set_calls(NULL);
+}
+
 /* ---------------------------------------------------------------------- */
 /* dispatch-level envelope validation                                      */
 /* ---------------------------------------------------------------------- */
@@ -1228,6 +1265,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_error_unsupported_field),
     cmocka_unit_test(test_set_module_params_error_bad_shapes),
     cmocka_unit_test(test_set_module_params_error_unknown_module),
+    cmocka_unit_test(test_set_module_params_error_unknown_instance),
 
     cmocka_unit_test(test_error_missing_id),
     cmocka_unit_test(test_error_invalid_id_type),
