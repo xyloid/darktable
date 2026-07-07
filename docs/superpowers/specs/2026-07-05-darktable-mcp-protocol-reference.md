@@ -258,7 +258,7 @@ Result:
 {
   "module": "exposure",
   "instance": 1,
-  "instance_name": "exposure 1",
+  "instance_name": "1",
   "enabled": true,
   "revision": 33
 }
