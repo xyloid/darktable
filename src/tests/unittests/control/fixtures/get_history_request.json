@@ -1,0 +1,7 @@
+{
+  "id": 53,
+  "method": "get_history",
+  "params": {
+    "limit": 20
+  }
+}

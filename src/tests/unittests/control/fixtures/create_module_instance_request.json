@@ -1,0 +1,10 @@
+{
+  "id": 52,
+  "method": "create_module_instance",
+  "params": {
+    "module": "exposure",
+    "source_instance": 0,
+    "copy_params": false,
+    "expected_revision": 31
+  }
+}

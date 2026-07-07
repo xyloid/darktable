@@ -583,9 +583,13 @@ static void test_hello_success(void **state)
   assert_int_equal(json_object_get_int_member(result, "protocol_version"), DT_REMOTE_PROTOCOL_VERSION);
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
+  // "params" (step 7) + "instances"/"history" (step 8); "preview"/"scopes"
+  // are still pending their handlers.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 1);
+  assert_int_equal(json_array_get_length(caps), 3);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
+  assert_string_equal(json_array_get_string_element(caps, 1), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 2), "history");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1155,6 +1159,574 @@ static void test_set_module_params_error_unknown_instance(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* set_module_enabled / reset_module / create_module_instance /            */
+/* get_history / undo  (plan step 8)                                        */
+/* ---------------------------------------------------------------------- */
+
+/* --- set_module_enabled --- */
+
+// Success stub for the wire-contract example: asserts the handler decoded
+// the request into (ref, enabled, expected_revision) exactly, then answers
+// with a canned read-back result matching set_module_enabled_response.json.
+static gboolean stub_set_module_enabled_ok(const dt_remote_module_ref_t *ref, gboolean enabled,
+                                           const uint64_t *expected_revision,
+                                           dt_remote_mutation_result_t **out,
+                                           dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+  assert_true(enabled);
+  assert_non_null(expected_revision);
+  assert_int_equal((int)*expected_revision, 31);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 0;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = NULL;  // enable carries no values
+  result->revision = 32;
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_set_module_enabled_conflict(const dt_remote_module_ref_t *ref, gboolean enabled,
+                                                 const uint64_t *expected_revision,
+                                                 dt_remote_mutation_result_t **out,
+                                                 dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)enabled;
+  (void)out;
+  assert_non_null(expected_revision);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_REVISION_CONFLICT,
+                         g_strdup_printf("expected revision %d does not match current state",
+                                         (int)*expected_revision));
+  return FALSE;
+}
+
+static gboolean stub_set_module_enabled_must_not_be_called(const dt_remote_module_ref_t *ref,
+                                                           gboolean enabled,
+                                                           const uint64_t *expected_revision,
+                                                           dt_remote_mutation_result_t **out,
+                                                           dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)enabled;
+  (void)expected_revision;
+  (void)out;
+  (void)error;
+  fail_msg("set_module_enabled engine must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
+static void test_set_module_enabled_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .set_module_enabled = stub_set_module_enabled_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_enabled_request.json", "set_module_enabled_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_enabled_error_revision_conflict(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .set_module_enabled = stub_set_module_enabled_conflict };
+  dt_remote_protocol_set_calls(&calls);
+  // retryable:true is pinned by the wire envelope for revision_conflict.
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":60,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"exposure\",\"enabled\":false,\"expected_revision\":30}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *err = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(err, "code"), "revision_conflict");
+  assert_true(json_object_get_boolean_member(err, "retryable"));
+  json_node_unref(actual);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_enabled_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .set_module_enabled = stub_set_module_enabled_must_not_be_called
+  };
+  dt_remote_protocol_set_calls(&calls);
+  // missing required 'enabled'
+  _assert_inline_error(
+    "{\"id\":61,\"method\":\"set_module_enabled\",\"params\":{\"module\":\"exposure\"}}",
+    "invalid_value");
+  // 'enabled' must be a boolean
+  _assert_inline_error(
+    "{\"id\":62,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"exposure\",\"enabled\":1}}",
+    "invalid_value");
+  // missing 'module'
+  _assert_inline_error(
+    "{\"id\":63,\"method\":\"set_module_enabled\",\"params\":{\"enabled\":true}}",
+    "invalid_value");
+  // unknown top-level key (strict-params rule)
+  _assert_inline_error(
+    "{\"id\":64,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"exposure\",\"enabled\":true,\"bogus\":1}}",
+    "invalid_value");
+  // negative expected_revision
+  _assert_inline_error(
+    "{\"id\":65,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"exposure\",\"enabled\":true,\"expected_revision\":-1}}",
+    "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- reset_module --- */
+
+static gboolean stub_reset_module_ok(const dt_remote_module_ref_t *ref,
+                                     const uint64_t *expected_revision,
+                                     dt_remote_mutation_result_t **out, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+  assert_non_null(expected_revision);
+  assert_int_equal((int)*expected_revision, 31);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 0;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(result->values, _make_result_entry("exposure", (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.0 }));
+  g_ptr_array_add(result->values, _make_result_entry("black", (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_FLOAT, .v.f = 0.0 }));
+  result->revision = 32;
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_reset_module_conflict(const dt_remote_module_ref_t *ref,
+                                           const uint64_t *expected_revision,
+                                           dt_remote_mutation_result_t **out,
+                                           dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)out;
+  assert_non_null(expected_revision);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_REVISION_CONFLICT,
+                         g_strdup_printf("expected revision %d does not match current state",
+                                         (int)*expected_revision));
+  return FALSE;
+}
+
+static gboolean stub_reset_module_must_not_be_called(const dt_remote_module_ref_t *ref,
+                                                     const uint64_t *expected_revision,
+                                                     dt_remote_mutation_result_t **out,
+                                                     dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)expected_revision;
+  (void)out;
+  (void)error;
+  fail_msg("reset_module engine must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
+static void test_reset_module_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .reset_module = stub_reset_module_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("reset_module_request.json", "reset_module_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_reset_module_error_revision_conflict(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .reset_module = stub_reset_module_conflict };
+  dt_remote_protocol_set_calls(&calls);
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":66,\"method\":\"reset_module\","
+    "\"params\":{\"module\":\"exposure\",\"expected_revision\":30}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *err = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(err, "code"), "revision_conflict");
+  assert_true(json_object_get_boolean_member(err, "retryable"));
+  json_node_unref(actual);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_reset_module_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .reset_module = stub_reset_module_must_not_be_called };
+  dt_remote_protocol_set_calls(&calls);
+  // missing 'module'
+  _assert_inline_error("{\"id\":67,\"method\":\"reset_module\",\"params\":{}}", "invalid_value");
+  // unknown top-level key
+  _assert_inline_error(
+    "{\"id\":68,\"method\":\"reset_module\",\"params\":{\"module\":\"exposure\",\"bogus\":1}}",
+    "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- create_module_instance --- */
+
+static gboolean stub_create_instance_ok(const dt_remote_module_ref_t *ref, gboolean copy_params,
+                                        const uint64_t *expected_revision,
+                                        dt_remote_mutation_result_t **out, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);  // source_instance
+  assert_false(copy_params);
+  assert_non_null(expected_revision);
+  assert_int_equal((int)*expected_revision, 31);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 1;  // the NEW instance's multi_priority
+  result->instance_name = g_strdup("1");
+  result->enabled = TRUE;
+  result->values = NULL;  // create carries no values
+  result->revision = 33;
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_create_instance_copy_params_true(const dt_remote_module_ref_t *ref,
+                                                      gboolean copy_params,
+                                                      const uint64_t *expected_revision,
+                                                      dt_remote_mutation_result_t **out,
+                                                      dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)expected_revision;
+  (void)error;
+  assert_true(copy_params);  // the sole point of this stub
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("exposure");
+  result->instance = 1;
+  result->instance_name = g_strdup("1");
+  result->enabled = TRUE;
+  result->values = NULL;
+  result->revision = 33;
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_create_instance_not_supported(const dt_remote_module_ref_t *ref,
+                                                   gboolean copy_params,
+                                                   const uint64_t *expected_revision,
+                                                   dt_remote_mutation_result_t **out,
+                                                   dt_remote_error_t **error)
+{
+  (void)copy_params;
+  (void)expected_revision;
+  (void)out;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_INSTANCE_NOT_SUPPORTED,
+                         g_strdup_printf("module '%s' does not support multiple instances", ref->op));
+  return FALSE;
+}
+
+static gboolean stub_create_instance_unknown_instance(const dt_remote_module_ref_t *ref,
+                                                      gboolean copy_params,
+                                                      const uint64_t *expected_revision,
+                                                      dt_remote_mutation_result_t **out,
+                                                      dt_remote_error_t **error)
+{
+  (void)copy_params;
+  (void)expected_revision;
+  (void)out;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_UNKNOWN_INSTANCE,
+                         g_strdup_printf("module '%s' has no instance %d", ref->op, ref->instance));
+  return FALSE;
+}
+
+static gboolean stub_create_instance_must_not_be_called(const dt_remote_module_ref_t *ref,
+                                                        gboolean copy_params,
+                                                        const uint64_t *expected_revision,
+                                                        dt_remote_mutation_result_t **out,
+                                                        dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)copy_params;
+  (void)expected_revision;
+  (void)out;
+  (void)error;
+  fail_msg("create_module_instance engine must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
+static void test_create_module_instance_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .create_module_instance = stub_create_instance_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("create_module_instance_request.json",
+                           "create_module_instance_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// copy_params defaults to false when absent, and threads through as true
+// when set -- both spellings are checked by their respective stubs.
+static void test_create_module_instance_copy_params_true(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .create_module_instance = stub_create_instance_copy_params_true
+  };
+  dt_remote_protocol_set_calls(&calls);
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":70,\"method\":\"create_module_instance\","
+    "\"params\":{\"module\":\"exposure\",\"copy_params\":true}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_create_module_instance_error_instance_not_supported(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .create_module_instance = stub_create_instance_not_supported
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("create_module_instance_error_instance_not_supported_request.json",
+                           "create_module_instance_error_instance_not_supported_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_create_module_instance_error_unknown_instance(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .create_module_instance = stub_create_instance_unknown_instance
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error(
+    "{\"id\":71,\"method\":\"create_module_instance\","
+    "\"params\":{\"module\":\"exposure\",\"source_instance\":9}}",
+    "unknown_instance");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_create_module_instance_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .create_module_instance = stub_create_instance_must_not_be_called
+  };
+  dt_remote_protocol_set_calls(&calls);
+  // missing 'module'
+  _assert_inline_error(
+    "{\"id\":72,\"method\":\"create_module_instance\",\"params\":{}}", "invalid_value");
+  // copy_params must be a boolean
+  _assert_inline_error(
+    "{\"id\":73,\"method\":\"create_module_instance\","
+    "\"params\":{\"module\":\"exposure\",\"copy_params\":1}}",
+    "invalid_value");
+  // unknown top-level key
+  _assert_inline_error(
+    "{\"id\":74,\"method\":\"create_module_instance\","
+    "\"params\":{\"module\":\"exposure\",\"bogus\":true}}",
+    "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- get_history --- */
+
+// captured across a dispatch so the clamping tests can assert the exact
+// limit the handler passed the engine (single-threaded test process).
+static int g_captured_history_limit = -1;
+
+static gboolean stub_get_history_one(int limit, GPtrArray **out, uint64_t *revision,
+                                     dt_remote_error_t **error)
+{
+  (void)error;
+  g_captured_history_limit = limit;
+
+  GPtrArray *items = g_ptr_array_new_with_free_func(dt_remote_history_item_free);
+  dt_remote_history_item_t *item = g_malloc0(sizeof(dt_remote_history_item_t));
+  item->seq = 12;
+  item->op = g_strdup("exposure");
+  item->instance = 0;
+  item->display_name = g_strdup("exposure");
+  item->instance_name = g_strdup("");
+  item->enabled = TRUE;
+  g_ptr_array_add(items, item);
+
+  if(revision) *revision = 33;
+  *out = items;
+  return TRUE;
+}
+
+static void test_get_history_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_history = stub_get_history_one };
+  dt_remote_protocol_set_calls(&calls);
+  g_captured_history_limit = -1;
+  _assert_dispatch_matches("get_history_request.json", "get_history_response.json");
+  assert_int_equal(g_captured_history_limit, 20);  // fixture asks for 20
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// limit absent -> default 20; >100 -> clamped to 100; <1 -> clamped to 1.
+static void test_get_history_limit_clamping(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_history = stub_get_history_one };
+  dt_remote_protocol_set_calls(&calls);
+
+  g_captured_history_limit = -1;
+  json_node_unref(_dispatch_inline("{\"id\":80,\"method\":\"get_history\",\"params\":{}}"));
+  assert_int_equal(g_captured_history_limit, 20);
+
+  g_captured_history_limit = -1;
+  json_node_unref(_dispatch_inline(
+    "{\"id\":81,\"method\":\"get_history\",\"params\":{\"limit\":500}}"));
+  assert_int_equal(g_captured_history_limit, 100);
+
+  g_captured_history_limit = -1;
+  json_node_unref(_dispatch_inline(
+    "{\"id\":82,\"method\":\"get_history\",\"params\":{\"limit\":0}}"));
+  assert_int_equal(g_captured_history_limit, 1);
+
+  g_captured_history_limit = -1;
+  json_node_unref(_dispatch_inline(
+    "{\"id\":83,\"method\":\"get_history\",\"params\":{\"limit\":-5}}"));
+  assert_int_equal(g_captured_history_limit, 1);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// no binary param-blob keys leak into the history items.
+static void test_get_history_items_carry_no_param_blobs(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_history = stub_get_history_one };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline("{\"id\":84,\"method\":\"get_history\",\"params\":{}}");
+  JsonObject *resp = json_node_get_object(actual);
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  JsonArray *items = json_object_get_array_member(result, "items");
+  JsonObject *item0 = json_array_get_object_element(items, 0);
+
+  // exactly the six model-metadata keys, nothing that could carry params.
+  assert_int_equal(json_object_get_size(item0), 6);
+  assert_true(json_object_has_member(item0, "seq"));
+  assert_true(json_object_has_member(item0, "op"));
+  assert_true(json_object_has_member(item0, "instance"));
+  assert_true(json_object_has_member(item0, "display_name"));
+  assert_true(json_object_has_member(item0, "instance_name"));
+  assert_true(json_object_has_member(item0, "enabled"));
+  assert_false(json_object_has_member(item0, "params"));
+  assert_false(json_object_has_member(item0, "values"));
+
+  json_node_unref(actual);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_get_history_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_history = stub_get_history_one };
+  dt_remote_protocol_set_calls(&calls);
+  // limit must be an integer
+  _assert_inline_error(
+    "{\"id\":85,\"method\":\"get_history\",\"params\":{\"limit\":\"lots\"}}", "invalid_value");
+  // fractional limit rejected
+  _assert_inline_error(
+    "{\"id\":86,\"method\":\"get_history\",\"params\":{\"limit\":1.5}}", "invalid_value");
+  // unknown top-level key
+  _assert_inline_error(
+    "{\"id\":87,\"method\":\"get_history\",\"params\":{\"limit\":20,\"bogus\":1}}", "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- undo --- */
+
+static gboolean stub_undo_ok(uint64_t expected_revision, uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_int_equal((int)expected_revision, 33);
+  if(revision) *revision = 34;
+  return TRUE;
+}
+
+static gboolean stub_undo_conflict(uint64_t expected_revision, uint64_t *revision,
+                                   dt_remote_error_t **error)
+{
+  (void)revision;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_REVISION_CONFLICT,
+                         g_strdup_printf("expected revision %d does not match current state",
+                                         (int)expected_revision));
+  return FALSE;
+}
+
+static gboolean stub_undo_must_not_be_called(uint64_t expected_revision, uint64_t *revision,
+                                             dt_remote_error_t **error)
+{
+  (void)expected_revision;
+  (void)revision;
+  (void)error;
+  fail_msg("undo engine must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
+static void test_undo_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .undo = stub_undo_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("undo_request.json", "undo_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_undo_error_revision_conflict(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .undo = stub_undo_conflict };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("undo_error_revision_conflict_request.json",
+                           "undo_error_revision_conflict_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// expected_revision is REQUIRED for undo (compare-and-undo, no unconditional
+// form) -- absent surfaces invalid_value and the engine is never reached.
+static void test_undo_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .undo = stub_undo_must_not_be_called };
+  dt_remote_protocol_set_calls(&calls);
+  // missing required expected_revision
+  _assert_inline_error("{\"id\":90,\"method\":\"undo\",\"params\":{}}", "invalid_value");
+  // negative expected_revision
+  _assert_inline_error(
+    "{\"id\":91,\"method\":\"undo\",\"params\":{\"expected_revision\":-1}}", "invalid_value");
+  // unknown top-level key
+  _assert_inline_error(
+    "{\"id\":92,\"method\":\"undo\",\"params\":{\"expected_revision\":5,\"steps\":2}}",
+    "invalid_value");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* ---------------------------------------------------------------------- */
 /* dispatch-level envelope validation                                      */
 /* ---------------------------------------------------------------------- */
 
@@ -1221,7 +1793,18 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
 
   const dt_remote_method_t *set_enabled = dt_remote_protocol_lookup_method("set_module_enabled");
   assert_true(set_enabled->is_mutation);
-  assert_null(set_enabled->handler);  // not implemented until its own step (8)
+  assert_non_null(set_enabled->handler);  // implemented in plan step 8
+
+  // get_history is a read (not a mutation); undo is a mutation. Both wired
+  // in plan step 8.
+  const dt_remote_method_t *history = dt_remote_protocol_lookup_method("get_history");
+  assert_true(history->needs_darkroom);
+  assert_false(history->is_mutation);
+  assert_non_null(history->handler);
+
+  const dt_remote_method_t *undo = dt_remote_protocol_lookup_method("undo");
+  assert_true(undo->is_mutation);
+  assert_non_null(undo->handler);
 
   const dt_remote_method_t *preview = dt_remote_protocol_lookup_method("render_preview");
   assert_true(preview->needs_darkroom);
@@ -1266,6 +1849,29 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_error_bad_shapes),
     cmocka_unit_test(test_set_module_params_error_unknown_module),
     cmocka_unit_test(test_set_module_params_error_unknown_instance),
+
+    cmocka_unit_test(test_set_module_enabled_success),
+    cmocka_unit_test(test_set_module_enabled_error_revision_conflict),
+    cmocka_unit_test(test_set_module_enabled_error_bad_shapes),
+
+    cmocka_unit_test(test_reset_module_success),
+    cmocka_unit_test(test_reset_module_error_revision_conflict),
+    cmocka_unit_test(test_reset_module_error_bad_shapes),
+
+    cmocka_unit_test(test_create_module_instance_success),
+    cmocka_unit_test(test_create_module_instance_copy_params_true),
+    cmocka_unit_test(test_create_module_instance_error_instance_not_supported),
+    cmocka_unit_test(test_create_module_instance_error_unknown_instance),
+    cmocka_unit_test(test_create_module_instance_error_bad_shapes),
+
+    cmocka_unit_test(test_get_history_success),
+    cmocka_unit_test(test_get_history_limit_clamping),
+    cmocka_unit_test(test_get_history_items_carry_no_param_blobs),
+    cmocka_unit_test(test_get_history_error_bad_shapes),
+
+    cmocka_unit_test(test_undo_success),
+    cmocka_unit_test(test_undo_error_revision_conflict),
+    cmocka_unit_test(test_undo_error_bad_shapes),
 
     cmocka_unit_test(test_error_missing_id),
     cmocka_unit_test(test_error_invalid_id_type),

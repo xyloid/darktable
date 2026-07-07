@@ -3,7 +3,7 @@
   "ok": false,
   "error": {
     "code": "internal",
-    "message": "method 'set_module_enabled' is not implemented yet",
+    "message": "method 'render_preview' is not implemented yet",
     "retryable": false
   }
 }

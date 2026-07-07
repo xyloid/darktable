@@ -1,5 +1,5 @@
 {
   "id": 9,
-  "method": "set_module_enabled",
-  "params": { "module": "exposure", "instance": 0, "enabled": false }
+  "method": "render_preview",
+  "params": { "max_px": 1024 }
 }

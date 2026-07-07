@@ -98,6 +98,16 @@ typedef struct dt_remote_protocol_calls_t
   gboolean (*set_module_params)(const dt_remote_module_ref_t *ref, const dt_remote_patch_t *patch,
                                 const uint64_t *expected_revision, dt_remote_mutation_result_t **out,
                                 dt_remote_error_t **error);
+  gboolean (*set_module_enabled)(const dt_remote_module_ref_t *ref, gboolean enabled,
+                                 const uint64_t *expected_revision, dt_remote_mutation_result_t **out,
+                                 dt_remote_error_t **error);
+  gboolean (*reset_module)(const dt_remote_module_ref_t *ref, const uint64_t *expected_revision,
+                           dt_remote_mutation_result_t **out, dt_remote_error_t **error);
+  gboolean (*create_module_instance)(const dt_remote_module_ref_t *ref, gboolean copy_params,
+                                     const uint64_t *expected_revision,
+                                     dt_remote_mutation_result_t **out, dt_remote_error_t **error);
+  gboolean (*get_history)(int limit, GPtrArray **out, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*undo)(uint64_t expected_revision, uint64_t *revision, dt_remote_error_t **error);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to

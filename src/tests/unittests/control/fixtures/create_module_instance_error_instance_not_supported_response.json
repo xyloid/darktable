@@ -1,0 +1,9 @@
+{
+  "id": 55,
+  "ok": false,
+  "error": {
+    "code": "instance_not_supported",
+    "message": "module 'demosaic' does not support multiple instances",
+    "retryable": false
+  }
+}

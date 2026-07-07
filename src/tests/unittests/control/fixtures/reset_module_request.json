@@ -1,0 +1,9 @@
+{
+  "id": 51,
+  "method": "reset_module",
+  "params": {
+    "module": "exposure",
+    "instance": 0,
+    "expected_revision": 31
+  }
+}

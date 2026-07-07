@@ -1,0 +1,17 @@
+{
+  "id": 53,
+  "ok": true,
+  "result": {
+    "revision": 33,
+    "items": [
+      {
+        "seq": 12,
+        "op": "exposure",
+        "instance": 0,
+        "display_name": "exposure",
+        "instance_name": "",
+        "enabled": true
+      }
+    ]
+  }
+}

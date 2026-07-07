@@ -43,6 +43,11 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .get_module_schema = dt_remote_get_module_schema,
   .get_module_params = dt_remote_get_module_params,
   .set_module_params = dt_remote_set_module_params,
+  .set_module_enabled = dt_remote_set_module_enabled,
+  .reset_module = dt_remote_reset_module,
+  .create_module_instance = dt_remote_create_module_instance,
+  .get_history = dt_remote_get_history,
+  .undo = dt_remote_undo,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -51,6 +56,11 @@ static dt_remote_protocol_calls_t s_calls = {
   .get_module_schema = dt_remote_get_module_schema,
   .get_module_params = dt_remote_get_module_params,
   .set_module_params = dt_remote_set_module_params,
+  .set_module_enabled = dt_remote_set_module_enabled,
+  .reset_module = dt_remote_reset_module,
+  .create_module_instance = dt_remote_create_module_instance,
+  .get_history = dt_remote_get_history,
+  .undo = dt_remote_undo,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -344,10 +354,12 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // Each named capability ("params", "instances", "history", "preview",
   // "scopes") is advertised in the same commit that gives its gating
   // method a real handler in the allowlist below. "params" = parameter
-  // mutation (set_module_params, plan step 7). Still pending: "instances"
-  // (create_module_instance), "history" (get_history/undo), "preview"
-  // (render_preview), "scopes" (compute_scopes).
+  // mutation (set_module_params, plan step 7). "instances" =
+  // create_module_instance; "history" = get_history/undo (plan step 8).
+  // Still pending: "preview" (render_preview), "scopes" (compute_scopes).
   json_builder_add_string_value(b, "params");
+  json_builder_add_string_value(b, "instances");
+  json_builder_add_string_value(b, "history");
   json_builder_end_array(b);
   json_builder_end_object(b);
 
@@ -897,6 +909,285 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   return result_node;
 }
 
+// Shared optional expected_revision parse used by every step-8 mutation
+// (and set_module_params inlines the same rule): absent -> have=FALSE;
+// present -> must be a finite, non-negative integer, else invalid_value.
+static gboolean _parse_expected_revision(JsonObject *params, gboolean *have, gint64 *value,
+                                         dt_remote_error_t **err)
+{
+  *have = FALSE;
+  *value = 0;
+  if(!params || !json_object_has_member(params, "expected_revision")) return TRUE;
+  if(!_require_int(params, "expected_revision", value, err)) return FALSE;
+  if(*value < 0)
+  {
+    if(err) *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'expected_revision' must not be negative"));
+    return FALSE;
+  }
+  *have = TRUE;
+  return TRUE;
+}
+
+// Serializes a mutation result (op/instance/enabled/revision, plus
+// instance_name and/or values only when requested) -- the wire shapes for
+// set_module_enabled, reset_module, and create_module_instance differ only
+// in which of those two optional members appear.
+static JsonNode *_mutation_result_to_json(const dt_remote_mutation_result_t *result,
+                                           const char *fallback_module,
+                                           gboolean with_instance_name, gboolean with_values)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "module");
+  json_builder_add_string_value(b, result->op ? result->op : fallback_module);
+  json_builder_set_member_name(b, "instance");
+  json_builder_add_int_value(b, result->instance);
+  if(with_instance_name)
+  {
+    json_builder_set_member_name(b, "instance_name");
+    json_builder_add_string_value(b, result->instance_name ? result->instance_name : "");
+  }
+  json_builder_set_member_name(b, "enabled");
+  json_builder_add_boolean_value(b, result->enabled);
+  if(with_values)
+  {
+    json_builder_set_member_name(b, "values");
+    json_builder_begin_object(b);
+    if(result->values)
+      for(guint i = 0; i < result->values->len; i++)
+      {
+        dt_remote_patch_entry_t *e = g_ptr_array_index(result->values, i);
+        json_builder_set_member_name(b, e->name);
+        json_builder_add_value(b, _value_to_json(&e->value));
+      }
+    json_builder_end_object(b);
+  }
+  json_builder_set_member_name(b, "revision");
+  json_builder_add_int_value(b, (gint64)result->revision);
+  json_builder_end_object(b);
+
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
+static const char *const SET_MODULE_ENABLED_KEYS[] =
+  { "module", "instance", "enabled", "expected_revision", NULL };
+
+static JsonNode *_handler_set_module_enabled(JsonObject *params, dt_remote_session_t *session,
+                                             dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, SET_MODULE_ENABLED_KEYS, &err)) return _handler_fail(err);
+
+  const char *module = NULL;
+  if(!_require_string(params, "module", &module, &err)) return _handler_fail(err);
+
+  gint64 instance = 0;
+  if(!_optional_int_default(params, "instance", 0, &instance, &err)) return _handler_fail(err);
+
+  // `enabled` is required and explicit -- enabling is never implicit.
+  if(!params || !json_object_has_member(params, "enabled"))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("missing required parameter 'enabled'")));
+  JsonNode *enabled_node = json_object_get_member(params, "enabled");
+  if(!enabled_node || !JSON_NODE_HOLDS_VALUE(enabled_node)
+     || json_node_get_value_type(enabled_node) != G_TYPE_BOOLEAN)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'enabled' must be a boolean")));
+  const gboolean enabled = json_node_get_boolean(enabled_node);
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision, &err))
+    return _handler_fail(err);
+
+  const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  dt_remote_mutation_result_t *result = NULL;
+  if(!s_calls.set_module_enabled(&ref, enabled, have_expected ? &expected_u64 : NULL, &result, &err))
+    return _handler_fail(err);
+
+  JsonNode *node = _mutation_result_to_json(result, module, FALSE, FALSE);
+  dt_remote_mutation_result_free(result);
+  return node;
+}
+
+static const char *const RESET_MODULE_KEYS[] = { "module", "instance", "expected_revision", NULL };
+
+static JsonNode *_handler_reset_module(JsonObject *params, dt_remote_session_t *session,
+                                       dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, RESET_MODULE_KEYS, &err)) return _handler_fail(err);
+
+  const char *module = NULL;
+  if(!_require_string(params, "module", &module, &err)) return _handler_fail(err);
+
+  gint64 instance = 0;
+  if(!_optional_int_default(params, "instance", 0, &instance, &err)) return _handler_fail(err);
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision, &err))
+    return _handler_fail(err);
+
+  const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  dt_remote_mutation_result_t *result = NULL;
+  if(!s_calls.reset_module(&ref, have_expected ? &expected_u64 : NULL, &result, &err))
+    return _handler_fail(err);
+
+  // reset returns the post-reset values (not instance_name).
+  JsonNode *node = _mutation_result_to_json(result, module, FALSE, TRUE);
+  dt_remote_mutation_result_free(result);
+  return node;
+}
+
+static const char *const CREATE_MODULE_INSTANCE_KEYS[] =
+  { "module", "source_instance", "copy_params", "expected_revision", NULL };
+
+static JsonNode *_handler_create_module_instance(JsonObject *params, dt_remote_session_t *session,
+                                                 dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, CREATE_MODULE_INSTANCE_KEYS, &err)) return _handler_fail(err);
+
+  const char *module = NULL;
+  if(!_require_string(params, "module", &module, &err)) return _handler_fail(err);
+
+  gint64 source_instance = 0;
+  if(!_optional_int_default(params, "source_instance", 0, &source_instance, &err))
+    return _handler_fail(err);
+
+  gboolean copy_params = FALSE;
+  if(json_object_has_member(params, "copy_params"))
+  {
+    JsonNode *cp_node = json_object_get_member(params, "copy_params");
+    if(!cp_node || !JSON_NODE_HOLDS_VALUE(cp_node)
+       || json_node_get_value_type(cp_node) != G_TYPE_BOOLEAN)
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'copy_params' must be a boolean")));
+    copy_params = json_node_get_boolean(cp_node);
+  }
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision, &err))
+    return _handler_fail(err);
+
+  const dt_remote_module_ref_t ref = { .op = module, .instance = (int)source_instance };
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  dt_remote_mutation_result_t *result = NULL;
+  if(!s_calls.create_module_instance(&ref, copy_params, have_expected ? &expected_u64 : NULL,
+                                     &result, &err))
+    return _handler_fail(err);
+
+  // create returns instance_name (the new instance) but no values.
+  JsonNode *node = _mutation_result_to_json(result, module, TRUE, FALSE);
+  dt_remote_mutation_result_free(result);
+  return node;
+}
+
+static const char *const GET_HISTORY_KEYS[] = { "limit", NULL };
+
+static JsonNode *_handler_get_history(JsonObject *params, dt_remote_session_t *session,
+                                      dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, GET_HISTORY_KEYS, &err)) return _handler_fail(err);
+
+  // limit defaults to 20 and is clamped to the server's [1,100] window --
+  // out-of-range integers are clamped, not rejected (per the reference's
+  // "server cap 100"); only a non-integer/fractional limit is invalid_value.
+  gint64 limit = 20;
+  if(!_optional_int_default(params, "limit", 20, &limit, &err)) return _handler_fail(err);
+  if(limit < 1) limit = 1;
+  if(limit > 100) limit = 100;
+
+  GPtrArray *items = NULL;
+  uint64_t revision = 0;
+  if(!s_calls.get_history((int)limit, &items, &revision, &err)) return _handler_fail(err);
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "revision");
+  json_builder_add_int_value(b, (gint64)revision);
+  json_builder_set_member_name(b, "items");
+  json_builder_begin_array(b);
+  for(guint i = 0; i < items->len; i++)
+  {
+    dt_remote_history_item_t *it = g_ptr_array_index(items, i);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "seq");
+    json_builder_add_int_value(b, it->seq);
+    json_builder_set_member_name(b, "op");
+    json_builder_add_string_value(b, it->op ? it->op : "");
+    json_builder_set_member_name(b, "instance");
+    json_builder_add_int_value(b, it->instance);
+    json_builder_set_member_name(b, "display_name");
+    json_builder_add_string_value(b, it->display_name ? it->display_name : "");
+    json_builder_set_member_name(b, "instance_name");
+    json_builder_add_string_value(b, it->instance_name ? it->instance_name : "");
+    json_builder_set_member_name(b, "enabled");
+    json_builder_add_boolean_value(b, it->enabled);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  json_builder_end_object(b);
+
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  g_ptr_array_unref(items);
+  return node;
+}
+
+static const char *const UNDO_KEYS[] = { "expected_revision", NULL };
+
+static JsonNode *_handler_undo(JsonObject *params, dt_remote_session_t *session,
+                               dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, UNDO_KEYS, &err)) return _handler_fail(err);
+
+  // expected_revision is REQUIRED for undo (compare-and-undo; no
+  // unconditional form and no `steps` in v1).
+  gint64 expected_revision = 0;
+  if(!_require_int(params, "expected_revision", &expected_revision, &err)) return _handler_fail(err);
+  if(expected_revision < 0)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                    _("'expected_revision' must not be negative")));
+
+  uint64_t revision = 0;
+  if(!s_calls.undo((uint64_t)expected_revision, &revision, &err)) return _handler_fail(err);
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "revision");
+  json_builder_add_int_value(b, (gint64)revision);
+  json_builder_end_object(b);
+
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
 /* ---------------------------------------------------------------------- */
 /* allowlist (internals §6: 13 entries, static, looked up by g_str_equal)  */
 /* ---------------------------------------------------------------------- */
@@ -913,11 +1204,11 @@ static const dt_remote_method_t g_methods[] = {
   { "get_module_schema",      FALSE, FALSE, FALSE, _handler_get_module_schema },
   { "get_module_params",      TRUE,  FALSE, FALSE, _handler_get_module_params },
   { "set_module_params",      TRUE,  TRUE,  FALSE, _handler_set_module_params },
-  { "set_module_enabled",     TRUE,  TRUE,  FALSE, NULL },
-  { "reset_module",           TRUE,  TRUE,  FALSE, NULL },
-  { "create_module_instance", TRUE,  TRUE,  FALSE, NULL },
-  { "get_history",            TRUE,  FALSE, FALSE, NULL },
-  { "undo",                   TRUE,  TRUE,  FALSE, NULL },
+  { "set_module_enabled",     TRUE,  TRUE,  FALSE, _handler_set_module_enabled },
+  { "reset_module",           TRUE,  TRUE,  FALSE, _handler_reset_module },
+  { "create_module_instance", TRUE,  TRUE,  FALSE, _handler_create_module_instance },
+  { "get_history",            TRUE,  FALSE, FALSE, _handler_get_history },
+  { "undo",                   TRUE,  TRUE,  FALSE, _handler_undo },
   { "render_preview",         TRUE,  FALSE, TRUE,  NULL },
   { "compute_scopes",         TRUE,  FALSE, TRUE,  NULL },
 };
