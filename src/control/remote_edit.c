@@ -662,11 +662,17 @@ gboolean dt_remote_get_state(dt_remote_state_t **out, dt_remote_error_t **error)
     // Real process-local revision tracker (internals doc §5): NOT the
     // database's history_end (that survives restarts and is not
     // monotonic across undo -- see dt_remote_revision_t's own header
-    // comment). dt_remote_revision_current() is NULL when no remote
-    // server is running (e.g. this call from a unit test), in which case
-    // dt_remote_revision_get() answers 0, matching "revision zero is
-    // valid at process start."
-    state->revision = dt_remote_revision_get(dt_remote_revision_current());
+    // comment). Self-healing read (fix round 2): if the tracker never
+    // learned the current darkroom image (its DEVELOP_IMAGE_CHANGED can
+    // be raised before dt_control_running() during startup and silently
+    // dropped), dt_remote_revision_observe_image() stamps it now -- so
+    // the revision handed out here always CAS-matches in a subsequent
+    // set_module_params against unchanged state, instead of the client
+    // conflicting forever against an imgid of NO_IMGID. In production
+    // this only runs while a server is connected; a unit-test call with
+    // a valid fixture image observes the test singleton, same as the
+    // simulation seams do.
+    state->revision = dt_remote_revision_observe_image(dev->image_storage.id);
   }
   // else: has_image stays FALSE and every image_* field stays at its
   // g_malloc0() zero/NULL value -- no error, per the protocol reference.
@@ -843,7 +849,18 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
 
   // Step 1 (internals §3): revision CAS against the *current* image --
   // checked before locating the module, so a stale/foreign revision is
-  // rejected without ever touching module lookup or params.
+  // rejected without ever touching module lookup or params. First,
+  // self-heal the tracker's image identity: if the tracker never learned
+  // the current darkroom image (its DEVELOP_IMAGE_CHANGED can be raised
+  // before dt_control_running() during startup and silently dropped),
+  // stamp it now -- see dt_remote_revision_observe_image()'s header
+  // comment. The stamp legitimately bumps (the tracker is observing a
+  // state change it missed), so a client whose expected_revision predates
+  // the healing gets a retryable revision_conflict, re-reads state (which
+  // heals through the same call and hands out a revision that will
+  // match), and succeeds -- instead of conflicting forever against an
+  // imgid of NO_IMGID.
+  dt_remote_revision_observe_image(dev->image_storage.id);
   if(expected_revision
      && !dt_remote_revision_matches(dt_remote_revision_current(), *expected_revision,
                                     dev->image_storage.id))
@@ -889,18 +906,37 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   // the "never add a history item inside a GUI-update guard" rule
   // (src/develop/develop.c:1379) holds by construction, not by a separate
   // check here.
+  //
+  // Revision snapshot BEFORE the history item: DEVELOP_HISTORY_CHANGE is
+  // delivered synchronously here -- g_main_context_invoke_full() invokes
+  // the handler directly when the calling thread owns the default main
+  // context (documented GLib behavior), and this function is asserted to
+  // run on the GTK main thread -- so by the time
+  // dt_dev_add_history_item() returns, the tracker's counter has already
+  // advanced by exactly the one delivery dt_dev_undo_end_record()
+  // raised. See _history_change_bump_and_stamp() in remote_revision.c
+  // for why the earlier commit+suppress design around an assumed-async
+  // delivery was wrong (live-verified double bump + a leaked slot that
+  // swallowed a genuine undo).
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
   dt_iop_gui_update(module);
   dt_dev_add_history_item(dev, module, FALSE);
   if(module->widget) gtk_widget_queue_draw(module->widget);
 
-  // Step 10: capture the resulting revision synchronously -- see
-  // dt_remote_revision_commit_history_change()'s header comment for why a
-  // plain dt_remote_revision_get() here would race the asynchronous
-  // DEVELOP_HISTORY_CHANGE delivery dt_dev_add_history_item() just
-  // triggered. Then read every value back from the now-live module state
-  // (never echoed from `patch`), restricted to exactly the field names the
-  // patch touched, matching the wire contract's result shape.
-  const uint64_t new_revision = dt_remote_revision_commit_history_change();
+  // Step 10: the tracker has already counted the synchronous delivery;
+  // read the resulting revision. Defensive fallback: if the counter did
+  // NOT advance (develop.c has gated paths that skip the raise, e.g.
+  // history_postpone_invalidate, and future debounce changes could add
+  // more), account for the change ourselves with a plain bump and NO
+  // suppression bookkeeping. Design rule (fix round 2): a redundant bump
+  // only costs a spurious *retryable* revision_conflict on the client's
+  // next CAS; a swallowed bump would let a stale CAS silently clobber a
+  // user edit -- always fail toward the former. Then read every value
+  // back from the now-live module state (never echoed from `patch`),
+  // restricted to exactly the field names the patch touched, matching
+  // the wire contract's result shape.
+  uint64_t new_revision = dt_remote_revision_get(dt_remote_revision_current());
+  if(new_revision == pre_revision) new_revision = dt_remote_revision_force_bump();
 
   dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
   result->op = g_strdup(module->op);

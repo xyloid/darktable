@@ -375,7 +375,10 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
  * engine sequence (internals doc §3, normative): checks the darkroom/
  * image precondition and, if `expected_revision` is non-NULL, the
  * compare-and-swap precondition against the current image
- * (DT_REMOTE_ERR_REVISION_CONFLICT on mismatch); locates the instance
+ * (DT_REMOTE_ERR_REVISION_CONFLICT on mismatch; the tracker's image
+ * identity is self-healed via dt_remote_revision_observe_image() first,
+ * so a revision the server previously handed out always matches against
+ * unchanged state); locates the instance
  * (DT_REMOTE_ERR_UNKNOWN_MODULE / DT_REMOTE_ERR_UNKNOWN_INSTANCE); copies
  * the whole params block to scratch and runs dt_remote_patch_apply() over
  * it (any rejection there is returned unchanged, with live state
@@ -385,11 +388,16 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
  * transaction (parameters never implicitly enable a disabled module), and
  * commits with the preset-apply idiom (`dt_iop_gui_update()` then exactly
  * one `dt_dev_add_history_item()` call -- see internals doc §1's binding
- * rules and src/gui/presets.c's precedent). The resulting revision is
- * captured via dt_remote_revision_commit_history_change() (see that
- * function's header comment for why a plain post-commit
- * dt_remote_revision_get() would be racy here) and `*out`'s fields are all
- * read back from the now-live module state, never echoed from `patch`.
+ * rules and src/gui/presets.c's precedent). The resulting revision is the
+ * tracker's counter read after dt_dev_add_history_item() returns: the
+ * DEVELOP_HISTORY_CHANGE it raises is delivered synchronously on the GTK
+ * main thread (g_main_context_invoke_full() invokes directly when the
+ * calling thread owns the context), so the counter has already advanced;
+ * if it did not (develop.c's gated/postponed raise paths), a plain
+ * unpaired dt_remote_revision_force_bump() accounts for the change --
+ * see that function's header comment for the fail-toward-retryable
+ * design rule. `*out`'s fields are all read back from the now-live
+ * module state, never echoed from `patch`.
  *
  * `expected_revision` may be NULL (no compare-and-swap: apply
  * unconditionally). Must be called on the GTK main thread (internals §1).
