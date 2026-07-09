@@ -5,9 +5,10 @@ private remote-edit protocol. It lets an MCP client (an LLM agent, the
 [MCP inspector](https://github.com/modelcontextprotocol/inspector), etc.)
 introspect *and* edit a running darktable darkroom session: read the
 current image, the live processing-module stack, and each module's
-parameter schema and current values; and mutate the edit by enabling or
+parameter schema and current values; mutate the edit by enabling or
 resetting a module, creating a new module instance, inspecting the history
-stack, and undoing the last change.
+stack, and undoing the last change; and render a bounded JPEG preview of
+the current edit state as native MCP image content.
 
 This is the sidecar for plan step 5 of
 `docs/superpowers/plans/2026-07-05-darktable-mcp-implementation-plan.md`.
@@ -44,20 +45,25 @@ one adapter layer on top.
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
 | `get_history` | `get_history` | the active edit-history stack (metadata only, no param blobs) |
 | `undo` | `undo` | compare-and-undo the last change (requires `expected_revision`) |
+| `render_preview` | `render_preview` | bounded JPEG preview of the current edit, as native image content |
 
-All nine require darktable to be running with
+All ten require darktable to be running with
 `security/enable_remote_control` set to true. The darkroom-scoped tools
 (everything except `get_current_image`) fail with a `not_in_darkroom` or
 `no_image_open` error (surfaced as an MCP tool error with an actionable
 hint, see `errors.py`) unless an image is currently open in the darkroom.
 
 The four read tools (`get_current_image`, `list_modules`,
-`get_module_schema`, `get_module_params`) never change the edit. The
+`get_module_schema`, `get_module_params`) never change the edit, and
+neither does `render_preview` (it renders server-side on a background job
+and returns the JPEG as an MCP image content block -- never base64 text
+for the model; `max_px` is clamped to [64, 2048], `quality` to [50, 95],
+and a `request_too_large` error means retry with a smaller `max_px`). The
 mutating tools (`set_module_enabled`, `reset_module`,
 `create_module_instance`, `undo`) advance the session revision; each
 mutating call may take an `expected_revision` for compare-and-swap so a
 stale client can't clobber a concurrent edit. Other protocol methods
-documented in the reference (`set_module_params`, `render_preview`, ...)
+documented in the reference (`set_module_params`, `compute_scopes`, ...)
 are exposed elsewhere or reserved for a later step.
 
 ## Setup

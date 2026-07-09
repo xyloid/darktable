@@ -6,12 +6,14 @@ SDK's stdio dispatcher makes once a real MCP client is attached.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ImageContent
 
 from conftest import WireError, load_fixture
 from darktable_mcp.server import build_server
@@ -335,6 +337,65 @@ async def test_undo_revision_conflict_surfaces_hint(tmp_path, fake_server_factor
     assert "re-read state and retry" in message
 
 
+async def test_render_preview_returns_native_image_content(tmp_path, fake_server_factory):
+    """The plan's binding requirement: MCP returns NATIVE image content,
+    never a base64 text blob for the model to choke on."""
+    server = await fake_server_factory()
+    fixture = load_fixture("render_preview_response.json")
+    server.handle_from_fixture("render_preview", "render_preview_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await app.call_tool("render_preview", {})
+
+    # unstructured-only tool: a one-item content list, no structured tuple
+    assert isinstance(result, list)
+    assert len(result) == 1
+    block = result[0]
+    assert isinstance(block, ImageContent)
+    assert block.type == "image"
+    assert block.mimeType == "image/jpeg"
+    # the image bytes round-trip the wire base64 exactly
+    assert base64.b64decode(block.data) == base64.b64decode(fixture["result"]["data"])
+
+
+async def test_render_preview_threads_and_clamps_params(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen: list[dict] = []
+    fixture = load_fixture("render_preview_response.json")
+
+    def handler(params):
+        seen.append(dict(params))
+        return fixture["result"]
+
+    server.handle("render_preview", handler)
+
+    app = await _built_server(tmp_path, server)
+
+    # defaults are made explicit on the wire
+    await app.call_tool("render_preview", {})
+    assert seen[-1] == {"max_px": 1024, "quality": 85}
+
+    # out-of-range values are clamped client-side too (the server clamps
+    # anyway; doing it here keeps requests honest and self-describing)
+    await app.call_tool("render_preview", {"max_px": 10, "quality": 200})
+    assert seen[-1] == {"max_px": 64, "quality": 95}
+
+    await app.call_tool("render_preview", {"max_px": 5000, "quality": 10})
+    assert seen[-1] == {"max_px": 2048, "quality": 50}
+
+
+async def test_render_preview_failure_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    server.handle_from_fixture("render_preview", "render_preview_error_preview_failed_response.json")
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("render_preview", {})
+
+    assert "preview_failed" in str(excinfo.value)
+
+
 async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     app = await _built_server(tmp_path, server)
@@ -352,6 +413,7 @@ async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_ser
         "create_module_instance",
         "get_history",
         "undo",
+        "render_preview",
     }
 
 

@@ -12,10 +12,16 @@ plus the darkroom mutation tools (plan steps 7-8):
     set_module_enabled, reset_module, create_module_instance,
     get_history, undo
 
+plus the bounded preview renderer (plan step 9):
+
+    render_preview
+
 Each tool is a thin shape-conversion layer over one wire method call
 through `protocol.ProtocolClient`; wire results are already compact and
 model-oriented (per the protocol reference), so most tools return the wire
-`result` object close to verbatim. Errors from the transport/protocol layer
+`result` object close to verbatim -- except `render_preview`, which
+decodes the wire's base64 JPEG into a FastMCP `Image` so the model
+receives native image content, never a base64 text blob. Errors from the transport/protocol layer
 propagate as exceptions; the MCP SDK's low-level dispatcher (see
 `mcp.server.lowlevel.server.Server.call_tool`) catches any exception raised
 from a tool function and turns it into an `isError` tool result carrying
@@ -25,9 +31,10 @@ actionable hint rather than requiring callers to fish it out separately.
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 from . import discovery
 from .protocol import ProtocolClient
@@ -36,10 +43,11 @@ SERVER_NAME = "darktable-mcp"
 SERVER_INSTRUCTIONS = (
     "Inspect and edit a running darktable darkroom session: read the "
     "current image/view, live processing modules, and their parameter "
-    "schemas and values; and mutate the edit -- enable/disable and reset "
+    "schemas and values; mutate the edit -- enable/disable and reset "
     "modules, create new module instances, read the history stack, and "
-    "undo. All tools require a darktable instance running with remote "
-    "control enabled and, for darkroom-scoped tools, an image open in the "
+    "undo; and render a bounded JPEG preview of the current edit state. "
+    "All tools require a darktable instance running with remote control "
+    "enabled and, for darkroom-scoped tools, an image open in the "
     "darkroom. Mutations accept an optional `expected_revision` for "
     "compare-and-swap against concurrent user edits."
 )
@@ -202,5 +210,27 @@ def build_server(
         observed. Returns the new post-undo `revision`."""
         client = await _client()
         return await client.call("undo", {"expected_revision": expected_revision})
+
+    @app.tool()
+    async def render_preview(max_px: int = 1024, quality: int = 85) -> Image:
+        """Render the image currently open in the darkroom, with its full
+        current edit history and normal output color management (sRGB),
+        and return it as a JPEG image the model can look at directly.
+        `max_px` bounds the longest edge (clamped to [64, 2048], default
+        1024); `quality` is the JPEG quality (clamped to [50, 95], default
+        85). Rendering happens asynchronously in darktable and can take a
+        few seconds for large raws. If it fails with `request_too_large`,
+        retry with a smaller `max_px`. The wire response's `revision` says
+        which history state was rendered."""
+        # The server clamps too (its contract); clamping here as well keeps
+        # the request honest and self-describing on the wire.
+        max_px = max(64, min(2048, max_px))
+        quality = max(50, min(95, quality))
+        client = await _client()
+        result = await client.call("render_preview", {"max_px": max_px, "quality": quality})
+        # Native MCP image content, never a base64 text blob to the model
+        # (a plan step 9 binding requirement): decode the wire base64 and
+        # hand FastMCP an Image, which becomes an ImageContent block.
+        return Image(data=base64.b64decode(result["data"]), format="jpeg")
 
     return app
