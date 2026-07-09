@@ -1,5 +1,5 @@
 {
   "id": 9,
-  "method": "render_preview",
-  "params": { "max_px": 1024 }
+  "method": "compute_scopes",
+  "params": { "scopes": ["histogram"] }
 }

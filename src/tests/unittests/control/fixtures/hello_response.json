@@ -6,7 +6,10 @@
     "darktable_version": "5.x",
     "pid": 12345,
     "capabilities": [
-      "params"
+      "params",
+      "instances",
+      "history",
+      "preview"
     ]
   }
 }

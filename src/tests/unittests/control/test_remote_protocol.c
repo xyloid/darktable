@@ -50,6 +50,9 @@
 #include "common/darktable.h"
 #include "control/remote_edit.h"
 #include "control/remote_protocol.h"
+#include "control/remote_server.h"  // session/pending definitions + the real
+                                    // async lifecycle, for the finish_preview
+                                    // completion tests (fake session, no sockets)
 
 #ifdef _WIN32
 #include "win/main_wrapper.h"
@@ -583,13 +586,14 @@ static void test_hello_success(void **state)
   assert_int_equal(json_object_get_int_member(result, "protocol_version"), DT_REMOTE_PROTOCOL_VERSION);
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
-  // "params" (step 7) + "instances"/"history" (step 8); "preview"/"scopes"
-  // are still pending their handlers.
+  // "params" (step 7) + "instances"/"history" (step 8) + "preview"
+  // (step 9); "scopes" is still pending its handler.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 3);
+  assert_int_equal(json_array_get_length(caps), 4);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "instances");
   assert_string_equal(json_array_get_string_element(caps, 2), "history");
+  assert_string_equal(json_array_get_string_element(caps, 3), "preview");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1788,6 +1792,448 @@ static void test_undo_error_bad_shapes(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* render_preview (plan step 9) -- the first asynchronous method           */
+/* ---------------------------------------------------------------------- */
+
+// -- fake async transport (records begin/queue/abort traffic; the fake
+// pending is static storage, never freed) --------------------------------
+
+static int g_async_begin_calls;
+static gint64 g_async_begin_request_id;
+static int g_async_abort_calls;
+static int g_queue_preview_calls;
+static dt_remote_preview_request_t g_queued_req;
+static int g_queued_max_px;
+static int g_queued_quality;
+static gboolean g_queue_preview_result;
+static dt_remote_pending_t g_fake_pending;
+
+static dt_remote_pending_t *fake_async_begin(dt_remote_session_t *session, gint64 request_id)
+{
+  (void)session;
+  g_async_begin_calls++;
+  g_async_begin_request_id = request_id;
+  memset(&g_fake_pending, 0, sizeof(g_fake_pending));
+  g_fake_pending.request_id = request_id;
+  return &g_fake_pending;
+}
+
+static void fake_async_abort(dt_remote_pending_t *pending)
+{
+  assert_ptr_equal(pending, &g_fake_pending);
+  g_async_abort_calls++;
+}
+
+static void fake_async_complete(dt_remote_pending_t *pending, JsonNode *response)
+{
+  (void)pending;
+  if(response) json_node_unref(response);
+  fail_msg("complete must not be reached from dispatch itself");
+}
+
+static gboolean fake_queue_preview(dt_remote_pending_t *pending,
+                                   const dt_remote_preview_request_t *req,
+                                   int max_px, int quality)
+{
+  assert_ptr_equal(pending, &g_fake_pending);
+  g_queue_preview_calls++;
+  g_queued_req = *req;
+  g_queued_max_px = max_px;
+  g_queued_quality = quality;
+  return g_queue_preview_result;
+}
+
+static void _install_fake_async(gboolean queue_result)
+{
+  g_async_begin_calls = 0;
+  g_async_begin_request_id = -1;
+  g_async_abort_calls = 0;
+  g_queue_preview_calls = 0;
+  g_queued_max_px = g_queued_quality = 0;
+  memset(&g_queued_req, 0, sizeof(g_queued_req));
+  g_queue_preview_result = queue_result;
+
+  static const dt_remote_protocol_async_t ops = {
+    .begin = fake_async_begin,
+    .abort = fake_async_abort,
+    .complete = fake_async_complete,
+    .queue_preview = fake_queue_preview,
+  };
+  dt_remote_protocol_set_async(&ops);
+}
+
+static gboolean stub_render_preview_prepare_ok(dt_remote_preview_request_t *out,
+                                               dt_remote_error_t **error)
+{
+  (void)error;
+  out->imgid = 172;
+  out->revision = 34;
+  return TRUE;
+}
+
+static gboolean stub_render_preview_prepare_not_in_darkroom(dt_remote_preview_request_t *out,
+                                                            dt_remote_error_t **error)
+{
+  (void)out;
+  if(error) *error = _make_error(DT_REMOTE_ERR_NOT_IN_DARKROOM, g_strdup("no darkroom view is active"));
+  return FALSE;
+}
+
+// like _dispatch_inline, but a NULL return (async deferral) is legal
+static JsonNode *_dispatch_inline_maybe_deferred(const char *json_text)
+{
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, json_text, -1, NULL));
+  JsonObject *request = json_node_get_object(json_parser_get_root(parser));
+  JsonNode *actual = dt_remote_protocol_dispatch(request, NULL);
+  g_object_unref(parser);
+  return actual;
+}
+
+// The deferral contract end-to-end through the seams: dispatch registers
+// the pending with the request id, the handler clamps/threads the params
+// and the prepared request into the queued job, and dispatch returns NULL
+// (the transport then leaves pending_requests to the completion).
+static void test_render_preview_defers_with_defaults(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  JsonNode *resp = _dispatch_inline_maybe_deferred("{\"id\":9,\"method\":\"render_preview\"}");
+  assert_null(resp);  // deferred
+
+  assert_int_equal(g_async_begin_calls, 1);
+  assert_int_equal((int)g_async_begin_request_id, 9);
+  assert_int_equal(g_queue_preview_calls, 1);
+  assert_int_equal(g_queued_max_px, 1024);  // wire default
+  assert_int_equal(g_queued_quality, 85);   // wire default
+  assert_int_equal((int)g_queued_req.imgid, 172);
+  assert_int_equal((int)g_queued_req.revision, 34);  // revision captured at prepare
+  assert_int_equal(g_async_abort_calls, 0);
+
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_render_preview_request_fixture_defers(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  JsonNode *request_node = _load_fixture("render_preview_request.json");
+  JsonNode *resp = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_null(resp);
+
+  assert_int_equal((int)g_async_begin_request_id, 9);
+  assert_int_equal(g_queued_max_px, 1024);
+  assert_int_equal(g_queued_quality, 85);
+
+  json_node_unref(request_node);
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// out-of-range integers are clamped (never rejected): 10 -> 64,
+// 5000 -> 2048; quality 10 -> 50, 200 -> 95
+static void test_render_preview_clamps_out_of_range_params(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  assert_null(_dispatch_inline_maybe_deferred(
+    "{\"id\":10,\"method\":\"render_preview\",\"params\":{\"max_px\":10,\"quality\":10}}"));
+  assert_int_equal(g_queued_max_px, 64);
+  assert_int_equal(g_queued_quality, 50);
+
+  assert_null(_dispatch_inline_maybe_deferred(
+    "{\"id\":11,\"method\":\"render_preview\",\"params\":{\"max_px\":5000,\"quality\":200}}"));
+  assert_int_equal(g_queued_max_px, 2048);
+  assert_int_equal(g_queued_quality, 95);
+
+  assert_int_equal(g_queue_preview_calls, 2);
+  assert_int_equal(g_async_abort_calls, 0);
+
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// Wrong-shaped params fail synchronously with invalid_value: the pending
+// dispatch pre-registered is aborted (exactly once), nothing is queued,
+// and prepare (the history flush) is never reached where params are bad.
+static void test_render_preview_error_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  // non-integer max_px
+  _assert_inline_error(
+    "{\"id\":20,\"method\":\"render_preview\",\"params\":{\"max_px\":\"big\"}}", "invalid_value");
+  // fractional max_px
+  _assert_inline_error(
+    "{\"id\":21,\"method\":\"render_preview\",\"params\":{\"max_px\":1024.5}}", "invalid_value");
+  // non-integer quality
+  _assert_inline_error(
+    "{\"id\":22,\"method\":\"render_preview\",\"params\":{\"quality\":\"good\"}}", "invalid_value");
+  // unknown key (strict-params rule)
+  _assert_inline_error(
+    "{\"id\":23,\"method\":\"render_preview\",\"params\":{\"max_px\":512,\"format\":\"png\"}}",
+    "invalid_value");
+
+  assert_int_equal(g_async_begin_calls, 4);
+  assert_int_equal(g_async_abort_calls, 4);  // one abort per synchronous outcome
+  assert_int_equal(g_queue_preview_calls, 0);
+
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// prepare failing (not in darkroom) surfaces synchronously through the
+// standard envelope; the pending is aborted and no job is queued.
+static void test_render_preview_error_not_in_darkroom(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls =
+    { .render_preview_prepare = stub_render_preview_prepare_not_in_darkroom };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  _assert_inline_error("{\"id\":30,\"method\":\"render_preview\"}", "not_in_darkroom");
+
+  assert_int_equal(g_async_abort_calls, 1);
+  assert_int_equal(g_queue_preview_calls, 0);
+
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// queueing failure maps to preview_failed (retryable -- the job system
+// hiccuped, not the request), with the pending aborted.
+static void test_render_preview_error_queue_failure(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(FALSE);  // queue_preview reports failure
+
+  JsonNode *resp = _dispatch_inline_maybe_deferred("{\"id\":31,\"method\":\"render_preview\"}");
+  assert_non_null(resp);
+  JsonObject *obj = json_node_get_object(resp);
+  assert_false(json_object_get_boolean_member(obj, "ok"));
+  JsonObject *error = json_object_get_object_member(obj, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"), "preview_failed");
+  assert_true(json_object_get_boolean_member(error, "retryable"));
+  json_node_unref(resp);
+
+  assert_int_equal(g_queue_preview_calls, 1);
+  assert_int_equal(g_async_abort_calls, 1);
+
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// No session (production async table, NULL session -> begin returns NULL):
+// params still validate, then the handler fails cleanly with internal --
+// never a crash, never a queued job.
+static void test_render_preview_without_transport_is_internal_error(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .render_preview_prepare = stub_render_preview_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  dt_remote_protocol_set_async(NULL);  // production table
+
+  _assert_inline_error("{\"id\":32,\"method\":\"render_preview\"}", "internal");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// -- response shaping (pure; matched against the shared wire fixtures) ----
+
+static const char RENDER_PREVIEW_STUB_BYTES[] = "stub-jpeg-bytes-for-render-preview-fixture";
+
+static void test_build_preview_response_success_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_preview_t preview = {
+    .jpeg = (uint8_t *)RENDER_PREVIEW_STUB_BYTES,
+    .jpeg_len = strlen(RENDER_PREVIEW_STUB_BYTES),
+    .width = 1024,
+    .height = 683,
+    .revision = 34,
+  };
+
+  JsonNode *actual = dt_remote_protocol_build_preview_response(9, &preview, NULL);
+  JsonNode *expected = _load_fixture("render_preview_response.json");
+  assert_true(_json_equal(actual, expected));
+
+  // and the fixture's data member really is the base64 of the stub bytes
+  JsonObject *result = json_object_get_object_member(json_node_get_object(actual), "result");
+  gsize decoded_len = 0;
+  guchar *decoded = g_base64_decode(json_object_get_string_member(result, "data"), &decoded_len);
+  assert_int_equal((int)decoded_len, (int)strlen(RENDER_PREVIEW_STUB_BYTES));
+  assert_memory_equal(decoded, RENDER_PREVIEW_STUB_BYTES, decoded_len);
+  g_free(decoded);
+
+  json_node_unref(actual);
+  json_node_unref(expected);
+}
+
+static void test_build_preview_response_error_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_error_t *err = _make_error(DT_REMOTE_ERR_PREVIEW_FAILED, g_strdup("pixelpipe export failed"));
+
+  JsonNode *actual = dt_remote_protocol_build_preview_response(9, NULL, err);
+  JsonNode *expected = _load_fixture("render_preview_error_preview_failed_response.json");
+  assert_true(_json_equal(actual, expected));  // pins retryable: true
+
+  json_node_unref(actual);
+  json_node_unref(expected);
+  dt_remote_error_free(err);
+}
+
+// an over-cap preview becomes the request_too_large envelope (retryable
+// false per the reference's table) -- the client lowers max_px and retries
+static void test_build_preview_response_too_large_matches_fixture(void **state)
+{
+  (void)state;
+  const size_t huge_len = (size_t)DT_REMOTE_MAX_FRAME;  // inflates ~4/3 over the cap
+  dt_remote_preview_t preview = {
+    .jpeg = g_malloc0(huge_len),
+    .jpeg_len = huge_len,
+    .width = 2048,
+    .height = 2048,
+    .revision = 34,
+  };
+
+  JsonNode *actual = dt_remote_protocol_build_preview_response(9, &preview, NULL);
+  JsonNode *expected = _load_fixture("render_preview_error_request_too_large_response.json");
+  assert_true(_json_equal(actual, expected));  // pins retryable: false
+
+  json_node_unref(actual);
+  json_node_unref(expected);
+  g_free(preview.jpeg);
+}
+
+static void test_preview_fits_frame_boundaries(void **state)
+{
+  (void)state;
+  assert_true(dt_remote_protocol_preview_fits_frame(100));
+  assert_true(dt_remote_protocol_preview_fits_frame(12000000));    // ~12 MB: inflates to ~16 MB, fits
+  assert_false(dt_remote_protocol_preview_fits_frame(12582912));   // 12 MiB: inflates past the cap
+  assert_false(dt_remote_protocol_preview_fits_frame((size_t)DT_REMOTE_MAX_FRAME));
+}
+
+// -- completion against a real (fake-transport-free) session --------------
+
+// The same fake-session technique as test_remote_server.c: writing=TRUE
+// parks outgoing frames on write_queue for inspection, and closing tests
+// preset io_refs=1 so releasing the pending never reaches the real
+// session destructor (which needs live GIO objects).
+static dt_remote_session_t *_fake_session(void)
+{
+  dt_remote_session_t *s = g_new0(dt_remote_session_t, 1);
+  s->auth_state = DT_REMOTE_SESSION_READY;
+  s->io_cancellable = g_cancellable_new();
+  s->write_queue = g_queue_new();
+  s->pendings = g_ptr_array_new();
+  s->writing = TRUE;
+  return s;
+}
+
+static void _fake_session_free(dt_remote_session_t *s)
+{
+  while(!g_queue_is_empty(s->write_queue)) g_bytes_unref(g_queue_pop_head(s->write_queue));
+  g_queue_free(s->write_queue);
+  g_ptr_array_free(s->pendings, TRUE);
+  g_object_unref(s->io_cancellable);
+  g_free(s);
+}
+
+// the full happy-path completion: job result -> framed success response on
+// the session's write path, with the async bookkeeping torn down once
+static void test_finish_preview_sends_framed_response(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);  // the real async transport
+
+  dt_remote_session_t *s = _fake_session();
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 9);
+
+  dt_remote_preview_t *preview = g_malloc0(sizeof(dt_remote_preview_t));
+  preview->jpeg = g_malloc(strlen(RENDER_PREVIEW_STUB_BYTES));
+  memcpy(preview->jpeg, RENDER_PREVIEW_STUB_BYTES, strlen(RENDER_PREVIEW_STUB_BYTES));
+  preview->jpeg_len = strlen(RENDER_PREVIEW_STUB_BYTES);
+  preview->width = 1024;
+  preview->height = 683;
+  preview->revision = 34;
+
+  dt_remote_protocol_finish_preview(pending, preview, NULL);  // takes ownership
+
+  assert_int_equal((int)g_queue_get_length(s->write_queue), 1);
+  GBytes *framed = g_queue_peek_head(s->write_queue);
+  gsize len = 0;
+  const guint8 *data = g_bytes_get_data(framed, &len);
+  assert_true(len > 4);
+
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, (const gchar *)data + 4, (gssize)(len - 4), NULL));
+  JsonNode *expected = _load_fixture("render_preview_response.json");
+  assert_true(_json_equal(json_parser_get_root(parser), expected));
+  json_node_unref(expected);
+  g_object_unref(parser);
+
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 0);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+}
+
+// cancellation-on-disconnect: the completion of a job whose session
+// closed must release the result buffers and the pending WITHOUT writing
+// to the closing session (the buffers' release is verified structurally
+// here and by the leak sanitizer)
+static void test_finish_preview_cancelled_releases_without_writing(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);
+
+  dt_remote_session_t *s = _fake_session();
+  s->io_refs = 1;  // the in-flight read every real closing session has
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 9);
+
+  // the disconnect path: close fires the pending's cancellable
+  dt_remote_session_request_close(s);
+  assert_true(g_cancellable_is_cancelled(pending->cancellable));
+
+  dt_remote_preview_t *preview = g_malloc0(sizeof(dt_remote_preview_t));
+  preview->jpeg = g_malloc(1024 * 1024);  // a result buffer that must be released
+  preview->jpeg_len = 1024 * 1024;
+  preview->width = 1024;
+  preview->height = 683;
+  preview->revision = 34;
+
+  dt_remote_protocol_finish_preview(pending, preview, NULL);
+
+  assert_int_equal((int)g_queue_get_length(s->write_queue), 0);  // nothing written
+  assert_int_equal(s->pending_requests, 0);                      // still balanced
+  assert_int_equal(s->io_refs, 1);                               // only the preset read ref left
+  assert_int_equal((int)s->pendings->len, 0);                    // pending released
+
+  _fake_session_free(s);
+}
+
+/* ---------------------------------------------------------------------- */
 /* dispatch-level envelope validation                                      */
 /* ---------------------------------------------------------------------- */
 
@@ -1871,6 +2317,11 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
   assert_true(preview->needs_darkroom);
   assert_false(preview->is_mutation);
   assert_true(preview->is_async);
+  assert_non_null(preview->handler);  // implemented in plan step 9
+
+  const dt_remote_method_t *scopes = dt_remote_protocol_lookup_method("compute_scopes");
+  assert_true(scopes->is_async);
+  assert_null(scopes->handler);  // still pending (the not-implemented fixture uses it)
 }
 
 int main(int argc, char *argv[])
@@ -1935,6 +2386,20 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_undo_success),
     cmocka_unit_test(test_undo_error_revision_conflict),
     cmocka_unit_test(test_undo_error_bad_shapes),
+
+    cmocka_unit_test(test_render_preview_defers_with_defaults),
+    cmocka_unit_test(test_render_preview_request_fixture_defers),
+    cmocka_unit_test(test_render_preview_clamps_out_of_range_params),
+    cmocka_unit_test(test_render_preview_error_bad_shapes),
+    cmocka_unit_test(test_render_preview_error_not_in_darkroom),
+    cmocka_unit_test(test_render_preview_error_queue_failure),
+    cmocka_unit_test(test_render_preview_without_transport_is_internal_error),
+    cmocka_unit_test(test_build_preview_response_success_matches_fixture),
+    cmocka_unit_test(test_build_preview_response_error_matches_fixture),
+    cmocka_unit_test(test_build_preview_response_too_large_matches_fixture),
+    cmocka_unit_test(test_preview_fits_frame_boundaries),
+    cmocka_unit_test(test_finish_preview_sends_framed_response),
+    cmocka_unit_test(test_finish_preview_cancelled_releases_without_writing),
 
     cmocka_unit_test(test_error_missing_id),
     cmocka_unit_test(test_error_invalid_id_type),

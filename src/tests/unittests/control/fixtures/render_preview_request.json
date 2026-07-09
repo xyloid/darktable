@@ -1,0 +1,5 @@
+{
+  "id": 9,
+  "method": "render_preview",
+  "params": { "max_px": 1024, "quality": 85 }
+}

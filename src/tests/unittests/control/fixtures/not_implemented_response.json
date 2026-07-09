@@ -3,7 +3,7 @@
   "ok": false,
   "error": {
     "code": "internal",
-    "message": "method 'render_preview' is not implemented yet",
+    "message": "method 'compute_scopes' is not implemented yet",
     "retryable": false
   }
 }

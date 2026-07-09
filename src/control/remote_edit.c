@@ -22,9 +22,13 @@
 #include "common/undo.h"
 #include "control/control.h"
 #include "control/remote_revision.h"
+#include "common/colorspaces.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_jpeg.h"
+#include "imageio/imageio_module.h"
 #include "views/view.h"
 
 #include <pthread.h>
@@ -1240,6 +1244,195 @@ gboolean dt_remote_undo(uint64_t expected_revision,
   const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
 
   if(revision_out) *revision_out = new_revision;
+  return TRUE;
+}
+
+/* ---------------------------------------------------------------------- */
+/* preview rendering (plan step 9, internals §8)                           */
+/* ---------------------------------------------------------------------- */
+
+void dt_remote_preview_free(dt_remote_preview_t *preview)
+{
+  if(!preview) return;
+  g_free(preview->jpeg);
+  g_free(preview);
+}
+
+gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
+                                          dt_remote_error_t **error)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
+
+  // Binding caveat (internals §8): the export path re-loads history from
+  // the database (dt_imageio_export_with_flags builds its own
+  // dt_develop_t), so any not-yet-written live history must be flushed
+  // first -- and the revision is captured at this same instant, because
+  // that is the state the background render will actually see.
+  dt_dev_write_history(dev);
+
+  out->imgid = dev->image_storage.id;
+  out->revision = dt_remote_revision_observe_image(dev->image_storage.id);
+  return TRUE;
+}
+
+// Synthetic in-memory format sink for dt_imageio_export_with_flags(),
+// mirroring the two in-tree precedents (_preview_write_image in
+// imageio.c, the HDR-merge job's ad-hoc format in control_jobs.c): the
+// export drives the pixelpipe and hands write_image() the final 8-bit
+// buffer, which is copied out instead of written to a file. `filename`
+// is an ignored constant throughout.
+typedef struct _remote_preview_sink_t
+{
+  dt_imageio_module_data_t head;
+  uint8_t *buf;         // g_malloc'd RGBA copy, 4 * width * height
+  int width, height;    // final processed dimensions
+} _remote_preview_sink_t;
+
+static int _remote_preview_bpp(dt_imageio_module_data_t *data)
+{
+  (void)data;
+  return 8;
+}
+
+static int _remote_preview_levels(dt_imageio_module_data_t *data)
+{
+  (void)data;
+  return IMAGEIO_RGB | IMAGEIO_INT8;
+}
+
+static const char *_remote_preview_mime(dt_imageio_module_data_t *data)
+{
+  (void)data;
+  return "memory";
+}
+
+static int _remote_preview_write_image(dt_imageio_module_data_t *data,
+                                       const char *filename,
+                                       const void *in,
+                                       const dt_colorspaces_color_profile_type_t over_type,
+                                       const char *over_filename,
+                                       void *exif,
+                                       const int exif_len,
+                                       const dt_imgid_t imgid,
+                                       const int num,
+                                       const int total,
+                                       dt_dev_pixelpipe_t *pipe,
+                                       const gboolean export_masks)
+{
+  (void)filename;
+  (void)over_type;
+  (void)over_filename;
+  (void)exif;
+  (void)exif_len;
+  (void)imgid;
+  (void)num;
+  (void)total;
+  (void)pipe;
+  (void)export_masks;
+
+  _remote_preview_sink_t *d = (_remote_preview_sink_t *)data;
+  if(!in || data->width <= 0 || data->height <= 0) return 1;
+
+  const size_t size = sizeof(uint32_t) * (size_t)data->width * data->height;
+  d->buf = g_malloc(size);
+  memcpy(d->buf, in, size);
+  d->width = data->width;
+  d->height = data->height;
+  return 0;
+}
+
+gboolean dt_remote_render_preview_execute(const dt_remote_preview_request_t *req,
+                                          int max_px, int quality,
+                                          GCancellable *cancellable,
+                                          dt_remote_preview_t **out,
+                                          dt_remote_error_t **error)
+{
+  // Deliberately NO main-thread assert: this is the one remote_edit entry
+  // point designed to run on a background job thread (internals §1/§8).
+  // It never touches darktable.develop -- the export builds its own
+  // dt_develop_t from the history prepare() flushed to the database.
+  if(!req || !out)
+  {
+    if(error) *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL, _("internal error: null argument"));
+    return FALSE;
+  }
+
+  if(g_cancellable_is_cancelled(cancellable))
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("preview render was cancelled"));
+    return FALSE;
+  }
+
+  dt_imageio_module_format_t format = {
+    .mime = _remote_preview_mime,
+    .levels = _remote_preview_levels,
+    .bpp = _remote_preview_bpp,
+    .write_image = _remote_preview_write_image,
+  };
+
+  _remote_preview_sink_t sink = { 0 };   // zero head: empty style, style_append FALSE
+  sink.head.max_width = max_px;          // bounds the longest edge (upscale FALSE below)
+  sink.head.max_height = max_px;
+
+  // Flag choices per internals §8 (binding): ignore_exif TRUE (no blob in
+  // a preview), display_byteorder FALSE (the 8-bit path then emits RGBA --
+  // exactly the layout dt_imageio_jpeg_compress() reads), high_quality
+  // FALSE, upscale FALSE (a small image stays its native size; max_px is a
+  // cap, not a target), thumbnail_export FALSE, sRGB output profile
+  // (portable interchange -- the display profile would be wrong
+  // off-machine), history_end -1 (the full current history).
+  const gboolean export_failed = dt_imageio_export_with_flags(
+    (dt_imgid_t)req->imgid, "remote-preview", &format, &sink.head,
+    TRUE /*ignore_exif*/, FALSE /*display_byteorder*/, FALSE /*high_quality*/,
+    FALSE /*upscale*/, FALSE /*is_scaling*/, 1.0 /*scale_factor*/,
+    FALSE /*thumbnail_export*/, NULL /*filter*/, FALSE /*copy_metadata*/,
+    FALSE /*export_masks*/, DT_COLORSPACE_SRGB, NULL /*icc_filename*/,
+    DT_INTENT_LAST, NULL /*storage*/, NULL /*storage_params*/, 1, 1,
+    NULL /*metadata*/, -1 /*history_end*/);
+
+  if(export_failed || !sink.buf)
+  {
+    g_free(sink.buf);
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("pixelpipe export failed"));
+    return FALSE;
+  }
+
+  if(g_cancellable_is_cancelled(cancellable))
+  {
+    g_free(sink.buf);
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("preview render was cancelled"));
+    return FALSE;
+  }
+
+  // dt_imageio_jpeg_compress()'s contract: caller allocates out >= 4*w*h;
+  // it returns the encoded byte length, or 1 from its setjmp error path.
+  const size_t cap = sizeof(uint32_t) * (size_t)sink.width * sink.height;
+  uint8_t *jpeg = g_malloc(cap);
+  const int jpeg_len = dt_imageio_jpeg_compress(sink.buf, jpeg, sink.width, sink.height, quality);
+  g_free(sink.buf);
+
+  if(jpeg_len <= 1 || (size_t)jpeg_len > cap)
+  {
+    g_free(jpeg);
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("JPEG encoding failed"));
+    return FALSE;
+  }
+
+  dt_remote_preview_t *preview = g_malloc0(sizeof(dt_remote_preview_t));
+  preview->jpeg = g_realloc(jpeg, (size_t)jpeg_len);  // shed the 4*w*h allocation slack
+  preview->jpeg_len = (size_t)jpeg_len;
+  preview->width = sink.width;
+  preview->height = sink.height;
+  preview->revision = req->revision;
+
+  *out = preview;
   return TRUE;
 }
 

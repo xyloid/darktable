@@ -31,6 +31,7 @@
 
 #include "common/introspection.h"
 
+#include <gio/gio.h>   // GCancellable (dt_remote_render_preview_execute)
 #include <glib.h>
 #include <inttypes.h>
 
@@ -493,6 +494,69 @@ gboolean dt_remote_get_history(int limit,
 gboolean dt_remote_undo(uint64_t expected_revision,
                         uint64_t *revision_out,
                         dt_remote_error_t **error);
+
+/* ---------------------------------------------------------------------- */
+/* preview rendering (plan step 9, internals §8)                           */
+/* ---------------------------------------------------------------------- */
+
+// What the main-thread prepare step captures for the background render:
+// the darkroom image id and the revision stamped at the exact instant the
+// live history was flushed to the database (the export path re-loads
+// history from there -- internals §8's binding caveat).
+typedef struct dt_remote_preview_request_t
+{
+  int32_t imgid;
+  uint64_t revision;
+} dt_remote_preview_request_t;
+
+typedef struct dt_remote_preview_t   // <- render_preview (pre-base64)
+{
+  uint8_t *jpeg;        // owned (g_free); the encoded JPEG bytes
+  size_t jpeg_len;
+  int width, height;    // pixel dimensions of the encoded preview
+  uint64_t revision;    // the revision actually rendered (from the request)
+} dt_remote_preview_t;
+
+/** frees a preview result, including its JPEG buffer. NULL-safe. */
+void dt_remote_preview_free(dt_remote_preview_t *preview);
+
+/** The main-thread half of render_preview (internals §8, binding): checks
+ * the darkroom/image precondition (DT_REMOTE_ERR_NOT_IN_DARKROOM /
+ * DT_REMOTE_ERR_NO_IMAGE_OPEN), flushes the live darkroom history to the
+ * database with dt_dev_write_history() -- the export path re-loads history
+ * from the DB, so without this flush the render would miss unsaved edits
+ * -- and captures the image id and the revision at that same instant into
+ * `*out`. The rendered preview is stamped with THAT revision. Must be
+ * called on the GTK main thread, BEFORE queueing the render job. */
+gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
+                                          dt_remote_error_t **error);
+
+/** The background half of render_preview: renders `req->imgid` through
+ * dt_imageio_export_with_flags() with a synthetic in-memory format sink
+ * (bpp 8, IMAGEIO_RGB|IMAGEIO_INT8, display_byteorder FALSE so the 8-bit
+ * path emits RGBA -- exactly what dt_imageio_jpeg_compress() consumes) and
+ * sRGB output color management (DT_COLORSPACE_SRGB: portable interchange;
+ * the display profile would be wrong off-machine -- internals §8), bounded
+ * to `max_px` on the longest edge (caller has already clamped it to
+ * [64, 2048], and `quality` to [50, 95]), then JPEG-encodes in memory.
+ *
+ * `cancellable` (nullable) is polled at stage boundaries (before the
+ * export and before the encode); once the pixelpipe run itself has
+ * started it finishes -- cancellation then only saves the encode and the
+ * result delivery. On cancellation or any render/encode failure returns
+ * FALSE with DT_REMOTE_ERR_PREVIEW_FAILED and no buffer left allocated.
+ *
+ * This is deliberately the ONE remote_edit entry point that must NOT run
+ * on the GTK main thread in production (internals §1: preview renders go
+ * to background jobs): it never touches darktable.develop -- the export
+ * builds its own dt_develop_t from the DB history flushed by prepare().
+ * Requires a running darktable (mipmap cache, module system); covered by
+ * the live integration harness, not unit tests. */
+gboolean dt_remote_render_preview_execute(const dt_remote_preview_request_t *req,
+                                          int max_px, int quality,
+                                          GCancellable *cancellable,
+                                          dt_remote_preview_t **out,
+                                          dt_remote_error_t **error);
 
 G_END_DECLS
 

@@ -108,12 +108,78 @@ typedef struct dt_remote_protocol_calls_t
                                      dt_remote_mutation_result_t **out, dt_remote_error_t **error);
   gboolean (*get_history)(int limit, GPtrArray **out, uint64_t *revision, dt_remote_error_t **error);
   gboolean (*undo)(uint64_t expected_revision, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*render_preview_prepare)(dt_remote_preview_request_t *out, dt_remote_error_t **error);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to
  * restore the real dt_remote_* implementations. Not thread-safe; call
  * only from a single-threaded test process, before dispatching. */
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls);
+
+/* ---------------------------------------------------------------------- */
+/* test seam: overridable async transport table                            */
+/* ---------------------------------------------------------------------- */
+
+// The async half of an async method (render_preview so far) crosses into
+// remote_server's pending lifecycle and darktable's background job queue
+// -- neither exists in a dispatcher unit test. Same call-table idiom as
+// dt_remote_protocol_calls_t: production defaults are the real
+// dt_remote_async_* functions (remote_server.c) plus this file's own
+// DT_JOB_QUEUE_SYSTEM_BG job for queue_preview; tests substitute fakes
+// that record the begin/queue/abort traffic.
+typedef struct dt_remote_protocol_async_t
+{
+  dt_remote_pending_t *(*begin)(dt_remote_session_t *session, gint64 request_id);
+  void (*abort)(dt_remote_pending_t *pending);
+  void (*complete)(dt_remote_pending_t *pending, JsonNode *response);
+  gboolean (*queue_preview)(dt_remote_pending_t *pending,
+                            const dt_remote_preview_request_t *req,
+                            int max_px, int quality);
+} dt_remote_protocol_async_t;
+
+/** overrides the async transport table (test seam only). Pass NULL to
+ * restore the production implementations. Same caveats as
+ * dt_remote_protocol_set_calls(). */
+void dt_remote_protocol_set_async(const dt_remote_protocol_async_t *ops);
+
+/* ---------------------------------------------------------------------- */
+/* render_preview response shaping (pure; exposed for unit tests)          */
+/* ---------------------------------------------------------------------- */
+
+/** TRUE iff a JPEG of `jpeg_len` bytes still fits one wire frame after
+ * base64 inflation (4 * ceil(n/3)) plus envelope headroom -- the
+ * proactive check behind the wire contract's request_too_large error
+ * ("result exceeds frame cap -- client retries with smaller max_px"),
+ * preferred over relying on the transport's over-cap fallback because it
+ * costs nothing and skips a pointless multi-MiB base64 encode. */
+gboolean dt_remote_protocol_preview_fits_frame(size_t jpeg_len);
+
+/** Builds render_preview's complete wire response for `request_id`:
+ * exactly one of `preview`/`error` should be non-NULL (both borrowed).
+ * A preview that fits the frame becomes the success envelope
+ * {mime_type:"image/jpeg", width, height, revision, data:<base64>}; an
+ * over-cap preview becomes the request_too_large error envelope
+ * (retryable false, per the protocol reference's retryable table); an
+ * `error` maps through the standard error envelope (preview_failed is
+ * retryable). Both NULL degrades to an internal-error envelope rather
+ * than crashing. Pure: unit-testable against the wire fixtures. */
+JsonNode *dt_remote_protocol_build_preview_response(gint64 request_id,
+                                                    const dt_remote_preview_t *preview,
+                                                    const dt_remote_error_t *error);
+
+/** The main-thread completion of a render job (invoked via
+ * g_main_context_invoke() by the production job, or directly by tests):
+ * takes ownership of `preview` and `error`. If the pending's cancellable
+ * has fired (disconnect/close won the race), releases both buffers and
+ * completes the pending with no response -- nothing is written to the
+ * closing session; otherwise builds the response (see
+ * dt_remote_protocol_build_preview_response(); a never-ran job with both
+ * NULL becomes a retryable preview_failed) and completes the pending
+ * with it. Completion always goes through the async transport table, so
+ * the pending is released exactly once either way. */
+void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
+                                       dt_remote_preview_t *preview,
+                                       dt_remote_error_t *error);
 
 /* ---------------------------------------------------------------------- */
 /* dispatch entry point                                                    */
@@ -132,10 +198,15 @@ void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls);
  * per handler, per the internals doc.
  *
  * Returns NULL only when the resolved method is asynchronous and its
- * handler deferred completion (not reachable yet -- no async method has
- * a handler in this step); every other outcome, including all malformed-
- * input cases, returns a non-NULL success or error envelope. Never
- * crashes on malformed input.
+ * handler deferred completion (render_preview's handler defers once it
+ * has validated params and queued the render job; the job's main-thread
+ * completion sends the deferred response through
+ * dt_remote_async_complete()); every other outcome, including all
+ * malformed-input cases, returns a non-NULL success or error envelope.
+ * Never crashes on malformed input. For an async method, dispatch
+ * registers the pending (async table `begin`) before running the handler
+ * -- the handler cannot, as it never sees the request id -- and releases
+ * it (`abort`) if the handler resolves synchronously after all.
  *
  * `session` may be NULL: no method implemented so far touches it (hello/
  * auth semantics land with remote_server). Ownership of the returned

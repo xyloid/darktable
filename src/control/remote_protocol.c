@@ -19,6 +19,9 @@
 #include "control/remote_protocol.h"
 
 #include "common/darktable.h"  // for the _() gettext macro
+#include "control/jobs.h"           // DT_JOB_QUEUE_SYSTEM_BG render job
+#include "control/remote_frame.h"   // DT_REMOTE_MAX_FRAME (proactive size check)
+#include "control/remote_server.h"  // dt_remote_async_* (production async table)
 
 #include <math.h>
 #include <string.h>
@@ -48,6 +51,7 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .create_module_instance = dt_remote_create_module_instance,
   .get_history = dt_remote_get_history,
   .undo = dt_remote_undo,
+  .render_preview_prepare = dt_remote_render_preview_prepare,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -61,11 +65,41 @@ static dt_remote_protocol_calls_t s_calls = {
   .create_module_instance = dt_remote_create_module_instance,
   .get_history = dt_remote_get_history,
   .undo = dt_remote_undo,
+  .render_preview_prepare = dt_remote_render_preview_prepare,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
 {
   s_calls = calls ? *calls : DEFAULT_CALLS;
+}
+
+/* ---------------------------------------------------------------------- */
+/* async transport table (test seam)                                       */
+/* ---------------------------------------------------------------------- */
+
+// production queue_preview: a DT_JOB_QUEUE_SYSTEM_BG job defined with the
+// rest of the render plumbing further down
+static gboolean _queue_preview_job(dt_remote_pending_t *pending,
+                                   const dt_remote_preview_request_t *req,
+                                   int max_px, int quality);
+
+static const dt_remote_protocol_async_t DEFAULT_ASYNC = {
+  .begin = dt_remote_async_begin,
+  .abort = dt_remote_async_abort,
+  .complete = dt_remote_async_complete,
+  .queue_preview = _queue_preview_job,
+};
+
+static dt_remote_protocol_async_t s_async = {
+  .begin = dt_remote_async_begin,
+  .abort = dt_remote_async_abort,
+  .complete = dt_remote_async_complete,
+  .queue_preview = _queue_preview_job,
+};
+
+void dt_remote_protocol_set_async(const dt_remote_protocol_async_t *ops)
+{
+  s_async = ops ? *ops : DEFAULT_ASYNC;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -356,10 +390,12 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // method a real handler in the allowlist below. "params" = parameter
   // mutation (set_module_params, plan step 7). "instances" =
   // create_module_instance; "history" = get_history/undo (plan step 8).
-  // Still pending: "preview" (render_preview), "scopes" (compute_scopes).
+  // "preview" = render_preview (plan step 9). Still pending: "scopes"
+  // (compute_scopes).
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
+  json_builder_add_string_value(b, "preview");
   json_builder_end_array(b);
   json_builder_end_object(b);
 
@@ -1188,15 +1224,63 @@ static JsonNode *_handler_undo(JsonObject *params, dt_remote_session_t *session,
   return node;
 }
 
+static const char *const RENDER_PREVIEW_KEYS[] = { "max_px", "quality", NULL };
+
+// The first asynchronous handler: validates and clamps params, does the
+// main-thread pre-work (history flush + revision capture, via the calls
+// table), queues the background render (via the async table), and defers
+// by returning NULL with no error set. Dispatch created `pending` before
+// calling here (it knows the request id; this handler does not) and
+// releases it again if this handler resolves synchronously.
+static JsonNode *_handler_render_preview(JsonObject *params, dt_remote_session_t *session,
+                                         dt_remote_pending_t *pending)
+{
+  (void)session;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, RENDER_PREVIEW_KEYS, &err)) return _handler_fail(err);
+
+  // Out-of-range integers are clamped, not rejected -- the wire contract
+  // says "max_px is clamped to [64, 2048]; quality to [50, 95]" (defaults
+  // 1024/85); only a non-integer/fractional/non-finite value is
+  // invalid_value.
+  gint64 max_px = 1024;
+  if(!_optional_int_default(params, "max_px", 1024, &max_px, &err)) return _handler_fail(err);
+  if(max_px < 64) max_px = 64;
+  if(max_px > 2048) max_px = 2048;
+
+  gint64 quality = 85;
+  if(!_optional_int_default(params, "quality", 85, &quality, &err)) return _handler_fail(err);
+  if(quality < 50) quality = 50;
+  if(quality > 95) quality = 95;
+
+  // main-thread pre-work (internals §8, binding): flush live history to
+  // the DB (the export re-loads it from there) and capture the revision
+  // at that instant -- the preview is stamped with it. Also where
+  // not_in_darkroom/no_image_open surface, synchronously.
+  dt_remote_preview_request_t req = { 0 };
+  if(!s_calls.render_preview_prepare(&req, &err)) return _handler_fail(err);
+
+  if(!pending)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
+                                    _("no async transport for this request")));
+
+  if(!s_async.queue_preview(pending, &req, (int)max_px, (int)quality))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_PREVIEW_FAILED,
+                                    _("could not queue the preview render job")));
+
+  // Deferred: ownership of `pending` moved to the queued job; its
+  // main-thread completion responds and releases it.
+  return NULL;
+}
+
 /* ---------------------------------------------------------------------- */
 /* allowlist (internals §6: 13 entries, static, looked up by g_str_equal)  */
 /* ---------------------------------------------------------------------- */
 
-// hello, the four read methods, and set_module_params (plan step 7) have a
-// handler so far. The remaining seven rows carry their internals-§6 flags
-// now so later steps only add a handler, never touch this table's shape.
-// A NULL handler dispatches to DT_REMOTE_ERR_INTERNAL rather than
-// crashing.
+// Every method except compute_scopes (plan step 9's sibling, still
+// pending) has a handler now. A NULL handler dispatches to
+// DT_REMOTE_ERR_INTERNAL rather than crashing.
 static const dt_remote_method_t g_methods[] = {
   { "hello",                  FALSE, FALSE, FALSE, _handler_hello },
   { "get_state",              FALSE, FALSE, FALSE, _handler_get_state },
@@ -1209,7 +1293,7 @@ static const dt_remote_method_t g_methods[] = {
   { "create_module_instance", TRUE,  TRUE,  FALSE, _handler_create_module_instance },
   { "get_history",            TRUE,  FALSE, FALSE, _handler_get_history },
   { "undo",                   TRUE,  TRUE,  FALSE, _handler_undo },
-  { "render_preview",         TRUE,  FALSE, TRUE,  NULL },
+  { "render_preview",         TRUE,  FALSE, TRUE,  _handler_render_preview },
   { "compute_scopes",         TRUE,  FALSE, TRUE,  NULL },
 };
 
@@ -1254,17 +1338,26 @@ static const char *_error_code_to_wire(dt_remote_error_code_t code)
 // Per the protocol reference: retryable is true for revision_conflict,
 // busy, and *transient* preview_failed/scope_failed; false otherwise.
 // busy is a transport-only code not reachable through dt_remote_error_t
-// (remote_edit never sees it); preview_failed/scope_failed's transient-
-// vs-permanent distinction needs a hint this error type does not carry
-// yet, and neither code is reachable until render_preview/compute_scopes
-// get handlers -- until then, only revision_conflict is retryable.
+// (remote_edit never sees it). preview_failed's transient-vs-permanent
+// distinction needs a hint this error type does not carry, so ALL
+// preview_failed errors are reported retryable: render failures from a
+// live darkroom are predominantly transient (memory pressure, contention),
+// and the design's standing rule is to fail toward retryable (see
+// dt_remote_revision_force_bump()'s rationale) -- the worst outcome of a
+// wrongly-retryable error is one wasted retry, while wrongly-permanent
+// would strand a recoverable client. scope_failed stays non-retryable
+// until compute_scopes exists to define its failure modes.
 static gboolean _error_code_retryable(dt_remote_error_code_t code)
 {
-  return code == DT_REMOTE_ERR_REVISION_CONFLICT;
+  return code == DT_REMOTE_ERR_REVISION_CONFLICT || code == DT_REMOTE_ERR_PREVIEW_FAILED;
 }
 
-static JsonNode *_build_error(gboolean has_id, gint64 id, dt_remote_error_code_t code,
-                              const char *message, const char *details_json)
+// The shared envelope body: `wire_code`/`retryable` given directly, for
+// the transport-only codes (request_too_large) that dt_remote_error_code_t
+// deliberately does not carry.
+static JsonNode *_build_error_wire(gboolean has_id, gint64 id, const char *wire_code,
+                                   gboolean retryable, const char *message,
+                                   const char *details_json)
 {
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
@@ -1279,7 +1372,7 @@ static JsonNode *_build_error(gboolean has_id, gint64 id, dt_remote_error_code_t
   json_builder_set_member_name(b, "error");
   json_builder_begin_object(b);
   json_builder_set_member_name(b, "code");
-  json_builder_add_string_value(b, _error_code_to_wire(code));
+  json_builder_add_string_value(b, wire_code);
   json_builder_set_member_name(b, "message");
   json_builder_add_string_value(b, message ? message : "");
 
@@ -1295,13 +1388,20 @@ static JsonNode *_build_error(gboolean has_id, gint64 id, dt_remote_error_code_t
   }
 
   json_builder_set_member_name(b, "retryable");
-  json_builder_add_boolean_value(b, _error_code_retryable(code));
+  json_builder_add_boolean_value(b, retryable);
   json_builder_end_object(b);
 
   json_builder_end_object(b);
   JsonNode *root = json_builder_get_root(b);
   g_object_unref(b);
   return root;
+}
+
+static JsonNode *_build_error(gboolean has_id, gint64 id, dt_remote_error_code_t code,
+                              const char *message, const char *details_json)
+{
+  return _build_error_wire(has_id, id, _error_code_to_wire(code), _error_code_retryable(code),
+                           message, details_json);
 }
 
 static JsonNode *_build_error_from_dt_error(gboolean has_id, gint64 id, dt_remote_error_t *err)
@@ -1332,6 +1432,212 @@ static JsonNode *_build_success(gboolean has_id, gint64 id, JsonNode *result)
   JsonNode *root = json_builder_get_root(b);
   g_object_unref(b);
   return root;
+}
+
+/* ---------------------------------------------------------------------- */
+/* render_preview: response shaping + background job plumbing              */
+/* ---------------------------------------------------------------------- */
+
+// Headroom for everything in the response envelope besides the base64
+// payload itself (id, ok, mime_type, dims, revision, JSON punctuation) --
+// generously above the ~120 bytes those actually take.
+#define DT_REMOTE_PREVIEW_ENVELOPE_SLACK ((size_t)512)
+
+gboolean dt_remote_protocol_preview_fits_frame(size_t jpeg_len)
+{
+  const size_t b64_len = ((jpeg_len + 2) / 3) * 4;  // 4 * ceil(n / 3)
+  return b64_len + DT_REMOTE_PREVIEW_ENVELOPE_SLACK <= (size_t)DT_REMOTE_MAX_FRAME;
+}
+
+JsonNode *dt_remote_protocol_build_preview_response(gint64 request_id,
+                                                    const dt_remote_preview_t *preview,
+                                                    const dt_remote_error_t *error)
+{
+  if(preview)
+  {
+    // Proactive size check (plan step 9: "the framed response stays below
+    // the configured maximum"): a clean, documented request_too_large the
+    // client answers by lowering max_px -- rather than encoding megabytes
+    // of base64 only for the transport fallback to throw them away. This
+    // is genuinely reachable: a 2048x2048 worst-case JPEG buffer is
+    // exactly the 16 MiB frame cap before base64's ~4/3 inflation.
+    if(!dt_remote_protocol_preview_fits_frame(preview->jpeg_len))
+      return _build_error_wire(TRUE, request_id, "request_too_large",
+                               FALSE /* per the reference's retryable table */,
+                               _("preview is too large to send; retry with a smaller max_px"),
+                               NULL);
+
+    gchar *b64 = g_base64_encode(preview->jpeg, preview->jpeg_len);
+
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "mime_type");
+    json_builder_add_string_value(b, "image/jpeg");
+    json_builder_set_member_name(b, "width");
+    json_builder_add_int_value(b, preview->width);
+    json_builder_set_member_name(b, "height");
+    json_builder_add_int_value(b, preview->height);
+    json_builder_set_member_name(b, "revision");
+    json_builder_add_int_value(b, (gint64)preview->revision);
+    json_builder_set_member_name(b, "data");
+    json_builder_add_string_value(b, b64);
+    json_builder_end_object(b);
+
+    JsonNode *result = json_builder_get_root(b);
+    g_object_unref(b);
+    g_free(b64);
+
+    return _build_success(TRUE, request_id, result);
+  }
+
+  if(error) return _build_error(TRUE, request_id, error->code, error->message, error->details_json);
+
+  return _build_error(TRUE, request_id, DT_REMOTE_ERR_INTERNAL,
+                      _("preview completion carried no result"), NULL);
+}
+
+void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
+                                       dt_remote_preview_t *preview,
+                                       dt_remote_error_t *error)
+{
+  if(!pending)
+  {
+    dt_remote_preview_free(preview);
+    dt_remote_error_free(error);
+    return;
+  }
+
+  if(g_cancellable_is_cancelled(pending->cancellable))
+  {
+    // Disconnect/close won the race: release the result buffers and the
+    // pending WITHOUT writing to the closing session (plan step 9:
+    // "cancellation on disconnect releases result buffers").
+    dt_remote_preview_free(preview);
+    dt_remote_error_free(error);
+    s_async.complete(pending, NULL);
+    return;
+  }
+
+  JsonNode *response;
+  if(preview || error)
+  {
+    response = dt_remote_protocol_build_preview_response(pending->request_id, preview, error);
+  }
+  else
+  {
+    // Neither result nor error: the job was discarded before it ever ran
+    // (job-system teardown). Session still up -> answer retryably rather
+    // than leaving the request dangling until disconnect.
+    dt_remote_error_t *discarded =
+      _error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("preview render job was discarded"));
+    response = dt_remote_protocol_build_preview_response(pending->request_id, NULL, discarded);
+    dt_remote_error_free(discarded);
+  }
+
+  dt_remote_preview_free(preview);
+  dt_remote_error_free(error);
+  s_async.complete(pending, response);
+}
+
+// -- the production DT_JOB_QUEUE_SYSTEM_BG job -----------------------------
+
+typedef struct _preview_job_params_t
+{
+  dt_remote_pending_t *pending;   // owned until handed to the completion
+  dt_remote_preview_request_t req;
+  int max_px, quality;
+} _preview_job_params_t;
+
+typedef struct _preview_completion_t
+{
+  dt_remote_pending_t *pending;
+  dt_remote_preview_t *preview;   // owned, nullable
+  dt_remote_error_t *error;       // owned, nullable
+} _preview_completion_t;
+
+static gboolean _preview_completion_invoke(gpointer data)
+{
+  _preview_completion_t *c = data;
+  dt_remote_protocol_finish_preview(c->pending, c->preview, c->error);
+  g_free(c);
+  return G_SOURCE_REMOVE;
+}
+
+// Marshals one completion to the GLib main context (internals §8:
+// "completion marshals back via g_main_context_invoke to write the
+// response frame"). Ownership of all three arguments transfers to the
+// main-thread callback; the caller must not touch them afterwards --
+// in particular not `pending`, which the callback may free before the
+// calling thread is scheduled again.
+static void _preview_queue_completion(dt_remote_pending_t *pending,
+                                      dt_remote_preview_t *preview,
+                                      dt_remote_error_t *error)
+{
+  _preview_completion_t *c = g_new0(_preview_completion_t, 1);
+  c->pending = pending;
+  c->preview = preview;
+  c->error = error;
+  g_main_context_invoke(NULL, _preview_completion_invoke, c);
+}
+
+static int32_t _preview_job_run(dt_job_t *job)
+{
+  _preview_job_params_t *p = dt_control_job_get_params(job);
+
+  dt_remote_pending_t *pending = p->pending;
+  p->pending = NULL;  // ownership transfers to the completion queued below
+
+  dt_remote_preview_t *preview = NULL;
+  dt_remote_error_t *error = NULL;
+
+  // Cancelled before we even started (disconnect while queued): skip the
+  // render entirely; finish_preview() sees the fired cancellable and
+  // releases everything without writing. Reading the cancellable from
+  // this thread is safe: g_cancellable_is_cancelled() is thread-safe, and
+  // the pending itself is only freed by the completion this job has not
+  // queued yet.
+  if(!g_cancellable_is_cancelled(pending->cancellable))
+    dt_remote_render_preview_execute(&p->req, p->max_px, p->quality, pending->cancellable,
+                                     &preview, &error);
+
+  _preview_queue_completion(pending, preview, error);
+  // `pending` must not be touched past this point (see above).
+  return 0;
+}
+
+static void _preview_job_params_free(void *data)
+{
+  _preview_job_params_t *p = data;
+  // Job discarded without ever running (job-system teardown): the pending
+  // is still ours. Release it on the main context through the normal
+  // completion path (with neither result nor error) so the session's
+  // io_refs/pending_requests accounting stays balanced.
+  if(p->pending) _preview_queue_completion(p->pending, NULL, NULL);
+  g_free(p);
+}
+
+static gboolean _queue_preview_job(dt_remote_pending_t *pending,
+                                   const dt_remote_preview_request_t *req,
+                                   int max_px, int quality)
+{
+  dt_job_t *job = dt_control_job_create(_preview_job_run, "remote-edit preview render");
+  if(!job) return FALSE;
+
+  _preview_job_params_t *p = g_new0(_preview_job_params_t, 1);
+  p->pending = pending;
+  p->req = *req;
+  p->max_px = max_px;
+  p->quality = quality;
+  dt_control_job_set_params(job, p, _preview_job_params_free);
+
+  // SYSTEM_BG (internals §8): does not contend with user exports on the
+  // serialized USER_EXPORT queue, and is never pushed out of the queue.
+  // dt_control_add_job() returns TRUE on failure -- but even then it has
+  // disposed the job, which ran _preview_job_params_free -> the pending
+  // was already released through the discarded-completion path above, so
+  // the caller must NOT fail the request a second time.
+  dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, job);
+  return TRUE;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1403,18 +1709,28 @@ JsonNode *dt_remote_protocol_dispatch(JsonObject *request, dt_remote_session_t *
     if(params_node && JSON_NODE_HOLDS_OBJECT(params_node)) params = json_node_get_object(params_node);
   }
 
-  // 5. run the handler
+  // 5. async methods get their pending registered up front -- dispatch is
+  // the one who knows the request id; the handler signature does not carry
+  // it. A NULL pending (no session, i.e. no async transport) is fine: the
+  // handler fails synchronously on it after validating params.
+  dt_remote_pending_t *pending = NULL;
+  if(method->is_async) pending = s_async.begin(session, id);
+
+  // 6. run the handler
   g_clear_pointer(&s_handler_error, dt_remote_error_free);
-  JsonNode *result = method->handler(params, session, NULL);
+  JsonNode *result = method->handler(params, session, pending);
 
   if(!result)
   {
-    if(method->is_async) return NULL;  // deferred completion; unreachable until an async handler exists
+    if(method->is_async && !s_handler_error)
+      return NULL;  // deferred: the pending now belongs to the queued job
     dt_remote_error_t *err = s_handler_error;
     s_handler_error = NULL;
+    if(pending) s_async.abort(pending);  // synchronous failure: pending unused
     return _build_error_from_dt_error(TRUE, id, err);
   }
 
+  if(pending) s_async.abort(pending);  // synchronous success: pending unused
   return _build_success(TRUE, id, result);
 }
 
