@@ -110,7 +110,21 @@ struct dt_remote_session_t   // one per accepted connection
   GBytes *inflight_write;                 // owned; the write currently in flight, if any
   gboolean writing;                       // a write is currently in flight
   gboolean closing;                       // logical close requested (see above)
-  int io_refs;                            // in-flight async op count (see above)
+  int io_refs;                            // in-flight async op count (see above);
+                                          // includes one ref per live pending --
+                                          // dt_remote_async_begin() takes it,
+                                          // complete()/abort() release it -- so a
+                                          // session with an in-flight background
+                                          // job stays alive until the job's
+                                          // main-thread completion has run: the
+                                          // same free-deferral discipline as
+                                          // reads/writes
+  GPtrArray *pendings;                    // dt_remote_pending_t* currently in
+                                          // flight; the array is owned here but
+                                          // its elements are owned by the async
+                                          // lifecycle below (never freed by the
+                                          // array). Walked on close to fire each
+                                          // pending's cancellable.
 };
 
 struct dt_remote_pending_t   // one per in-flight async request
@@ -119,6 +133,61 @@ struct dt_remote_pending_t   // one per in-flight async request
   gint64 request_id;
   GCancellable *cancellable;      // fired on disconnect; job checks it
 };
+
+/* ---------------------------------------------------------------------- */
+/* async request lifecycle (internals §6: "async methods return NULL from  */
+/* the handler and complete later: the pending object holds the connection */
+/* ref, request id, and a cancellable that fires if the connection drops   */
+/* before the job completes"). Main-context only, all three: begin() runs  */
+/* inline in dispatch; complete()/abort() run from a                       */
+/* g_main_context_invoke()d job completion or from dispatch itself.        */
+/* ---------------------------------------------------------------------- */
+
+/** Registers one in-flight async request against `session`: allocates a
+ * pending with a fresh cancellable (fired by
+ * dt_remote_session_request_close() on disconnect), records it on the
+ * session's pending list, and takes one io_refs liveness ref so the
+ * session cannot be freed before dt_remote_async_complete()/_abort()
+ * releases the pending -- which is what makes the g_main_context_invoke()d
+ * completion of a background job safe against use-after-free by
+ * construction. Returns NULL (registering nothing) if `session` is NULL
+ * (e.g. a dispatcher unit test with no transport; the dispatcher maps
+ * that to a synchronous internal error). The returned pending is owned by
+ * the async lifecycle: exactly one complete()/abort() call must
+ * eventually follow. */
+dt_remote_pending_t *dt_remote_async_begin(dt_remote_session_t *session, gint64 request_id);
+
+/** Completes one deferred request. If `response` is non-NULL and the
+ * session is not closing, sends it through the normal session write path
+ * (which includes the oversized-frame -> request_too_large fallback); a
+ * NULL `response` -- the cancelled/disconnected path -- sends nothing.
+ * Either way: takes ownership of `response`, decrements the session's
+ * pending_requests count (releasing the increment _handle_ready_frame
+ * made before the handler deferred), releases the liveness ref taken by
+ * dt_remote_async_begin(), and frees the pending -- which, on a closing
+ * session whose other in-flight ops have already drained, is the point
+ * the session itself is finally freed. NULL-safe on `pending` (releases
+ * `response` and returns). */
+void dt_remote_async_complete(dt_remote_pending_t *pending, JsonNode *response);
+
+/** Releases a pending whose request resolved synchronously after all
+ * (dispatch produced an immediate validation-error response instead of
+ * deferring): frees the pending and releases the liveness ref WITHOUT
+ * touching pending_requests -- for a synchronous response the transport
+ * layer's own "if(response) pending_requests--" still runs, so
+ * decrementing here too would double-count. NULL-safe. */
+void dt_remote_async_abort(dt_remote_pending_t *pending);
+
+/** Idempotently requests teardown of `session`: marks it closing, cancels
+ * its in-flight read, and fires every live pending's cancellable so
+ * in-flight background jobs bail out early and their completions release
+ * their result buffers without writing to the closing session. Never
+ * frees `session` itself -- that happens once every in-flight op (reads,
+ * writes, pendings) has released its ref. Main-context only. Public
+ * (rather than file-static) so unit tests can drive the
+ * cancellation-on-disconnect contract against a fake session; production
+ * callers are all inside remote_server.c. NULL-safe. */
+void dt_remote_session_request_close(dt_remote_session_t *session);
 
 /* ---------------------------------------------------------------------- */
 /* lifecycle                                                                */

@@ -22,10 +22,12 @@
 #include "common/darktable.h"
 #include "common/file_location.h"
 #include "control/conf.h"
+#include "control/control.h"
 #include "control/remote_discovery.h"
 #include "control/remote_revision.h"
 
 #include <json-glib/json-glib.h>
+#include <pthread.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------- */
@@ -224,11 +226,14 @@ static void _on_write_ready(GObject *source, GAsyncResult *res, gpointer user_da
 
 static void _session_free_now(dt_remote_session_t *s)
 {
+  // every pending holds an io_refs liveness ref, so a session can only
+  // get here (io_refs == 0) with an empty pending list by construction
   g_ptr_array_remove_fast(s->server->sessions, s);  // array has no element free-func
   dt_remote_frame_parser_clear(&s->frame);
   g_clear_pointer(&s->inflight_write, g_bytes_unref);
   while(!g_queue_is_empty(s->write_queue)) g_bytes_unref(g_queue_pop_head(s->write_queue));
   g_queue_free(s->write_queue);
+  g_ptr_array_free(s->pendings, TRUE);
   g_object_unref(s->io_cancellable);
   g_io_stream_close(G_IO_STREAM(s->connection), NULL, NULL);
   g_object_unref(s->connection);
@@ -236,22 +241,32 @@ static void _session_free_now(dt_remote_session_t *s)
 }
 
 // Call after every change to `io_refs` (i.e. at the tail of every read/
-// write completion callback): finalizes the session exactly once, only
-// once no async operation is still in flight against it.
+// write completion callback, and of every pending release): finalizes the
+// session exactly once, only once no async operation is still in flight
+// against it.
 static void _session_after_io_completed(dt_remote_session_t *s)
 {
   if(s->closing && s->io_refs == 0) _session_free_now(s);
 }
 
-// Idempotent. Marks the session for teardown and cancels any in-flight
+// Idempotent. Marks the session for teardown, cancels any in-flight
 // *read* (writes are allowed to finish naturally -- see the header
-// comment on dt_remote_session_t::io_cancellable). Never frees `s`
-// itself; _session_after_io_completed() does that once safe.
-static void _session_request_close(dt_remote_session_t *s)
+// comment on dt_remote_session_t::io_cancellable), and fires every live
+// pending's cancellable so in-flight background jobs bail out and their
+// completions release result buffers without writing here. Never frees
+// `s` itself; _session_after_io_completed() does that once safe. Public
+// for unit tests (see the header); production callers all live in this
+// file.
+void dt_remote_session_request_close(dt_remote_session_t *s)
 {
-  if(s->closing) return;
+  if(!s || s->closing) return;
   s->closing = TRUE;
   g_cancellable_cancel(s->io_cancellable);
+  for(guint i = 0; i < s->pendings->len; i++)
+  {
+    dt_remote_pending_t *pending = g_ptr_array_index(s->pendings, i);
+    g_cancellable_cancel(pending->cancellable);
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -266,8 +281,8 @@ static void _session_queue_write(dt_remote_session_t *s, GBytes *framed /* owner
 
 // Takes ownership of `response` (as returned by dt_remote_protocol_dispatch()
 // or built locally by _transport_error()). A NULL `response` is the async-
-// deferral case (no handler in this step produces it, but the shape is
-// honored): nothing to send yet.
+// deferral case (render_preview's handler defers): nothing to send yet --
+// dt_remote_async_complete() sends the deferred response later.
 static void _session_send(dt_remote_session_t *s, JsonNode *response)
 {
   if(!response) return;
@@ -295,6 +310,77 @@ static void _session_send(dt_remote_session_t *s, JsonNode *response)
   }
 
   _session_queue_write(s, framed);
+}
+
+/* ---------------------------------------------------------------------- */
+/* async request lifecycle (see the header for the contract)               */
+/* ---------------------------------------------------------------------- */
+
+dt_remote_pending_t *dt_remote_async_begin(dt_remote_session_t *session, gint64 request_id)
+{
+  // main-context only: io_refs/pendings are unsynchronized session state
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  if(!session) return NULL;
+
+  dt_remote_pending_t *pending = g_new0(dt_remote_pending_t, 1);
+  pending->session = session;
+  pending->request_id = request_id;
+  pending->cancellable = g_cancellable_new();
+
+  // the pending is one more in-flight op against the session, accounted
+  // exactly like a read/write: the session cannot be freed while it lives
+  session->io_refs++;
+  g_ptr_array_add(session->pendings, pending);
+  return pending;
+}
+
+// Shared back half of complete()/abort(): drops the pending from the
+// session's list, frees it, releases its liveness ref, and -- exactly like
+// the read/write completion callbacks -- finalizes the session if this was
+// the last in-flight op holding a closing session alive.
+static void _pending_release(dt_remote_pending_t *pending)
+{
+  dt_remote_session_t *s = pending->session;
+  g_ptr_array_remove_fast(s->pendings, pending);
+  g_object_unref(pending->cancellable);
+  g_free(pending);
+  s->io_refs--;
+  _session_after_io_completed(s);
+}
+
+void dt_remote_async_complete(dt_remote_pending_t *pending, JsonNode *response)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  if(!pending)
+  {
+    if(response) json_node_unref(response);
+    return;
+  }
+
+  dt_remote_session_t *s = pending->session;
+  if(response)
+  {
+    if(!s->closing) _session_send(s, response);  // takes ownership
+    else json_node_unref(response);              // disconnect won: released, never written
+  }
+
+  // release the increment _handle_ready_frame made before the handler
+  // deferred (its own `if(response)` decrement did not run for a deferral)
+  s->pending_requests--;
+  _pending_release(pending);
+}
+
+void dt_remote_async_abort(dt_remote_pending_t *pending)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  if(!pending) return;
+  // no pending_requests decrement here: abort means dispatch produced a
+  // synchronous response after all, and the transport layer's own
+  // `if(response) pending_requests--` covers that one
+  _pending_release(pending);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -360,7 +446,7 @@ static gboolean _handle_pre_auth_frame(dt_remote_session_t *s, JsonObject *req,
   }
 
   _session_send(s, response);
-  if(!keep_going) _session_request_close(s);
+  if(!keep_going) dt_remote_session_request_close(s);
 
   return keep_going;
 }
@@ -385,10 +471,9 @@ static gboolean _handle_ready_frame(dt_remote_session_t *s, JsonObject *req,
   {
     s->pending_requests++;
     response = dt_remote_protocol_dispatch(req, s);
-    // NULL means an async handler deferred completion -- not reachable
-    // in this step (no async method has a handler yet); when it is, a
-    // future job-completion path sends the deferred response and
-    // decrements pending_requests itself.
+    // NULL means an async handler deferred completion: the background
+    // job's main-thread completion sends the deferred response and
+    // decrements pending_requests itself (dt_remote_async_complete()).
     if(response) s->pending_requests--;
   }
 
@@ -457,7 +542,7 @@ static void _on_read_ready(GObject *source, GAsyncResult *res, gpointer user_dat
       // internals §4: a non-empty parser at EOF is a protocol error
       dt_print(DT_DEBUG_CONTROL, "[remote-edit] connection closed mid-frame");
     g_clear_error(&error);
-    _session_request_close(s);
+    dt_remote_session_request_close(s);
     _session_after_io_completed(s);
     return;
   }
@@ -468,13 +553,13 @@ static void _on_read_ready(GObject *source, GAsyncResult *res, gpointer user_dat
     dt_print(DT_DEBUG_CONTROL, "[remote-edit] frame error: %s",
             frame_error ? frame_error->message : "unknown error");
     g_clear_error(&frame_error);
-    _session_request_close(s);
+    dt_remote_session_request_close(s);
   }
   // Note: dt_remote_frame_feed() returns TRUE even when _on_frame_cb()
   // returned FALSE to request abandonment ("caller-requested early
   // stop; not an error") -- that decision is only visible via
   // s->closing, which _on_frame_cb() sets through
-  // _session_request_close() before returning FALSE.
+  // dt_remote_session_request_close() before returning FALSE.
 
   if(!s->closing) _session_start_read(s);
   _session_after_io_completed(s);
@@ -503,7 +588,7 @@ static void _on_write_ready(GObject *source, GAsyncResult *res, gpointer user_da
   {
     dt_print(DT_DEBUG_CONTROL, "[remote-edit] connection write error: %s", error->message);
     g_clear_error(&error);
-    _session_request_close(s);
+    dt_remote_session_request_close(s);
   }
 
   g_clear_pointer(&s->inflight_write, g_bytes_unref);
@@ -545,6 +630,7 @@ static gboolean _on_incoming(GSocketService *service, GSocketConnection *connect
   session->output = g_io_stream_get_output_stream(G_IO_STREAM(connection));
   session->io_cancellable = g_cancellable_new();
   session->write_queue = g_queue_new();
+  session->pendings = g_ptr_array_new();
 
   g_ptr_array_add(server->sessions, session);
   _session_start_read(session);
@@ -625,7 +711,13 @@ dt_remote_server_t *dt_remote_server_start(void)
     return NULL;
   }
 
-  g_signal_connect(service, "incoming", G_CALLBACK(_on_incoming), server);
+  // g_signal_connect_data, not the g_signal_connect macro: gui/gtk.h
+  // (pulled in via control/control.h) replaces that macro with a static
+  // assertion whitelisting the *GTK* signals that return gboolean --
+  // GSocketService's "incoming" is a GIO signal that legitimately returns
+  // gboolean but is not (and should not be) on that GTK-oriented list.
+  g_signal_connect_data(service, "incoming", G_CALLBACK(_on_incoming), server, NULL,
+                        (GConnectFlags)0);
   dt_remote_revision_connect();
 
   dt_print(DT_DEBUG_CONTROL, "[remote-edit] listening on 127.0.0.1:%u", (unsigned)port);
@@ -649,7 +741,7 @@ void dt_remote_server_stop(dt_remote_server_t *server)
   // record and every connection are gone, and nothing can reference
   // `server` after it is freed below.
   for(guint i = 0; i < server->sessions->len; i++)
-    _session_request_close(g_ptr_array_index(server->sessions, i));
+    dt_remote_session_request_close(g_ptr_array_index(server->sessions, i));
   while(server->sessions->len > 0) g_main_context_iteration(NULL, TRUE);
 
   g_object_unref(server->service);
