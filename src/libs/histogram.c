@@ -18,6 +18,7 @@
 
 #include "common/darktable.h"
 #include "common/color_picker.h"
+#include "common/scopes.h"
 #include "control/remote_scopes.h"
 #include "gui/accelerators.h"
 #include "scopes.h"
@@ -178,11 +179,13 @@ static void _scope_process
     dt_ioppr_add_profile_info_to_list(darktable.develop,
       DT_COLORSPACE_LIN_REC2020, "", DT_INTENT_RELATIVE_COLORIMETRIC);
 
-  const dt_iop_order_iccprofile_info_t *profile_info_out = !profile_info_to ? fallback : profile_info_to;
-
-  dt_ioppr_transform_image_colorspace_rgb(input, img_display, width, height,
-                                            profile_info_from, profile_info_out,
-                                            "final histogram");
+  // Shared conversion helper (internals §9.3): the GUI and the remote
+  // compute_scopes service convert display RGB to the histogram profile
+  // through one implementation (and, below, share the converted buffer
+  // itself, so the numbers are identical by construction).
+  const dt_iop_order_iccprofile_info_t *profile_info_out =
+    dt_scopes_convert_to_histogram_profile(input, img_display, width, height,
+                                           profile_info_from, profile_info_to, fallback);
 
   // Remote-edit scope capture (plan step 10): register at the same
   // preview-pixelpipe gamma hook the GUI uses by pushing a copy of this
