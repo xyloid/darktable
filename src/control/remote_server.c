@@ -770,6 +770,7 @@ dt_remote_server_t *dt_remote_server_start(void)
   g_signal_connect_data(service, "incoming", G_CALLBACK(_on_incoming), server, NULL,
                         (GConnectFlags)0);
   dt_remote_revision_connect();
+  dt_remote_scopes_capture_start();
 
   dt_print(DT_DEBUG_CONTROL, "[remote-edit] listening on 127.0.0.1:%u", (unsigned)port);
 
@@ -785,7 +786,7 @@ void dt_remote_server_stop(dt_remote_server_t *server)
   if(!server) return;
 
   dt_remote_revision_disconnect();
-  dt_remote_scopes_capture_reset();
+  dt_remote_scopes_capture_stop();
 
   g_socket_service_stop(server->service);
 

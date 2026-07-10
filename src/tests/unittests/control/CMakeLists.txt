@@ -54,3 +54,12 @@ add_cmocka_test(test_remote_revision
 if(WIN32)
     _copy_required_library(test_remote_revision lib_darktable)
 endif(WIN32)
+
+add_cmocka_test(test_remote_scopes
+                SOURCES test_remote_scopes.c
+                LINK_LIBRARIES lib_darktable cmocka)
+
+# Windows: libs have to be copied next to the executable
+if(WIN32)
+    _copy_required_library(test_remote_scopes lib_darktable)
+endif(WIN32)

@@ -557,12 +557,41 @@ loadable MODULE and cannot be linked from common code):
 
 Remote capture: the remote scopes service registers at the same gamma-hook
 point and **retains a copy of the latest pushed preview buffer** (preview
-pipe is small; order tens of MB float) plus the revision stamped at push
-time, behind a mutex. `compute_scopes` runs the requested kernels over the
-retained buffer on a background job — all results share one buffer and one
-revision by construction, exactly as the protocol reference requires. If no
-buffer has been pushed yet (fresh darkroom), the handler returns
-`scope_failed` with a retryable hint.
+pipe is small; order tens of MB float) plus a revision, behind a mutex.
+`compute_scopes` runs the requested kernels over the retained buffer on a
+background job — all results share one buffer and one revision by
+construction, exactly as the protocol reference requires. If no buffer has
+been pushed yet (fresh darkroom), the handler returns `scope_failed` with a
+retryable hint.
+
+Capture gate (cost): the deep copy is gated on a single `g_atomic` flag set
+by `dt_remote_server_start()`/`stop()`. When no remote server is active the
+push reads that flag and returns before any allocation, deep copy, or
+develop access — a true no-op, so darktable users without remote control pay
+nothing on every preview run. The slot is cleared at both server start and
+stop, so a pre-connect buffer can never be served.
+
+Revision coherence (stamp proves the pixels): the pushed pixels reflect the
+history the preview pipe read when it fixed its input, but the push runs at
+the *end* of the pipe run, after conversion. A history bump landing in that
+window would otherwise let revision-R pixels be stamped R+1. Because revision
+bumps happen **only on the main thread** (§5), coherence is proven by
+equality: the process-local revision is recorded on the preview pipe's worker
+thread just before `dt_dev_pixelpipe_change()` reads history
+(`src/develop/develop.c`, preview pipe only), and read again at push. If the
+two are equal, no bump occurred during the run, so the pixels provably match
+that revision and it is stamped. If they differ (or a push arrives with no
+paired pipe-start note, e.g. from a non-preview pipe), the push is **dropped**
+and the previous, coherent slot is left intact — the bump that caused the
+mismatch has already scheduled a fresh preview run that will push a coherent
+buffer moments later. A `compute_scopes` in the gap therefore sees an
+older-but-coherent buffer or an empty slot (retryable `scope_failed`), never a
+mislabelled one. The `compute_scopes` completion keeps **no** revision-drift
+check (design-spec semantics): a result whose stamped revision has since been
+superseded is still returned as success for that revision, because the stamp
+is now trustworthy at the source. The slot is also reset on
+`DT_SIGNAL_DEVELOP_IMAGE_CHANGED` so the previous image's buffer is never
+served as the new image's scopes.
 
 ## 10. Test seams recap
 

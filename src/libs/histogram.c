@@ -191,9 +191,10 @@ static void _scope_process
   // preview-pixelpipe gamma hook the GUI uses by pushing a copy of this
   // already-converted histogram-profile buffer into the capture slot, so
   // the remote compute_scopes service and the GUI panel share one buffer
-  // and convert identically. Cheap no-op when remote control is disabled
-  // (the slot is simply never read). Uses the same profile the modes below
-  // receive as vs_prof.
+  // and convert identically. dt_remote_scopes_push() returns immediately on
+  // a single atomic read when no remote server is active -- before any
+  // allocation or copy -- so this costs nothing for users without remote
+  // control. Uses the same profile the modes below receive as vs_prof.
   dt_remote_scopes_push(img_display, width, height,
                         profile_info_out->type ? profile_info_out : fallback);
 

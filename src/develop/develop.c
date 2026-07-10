@@ -36,6 +36,7 @@
 #include "control/conf.h"
 #include "control/control.h"
 #include "control/jobs.h"
+#include "control/remote_scopes.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -725,6 +726,16 @@ restart:
   const float anticipate_move = pipe->changed & DT_DEV_PIPE_ZOOMED
               ? dt_conf_get_float("darkroom/ui/anticipate_move")
               : 1.0f;
+
+  // Remote scopes coherence (internals §9): record the process-local
+  // revision now, before dt_dev_pixelpipe_change() reads history into the
+  // pipe nodes, so the gamma-hook push at the end of this preview run can
+  // prove its captured pixels were not overtaken by a mid-run history bump
+  // (bumps happen only on the main thread). Preview pipe only -- that is the
+  // pipe whose gamma hook feeds the capture slot. Cheap no-op when no remote
+  // server is capturing.
+  if(pipe == dev->preview_pipe)
+    dt_remote_scopes_note_pipe_start();
 
   /* dt_dev_pixelpipe_change()
       locks history mutex while syncing nodes

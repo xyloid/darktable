@@ -22,6 +22,7 @@
 #include "common/darktable.h"
 #include "common/iop_profile.h"
 #include "control/control.h"    // dt_control_t (main-thread assert)
+#include "control/signal.h"     // DT_SIGNAL_DEVELOP_IMAGE_CHANGED
 #include "develop/develop.h"
 #include "views/view.h"
 
@@ -67,6 +68,38 @@ typedef struct _capture_t
 static GMutex s_capture_mutex;
 static _capture_t *s_capture = NULL;   // latest pushed buffer; NULL == empty slot
 
+// The hot-path gate (finding 1). A single g_atomic int read on the preview
+// pixelpipe worker thread decides, before any allocation or develop access,
+// whether the remote server is active at all -- so darktable users without
+// remote control pay nothing for the capture. Set TRUE by
+// dt_remote_scopes_capture_start() (server start) and FALSE by
+// dt_remote_scopes_capture_stop() (server stop), both on the main thread.
+static gint s_capture_active = 0;
+
+// Pipe-start/push revision equality proof (finding 2). Bumps to the
+// process-local revision happen ONLY on the main thread (remote_revision.c),
+// so if the revision read when the preview pipe fixed its input history
+// equals the revision read at push time, no bump landed during the run and
+// the captured pixels provably match their stamp. s_pipe_start_revision is
+// written by dt_remote_scopes_note_pipe_start() and consumed once by the
+// next push; both run in sequence on the same preview-pipe worker thread
+// (serialized by the pipe mutex), and s_capture_mutex guards them against a
+// concurrent full-pipe worker. s_pipe_start_valid makes the note one-shot:
+// a push with no paired note (e.g. a tether-view push) has no coherence
+// proof and is dropped.
+static uint64_t s_pipe_start_revision = 0;
+static gboolean s_pipe_start_valid = FALSE;
+
+// Injectable revision getter (test seam). Production reads the live
+// process-local counter; unit tests override it to drive the equal/unequal
+// coherence branches deterministically without a develop context.
+static uint64_t (*s_revision_getter)(void) = dt_remote_current_revision;
+
+static uint64_t _current_revision(void)
+{
+  return s_revision_getter ? s_revision_getter() : 0;
+}
+
 static void _capture_free(_capture_t *c)
 {
   if(!c) return;
@@ -98,19 +131,53 @@ static void _copy_profile(const dt_iop_order_iccprofile_info_t *src, _capture_t 
     }
 }
 
+void dt_remote_scopes_note_pipe_start(void)
+{
+  // Cheap gate first: nothing to prove when no server is capturing.
+  if(!g_atomic_int_get(&s_capture_active)) return;
+  const uint64_t rev = _current_revision();
+  g_mutex_lock(&s_capture_mutex);
+  s_pipe_start_revision = rev;
+  s_pipe_start_valid = TRUE;
+  g_mutex_unlock(&s_capture_mutex);
+}
+
 void dt_remote_scopes_push(const float *hist_rgb, int width, int height,
                            const dt_iop_order_iccprofile_info_t *vs_prof)
 {
+  // Finding 1: the single cheap atomic read that makes this a true no-op for
+  // every darktable user without remote control -- BEFORE any allocation,
+  // deep copy, or develop access.
+  if(!g_atomic_int_get(&s_capture_active)) return;
+
   if(!hist_rgb || width <= 0 || height <= 0 || !vs_prof)
   {
     // clear the slot
     g_mutex_lock(&s_capture_mutex);
     _capture_t *old = s_capture;
     s_capture = NULL;
+    s_pipe_start_valid = FALSE;
     g_mutex_unlock(&s_capture_mutex);
     _capture_free(old);
     return;
   }
+
+  // Finding 2: prove stamp/pixel coherence before spending anything. Read the
+  // revision now (push time) and compare against the pipe-start revision. An
+  // exact match means no history bump landed on the main thread during the
+  // run, so these pixels reflect exactly this revision. Consume the one-shot
+  // note under the same lock. On any mismatch (or a push with no paired
+  // note) DROP the push: leave the previous, coherent slot untouched. The
+  // bump that caused the mismatch has already scheduled a fresh preview run
+  // which will push a coherent buffer moments later; a compute_scopes in the
+  // gap sees the older-but-coherent slot (acceptable) or an empty slot
+  // (retryable scope_failed) -- never a mislabelled buffer.
+  const uint64_t r_push = _current_revision();
+  g_mutex_lock(&s_capture_mutex);
+  const gboolean coherent = s_pipe_start_valid && s_pipe_start_revision == r_push;
+  s_pipe_start_valid = FALSE;
+  g_mutex_unlock(&s_capture_mutex);
+  if(!coherent) return;
 
   _capture_t *c = g_malloc0(sizeof(_capture_t));
   c->width = width;
@@ -125,10 +192,13 @@ void dt_remote_scopes_push(const float *hist_rgb, int width, int height,
 
   // Resolve + copy the display-gamma (HLG Rec2020) LUT the waveform and
   // vectorscope kernels borrow, exactly as the GUI panel does. Same
-  // pixelpipe-worker-thread context as the existing lib code.
-  const dt_iop_order_iccprofile_info_t *hlg =
-    dt_ioppr_add_profile_info_to_list(darktable.develop, DT_COLORSPACE_HLG_REC2020,
-                                      "", DT_INTENT_PERCEPTUAL);
+  // pixelpipe-worker-thread context as the existing lib code. Guarded on a
+  // live develop so the capture is safe to exercise without one (unit tests
+  // and any pre-develop call fall through to the identity LUT below).
+  const dt_iop_order_iccprofile_info_t *hlg = darktable.develop
+    ? dt_ioppr_add_profile_info_to_list(darktable.develop, DT_COLORSPACE_HLG_REC2020,
+                                        "", DT_INTENT_PERCEPTUAL)
+    : NULL;
   if(hlg && hlg->lut_out[0] && hlg->lutsize > 0)
   {
     c->gamma_lutsize = hlg->lutsize;
@@ -144,13 +214,9 @@ void dt_remote_scopes_push(const float *hist_rgb, int width, int height,
     for(int i = 0; i < 256; i++) c->gamma_lut[i] = (float)i / 255.f;
   }
 
-  // Revision stamp: a thread-safe plain read of the process-local counter
-  // (G_LOCK-guarded). The main-thread-only observe_image self-heal is NOT
-  // available here, so this can read a slightly stale value if an image
-  // change is mid-flight -- accepted: it fails toward a stale stamp plus a
-  // retryable downstream conflict, never toward a fabricated value
-  // (internals §9 capture design; flagged for controller ratification).
-  c->revision = dt_remote_current_revision();
+  // Revision stamp: r_push, already proven equal to the pipe-start revision
+  // above, so it is exactly the revision these pixels reflect (finding 2).
+  c->revision = r_push;
 
   g_mutex_lock(&s_capture_mutex);
   _capture_t *old = s_capture;
@@ -164,8 +230,60 @@ void dt_remote_scopes_capture_reset(void)
   g_mutex_lock(&s_capture_mutex);
   _capture_t *old = s_capture;
   s_capture = NULL;
+  s_pipe_start_valid = FALSE;
   g_mutex_unlock(&s_capture_mutex);
   _capture_free(old);
+}
+
+// Darkroom image switch (finding 2 / folded Minor F6): drop the slot so the
+// previous image's buffer can never be served as another image's scopes.
+// The next preview run for the new image will push a coherent buffer; a
+// compute_scopes in the gap fails retryably. Runs on the main thread.
+static void _on_image_changed(gpointer instance, gpointer user_data)
+{
+  (void)instance;
+  (void)user_data;
+  dt_remote_scopes_capture_reset();
+}
+
+void dt_remote_scopes_capture_start(void)
+{
+  // Clear any stale slot BEFORE arming the gate: after this a pre-connect
+  // buffer cannot exist at all (folds Minor F5 -- previously the slot was
+  // reset only at stop, so the first compute_scopes after connect could
+  // serve a pre-connect buffer stamped revision 0).
+  dt_remote_scopes_capture_reset();
+  g_atomic_int_set(&s_capture_active, 1);
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _on_image_changed, NULL);
+}
+
+void dt_remote_scopes_capture_stop(void)
+{
+  g_atomic_int_set(&s_capture_active, 0);
+  DT_CONTROL_SIGNAL_DISCONNECT(_on_image_changed, NULL);
+  dt_remote_scopes_capture_reset();
+}
+
+/* ---------------------------------------------------------------------- */
+/* test seams                                                              */
+/* ---------------------------------------------------------------------- */
+
+void dt_remote_scopes_test_set_revision_getter(uint64_t (*getter)(void))
+{
+  s_revision_getter = getter ? getter : dt_remote_current_revision;
+}
+
+void dt_remote_scopes_test_set_active(gboolean active)
+{
+  g_atomic_int_set(&s_capture_active, active ? 1 : 0);
+}
+
+int64_t dt_remote_scopes_test_slot_revision(void)
+{
+  g_mutex_lock(&s_capture_mutex);
+  const int64_t rev = s_capture ? (int64_t)s_capture->revision : -1;
+  g_mutex_unlock(&s_capture_mutex);
+  return rev;
 }
 
 // Deep-copies the current slot under the lock, so the compute path runs
