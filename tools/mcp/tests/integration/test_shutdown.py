@@ -62,32 +62,80 @@ async def test_clean_exit_after_mutation_session(instance_factory):
 
 
 async def test_quit_with_inflight_preview_does_not_hang(instance_factory):
-    """M42: quit while an async ``render_preview`` is still queued/running.
+    """M42: quit while async render/scope work is still queued or running.
     The stop-drain / reclaim path must let darktable exit cleanly with no
-    hang and no leaked pending -- the Task 9 debt."""
+    hang and no leaked pending -- the Task 9 debt.
+
+    Trigger: after establishing edit state, fire a *burst* of expensive
+    ``render_preview`` jobs (plus a ``compute_scopes``) back-to-back without
+    awaiting any of them, then quit immediately -- no settle sleep. The async
+    render queue admits multiple jobs, so even if the first has started, the
+    remainder sit QUEUED and are reclaimed by the stop-time walk at quit,
+    exercising the drain/reclaim path directly rather than relying on a
+    single job still being mid-render after a fixed delay (the old, weak
+    trigger: one 2048 px render of a 256x256 image could finish inside the
+    0.05 s sleep, leaving nothing to drain and letting a regression pass
+    unnoticed).
+
+    LIMITATION -- what this test does and does NOT pin (cannot be made
+    airtight from the client side): job scheduling and render duration live
+    entirely inside darktable, and there is no client-visible "job started"
+    signal to synchronise on, so this test cannot *guarantee* a job is
+    mid-render at the exact instant ``dt_control_quit()`` runs its
+    stop-drain. What it deterministically pins is the invariant that
+    matters: submitting a burst of render/scope work and then quitting must
+    ALWAYS yield a clean, bounded exit (code 0), a removed discovery record,
+    and no crash marker -- whether that work was running, still queued, or
+    already drained at quit. Because the burst guarantees work was actually
+    submitted to the server, the assertions cannot pass vacuously on "an
+    empty queue"; a stop-drain/reclaim regression that hung or crashed on
+    queued work would fail here. Pinning the guaranteed-mid-render path would
+    require instrumenting the C server, which this suite may not modify.
+    """
     import asyncio
 
     instance = instance_factory()
     _require_clean_quit(instance)
 
     async with harness.connected_client(instance) as client:
-        # Make sure there is edit state, then queue a large preview and quit
-        # almost immediately so the render job is still QUEUED/RUNNING.
+        # Make sure there is real edit state so each render has work to do.
         await client.call(
             "set_module_params",
             {"module": "exposure", "instance": 0, "values": {"exposure": 1.5}, "enable": True},
         )
-        pending = asyncio.ensure_future(
-            client.call("render_preview", {"max_px": 2048, "quality": 92})
+        # Fire a burst of async work without awaiting completion: several
+        # large previews plus a heavy scope compute. Enough jobs that the
+        # queue cannot plausibly have drained them all before quit fires.
+        pending = [
+            asyncio.ensure_future(
+                client.call("render_preview", {"max_px": 2048, "quality": 92})
+            )
+            for _ in range(6)
+        ]
+        pending.append(
+            asyncio.ensure_future(
+                client.call(
+                    "compute_scopes",
+                    {
+                        "scopes": ["histogram", "waveform"],
+                        "include_summary": True,
+                        "include_bins": True,
+                        "include_images": True,
+                        "image_size": 256,
+                    },
+                )
+            )
         )
-        # Let the request reach the server and the job get queued, but do not
-        # await completion.
-        await asyncio.sleep(0.05)
-        pending.cancel()
+        # Yield exactly once so every request's send half runs (frame written
+        # to the socket), but do NOT wait for any render to complete -- there
+        # is deliberately no settle sleep here.
+        await asyncio.sleep(0)
+        for fut in pending:
+            fut.cancel()
 
     # Now quit; this must not hang (bounded wait) and must exit cleanly.
     exit_code = instance.quit_via_dbus(timeout=60)
-    assert exit_code == 0, f"darktable did not exit cleanly with a preview in flight ({exit_code})"
+    assert exit_code == 0, f"darktable did not exit cleanly with previews in flight ({exit_code})"
     assert not instance.discovery_record_exists()
 
     log = instance.log_text()

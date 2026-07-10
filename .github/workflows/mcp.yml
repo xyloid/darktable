@@ -116,14 +116,23 @@ jobs:
       - name: Install compiler
         run: eatmydata apt-get --yes install gcc-16 g++-16
       - name: Install build dependencies
+        # Mirrors ci.yml's "Install Base Dependencies" package list exactly
+        # (verify with a diff of the two lists). libgmic-dev is required because
+        # DefineOptions.cmake defaults USE_GMIC=ON and src/CMakeLists.txt
+        # hard-FATALs without it; libglib2.0-dev and libonnxruntime-dev are
+        # required because .ci/ci-script.sh forces -DUSE_AI=ON (src/ai needs
+        # glib dev + a system ONNXRuntime, else FindONNXRuntime.cmake silently
+        # network-downloads mid-build).
         run: |
           eatmydata apt-get --yes install \
             build-essential cmake appstream-util desktop-file-utils gettext git \
             gdb intltool libarchive-dev libatk1.0-dev libavif-dev libcairo2-dev \
             libcolord-dev libcolord-gtk-dev libcups2-dev libcurl4-gnutls-dev \
-            libexiv2-dev libgdk-pixbuf-2.0-dev libgphoto2-dev libgraphicsmagick1-dev \
+            libexiv2-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libgmic-dev \
+            libgphoto2-dev libgraphicsmagick1-dev \
             libgtk-3-dev libheif-dev libjpeg-dev libjson-glib-dev liblcms2-dev \
-            liblensfun-dev liblua5.4-dev libopenexr-dev libopenjp2-7-dev \
+            liblensfun-dev liblua5.4-dev libonnxruntime-dev libopenexr-dev \
+            libopenjp2-7-dev \
             libosmgpsmap-1.0-dev libpango1.0-dev libpng-dev libportmidi-dev \
             libpotrace-dev libpugixml-dev libraw-dev librsvg2-dev libsaxon-java \
             libsdl2-dev libsecret-1-dev libsqlite3-dev libtiff5-dev libwebp-dev \
@@ -178,7 +187,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: integration-logs
-          # The harness writes each instance's (token-redacted) darktable.log
-          # under a pytest tmp path; capture whatever is present.
-          path: /tmp/pytest-of-*/**/darktable.log
+          # The harness persists a token-redacted copy of each instance's log
+          # (darktable.redacted.log, written at teardown) next to the raw log
+          # under a pytest tmp path. Upload ONLY the redacted copy so the live
+          # session token can never leak into a CI artifact; the raw
+          # darktable.log is deliberately NOT matched here.
+          path: /tmp/pytest-of-*/**/darktable.redacted.log
           if-no-files-found: ignore

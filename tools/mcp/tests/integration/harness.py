@@ -20,8 +20,11 @@ determinism constraints:
 
 * **Captured logs are redacted.** ``DarktableInstance.log_text()`` returns
   darktable's stderr with the live session token blanked out, so a test
-  that prints a failing instance's log (or a CI job that uploads it) cannot
-  leak the token. :func:`assert_token_absent` is the standing check.
+  that prints a failing instance's log cannot leak the token. Teardown
+  additionally persists a token-redacted copy to disk
+  (``darktable.redacted.log``, written by ``close()``) so a CI job uploads
+  the redacted file rather than the raw ``darktable.log``.
+  :func:`assert_token_absent` is the standing check.
 
 * **Teardown always runs.** ``close()`` escalates SIGTERM -> SIGKILL under a
   bounded deadline and always reaps the private dbus-daemon and Xvfb, from
@@ -303,10 +306,15 @@ class DarktableInstance:
     _record: discovery.DiscoveryRecord | None = field(default=None, init=False)
     config_dir: Path = field(init=False)
     log_path: Path = field(init=False)
+    redacted_log_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.config_dir = self.workdir / "config"
         self.log_path = self.workdir / "darktable.log"
+        # A token-redacted copy of the raw log, persisted to disk at teardown
+        # so a CI job can upload *this* file instead of the raw darktable.log
+        # (which contains darktable's untouched stderr). See close().
+        self.redacted_log_path = self.workdir / "darktable.redacted.log"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -432,11 +440,28 @@ class DarktableInstance:
 
     def close(self) -> None:
         """Deterministic teardown: SIGTERM -> SIGKILL the process group under
-        a bounded deadline. Safe to call more than once."""
+        a bounded deadline, then persist a token-redacted copy of the log.
+        Safe to call more than once."""
         _terminate(self._proc)
         self._proc = None
+        self._persist_redacted_log()
 
     # -- logs (token-redacted) --------------------------------------------
+
+    def _persist_redacted_log(self) -> None:
+        """Write a token-redacted copy of the raw log to disk so it can be
+        safely captured as a CI artifact. Best-effort and idempotent: the
+        process has stopped writing by the time close() calls this, and a
+        missing/unreadable log simply yields no redacted copy."""
+        try:
+            raw = self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        redacted = redact_token(raw, self._record.token if self._record else None)
+        try:
+            self.redacted_log_path.write_text(redacted, encoding="utf-8")
+        except OSError:
+            pass
 
     def log_text(self) -> str:
         try:
