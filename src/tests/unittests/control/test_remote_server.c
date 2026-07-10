@@ -429,6 +429,126 @@ static void test_async_complete_oversized_response_falls_back_to_request_too_lar
 }
 
 /* ---------------------------------------------------------------------- */
+/* shutdown reclaim handshake (dt_remote_job_handshake_*)                    */
+/* ---------------------------------------------------------------------- */
+
+// The QUEUED->RUNNING (worker) and QUEUED->RECLAIMED (stop) transitions are
+// mutually exclusive: whoever CASes first wins and the other side can no
+// longer act on the pending. This is the whole guarantee that keeps stop()
+// from double-freeing a pending a worker is about to run, or hanging on a
+// queued job a worker will never run.
+static void test_job_handshake_run_and_reclaim_are_mutually_exclusive(void **state)
+{
+  (void)state;
+
+  // worker wins first -> stop can no longer reclaim
+  dt_remote_job_handshake_t *h = dt_remote_job_handshake_new();
+  assert_true(dt_remote_job_handshake_claim_run(h));
+  assert_false(dt_remote_job_handshake_claim_run(h));  // idempotent: only once
+  assert_false(dt_remote_job_handshake_reclaim(h));
+  dt_remote_job_handshake_unref(h);
+
+  // stop wins first -> the worker now loses and must not touch the pending
+  h = dt_remote_job_handshake_new();
+  assert_true(dt_remote_job_handshake_reclaim(h));
+  assert_false(dt_remote_job_handshake_reclaim(h));
+  assert_false(dt_remote_job_handshake_claim_run(h));
+  dt_remote_job_handshake_unref(h);
+
+  // all entry points NULL-safe
+  assert_false(dt_remote_job_handshake_claim_run(NULL));
+  assert_false(dt_remote_job_handshake_reclaim(NULL));
+  dt_remote_job_handshake_ref(NULL);
+  dt_remote_job_handshake_unref(NULL);
+}
+
+// Two holders (the pending and the job params) share one refcounted
+// handshake: one holder releasing its ref must leave the state atom readable
+// by the other -- the property that lets stop free the pending while the
+// still-queued job keeps its params, without a use-after-free on the atom
+// (asan/lsan enforce no double-free/leak).
+static void test_job_handshake_survives_one_holder_release(void **state)
+{
+  (void)state;
+  dt_remote_job_handshake_t *h = dt_remote_job_handshake_new();  // rc 1 (job side)
+  dt_remote_job_handshake_ref(h);                                // rc 2 (pending side)
+
+  assert_true(dt_remote_job_handshake_reclaim(h));  // stop wins via the pending side
+  dt_remote_job_handshake_unref(h);                 // pending freed: rc 1, still alive
+  assert_false(dt_remote_job_handshake_claim_run(h));  // job reads a live RECLAIMED
+  dt_remote_job_handshake_unref(h);                 // job freed: rc 0
+}
+
+// End-to-end at the pending level: stop() reclaims an orphaned QUEUED job's
+// pending (a worker will never run it at shutdown) and releases it, balancing
+// io_refs/pending_requests; the job -- run or discarded afterwards -- then
+// loses the claim and touches only its own handshake ref, never the freed
+// pending. This mirrors dt_remote_server_stop()'s phase-2 walk without a real
+// server/socket.
+static void test_stop_reclaims_orphaned_queued_pending(void **state)
+{
+  (void)state;
+  dt_remote_session_t *s = _fake_session();
+  s->io_refs = 1;          // the in-flight read every real closing session has
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 7);
+
+  // publish the shared handshake exactly as _queue_preview_job() does
+  dt_remote_job_handshake_t *job_side = dt_remote_job_handshake_new();  // rc 1
+  pending->handshake = job_side;
+  dt_remote_job_handshake_ref(pending->handshake);                      // rc 2
+
+  dt_remote_session_request_close(s);  // stop phase 1
+
+  // stop phase 2: still QUEUED (unstarted), so reclaim wins, then release
+  assert_true(dt_remote_job_handshake_reclaim(pending->handshake));
+  dt_remote_async_complete(pending, NULL);
+
+  assert_int_equal((int)s->pendings->len, 0);
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 1);  // only the preset read ref remains
+
+  // the never-run job now loses the claim (must not touch the freed pending)
+  assert_false(dt_remote_job_handshake_claim_run(job_side));
+  dt_remote_job_handshake_unref(job_side);  // job side drops its ref: rc 0
+
+  _fake_session_free(s);
+}
+
+// The converse: a worker that already claimed QUEUED->RUNNING before stop
+// walked is NOT reclaimed -- stop leaves that pending for the job's real
+// completion to release.
+static void test_stop_does_not_reclaim_running_job_pending(void **state)
+{
+  (void)state;
+  dt_remote_session_t *s = _fake_session();
+  s->io_refs = 1;
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 8);
+
+  dt_remote_job_handshake_t *job_side = dt_remote_job_handshake_new();
+  pending->handshake = job_side;
+  dt_remote_job_handshake_ref(pending->handshake);
+
+  // the worker got there first
+  assert_true(dt_remote_job_handshake_claim_run(job_side));
+
+  dt_remote_session_request_close(s);
+  // stop phase 2: reclaim loses, so stop leaves this pending in place
+  assert_false(dt_remote_job_handshake_reclaim(pending->handshake));
+  assert_int_equal((int)s->pendings->len, 1);  // still registered
+
+  // the job's real completion (running on the main thread) releases it; stop
+  // never touched it, so the accounting drains through the normal path
+  dt_remote_async_complete(pending, NULL);
+  assert_int_equal((int)s->pendings->len, 0);
+  assert_int_equal(s->io_refs, 1);
+
+  dt_remote_job_handshake_unref(job_side);
+  _fake_session_free(s);
+}
+
+/* ---------------------------------------------------------------------- */
 /* lifecycle NULL-safety (no sockets exercised)                            */
 /* ---------------------------------------------------------------------- */
 
@@ -469,6 +589,11 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_session_request_close_fires_pending_cancellables),
     cmocka_unit_test(test_async_complete_on_closing_session_drops_response),
     cmocka_unit_test(test_async_complete_oversized_response_falls_back_to_request_too_large),
+
+    cmocka_unit_test(test_job_handshake_run_and_reclaim_are_mutually_exclusive),
+    cmocka_unit_test(test_job_handshake_survives_one_holder_release),
+    cmocka_unit_test(test_stop_reclaims_orphaned_queued_pending),
+    cmocka_unit_test(test_stop_does_not_reclaim_running_job_pending),
 
     cmocka_unit_test(test_stop_is_null_safe),
     cmocka_unit_test(test_get_port_of_null_server_is_zero),

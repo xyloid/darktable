@@ -2157,12 +2157,44 @@ static void _fake_session_free(dt_remote_session_t *s)
   g_free(s);
 }
 
+// asserts exactly one frame is queued, strips its 4-byte length prefix, and
+// returns the parsed payload object (owned by *parser_out; unref when done)
+static JsonObject *_parse_single_queued_frame(dt_remote_session_t *s, JsonParser **parser_out)
+{
+  assert_int_equal((int)g_queue_get_length(s->write_queue), 1);
+  GBytes *framed = g_queue_peek_head(s->write_queue);
+  gsize len = 0;
+  const guint8 *data = g_bytes_get_data(framed, &len);
+  assert_true(len > 4);
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, (const gchar *)data + 4, (gssize)(len - 4), NULL));
+  *parser_out = parser;
+  return json_node_get_object(json_parser_get_root(parser));
+}
+
+// current_revision seam stubs for the completion-time coherence check: the
+// preview fixtures are stamped revision 34, so _coherent returns 34 (no
+// drift, success) and _drifted returns something else (state changed during
+// the render, retryable failure).
+static uint64_t stub_current_revision_coherent(void)
+{
+  return 34;
+}
+
+static uint64_t stub_current_revision_drifted(void)
+{
+  return 35;
+}
+
 // the full happy-path completion: job result -> framed success response on
 // the session's write path, with the async bookkeeping torn down once
 static void test_finish_preview_sends_framed_response(void **state)
 {
   (void)state;
   dt_remote_protocol_set_async(NULL);  // the real async transport
+  // revision unchanged since the stamp -> the coherence check passes
+  dt_remote_protocol_calls_t calls = { .current_revision = stub_current_revision_coherent };
+  dt_remote_protocol_set_calls(&calls);
 
   dt_remote_session_t *s = _fake_session();
   s->pending_requests = 1;
@@ -2196,6 +2228,87 @@ static void test_finish_preview_sends_framed_response(void **state)
   assert_int_equal((int)s->pendings->len, 0);
 
   _fake_session_free(s);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// revision-coherence race (internals §8): if the live revision drifted from
+// the stamp while the render was in flight, the completion discards the
+// rendered payload and answers a RETRYABLE preview_failed -- never revision R
+// with revision-R+1 pixels. The JPEG buffer must be released, not sent.
+static void test_finish_preview_revision_drift_fails_retryable(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);  // the real async transport
+  dt_remote_protocol_calls_t calls = { .current_revision = stub_current_revision_drifted };
+  dt_remote_protocol_set_calls(&calls);
+
+  dt_remote_session_t *s = _fake_session();
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 9);
+
+  dt_remote_preview_t *preview = g_malloc0(sizeof(dt_remote_preview_t));
+  preview->jpeg = g_malloc(1024 * 1024);  // must be discarded, never encoded/sent
+  preview->jpeg_len = 1024 * 1024;
+  preview->width = 1024;
+  preview->height = 683;
+  preview->revision = 34;  // stamp; stub_current_revision_drifted() returns 35
+
+  dt_remote_protocol_finish_preview(pending, preview, NULL);  // takes ownership
+
+  JsonParser *parser = NULL;
+  JsonObject *resp = _parse_single_queued_frame(s, &parser);
+  assert_int_equal((int)json_object_get_int_member(resp, "id"), 9);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *error = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"), "preview_failed");
+  assert_true(json_object_get_boolean_member(error, "retryable"));
+  g_object_unref(parser);
+
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 0);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// the converse: revision unchanged since the stamp -> the render is coherent
+// and the success frame is sent (this is the same coherent path the happy
+// path above pins, asserted here explicitly against the drift case).
+static void test_finish_preview_no_drift_succeeds(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_calls_t calls = { .current_revision = stub_current_revision_coherent };
+  dt_remote_protocol_set_calls(&calls);
+
+  dt_remote_session_t *s = _fake_session();
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 9);
+
+  dt_remote_preview_t *preview = g_malloc0(sizeof(dt_remote_preview_t));
+  preview->jpeg = g_malloc(strlen(RENDER_PREVIEW_STUB_BYTES));
+  memcpy(preview->jpeg, RENDER_PREVIEW_STUB_BYTES, strlen(RENDER_PREVIEW_STUB_BYTES));
+  preview->jpeg_len = strlen(RENDER_PREVIEW_STUB_BYTES);
+  preview->width = 1024;
+  preview->height = 683;
+  preview->revision = 34;  // matches stub_current_revision_coherent()
+
+  dt_remote_protocol_finish_preview(pending, preview, NULL);
+
+  JsonParser *parser = NULL;
+  JsonObject *resp = _parse_single_queued_frame(s, &parser);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  assert_int_equal((int)json_object_get_int_member(result, "revision"), 34);
+  g_object_unref(parser);
+
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 0);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+  dt_remote_protocol_set_calls(NULL);
 }
 
 // cancellation-on-disconnect: the completion of a job whose session
@@ -2399,6 +2512,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_build_preview_response_too_large_matches_fixture),
     cmocka_unit_test(test_preview_fits_frame_boundaries),
     cmocka_unit_test(test_finish_preview_sends_framed_response),
+    cmocka_unit_test(test_finish_preview_revision_drift_fails_retryable),
+    cmocka_unit_test(test_finish_preview_no_drift_succeeds),
     cmocka_unit_test(test_finish_preview_cancelled_releases_without_writing),
 
     cmocka_unit_test(test_error_missing_id),

@@ -52,6 +52,7 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .get_history = dt_remote_get_history,
   .undo = dt_remote_undo,
   .render_preview_prepare = dt_remote_render_preview_prepare,
+  .current_revision = dt_remote_current_revision,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -66,6 +67,7 @@ static dt_remote_protocol_calls_t s_calls = {
   .get_history = dt_remote_get_history,
   .undo = dt_remote_undo,
   .render_preview_prepare = dt_remote_render_preview_prepare,
+  .current_revision = dt_remote_current_revision,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -1518,6 +1520,30 @@ void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
     return;
   }
 
+  // Revision-coherence check (internals §8, main thread). prepare() stamped
+  // the preview with the revision observed the instant it flushed history to
+  // the DB; the background export then re-read history from the DB. Revision
+  // bumps happen only on the main thread, so if the live revision still equals
+  // the stamp at this completion, no newer history could have reached the DB
+  // during the render and the pixels are coherent. If it drifted (e.g. a
+  // second render_preview's prepare, or a set_module_params, flushed newer
+  // history in the queue->run window), the stamp may be stale: discard the
+  // rendered payload and fail retryably rather than answer revision R with
+  // revision-R+1 pixels (the branch's fail-toward-retryable rule).
+  if(preview && s_calls.current_revision
+     && s_calls.current_revision() != preview->revision)
+  {
+    dt_remote_preview_free(preview);
+    dt_remote_error_free(error);
+    dt_remote_error_t *stale =
+      _error_new(DT_REMOTE_ERR_PREVIEW_FAILED,
+                 _("darkroom state changed while rendering -- retry"));
+    JsonNode *drift = dt_remote_protocol_build_preview_response(pending->request_id, NULL, stale);
+    dt_remote_error_free(stale);
+    s_async.complete(pending, drift);
+    return;
+  }
+
   JsonNode *response;
   if(preview || error)
   {
@@ -1544,6 +1570,10 @@ void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
 typedef struct _preview_job_params_t
 {
   dt_remote_pending_t *pending;   // owned until handed to the completion
+  dt_remote_job_handshake_t *handshake;  // shared with pending->handshake
+                                         // (one ref held here); QUEUED ->
+                                         // RUNNING claimed by _preview_job_run,
+                                         // QUEUED -> RECLAIMED by stop()
   dt_remote_preview_request_t req;
   int max_px, quality;
 } _preview_job_params_t;
@@ -1563,12 +1593,20 @@ static gboolean _preview_completion_invoke(gpointer data)
   return G_SOURCE_REMOVE;
 }
 
-// Marshals one completion to the GLib main context (internals §8:
-// "completion marshals back via g_main_context_invoke to write the
-// response frame"). Ownership of all three arguments transfers to the
-// main-thread callback; the caller must not touch them afterwards --
-// in particular not `pending`, which the callback may free before the
-// calling thread is scheduled again.
+// Marshals one completion to the GLib main context (internals §8). Ownership
+// of all three arguments transfers to the main-thread callback; the caller
+// must not touch them afterwards -- in particular not `pending`, which the
+// callback may free before the calling thread is scheduled again.
+//
+// Uses g_idle_source_new() + g_source_attach(NULL), NOT g_main_context_invoke:
+// invoke runs the callback INLINE on the calling thread whenever that thread
+// happens to own the default context, which a worker transiently does during
+// dt_remote_server_stop()'s drain (g_main_context_iteration acquires and
+// releases ownership each pass). Running _preview_completion_invoke ->
+// dt_remote_async_complete on a worker thread would trip its main-thread
+// g_assert and abort at shutdown. An attached idle source is only ever
+// dispatched by the thread iterating the default context (gtk_main, or the
+// stop drain), so the completion is guaranteed to run on the main thread.
 static void _preview_queue_completion(dt_remote_pending_t *pending,
                                       dt_remote_preview_t *preview,
                                       dt_remote_error_t *error)
@@ -1577,12 +1615,24 @@ static void _preview_queue_completion(dt_remote_pending_t *pending,
   c->pending = pending;
   c->preview = preview;
   c->error = error;
-  g_main_context_invoke(NULL, _preview_completion_invoke, c);
+
+  GSource *source = g_idle_source_new();
+  g_source_set_callback(source, _preview_completion_invoke, c, NULL);
+  g_source_attach(source, NULL);  // default context; never runs inline here
+  g_source_unref(source);
 }
 
 static int32_t _preview_job_run(dt_job_t *job)
 {
   _preview_job_params_t *p = dt_control_job_get_params(job);
+
+  // Claim the job for running (QUEUED -> RUNNING). If dt_remote_server_stop()
+  // already reclaimed it at shutdown (QUEUED -> RECLAIMED), this CAS fails:
+  // stop has released the pending on the main thread and it must NOT be
+  // touched here -- return, leaving _preview_job_params_free to drop only our
+  // own handshake reference and free the params.
+  if(!dt_remote_job_handshake_claim_run(p->handshake))
+    return 0;
 
   dt_remote_pending_t *pending = p->pending;
   p->pending = NULL;  // ownership transfers to the completion queued below
@@ -1608,11 +1658,17 @@ static int32_t _preview_job_run(dt_job_t *job)
 static void _preview_job_params_free(void *data)
 {
   _preview_job_params_t *p = data;
-  // Job discarded without ever running (job-system teardown): the pending
-  // is still ours. Release it on the main context through the normal
-  // completion path (with neither result nor error) so the session's
-  // io_refs/pending_requests accounting stays balanced.
-  if(p->pending) _preview_queue_completion(p->pending, NULL, NULL);
+  // Job discarded without ever running (job-system teardown): the pending is
+  // still ours (a job that ran set p->pending = NULL). Claim it first
+  // (QUEUED -> RUNNING) so we do not race dt_remote_server_stop()'s reclaim:
+  // if stop already won (RECLAIMED), the claim fails and stop owns/released
+  // the pending -- we must not touch it. If we win, release it on the main
+  // context through the normal completion path (neither result nor error ->
+  // a retryable preview_failed) so the session's io_refs/pending_requests
+  // accounting stays balanced.
+  if(p->pending && dt_remote_job_handshake_claim_run(p->handshake))
+    _preview_queue_completion(p->pending, NULL, NULL);
+  dt_remote_job_handshake_unref(p->handshake);
   g_free(p);
 }
 
@@ -1625,6 +1681,13 @@ static gboolean _queue_preview_job(dt_remote_pending_t *pending,
 
   _preview_job_params_t *p = g_new0(_preview_job_params_t, 1);
   p->pending = pending;
+  // Shared reclaim handshake: one ref stays with the job params, one is
+  // published on the pending so dt_remote_server_stop() can reclaim this job
+  // if it is still QUEUED when shutdown drains. Set on the main thread (this
+  // runs inline in dispatch), before the job can be scheduled.
+  p->handshake = dt_remote_job_handshake_new();  // refcount 1 (job side)
+  pending->handshake = p->handshake;
+  dt_remote_job_handshake_ref(pending->handshake);  // refcount 2 (pending side)
   p->req = *req;
   p->max_px = max_px;
   p->quality = quality;

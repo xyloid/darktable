@@ -520,6 +520,12 @@ typedef struct dt_remote_preview_t   // <- render_preview (pre-base64)
 /** frees a preview result, including its JPEG buffer. NULL-safe. */
 void dt_remote_preview_free(dt_remote_preview_t *preview);
 
+/** Returns the live process-local revision counter (self-healing singleton;
+ * 0 when no server is connected). Read on the main thread at preview
+ * completion to detect state drift between the pre-queue stamp and the
+ * rendered result (internals §8's coherence check). */
+uint64_t dt_remote_current_revision(void);
+
 /** The main-thread half of render_preview (internals §8, binding): checks
  * the darkroom/image precondition (DT_REMOTE_ERR_NOT_IN_DARKROOM /
  * DT_REMOTE_ERR_NO_IMAGE_OPEN), flushes the live darkroom history to the

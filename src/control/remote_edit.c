@@ -1258,6 +1258,18 @@ void dt_remote_preview_free(dt_remote_preview_t *preview)
   g_free(preview);
 }
 
+uint64_t dt_remote_current_revision(void)
+{
+  // The live process-local revision counter, read on the main thread at
+  // preview-completion time to detect whether darkroom state drifted while a
+  // background render was in flight (internals §8's coherence check). Reads
+  // the same self-healing singleton every other main-thread revision path
+  // uses; 0 when no server is connected (dt_remote_revision_get is NULL-safe),
+  // which the completion treats as "changed" and fails toward a retryable
+  // error -- the branch's fail-toward-retryable rule.
+  return dt_remote_revision_get(dt_remote_revision_current());
+}
+
 gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
                                           dt_remote_error_t **error)
 {

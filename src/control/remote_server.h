@@ -127,11 +127,42 @@ struct dt_remote_session_t   // one per accepted connection
                                           // pending's cancellable.
 };
 
+// Shutdown reclaim handshake for a queued background job (render_preview).
+// Shared, atomically refcounted, and pointed at by BOTH the pending (main
+// thread) and the queued job's params (worker thread), so either side can
+// read/CAS the state without racing the other's free -- the state atom
+// outlives whichever container is freed first. See remote_server.c.
+//
+// State machine (g_atomic CAS; exactly one transition wins):
+//   QUEUED -> RUNNING     claimed by the job's worker (_preview_job_run)
+//   QUEUED -> RECLAIMED   claimed by dt_remote_server_stop() at shutdown,
+//                         for a job whose worker will never dequeue it
+// The loser of the race must not touch the pending: if stop reclaimed, the
+// worker frees only its own params; if the worker ran, stop leaves the
+// pending for the job's completion to release.
+typedef struct dt_remote_job_handshake_t dt_remote_job_handshake_t;
+
+/** Allocates a handshake in the QUEUED state with refcount 1. */
+dt_remote_job_handshake_t *dt_remote_job_handshake_new(void);
+/** Adds a reference. NULL-safe. */
+void dt_remote_job_handshake_ref(dt_remote_job_handshake_t *h);
+/** Drops a reference, freeing at zero. NULL-safe. */
+void dt_remote_job_handshake_unref(dt_remote_job_handshake_t *h);
+/** Atomically claims QUEUED -> RUNNING; TRUE iff this call won. NULL -> FALSE. */
+gboolean dt_remote_job_handshake_claim_run(dt_remote_job_handshake_t *h);
+/** Atomically claims QUEUED -> RECLAIMED; TRUE iff this call won. NULL -> FALSE. */
+gboolean dt_remote_job_handshake_reclaim(dt_remote_job_handshake_t *h);
+
 struct dt_remote_pending_t   // one per in-flight async request
 {
   dt_remote_session_t *session;   // connection ref held via session
   gint64 request_id;
   GCancellable *cancellable;      // fired on disconnect; job checks it
+  dt_remote_job_handshake_t *handshake;  // nullable; non-NULL once a
+                                         // reclaimable background job has been
+                                         // queued for this pending (owned:
+                                         // one ref, dropped when the pending
+                                         // is released)
 };
 
 /* ---------------------------------------------------------------------- */

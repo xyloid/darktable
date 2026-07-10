@@ -109,6 +109,10 @@ typedef struct dt_remote_protocol_calls_t
   gboolean (*get_history)(int limit, GPtrArray **out, uint64_t *revision, dt_remote_error_t **error);
   gboolean (*undo)(uint64_t expected_revision, uint64_t *revision, dt_remote_error_t **error);
   gboolean (*render_preview_prepare)(dt_remote_preview_request_t *out, dt_remote_error_t **error);
+  // Live revision read at preview-completion time (internals §8 coherence
+  // check): if it differs from the revision the preview was stamped with,
+  // darkroom state drifted during the render and the result is discarded.
+  uint64_t (*current_revision)(void);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to
@@ -175,8 +179,12 @@ JsonNode *dt_remote_protocol_build_preview_response(gint64 request_id,
  * closing session; otherwise builds the response (see
  * dt_remote_protocol_build_preview_response(); a never-ran job with both
  * NULL becomes a retryable preview_failed) and completes the pending
- * with it. Completion always goes through the async transport table, so
- * the pending is released exactly once either way. */
+ * with it. On the success path it first re-observes the live revision
+ * (calls-table current_revision) and, if it drifted from the revision the
+ * preview was stamped with, discards the payload and fails with a retryable
+ * preview_failed (internals §8 coherence check). Completion always goes
+ * through the async transport table, so the pending is released exactly
+ * once either way. */
 void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
                                        dt_remote_preview_t *preview,
                                        dt_remote_error_t *error);

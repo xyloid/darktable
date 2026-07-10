@@ -313,6 +313,53 @@ static void _session_send(dt_remote_session_t *s, JsonNode *response)
 }
 
 /* ---------------------------------------------------------------------- */
+/* shutdown reclaim handshake (see the header for the contract)            */
+/* ---------------------------------------------------------------------- */
+
+enum
+{
+  DT_REMOTE_JOB_QUEUED = 0,   // g_new0 default: not yet claimed by anyone
+  DT_REMOTE_JOB_RUNNING,      // a worker won it (_preview_job_run)
+  DT_REMOTE_JOB_RECLAIMED,    // stop() won it at shutdown
+};
+
+struct dt_remote_job_handshake_t
+{
+  gint state;      // one of the DT_REMOTE_JOB_* values; touched only via g_atomic
+  gint refcount;   // 1 at birth; +1 per extra holder; freed at 0 (g_atomic)
+};
+
+dt_remote_job_handshake_t *dt_remote_job_handshake_new(void)
+{
+  dt_remote_job_handshake_t *h = g_new0(dt_remote_job_handshake_t, 1);
+  h->state = DT_REMOTE_JOB_QUEUED;
+  h->refcount = 1;
+  return h;
+}
+
+void dt_remote_job_handshake_ref(dt_remote_job_handshake_t *h)
+{
+  if(h) g_atomic_int_inc(&h->refcount);
+}
+
+void dt_remote_job_handshake_unref(dt_remote_job_handshake_t *h)
+{
+  if(h && g_atomic_int_dec_and_test(&h->refcount)) g_free(h);
+}
+
+gboolean dt_remote_job_handshake_claim_run(dt_remote_job_handshake_t *h)
+{
+  return h
+    && g_atomic_int_compare_and_exchange(&h->state, DT_REMOTE_JOB_QUEUED, DT_REMOTE_JOB_RUNNING);
+}
+
+gboolean dt_remote_job_handshake_reclaim(dt_remote_job_handshake_t *h)
+{
+  return h
+    && g_atomic_int_compare_and_exchange(&h->state, DT_REMOTE_JOB_QUEUED, DT_REMOTE_JOB_RECLAIMED);
+}
+
+/* ---------------------------------------------------------------------- */
 /* async request lifecycle (see the header for the contract)               */
 /* ---------------------------------------------------------------------- */
 
@@ -344,6 +391,9 @@ static void _pending_release(dt_remote_pending_t *pending)
   dt_remote_session_t *s = pending->session;
   g_ptr_array_remove_fast(s->pendings, pending);
   g_object_unref(pending->cancellable);
+  // Drop this pending's share of the reclaim handshake (if a background job
+  // was ever queued for it); the job's params hold the other reference.
+  g_clear_pointer(&pending->handshake, dt_remote_job_handshake_unref);
   g_free(pending);
   s->io_refs--;
   _session_after_io_completed(s);
@@ -725,6 +775,10 @@ dt_remote_server_t *dt_remote_server_start(void)
   return server;
 }
 
+// How long the drain loop will pump the main context waiting for in-flight
+// I/O and background-job completions before giving up and leaking (below).
+#define DT_REMOTE_STOP_DRAIN_TIMEOUT_US ((gint64)5 * G_USEC_PER_SEC)
+
 void dt_remote_server_stop(dt_remote_server_t *server)
 {
   if(!server) return;
@@ -733,24 +787,74 @@ void dt_remote_server_stop(dt_remote_server_t *server)
 
   g_socket_service_stop(server->service);
 
-  // Request close on every live session, then synchronously pump this
-  // main context until each has actually torn itself down (each session
-  // removes itself from server->sessions as its last in-flight I/O
-  // callback completes -- see _session_free_now()). This keeps shutdown
-  // deterministic: by the time this function returns, the discovery
-  // record and every connection are gone, and nothing can reference
-  // `server` after it is freed below.
+  // Phase 1 -- request close on every live session: cancels in-flight reads
+  // and fires each pending's cancellable so a still-running background job
+  // bails early and its completion releases buffers without writing here.
   for(guint i = 0; i < server->sessions->len; i++)
     dt_remote_session_request_close(g_ptr_array_index(server->sessions, i));
-  while(server->sessions->len > 0) g_main_context_iteration(NULL, TRUE);
+
+  // Phase 2 -- reclaim orphaned queued jobs. By the time stop() runs at
+  // shutdown, dt_control_running() is already FALSE (dt_control_quit() flipped
+  // it before gtk_main returned), so a worker will never dequeue a job that is
+  // still merely QUEUED -- its completion would never fire and the drain below
+  // would hang forever. For each such pending we win the QUEUED->RECLAIMED CAS
+  // (a worker that already claimed QUEUED->RUNNING makes this fail, and we
+  // leave that pending for its real completion), then release the pending here
+  // on the main thread. The handshake is refcounted and shared with the job's
+  // params, so the job -- if it is ever run or discarded after this -- reads
+  // RECLAIMED and frees only its own params, never touching the pending we
+  // just released. We snapshot first because releasing a pending mutates both
+  // the pending list and (potentially) the session list.
+  GPtrArray *reclaim = g_ptr_array_new();
+  for(guint i = 0; i < server->sessions->len; i++)
+  {
+    dt_remote_session_t *s = g_ptr_array_index(server->sessions, i);
+    for(guint j = 0; j < s->pendings->len; j++)
+    {
+      dt_remote_pending_t *p = g_ptr_array_index(s->pendings, j);
+      if(dt_remote_job_handshake_reclaim(p->handshake)) g_ptr_array_add(reclaim, p);
+    }
+  }
+  for(guint i = 0; i < reclaim->len; i++)
+    dt_remote_async_complete(g_ptr_array_index(reclaim, i), NULL);
+  g_ptr_array_free(reclaim, TRUE);
+
+  // Phase 3 -- bounded drain. Pump this main context until every session has
+  // torn itself down (each removes itself from server->sessions as its last
+  // in-flight op completes -- see _session_free_now()), but never longer than
+  // the deadline: a still-running, non-interruptible pixelpipe could otherwise
+  // stall shutdown indefinitely. Iterate non-blocking so the deadline is
+  // always honored, sleeping briefly when nothing is ready to avoid a busy
+  // spin while a background render finishes.
+  const gint64 deadline = g_get_monotonic_time() + DT_REMOTE_STOP_DRAIN_TIMEOUT_US;
+  while(server->sessions->len > 0 && g_get_monotonic_time() < deadline)
+    if(!g_main_context_iteration(NULL, FALSE)) g_usleep(1000);
 
   g_object_unref(server->service);
-
   dt_remote_discovery_remove(server->discovery_path);
   g_free(server->discovery_path);
   g_free(server->token_b64);
-  g_ptr_array_unref(server->sessions);
-  g_free(server);
+
+  if(server->sessions->len == 0)
+  {
+    g_ptr_array_unref(server->sessions);
+    g_free(server);
+    return;
+  }
+
+  // Deadline exceeded with sessions still alive. Each still holds live io_refs
+  // (an unfinished read/write, or a pending whose completion has not run) and
+  // points back at `server` via s->server; a late I/O or job completion would
+  // walk server->sessions and free the session. If we freed `server` (or its
+  // sessions array) now, that would be a use-after-free -- far worse than a
+  // bounded leak in a process that is already exiting. Deliberately leak the
+  // remaining sessions AND the server object so every s->server back-pointer,
+  // and any idle-source completion still pointing at a leaked pending/session,
+  // stays valid. (F2's completion dispatch uses g_idle_source_new + attach,
+  // which only ever runs while the main thread iterates; undispatched sources
+  // therefore only reference this leaked -- never freed -- memory.)
+  dt_print(DT_DEBUG_CONTROL, "[remote] %u session(s) leaked at shutdown",
+          server->sessions->len);
 }
 
 guint16 dt_remote_server_get_port(const dt_remote_server_t *server)

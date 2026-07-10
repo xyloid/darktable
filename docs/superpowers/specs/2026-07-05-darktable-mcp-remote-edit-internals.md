@@ -482,10 +482,39 @@ Evidence and recipe:
   the database (`imageio.c:1069-1073`). The handler must call
   `dt_dev_write_history(darktable.develop)` on the main thread *before*
   queueing the job, and capture the revision at that moment — the rendered
-  preview is stamped with that revision.
+  preview is stamped with that revision (the *pre-queue stamp*).
+- **Completion-time coherence check (binding):** the pre-queue stamp alone is
+  not sufficient. Between the stamp and the job's DB read, another main-thread
+  op (a second `render_preview`'s prepare, a `set_module_params`, …) can flush
+  *newer* history to the database, so the job would render revision-R+1 pixels
+  yet the pending still carries revision R. Because every revision bump happens
+  on the main thread, the main-thread completion re-observes the live revision
+  before sending the response: if it still equals the pre-queue stamp, the DB
+  could not have held newer history during the render and the payload is
+  coherent; if it drifted, the completion **discards the rendered payload and
+  fails the request with `preview_failed`, retryable=`true`** (message: state
+  changed during rendering — retry). This applies the branch's standing
+  fail-toward-a-spurious-retryable-error rule (§5, `force_bump`) rather than
+  ever answering with a swathe of pixels whose revision label is stale.
 - Job queue: `DT_JOB_QUEUE_SYSTEM_BG` (does not contend with user exports
-  on `USER_EXPORT`, which serializes). Completion marshals back via
-  `g_main_context_invoke` to write the response frame.
+  on `USER_EXPORT`, which serializes). Completion marshals back to the main
+  thread via a `g_idle_source_new()` attached to the default context (**not**
+  `g_main_context_invoke`, which runs inline whenever the calling thread
+  transiently owns the context — a worker does during
+  `dt_remote_server_stop()`'s drain — and would run the main-thread-asserting
+  completion on the worker thread). An attached idle source is only dispatched
+  by the thread iterating the default context (gtk_main, or the stop drain),
+  guaranteeing the completion runs on the main thread.
+- **Shutdown reclaim (binding):** at quit `dt_control_running()` is already
+  false, so a still-`QUEUED` `SYSTEM_BG` job is never dequeued and its
+  completion never fires. `dt_remote_server_stop()` must therefore reclaim
+  such orphans: a refcounted handshake shared by the pending and the job
+  params carries an atomic `QUEUED→RUNNING` (worker) / `QUEUED→RECLAIMED`
+  (stop) CAS so exactly one side wins; stop releases the pendings it reclaims,
+  then drains the main context under a bounded deadline and, past it,
+  deliberately **leaks** (never frees) any session still holding live io_refs
+  — a late completion touching freed memory is worse than a leak in an exiting
+  process.
 
 ## 9. Scopes (plan open question resolved — fork is ~70% there)
 
