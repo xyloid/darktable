@@ -311,7 +311,7 @@ static void test_vectorscope_hue_ring_primaries_are_distinct(void **state)
   dt_scopes_vectorscope_t v;
   memset(&v, 0, sizeof(v));
   dt_scopes_vectorscope_hue_ring(&prof, DT_SCOPES_VEC_TYPE_CIELUV,
-                                 DT_SCOPES_VEC_SCALE_LINEAR, &v);
+                                 DT_SCOPES_VS_SCALE_LINEAR, &v);
 
   assert_true(v.radius > 0.f);
 
@@ -349,7 +349,7 @@ static void test_vectorscope_graph_has_mass_offcenter_for_saturated_input(void *
   _make_test_profile(&prof);
 
   dt_scopes_vectorscope_t *v = dt_scopes_vectorscope_alloc_compute(
-      img, &roi, &prof, DT_SCOPES_VEC_TYPE_CIELUV, DT_SCOPES_VEC_SCALE_LINEAR, diam, lut, 256);
+      img, &roi, &prof, DT_SCOPES_VEC_TYPE_CIELUV, DT_SCOPES_VS_SCALE_LINEAR, diam, lut, 256);
   assert_non_null(v);
   assert_int_equal(v->diameter, diam);
 

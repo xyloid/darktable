@@ -370,7 +370,7 @@ gboolean dt_remote_scopes_execute(const dt_remote_scopes_request_t *req,
     const int diam = CLAMP(image_size, 128, 1024);
     dt_scopes_vectorscope_t *v = dt_scopes_vectorscope_alloc_compute(
         cap->rgb, &roi, &cap->vs_prof, DT_SCOPES_VEC_TYPE_CIELUV,
-        DT_SCOPES_VEC_SCALE_LOGARITHMIC, diam, cap->gamma_lut, cap->gamma_lutsize);
+        DT_SCOPES_VS_SCALE_LOGARITHMIC, diam, cap->gamma_lut, cap->gamma_lutsize);
     if(v)
     {
       int dim; size_t stride;

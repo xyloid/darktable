@@ -188,17 +188,24 @@ uint8_t *dt_scopes_waveform_colorize(const dt_scopes_waveform_t *w, gboolean par
 /* vectorscope kernel                                                      */
 /* ---------------------------------------------------------------------- */
 
+// NOTE: type/constant names deliberately differ from the lib's private
+// dt_scopes_vec_vectorscope_type_t / dt_scopes_vec_scale_t enums so
+// src/libs/scopes/vectorscope.c can include this header and adapt onto the
+// shared kernel without redefinition collisions.
 typedef enum dt_scopes_vec_type_t
 {
   DT_SCOPES_VEC_TYPE_CIELUV = 0,   // CIE 1976 u*v*
   DT_SCOPES_VEC_TYPE_JZAZBZ,
+  DT_SCOPES_VEC_TYPE_RYB,          // GUI presentation colorspace (needs a
+                                   // rgb2ryb spline); protocol v1 never
+                                   // requests it remotely
 } dt_scopes_vec_type_t;
 
-typedef enum dt_scopes_vec_scale_t
+typedef enum dt_scopes_vs_scale_t
 {
-  DT_SCOPES_VEC_SCALE_LOGARITHMIC = 0,
-  DT_SCOPES_VEC_SCALE_LINEAR,
-} dt_scopes_vec_scale_t;
+  DT_SCOPES_VS_SCALE_LOGARITHMIC = 0,
+  DT_SCOPES_VS_SCALE_LINEAR,
+} dt_scopes_vs_scale_t;
 
 #define DT_SCOPES_VEC_HUES 48
 
@@ -216,7 +223,7 @@ typedef struct dt_scopes_vectorscope_t
   float hue_ring[6][DT_SCOPES_VEC_HUES][2];
   float hue_rgb[6][DT_SCOPES_VEC_HUES][3];   // display RGB along the ring
   dt_scopes_vec_type_t type;
-  dt_scopes_vec_scale_t scale;
+  dt_scopes_vs_scale_t scale;
   gboolean owns_buffers;
 } dt_scopes_vectorscope_t;
 
@@ -227,7 +234,7 @@ typedef struct dt_scopes_vectorscope_t
  * `type`, `scale`. */
 void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_prof,
                                     dt_scopes_vec_type_t type,
-                                    dt_scopes_vec_scale_t scale,
+                                    dt_scopes_vs_scale_t scale,
                                     dt_scopes_vectorscope_t *out);
 
 /** The vectorscope binning kernel (lifted from vectorscope.c:494-684,
@@ -235,21 +242,28 @@ void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_pro
  * histogram-profile `input` over the ROI, converts each sample to
  * chromaticity in `vs_prof`, log/linear-scales it, and accumulates into
  * the A8 `out->graph` with the display-gamma LUT. Requires
- * `out->radius`/`out->hue_ring` from dt_scopes_vectorscope_hue_ring().
- * Pure: no darktable.develop, no colorpicker globals. */
+ * `out->radius` (and, for the remote path, `out->hue_ring`) from
+ * dt_scopes_vectorscope_hue_ring() -- or, for the GUI adapter, from the
+ * lib's own hue-ring/background pass. `rgb2ryb_ypp` is the cubic-spline
+ * second-derivative table for the RYB hue transposition (interpolate_set
+ * over dt_color_ryb_{x,y}_vtx); required iff `out->type` is RYB, NULL
+ * otherwise. Pure: no darktable.develop, no colorpicker globals. */
 void dt_scopes_vectorscope_compute(const float *input,
                                    const dt_histogram_roi_t *roi,
                                    const dt_iop_order_iccprofile_info_t *vs_prof,
                                    const float *gamma_lut, int gamma_lutsize,
+                                   const float *rgb2ryb_ypp,
                                    dt_scopes_vectorscope_t *out);
 
 /** Allocates a vectorscope result of `diameter` px, computes hue ring +
  * graph over `input`, and returns it (caller frees with
- * dt_scopes_vectorscope_free). NULL on failure. */
+ * dt_scopes_vectorscope_free). NULL on failure. RYB is not supported
+ * through this remote-path convenience wrapper (no hue-ring math for it);
+ * type must be CIELUV or JZAZBZ. */
 dt_scopes_vectorscope_t *dt_scopes_vectorscope_alloc_compute(
     const float *input, const dt_histogram_roi_t *roi,
     const dt_iop_order_iccprofile_info_t *vs_prof,
-    dt_scopes_vec_type_t type, dt_scopes_vec_scale_t scale, int diameter,
+    dt_scopes_vec_type_t type, dt_scopes_vs_scale_t scale, int diameter,
     const float *gamma_lut, int gamma_lutsize);
 
 /** Frees a vectorscope result. NULL-safe. */

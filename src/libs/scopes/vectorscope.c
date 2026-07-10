@@ -21,6 +21,7 @@
 #include "common/color_ryb.h"
 #include "common/image_cache.h"
 #include "common/math.h"
+#include "common/scopes.h"
 #include "gui/accelerators.h"
 #include "libs/colorpicker.h"
 #include "scopes.h"
@@ -508,98 +509,43 @@ static void _vec_process(dt_scopes_mode_t *const self,
   const float max_radius = d->vectorscope_radius;
   const float max_diam = max_radius * 2.f;
 
-  int sample_width = MAX(1, roi->width - roi->crop_right - roi->crop_x);
-  int sample_height = MAX(1, roi->height - roi->crop_bottom - roi->crop_y);
-  if(sample_width == 1 && sample_height == 1)
+  if(MAX(1, roi->width - roi->crop_right - roi->crop_x) == 1
+     && MAX(1, roi->height - roi->crop_bottom - roi->crop_y) == 1)
   {
-    // point sample still calculates graph based on whole image
-    sample_width = roi->width;
-    sample_height = roi->height;
-    roi->crop_x = roi->crop_y = 0;
+    // point sample still calculates graph based on whole image (all four
+    // crops are reset so the shared kernel recomputes whole-image sample
+    // dimensions -- the pre-factoring code did the same via its locals)
+    roi->crop_x = roi->crop_y = roi->crop_right = roi->crop_bottom = 0;
   }
 
   const float *rgb2ryb_ypp = d->rgb2ryb_ypp;
-  // RGB -> chromaticity (processor-heavy), count into bins by chromaticity
-  //
-  // FIXME: if we do convert to histogram RGB, should it be an
-  // absolute colorimetric conversion (would mean knowing the
-  // histogram profile whitepoint and un-adapting its matrices) and
-  // then we have a meaningful whitepoint and could plot spectral
-  // locus -- or the reverse, adapt the spectral locus to the
-  // histogram profile PCS (always D50)?
-  //
-  // FIXME: pre-allocate? -- use the same buffer as for waveform?
-  dt_atomic_int *const restrict binned = (dt_atomic_int*)dt_calloc_align_int(diam_px * diam_px);
-  // FIXME: move verbosed interleaved comments into a method note at
-  // the start, as the code itself is succinct and clear
-  //
-  // FIXME: even with getting rid of the extra profile conversion hop
-  // there's no noticeable speedup -- maybe this loop is memory bound
-  // -- if can get rid of one of the output buffers and still no
-  // speedup, consider doing more work in this loop, such as atomic
-  // binning
-  //
-  // FIXME: make 2x2 averaging be conditional on preprocessor define
-  //
-  // FIXME: average neighboring pixels on x but not y -- may be enough of an optimization
-  const int sample_max_x = sample_width - (sample_width % 2);
-  const int sample_max_y = sample_height - (sample_height % 2);
-  // FIXME: if decimate/downsample, should blur before this
-  //
-  // FIXME: instead of scaling, if chromaticity really depends only on
-  // XY, then make a lookup on startup of for each grid cell on graph
-  // output the minimum XY to populate that cell, then either
-  // brute-force scan that LUT, or start from position of last pixel
-  // and scan, or do an optimized search (1/2, 1/2, 1/2, etc.) --
-  // would also find point sample pixel this way
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t y=0; y<sample_max_y; y+=2)
-    for(size_t x=0; x<sample_max_x; x+=2)
-    {
-      // FIXME: There are unnecessary color math hops. Right now the
-      // data comes into dt_lib_histogram_process() in a known profile
-      // (usually from pixelpipe). Then (usually) it gets converted to
-      // the histogram profile. Here it gets converted to XYZ D50
-      // before making its way to L*u*v* or JzAzBz:
-      //   RGB (pixelpipe) -> XYZ(PCS, D50) -> RGB (histogram) -> XYZ (PCS, D50) -> chromaticity
-      // Given that the histogram profile is "well behaved" and the
-      // conversion to histogram profile is relative colorimetric, could
-      // instead:
-      //   RGB (pixelpipe) -> XYZ(PCS, D50) -> chromaticity
-      // A catch is that pixelpipe RGB may be a CLUT profile, hence would
-      // need to have an LCMS path unless histogram moves to before colorout.
-      dt_aligned_pixel_t RGB = {0.f}, chromaticity;
-      // FIXME: for speed, downsample 2x2 -> 1x1 here, which still
-      // should produce enough chromaticity data -- Question:
-      // AVERAGE(RGBx4) -> chromaticity, or AVERAGE((RGB ->
-      // chromaticity)x4)?
-      //
-      // FIXME: could compromise and downsample to 2x1 -- may also be
-      // a bit faster than skipping rows
-      const float *const restrict px =
-        DT_IS_ALIGNED((const float *const restrict)input +
-                      4U * ((y + roi->crop_y) * roi->width + x + roi->crop_x));
-      for(size_t xx=0; xx<2; xx++)
-        for(size_t yy=0; yy<2; yy++)
-          for_each_channel(ch, aligned(px,RGB:16))
-            RGB[ch] += px[4U * (yy * roi->width + xx) + ch] * 0.25f;
-
-      _get_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
-      // FIXME: we ignore the L or Jz components -- do they optimize
-      // out of the above code, or would in particular a XYZ_2_AzBz
-      // but helpful?
-      if(vs_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-        log_scale(&chromaticity[1], &chromaticity[2], max_radius);
-
-      // FIXME: make cx,cy which are float, check 0 <= cx < 1, then multiply by diam_px
-      const int out_x = (diam_px-1) * (chromaticity[1] / max_diam + 0.5f);
-      const int out_y = (diam_px-1) * (chromaticity[2] / max_diam + 0.5f);
-
-      // clip any out-of-scale values, so there aren't light edges
-      if(out_x >= 0 && out_x <= diam_px-1 && out_y >= 0 && out_y <= diam_px-1)
-        dt_atomic_add_int(binned + out_y * diam_px + out_x, 1);
-    }
+  // Thin adapter over the shared kernel (src/common/scopes.c): the RGB ->
+  // chromaticity binning and display-gamma rasterization that used to live
+  // here is now the GUI-independent dt_scopes_vectorscope_compute, so the
+  // GUI panel and the remote compute_scopes service run one implementation
+  // (internals §9.2/§9.5) -- the lifted code verbatim, with type/scale/
+  // diameter as parameters. GUI-only work stays in this file: the cairo
+  // mesh hue-ring background above, and the colorpicker/live-sample
+  // overlay below.
+  const dt_iop_order_iccprofile_info_t *const profile =
+    dt_ioppr_add_profile_info_to_list(darktable.develop,
+                                      DT_COLORSPACE_HLG_REC2020, "", DT_INTENT_PERCEPTUAL);
+  dt_scopes_vectorscope_t kernel_out = {
+    .graph = d->vectorscope_graph,
+    .diameter = diam_px,
+    .radius = max_radius,
+    .type = vs_type == DT_SCOPES_VEC_VECTORSCOPE_CIELUV ? DT_SCOPES_VEC_TYPE_CIELUV
+          : vs_type == DT_SCOPES_VEC_VECTORSCOPE_JZAZBZ ? DT_SCOPES_VEC_TYPE_JZAZBZ
+                                                        : DT_SCOPES_VEC_TYPE_RYB,
+    .scale = vs_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC ? DT_SCOPES_VS_SCALE_LOGARITHMIC
+                                                         : DT_SCOPES_VS_SCALE_LINEAR,
+    .owns_buffers = FALSE,
+  };
+  dt_scopes_vectorscope_compute(input, roi, vs_prof,
+                                profile->lut_out[0], profile->lutsize,
+                                rgb2ryb_ypp, &kernel_out);
+  (void)max_diam;
 
   dt_aligned_pixel_t RGB = {0.f}, chromaticity;
   const dt_lib_colorpicker_statistic_t statistic =
@@ -655,31 +601,6 @@ static void _vec_process(dt_scopes_mode_t *const self,
     }
   }
 
-  // shortcut to change from linear to display gamma
-  const dt_iop_order_iccprofile_info_t *const profile =
-    dt_ioppr_add_profile_info_to_list(darktable.develop,
-                                      DT_COLORSPACE_HLG_REC2020, "", DT_INTENT_PERCEPTUAL);
-  const float *const restrict lut =
-    DT_IS_ALIGNED((const float *const restrict)profile->lut_out[0]);
-  const float lutmax = profile->lutsize - 1;
-  const int out_stride = cairo_format_stride_for_width(CAIRO_FORMAT_A8, diam_px);
-  uint8_t *const graph = d->vectorscope_graph;
-
-  // FIXME: should count the max bin size, and vary the scale such that it is always 1?
-  const float gain = 1.f / 30.f;
-  const float scale = gain * (diam_px * diam_px) / (sample_width * sample_height);
-
-  // loop appears to be too small to benefit w/OpenMP
-  // FIXME: is this still true?
-  for(size_t out_y = 0; out_y < diam_px; out_y++)
-    for(size_t out_x = 0; out_x < diam_px; out_x++)
-    {
-      const int count = binned[out_y * diam_px + out_x];
-      const float intensity = lut[(int)(MIN(1.f, scale * count) * lutmax)];
-      graph[out_y * out_stride + out_x] = intensity * 255.0f;
-    }
-
-  dt_free_align(binned);
   self->update_counter = self->scopes->update_counter;
 }
 

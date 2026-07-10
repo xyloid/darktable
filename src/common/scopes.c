@@ -19,7 +19,9 @@
 #include "common/scopes.h"
 
 #include "common/atomic.h"
+#include "common/color_ryb.h"
 #include "common/colorspaces_inline_conversions.h"
+#include "common/curve_tools.h"   // interpolate_val (RYB hue spline)
 #include "common/darktable.h"
 #include "common/math.h"
 
@@ -388,33 +390,71 @@ static inline void _vec_log_scale(float *x, float *y, const float r)
   }
 }
 
+// RGB -> RYB hue transposition via the Gossett cube-hue spline (lifted
+// verbatim from the lib's _rgb2ryb; dt_color_ryb_{x,y}_vtx come from
+// common/color_ryb.h, `rgb2ryb_ypp` is the caller's interpolate_set table).
+static void _vec_rgb2ryb(const dt_aligned_pixel_t rgb,
+                         dt_aligned_pixel_t ryb,
+                         const float *rgb2ryb_ypp)
+{
+  dt_aligned_pixel_t HSV;
+  dt_RGB_2_HSV(rgb, HSV);
+  HSV[0] = interpolate_val(sizeof(dt_color_ryb_x_vtx)/sizeof(float), (float *)dt_color_ryb_x_vtx, HSV[0],
+                           (float *)dt_color_ryb_y_vtx, (float *)rgb2ryb_ypp, CUBIC_SPLINE);
+  dt_HSV_2_RGB(HSV, ryb);
+}
+
 static void _vec_chromaticity(const dt_aligned_pixel_t RGB,
                               dt_aligned_pixel_t chromaticity,
                               const dt_scopes_vec_type_t vs_type,
-                              const dt_iop_order_iccprofile_info_t *vs_prof)
+                              const dt_iop_order_iccprofile_info_t *vs_prof,
+                              const float *rgb2ryb_ypp)
 {
-  // Lifted from _get_chromaticity (vectorscope.c:419-492), CIELUV +
-  // JzAzBz branches (RYB dropped: not exposed by the remote v1).
-  dt_aligned_pixel_t XYZ_D50;
-  dt_ioppr_rgb_matrix_to_xyz(RGB, XYZ_D50, vs_prof->matrix_in_transposed, vs_prof->lut_in,
-                             vs_prof->unbounded_coeffs_in, vs_prof->lutsize, vs_prof->nonlinearlut);
-  if(vs_type == DT_SCOPES_VEC_TYPE_CIELUV)
+  // Lifted from _get_chromaticity (vectorscope.c:419-492): CIELUV, JzAzBz
+  // and RYB branches (RYB is GUI-only but must stay in the shared kernel
+  // so the lib's process can be a thin adapter over it).
+  for(int ch = 0; ch < 4; ch++) chromaticity[ch] = 0.f;
+  switch(vs_type)
   {
-    dt_aligned_pixel_t xyY_D50;
-    dt_D50_XYZ_to_xyY(XYZ_D50, xyY_D50);
-    dt_xyY_to_Luv(xyY_D50, chromaticity);
-  }
-  else
-  {
-    dt_aligned_pixel_t XYZ_D65;
-    dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
-    dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
+    case DT_SCOPES_VEC_TYPE_CIELUV:
+    {
+      dt_aligned_pixel_t XYZ_D50;
+      dt_ioppr_rgb_matrix_to_xyz(RGB, XYZ_D50, vs_prof->matrix_in_transposed, vs_prof->lut_in,
+                                 vs_prof->unbounded_coeffs_in, vs_prof->lutsize,
+                                 vs_prof->nonlinearlut);
+      dt_aligned_pixel_t xyY_D50;
+      dt_D50_XYZ_to_xyY(XYZ_D50, xyY_D50);
+      dt_xyY_to_Luv(xyY_D50, chromaticity);
+      break;
+    }
+    case DT_SCOPES_VEC_TYPE_JZAZBZ:
+    {
+      dt_aligned_pixel_t XYZ_D50;
+      dt_ioppr_rgb_matrix_to_xyz(RGB, XYZ_D50, vs_prof->matrix_in_transposed, vs_prof->lut_in,
+                                 vs_prof->unbounded_coeffs_in, vs_prof->lutsize,
+                                 vs_prof->nonlinearlut);
+      dt_aligned_pixel_t XYZ_D65;
+      dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
+      dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
+      break;
+    }
+    case DT_SCOPES_VEC_TYPE_RYB:
+    {
+      dt_aligned_pixel_t RYB, rgb, HCV;
+      dt_sRGB_to_linear_sRGB(RGB, rgb);
+      _vec_rgb2ryb(rgb, RYB, rgb2ryb_ypp);
+      dt_RGB_2_HCV(RYB, HCV);
+      const float alpha = DT_2PI_F * HCV[0];
+      chromaticity[1] = cosf(alpha) * HCV[1] * 0.01;
+      chromaticity[2] = sinf(alpha) * HCV[1] * 0.01;
+      break;
+    }
   }
 }
 
 void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_prof,
                                     dt_scopes_vec_type_t type,
-                                    dt_scopes_vec_scale_t scale,
+                                    dt_scopes_vs_scale_t scale,
                                     dt_scopes_vectorscope_t *out)
 {
   out->type = type;
@@ -464,7 +504,7 @@ void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_pro
     }
   }
 
-  if(scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
+  if(scale == DT_SCOPES_VS_SCALE_LOGARITHMIC)
     for(int k = 0; k < 6; k++)
       for(int i = 0; i < DT_SCOPES_VEC_HUES; i++)
         _vec_log_scale(&out->hue_ring[k][i][0], &out->hue_ring[k][i][1], max_radius);
@@ -476,11 +516,12 @@ void dt_scopes_vectorscope_compute(const float *input,
                                    const dt_histogram_roi_t *roi,
                                    const dt_iop_order_iccprofile_info_t *vs_prof,
                                    const float *gamma_lut, int gamma_lutsize,
+                                   const float *rgb2ryb_ypp,
                                    dt_scopes_vectorscope_t *out)
 {
   const int diam_px = out->diameter;
   const dt_scopes_vec_type_t vs_type = out->type;
-  const dt_scopes_vec_scale_t vs_scale = out->scale;
+  const dt_scopes_vs_scale_t vs_scale = out->scale;
   const float max_radius = out->radius;
   const float max_diam = max_radius * 2.f;
 
@@ -505,8 +546,8 @@ void dt_scopes_vectorscope_compute(const float *input,
           for_each_channel(ch, aligned(px, RGB:16))
             RGB[ch] += px[4U * (yy * roi->width + xx) + ch] * 0.25f;
 
-      _vec_chromaticity(RGB, chromaticity, vs_type, vs_prof);
-      if(vs_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
+      _vec_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
+      if(vs_scale == DT_SCOPES_VS_SCALE_LOGARITHMIC)
         _vec_log_scale(&chromaticity[1], &chromaticity[2], max_radius);
 
       const int out_x = (diam_px - 1) * (chromaticity[1] / max_diam + 0.5f);
@@ -538,7 +579,7 @@ void dt_scopes_vectorscope_compute(const float *input,
 dt_scopes_vectorscope_t *dt_scopes_vectorscope_alloc_compute(
     const float *input, const dt_histogram_roi_t *roi,
     const dt_iop_order_iccprofile_info_t *vs_prof,
-    dt_scopes_vec_type_t type, dt_scopes_vec_scale_t scale, int diameter,
+    dt_scopes_vec_type_t type, dt_scopes_vs_scale_t scale, int diameter,
     const float *gamma_lut, int gamma_lutsize)
 {
   dt_scopes_vectorscope_t *v = g_malloc0(sizeof(dt_scopes_vectorscope_t));
@@ -549,7 +590,8 @@ dt_scopes_vectorscope_t *dt_scopes_vectorscope_alloc_compute(
   if(!v->graph) { dt_scopes_vectorscope_free(v); return NULL; }
 
   dt_scopes_vectorscope_hue_ring(vs_prof, type, scale, v);
-  dt_scopes_vectorscope_compute(input, roi, vs_prof, gamma_lut, gamma_lutsize, v);
+  dt_scopes_vectorscope_compute(input, roi, vs_prof, gamma_lut, gamma_lutsize,
+                                NULL /* RYB not supported on this path */, v);
   return v;
 }
 
