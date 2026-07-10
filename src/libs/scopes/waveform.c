@@ -20,6 +20,7 @@
 
 #include "common/darktable.h"
 #include "common/iop_profile.h"
+#include "common/scopes.h"
 #include "develop/develop.h"
 #include "dtgtk/paint.h"
 #include "gui/accelerators.h"
@@ -60,103 +61,29 @@ static void _wave_process(dt_scopes_mode_t *const self,
                           dt_histogram_roi_t *const roi,
                           const dt_iop_order_iccprofile_info_t *vs_prof)
 {
+  // Thin adapter over the shared kernel (src/common/scopes.c): the OMP
+  // binning + display-gamma mapping that used to live here is now the
+  // GUI-independent dt_scopes_waveform_compute, so the GUI panel and the
+  // remote compute_scopes service run one implementation over one captured
+  // buffer (internals §9.2/§9.5). Numbers are identical: the kernel is the
+  // lifted code verbatim with `orient` a parameter and the same HLG
+  // Rec2020 display-gamma LUT.
   dt_scopes_wave_t *const d = self->data;
-  // FIXME: for point sample, calculate whole graph and the point
-  // sample values, draw these on top of a dimmer graph
-  const int sample_width = MAX(1, roi->width - roi->crop_right - roi->crop_x);
-  const int sample_height = MAX(1, roi->height - roi->crop_bottom - roi->crop_y);
 
-  // Use integral sized bins for columns, as otherwise they will be
-  // unequal and have banding. Rely on draw to smoothly do horizontal
-  // scaling. For a horizontal waveform of a 3:2 image, "landscape"
-  // orientation, bin_width will generally be 4, for "portrait" it
-  // will generally be 3. Note that waveform_bins varies, depending on
-  // preview image width and # of bins.
-  const dt_wave_orient_t orient = d->orient;
-  const int to_bin = orient == DT_WAVE_ORIENT_HORI ? sample_width : sample_height;
-  const size_t samples_per_bin = ceilf(to_bin / (float)d->waveform_max_bins);
-  const size_t num_bins = ceilf(to_bin / (float)samples_per_bin);
-  d->waveform_bins = num_bins;
-  const size_t num_tones = d->waveform_tones;
-
-  // Note that, with current constants, the input buffer is from the
-  // preview pixelpipe and should be <= 1440x900x4. The output buffer
-  // will be <= 360x160x3. Hence process works with a relatively small
-  // quantity of data.
-  size_t bin_pad;
-  uint32_t *const restrict partial_binned =
-    dt_calloc_perthread(3U * num_bins * num_tones, sizeof(uint32_t), &bin_pad);
-
-  DT_OMP_FOR()
-  for(size_t y=0; y<sample_height; y++)
-  {
-    const float *const restrict px = DT_IS_ALIGNED((const float *const restrict)input +
-                                                   4U * ((y + roi->crop_y) * roi->width));
-    uint32_t *const restrict binned = dt_get_perthread(partial_binned, bin_pad);
-    for(size_t x=0; x<sample_width; x++)
-    {
-      const size_t bin = (orient == DT_WAVE_ORIENT_HORI ? x : y) / samples_per_bin;
-      size_t tone[4] DT_ALIGNED_PIXEL;
-      for_each_channel(ch, aligned(px,tone:16))
-      {
-        // 1.0 is at 8/9 of the height!
-        const float v = (8.0f / 9.0f) * px[4U * (x + roi->crop_x) + ch];
-        // Using ceilf brings everything <= 0 to bottom tone,
-        // everything > 1.0f/(num_tones-1) to top tone.
-        tone[ch] = ceilf(CLAMPS(v, 0.0f, 1.0f) * (num_tones-1));
-      }
-      for(size_t ch = 0; ch < 3; ch++)
-        binned[num_tones * (ch * num_bins + bin) + tone[ch]]++;
-    }
-  }
-
-  // shortcut to change from linear to display gamma -- borrow hybrid log-gamma LUT
+  // shortcut to change from linear to display gamma -- borrow hybrid
+  // log-gamma LUT (lut for all three channels is the same)
   const dt_iop_order_iccprofile_info_t *const profile =
     dt_ioppr_add_profile_info_to_list(darktable.develop, DT_COLORSPACE_HLG_REC2020,
                                       "", DT_INTENT_PERCEPTUAL);
-  // lut for all three channels should be the same
-  const float *const restrict lut =
-    DT_IS_ALIGNED((const float *const restrict)profile->lut_out[0]);
-  const float lutmax = profile->lutsize - 1;
-  const size_t wf_img_stride = cairo_format_stride_for_width
-    (CAIRO_FORMAT_A8,
-     orient == DT_WAVE_ORIENT_HORI ? num_bins : num_tones);
 
-  // Every bin_width x height portion of the image is being described
-  // in a 1 pixel x waveform_tones portion of the histogram.
-  // NOTE: if constant is decreased, will brighten output
-
-  // FIXME: instead of using an area-beased scale, figure out max bin
-  // count and scale to that?
-
-  const float brightness = num_tones / 40.0f;
-  const float scale = brightness / ((orient == DT_WAVE_ORIENT_HORI
-                                     ? sample_height
-                                     : sample_width) * samples_per_bin);
-  const size_t nthreads = dt_get_num_threads();
-
-  DT_OMP_FOR(collapse(3))
-  for(size_t ch = 0; ch < 3; ch++)
-    for(size_t bin = 0; bin < num_bins; bin++)
-      for(size_t tone = 0; tone < num_tones; tone++)
-      {
-        uint8_t *const restrict wf_img =
-          DT_IS_ALIGNED((uint8_t *const restrict)d->waveform_img[ch]);
-        uint32_t acc = 0;
-        for(size_t n = 0; n < nthreads; n++)
-        {
-          uint32_t *const restrict binned = dt_get_bythread(partial_binned, bin_pad, n);
-          acc += binned[num_tones * (ch * num_bins + bin) + tone];
-        }
-        const float linear = MIN(1.f, scale * acc);
-        const uint8_t display = lut[(int)(linear * lutmax)] * 255.f;
-        if(orient == DT_WAVE_ORIENT_HORI)
-          wf_img[tone * wf_img_stride + bin] = display;
-        else
-          wf_img[bin * wf_img_stride + tone] = display;
-      }
-
-  dt_free_align(partial_binned);
+  int out_bins = 0;
+  dt_scopes_waveform_compute(input, roi,
+                             d->orient == DT_WAVE_ORIENT_HORI ? DT_SCOPES_WAVE_ORIENT_HORI
+                                                              : DT_SCOPES_WAVE_ORIENT_VERT,
+                             d->waveform_max_bins, d->waveform_tones,
+                             profile->lut_out[0], profile->lutsize,
+                             d->waveform_img, &out_bins);
+  d->waveform_bins = out_bins;
 
   // waveform and rgb parade share underlying data, so updates to one update both
   self->scopes->modes[DT_SCOPES_MODE_WAVEFORM].update_counter =

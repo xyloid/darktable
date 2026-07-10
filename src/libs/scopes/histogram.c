@@ -16,6 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "common/scopes.h"
 #include "dtgtk/paint.h"
 #include "gui/accelerators.h"
 #include "gui/draw.h"
@@ -55,31 +56,14 @@ static void _hist_process(dt_scopes_mode_t *const self,
                           dt_histogram_roi_t *const roi,
                           const dt_iop_order_iccprofile_info_t *vs_prof)
 {
+  // Thin adapter over the shared kernel (src/common/scopes.c): the GUI
+  // panel and the remote compute_scopes service run one implementation
+  // and produce identical numbers (internals §9.5).
   dt_scopes_hist_t *const d = self->data;
-  dt_dev_histogram_collection_params_t histogram_params = { 0 };
-  const dt_iop_colorspace_type_t cst = IOP_CS_RGB;
-  dt_dev_histogram_stats_t histogram_stats =
-    { .bins_count = HISTOGRAM_BINS,
-      .ch = 4,
-      .pixels = 0,
-      .buf_size = sizeof(uint32_t) * 4 * HISTOGRAM_BINS };
-  uint32_t histogram_max[4] = { 0 };
-
-  d->histogram_max = 0;
-  memset(d->histogram, 0, sizeof(uint32_t) * 4 * HISTOGRAM_BINS);
-
-  histogram_params.roi = roi;
-  histogram_params.bins_count = HISTOGRAM_BINS;
-
-  // FIXME: for point sample, calculate whole graph and the point
-  // sample values, draw these on top of the graph
-
-  // FIXME: set up "custom" histogram worker which can do colorspace
-  // conversion on fly -- in cases that we need to do that -- may need
-  // to add from colorspace to dt_dev_histogram_collection_params_t
-  dt_histogram_helper(&histogram_params, &histogram_stats, cst, IOP_CS_NONE,
-                      input, &d->histogram, histogram_max, FALSE, NULL);
-  d->histogram_max = MAX(MAX(histogram_max[0], histogram_max[1]), histogram_max[2]);
+  dt_scopes_histogram_t hist;
+  dt_scopes_histogram_compute(input, roi, &hist);
+  memcpy(d->histogram, hist.bins, sizeof(uint32_t) * 4 * HISTOGRAM_BINS);
+  d->histogram_max = hist.max;
   self->update_counter = self->scopes->update_counter;
 }
 

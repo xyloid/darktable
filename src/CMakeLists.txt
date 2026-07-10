@@ -57,6 +57,7 @@ FILE(GLOB SOURCE_FILES
   "common/guided_filter.c"
   "common/heal.c"
   "common/histogram.c"
+  "common/scopes.c"
   "common/history.c"
   "common/history_snapshot.c"
   "common/image.c"
