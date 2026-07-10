@@ -52,3 +52,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# The live, Xvfb-backed end-to-end suite under tests/integration/ is marked
+# `integration` and DESELECTED by default so the fast unit suite stays fast
+# and needs no darktable build. Run it explicitly with `pytest -m integration`
+# (the trailing `-m` on the command line overrides this default).
+addopts = "-m 'not integration'"
+markers = [
+  "integration: live end-to-end test; launches a real darktable GUI under a display server (Xvfb or an inherited $DISPLAY) and drives it over the remote-edit protocol. Deselected by default; skips loudly when a GUI build or display is missing.",
+]
