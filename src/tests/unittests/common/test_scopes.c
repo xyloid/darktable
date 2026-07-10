@@ -373,6 +373,72 @@ static void test_vectorscope_graph_has_mass_offcenter_for_saturated_input(void *
   dt_free_align(img);
 }
 
+// The exported per-vertex helper is the single source the hue ring is built
+// from: for a linear-scale ring, hue_ring[k][0] must equal the helper's
+// chromaticity for that vertex's cube corner (no drift between the shared
+// surface and the ring it feeds, and by extension the GUI mesh that also
+// calls the helper).
+static void test_vectorscope_hue_ring_vertex_feeds_the_ring(void **state)
+{
+  (void)state;
+  dt_iop_order_iccprofile_info_t prof;
+  _make_test_profile(&prof);
+
+  dt_scopes_vectorscope_t v;
+  memset(&v, 0, sizeof(v));
+  dt_scopes_vectorscope_hue_ring(&prof, DT_SCOPES_VEC_TYPE_CIELUV,
+                                 DT_SCOPES_VS_SCALE_LINEAR, &v);
+
+  // vertex 0 is the red corner {1,0,0}
+  const dt_aligned_pixel_t red_rgb = { 1.f, 0.f, 0.f, 0.f };
+  dt_aligned_pixel_t chroma = { 0.f }, rgb_display = { 0.f };
+  dt_scopes_vectorscope_hue_ring_vertex(&prof, DT_SCOPES_VEC_TYPE_CIELUV,
+                                        red_rgb, chroma, rgb_display);
+
+  assert_float_equal(chroma[1], v.hue_ring[0][0][0], 1e-6f);
+  assert_float_equal(chroma[2], v.hue_ring[0][0][1], 1e-6f);
+}
+
+// F10: the remote convenience wrapper must reject RYB (no rgb2ryb table
+// here) rather than NULL-deref'ing in the spline, and reject a non-positive
+// diameter.
+static void test_vectorscope_alloc_compute_rejects_ryb(void **state)
+{
+  (void)state;
+  dt_iop_order_iccprofile_info_t prof;
+  _make_test_profile(&prof);
+  const dt_histogram_roi_t roi = { .width = 4, .height = 4,
+                                   .crop_x = 0, .crop_y = 0, .crop_right = 0, .crop_bottom = 0 };
+  float buf[4 * 4 * 4] = { 0.f };
+  float lut[2] = { 0.f, 1.f };
+
+  assert_null(dt_scopes_vectorscope_alloc_compute(buf, &roi, &prof,
+                                                  DT_SCOPES_VEC_TYPE_RYB,
+                                                  DT_SCOPES_VS_SCALE_LINEAR, 64, lut, 2));
+  assert_null(dt_scopes_vectorscope_alloc_compute(buf, &roi, &prof,
+                                                  DT_SCOPES_VEC_TYPE_CIELUV,
+                                                  DT_SCOPES_VS_SCALE_LINEAR, 0, lut, 2));
+}
+
+// The exported log scaling compresses radius toward the centre (logarithmic
+// display) yet preserves direction -- pin the shared helper both GUI and
+// remote now share.
+static void test_vec_log_scale_compresses_and_preserves_direction(void **state)
+{
+  (void)state;
+  const float bound = 10.f;
+  float x = 6.f, y = 8.f;   // radius 10 == bound
+  const float ang0 = atan2f(y, x);
+  dt_scopes_vec_log_scale(&x, &y, bound);
+  const float ang1 = atan2f(y, x);
+  assert_float_equal(ang0, ang1, 1e-5f);           // direction unchanged
+  assert_float_equal(hypotf(x, y), bound, 1e-3f);  // baselog(bound,bound)==bound
+
+  float x2 = 3.f, y2 = 4.f;                         // radius 5 < bound
+  dt_scopes_vec_log_scale(&x2, &y2, bound);
+  assert_true(hypotf(x2, y2) > 5.f);                // interior radii expand under log
+}
+
 /* ---- colorizers + PNG --------------------------------------------------- */
 
 static void test_histogram_colorize_and_png_header(void **state)
@@ -440,6 +506,9 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_waveform_vertical_orientation_swaps_axes),
     cmocka_unit_test(test_parade_is_three_panels_wide),
     cmocka_unit_test(test_vectorscope_hue_ring_primaries_are_distinct),
+    cmocka_unit_test(test_vectorscope_hue_ring_vertex_feeds_the_ring),
+    cmocka_unit_test(test_vectorscope_alloc_compute_rejects_ryb),
+    cmocka_unit_test(test_vec_log_scale_compresses_and_preserves_direction),
     cmocka_unit_test(test_vectorscope_graph_has_mass_offcenter_for_saturated_input),
     cmocka_unit_test(test_histogram_colorize_and_png_header),
     cmocka_unit_test(test_png_encoder_rejects_bad_input),

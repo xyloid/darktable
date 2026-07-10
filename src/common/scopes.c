@@ -374,21 +374,25 @@ uint8_t *dt_scopes_waveform_colorize(const dt_scopes_waveform_t *w, gboolean par
 
 #define VECTORSCOPE_BASE_LOG 30
 
-static inline float _vec_baselog(float x, const float bound)
+float dt_scopes_vec_baselog(float x, const float bound)
 {
   return log1pf((VECTORSCOPE_BASE_LOG - 1.f) * x / bound) / logf(VECTORSCOPE_BASE_LOG) * bound;
 }
 
-static inline void _vec_log_scale(float *x, float *y, const float r)
+void dt_scopes_vec_log_scale(float *x, float *y, const float r)
 {
   const float h = dt_fast_hypotf(*x, *y);
   if(h >= FLT_MIN)
   {
-    const float s = _vec_baselog(h, r) / h;
+    const float s = dt_scopes_vec_baselog(h, r) / h;
     *x *= s;
     *y *= s;
   }
 }
+
+// internal short aliases so the lifted kernel code below reads unchanged
+#define _vec_baselog dt_scopes_vec_baselog
+#define _vec_log_scale dt_scopes_vec_log_scale
 
 // RGB -> RYB hue transposition via the Gossett cube-hue spline (lifted
 // verbatim from the lib's _rgb2ryb; dt_color_ryb_{x,y}_vtx come from
@@ -404,11 +408,11 @@ static void _vec_rgb2ryb(const dt_aligned_pixel_t rgb,
   dt_HSV_2_RGB(HSV, ryb);
 }
 
-static void _vec_chromaticity(const dt_aligned_pixel_t RGB,
-                              dt_aligned_pixel_t chromaticity,
-                              const dt_scopes_vec_type_t vs_type,
-                              const dt_iop_order_iccprofile_info_t *vs_prof,
-                              const float *rgb2ryb_ypp)
+void dt_scopes_vectorscope_chromaticity(const float *RGB,
+                                        float *chromaticity,
+                                        const dt_scopes_vec_type_t vs_type,
+                                        const dt_iop_order_iccprofile_info_t *vs_prof,
+                                        const float *rgb2ryb_ypp)
 {
   // Lifted from _get_chromaticity (vectorscope.c:419-492): CIELUV, JzAzBz
   // and RYB branches (RYB is GUI-only but must stay in the shared kernel
@@ -452,6 +456,37 @@ static void _vec_chromaticity(const dt_aligned_pixel_t RGB,
   }
 }
 
+void dt_scopes_vectorscope_hue_ring_vertex(const dt_iop_order_iccprofile_info_t *vs_prof,
+                                           dt_scopes_vec_type_t type,
+                                           const float *rgb_scope,
+                                           float *chromaticity,
+                                           float *rgb_display)
+{
+  // The per-vertex max-chroma-boundary math, lifted from
+  // _lib_histogram_vectorscope_bkgd (vectorscope.c) for CIELUV/JzAzBz, so
+  // both this kernel's hue-ring pass and the GUI lib's cairo-mesh background
+  // run one implementation. RYB's hue ring is a synthetic angular layout and
+  // is handled by its (GUI-only) caller.
+  for(int ch = 0; ch < 4; ch++) chromaticity[ch] = 0.f;
+  dt_aligned_pixel_t XYZ_D50 = { 0 };
+  dt_ioppr_rgb_matrix_to_xyz(rgb_scope, XYZ_D50, vs_prof->matrix_in_transposed,
+                             vs_prof->lut_in, vs_prof->unbounded_coeffs_in,
+                             vs_prof->lutsize, vs_prof->nonlinearlut);
+  if(type == DT_SCOPES_VEC_TYPE_CIELUV)
+  {
+    dt_aligned_pixel_t xyY;
+    dt_D50_XYZ_to_xyY(XYZ_D50, xyY);
+    dt_xyY_to_Luv(xyY, chromaticity);
+  }
+  else
+  {
+    dt_aligned_pixel_t XYZ_D65;
+    dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
+    dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
+  }
+  dt_XYZ_to_Rec709_D50(XYZ_D50, rgb_display);
+}
+
 void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_prof,
                                     dt_scopes_vec_type_t type,
                                     dt_scopes_vs_scale_t scale,
@@ -472,26 +507,11 @@ void dt_scopes_vectorscope_hue_ring(const dt_iop_order_iccprofile_info_t *vs_pro
       delta[ch] = (vertex_rgb[(k + 1) % 6][ch] - vertex_rgb[k][ch]) / DT_SCOPES_VEC_HUES;
     for(int i = 0; i < DT_SCOPES_VEC_HUES; i++)
     {
-      dt_aligned_pixel_t rgb_scope, XYZ_D50 = { 0 }, chromaticity = { 0 }, rgb_display = { 0 };
+      dt_aligned_pixel_t rgb_scope, chromaticity = { 0 }, rgb_display = { 0 };
       for_each_channel(ch, aligned(vertex_rgb, delta, rgb_scope:16))
         rgb_scope[ch] = vertex_rgb[k][ch] + delta[ch] * i;
 
-      dt_ioppr_rgb_matrix_to_xyz(rgb_scope, XYZ_D50, vs_prof->matrix_in_transposed,
-                                 vs_prof->lut_in, vs_prof->unbounded_coeffs_in,
-                                 vs_prof->lutsize, vs_prof->nonlinearlut);
-      if(type == DT_SCOPES_VEC_TYPE_CIELUV)
-      {
-        dt_aligned_pixel_t xyY;
-        dt_D50_XYZ_to_xyY(XYZ_D50, xyY);
-        dt_xyY_to_Luv(xyY, chromaticity);
-      }
-      else
-      {
-        dt_aligned_pixel_t XYZ_D65;
-        dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
-        dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
-      }
-      dt_XYZ_to_Rec709_D50(XYZ_D50, rgb_display);
+      dt_scopes_vectorscope_hue_ring_vertex(vs_prof, type, rgb_scope, chromaticity, rgb_display);
 
       out->hue_ring[k][i][0] = chromaticity[1];
       out->hue_ring[k][i][1] = chromaticity[2];
@@ -546,7 +566,7 @@ void dt_scopes_vectorscope_compute(const float *input,
           for_each_channel(ch, aligned(px, RGB:16))
             RGB[ch] += px[4U * (yy * roi->width + xx) + ch] * 0.25f;
 
-      _vec_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
+      dt_scopes_vectorscope_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
       if(vs_scale == DT_SCOPES_VS_SCALE_LOGARITHMIC)
         _vec_log_scale(&chromaticity[1], &chromaticity[2], max_radius);
 
@@ -582,6 +602,12 @@ dt_scopes_vectorscope_t *dt_scopes_vectorscope_alloc_compute(
     dt_scopes_vec_type_t type, dt_scopes_vs_scale_t scale, int diameter,
     const float *gamma_lut, int gamma_lutsize)
 {
+  // RYB is a GUI-only presentation mode: it needs the rgb2ryb spline table
+  // (never available here) and a synthetic hue ring this path does not build.
+  // Reject it rather than passing NULL through to interpolate_val (F10).
+  if(type == DT_SCOPES_VEC_TYPE_RYB) return NULL;
+  if(diameter <= 0) return NULL;
+
   dt_scopes_vectorscope_t *v = g_malloc0(sizeof(dt_scopes_vectorscope_t));
   v->diameter = diameter;
   v->owns_buffers = TRUE;

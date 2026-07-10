@@ -227,6 +227,36 @@ typedef struct dt_scopes_vectorscope_t
   gboolean owns_buffers;
 } dt_scopes_vectorscope_t;
 
+/** Base-`VECTORSCOPE_BASE_LOG` log compression used by the logarithmic
+ * vectorscope scale, and the 2D form that scales a chromaticity vector by
+ * it. Exported so the GUI lib (grid rings, colorpicker overlay, harmony
+ * sectors) runs the exact kernel math rather than a parallel copy. */
+float dt_scopes_vec_baselog(float x, float bound);
+void dt_scopes_vec_log_scale(float *x, float *y, float r);
+
+/** Converts a single display RGB sample to vectorscope chromaticity
+ * (`chromaticity[1]`,`chromaticity[2]`) in `vs_prof` for `type` -- the
+ * per-sample math the GUI colorpicker/live-sample overlay needs. RYB
+ * requires `rgb2ryb_ypp` (the cubic-spline second-derivative table);
+ * CIELUV/JzAzBz ignore it. `RGB` and `chromaticity` are 4-float pixels. */
+void dt_scopes_vectorscope_chromaticity(const float *RGB, float *chromaticity,
+                                        dt_scopes_vec_type_t type,
+                                        const dt_iop_order_iccprofile_info_t *vs_prof,
+                                        const float *rgb2ryb_ypp);
+
+/** One hue-ring vertex: maps a point `rgb_scope` on the RGB-cube edge walk
+ * to its linear (pre-scale) `chromaticity` and its display `rgb_display`
+ * (Rec709 D50, pre-normalization) for CIELUV/JzAzBz. This is the single
+ * implementation both dt_scopes_vectorscope_hue_ring() and the GUI lib's
+ * cairo-mesh hue-ring background call, so the max-chroma boundary math has
+ * no parallel copy. `type` must be CIELUV or JZAZBZ (RYB's ring is a
+ * synthetic angular layout, handled by its caller). 4-float pixels. */
+void dt_scopes_vectorscope_hue_ring_vertex(const dt_iop_order_iccprofile_info_t *vs_prof,
+                                           dt_scopes_vec_type_t type,
+                                           const float *rgb_scope,
+                                           float *chromaticity,
+                                           float *rgb_display);
+
 /** Computes the vectorscope hue ring (the max-chroma boundary traced along
  * the RGB-cube edges) into `out->hue_ring`/`out->hue_rgb` and sets
  * `out->radius` -- lifted from _lib_histogram_vectorscope_bkgd's math

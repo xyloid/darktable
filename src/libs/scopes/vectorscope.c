@@ -33,7 +33,9 @@
 // PQ P3 RGB colorspace. This could be lowered to 32 with little
 // visible consequence.
 #define VECTORSCOPE_HUES 48
-#define VECTORSCOPE_BASE_LOG 30
+// VECTORSCOPE_BASE_LOG lived here as a duplicate of the shared kernel's
+// constant; the log math now runs through dt_scopes_vec_baselog /
+// dt_scopes_vec_log_scale (src/common/scopes.c).
 
 typedef enum dt_scopes_vec_scale_t
 {
@@ -161,38 +163,13 @@ static void _ryb2rgb(const dt_aligned_pixel_t ryb,
   dt_HSV_2_RGB(HSV, rgb);
 }
 
-static void _rgb2ryb(const dt_aligned_pixel_t rgb,
-                     dt_aligned_pixel_t ryb,
-                     const float *rgb2ryb_ypp)
-{
-  dt_aligned_pixel_t HSV;
-  dt_RGB_2_HSV(rgb, HSV);
-  HSV[0] = interpolate_val(sizeof(dt_color_ryb_x_vtx)/sizeof(float), (float *)dt_color_ryb_x_vtx, HSV[0],
-                           (float *)dt_color_ryb_y_vtx, (float *)rgb2ryb_ypp, CUBIC_SPLINE);
-  dt_HSV_2_RGB(HSV, ryb);
-}
-
-static inline float baselog(const float x,
-                            const float bound)
-{
-  // FIXME: use dt's fastlog()?
-  return log1pf((VECTORSCOPE_BASE_LOG - 1.f) * x / bound)
-    / logf(VECTORSCOPE_BASE_LOG) * bound;
-}
-
-static inline void log_scale(float *x, float *y, const float r)
-{
-  const float h = dt_fast_hypotf(*x,*y);
-  // Haven't seen a zero point in practice, but it is certainly
-  // possible. Map these to zero, and CPU should predict that
-  // this is unlikely.
-  if(h >= FLT_MIN)
-  {
-    const float s = baselog(h, r) / h;
-    *x *= s;
-    *y *= s;
-  }
-}
+// _rgb2ryb / baselog / log_scale used to live here as duplicates of the
+// shared kernel (src/common/scopes.c). They are gone: the log compression
+// and 2D scaling are dt_scopes_vec_baselog / dt_scopes_vec_log_scale, and
+// the RGB->RYB chromaticity is folded into
+// dt_scopes_vectorscope_chromaticity. _ryb2rgb (above) has no kernel
+// counterpart -- it feeds the GUI-only RYB hue-ring display colour and the
+// harmony rotation helper -- so it stays local.
 
 static void _lib_histogram_vectorscope_bkgd(dt_scopes_vec_t *d,
                                             const dt_iop_order_iccprofile_info_t *const vs_prof)
@@ -245,52 +222,30 @@ static void _lib_histogram_vectorscope_bkgd(dt_scopes_vec_t *d,
       delta[ch] = (vertex_rgb[(k+1)%6][ch] - vertex_rgb[k][ch]) / VECTORSCOPE_HUES;
     for(int i=0; i < VECTORSCOPE_HUES; i++)
     {
-      dt_aligned_pixel_t rgb_scope, XYZ_D50 = { 0 }, chromaticity = { 0 };
+      dt_aligned_pixel_t rgb_scope, chromaticity = { 0 };
       for_each_channel(ch, aligned(vertex_rgb, delta, rgb_scope:16))
         rgb_scope[ch] = vertex_rgb[k][ch] + delta[ch] * i;
-      switch(vs_type)
+      if(vs_type == DT_SCOPES_VEC_VECTORSCOPE_RYB)
       {
-        case DT_SCOPES_VEC_VECTORSCOPE_CIELUV:
-        {
-          dt_ioppr_rgb_matrix_to_xyz(rgb_scope,
-                                     XYZ_D50,
-                                     vs_prof->matrix_in_transposed,
-                                     vs_prof->lut_in,
-                                     vs_prof->unbounded_coeffs_in,
-                                     vs_prof->lutsize,
-                                     vs_prof->nonlinearlut);
-          dt_aligned_pixel_t xyY;
-          dt_D50_XYZ_to_xyY(XYZ_D50, xyY);
-          dt_xyY_to_Luv(xyY, chromaticity);
-          dt_XYZ_to_Rec709_D50(XYZ_D50, rgb_display);
-          break;
-        }
-        case DT_SCOPES_VEC_VECTORSCOPE_JZAZBZ:
-        {
-          dt_ioppr_rgb_matrix_to_xyz(rgb_scope,
-                                     XYZ_D50,
-                                     vs_prof->matrix_in_transposed,
-                                     vs_prof->lut_in,
-                                     vs_prof->unbounded_coeffs_in,
-                                     vs_prof->lutsize,
-                                     vs_prof->nonlinearlut);
-          dt_aligned_pixel_t XYZ_D65;
-          dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
-          dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
-          dt_XYZ_to_Rec709_D50(XYZ_D50, rgb_display);
-          break;
-        }
-        case DT_SCOPES_VEC_VECTORSCOPE_RYB:
-        {
-          // get the color to be displayed
-          _ryb2rgb(rgb_scope, rgb_display, d->ryb2rgb_ypp);
-          const float alpha = M_PI_F * (0.33333f * ((float)k + (float)i / VECTORSCOPE_HUES));
-          chromaticity[1] = cosf(alpha) * 0.01;
-          chromaticity[2] = sinf(alpha) * 0.01;
-          break;
-        }
-        case DT_SCOPES_VEC_VECTORSCOPE_N:
-          dt_unreachable_codepath();
+        // RYB's hue ring is a synthetic angular layout with a Gossett
+        // ryb->rgb display colour -- GUI-only, no shared kernel counterpart
+        // (the CIELUV/JzAzBz max-chroma boundary math is shared below).
+        _ryb2rgb(rgb_scope, rgb_display, d->ryb2rgb_ypp);
+        const float alpha = M_PI_F * (0.33333f * ((float)k + (float)i / VECTORSCOPE_HUES));
+        chromaticity[1] = cosf(alpha) * 0.01;
+        chromaticity[2] = sinf(alpha) * 0.01;
+      }
+      else
+      {
+        // Delegate the max-chroma boundary math (chromaticity + display RGB)
+        // to the shared kernel so the GUI mesh and the remote raster derive
+        // the hue ring / radius from one implementation. The cairo mesh
+        // construction (progressive max_radius, patches) stays below.
+        dt_scopes_vectorscope_hue_ring_vertex(
+            vs_prof,
+            vs_type == DT_SCOPES_VEC_VECTORSCOPE_CIELUV ? DT_SCOPES_VEC_TYPE_CIELUV
+                                                        : DT_SCOPES_VEC_TYPE_JZAZBZ,
+            rgb_scope, chromaticity, rgb_display);
       }
 
       d->hue_ring[k][i][0] = chromaticity[1];
@@ -409,87 +364,12 @@ static void _lib_histogram_vectorscope_bkgd(dt_scopes_vec_t *d,
     for(int k = 0; k < 6; k++)
       for(int i = 0; i < VECTORSCOPE_HUES; i++)
         // NOTE: hypotenuse is already calculated above, but not worth caching it
-        log_scale(&d->hue_ring[k][i][0], &d->hue_ring[k][i][1], max_radius);
+        dt_scopes_vec_log_scale(&d->hue_ring[k][i][0], &d->hue_ring[k][i][1], max_radius);
 
   d->vectorscope_radius = max_radius;
   d->hue_ring_prof = vs_prof;
   d->hue_ring_scale = d->vectorscope_scale;
   d->hue_ring_colorspace = d->vectorscope_type;
-}
-
-static void _get_chromaticity(const dt_aligned_pixel_t RGB,
-                              dt_aligned_pixel_t chromaticity,
-                              const dt_scopes_vec_vectorscope_type_t vs_type,
-                              const dt_iop_order_iccprofile_info_t *vs_prof,
-                              const float *rgb2ryb_ypp)
-{
-  switch(vs_type)
-  {
-    case DT_SCOPES_VEC_VECTORSCOPE_CIELUV:
-    {
-      // NOTE: see for comparison/reference rgb_to_JzCzhz() in color_picker.c
-      dt_aligned_pixel_t XYZ_D50;
-      // this goes to the PCS which has standard illuminant D50
-      dt_ioppr_rgb_matrix_to_xyz(RGB, XYZ_D50,
-                                 vs_prof->matrix_in_transposed,
-                                 vs_prof->lut_in,
-                                 vs_prof->unbounded_coeffs_in,
-                                 vs_prof->lutsize,
-                                 vs_prof->nonlinearlut);
-      // FIXME: do have to worry about chromatic adaptation? this
-      // assumes that the histogram profile white point is the same as
-      // PCS whitepoint (D50) -- if we have a D65 whitepoint profile,
-      // how does the result change if we adapt to D65 then convert to
-      // L*u*v* with a D65 whitepoint?
-      dt_aligned_pixel_t xyY_D50;
-      dt_D50_XYZ_to_xyY(XYZ_D50, xyY_D50);
-      // using D50 correct u*v* (not u'v') to be relative to the
-      // whitepoint (important for vectorscope) and as u*v* is more
-      // evenly spaced
-      dt_xyY_to_Luv(xyY_D50, chromaticity);
-      break;
-    }
-    case DT_SCOPES_VEC_VECTORSCOPE_JZAZBZ:
-    {
-      dt_aligned_pixel_t XYZ_D50;
-      // this goes to the PCS which has standard illuminant D50
-      dt_ioppr_rgb_matrix_to_xyz(RGB, XYZ_D50,
-                                 vs_prof->matrix_in_transposed,
-                                 vs_prof->lut_in,
-      vs_prof->unbounded_coeffs_in, vs_prof->lutsize, vs_prof->nonlinearlut);
-      // FIXME: can skip a hop by pre-multipying matrices: see
-      // colorbalancergb and dt_develop_blendif_init_masking_profile()
-      // for how to make hacked profile
-      dt_aligned_pixel_t XYZ_D65;
-      // If the profile whitepoint is D65, its RGB -> XYZ conversion
-      // matrix has been adapted to D50 (PCS standard) via
-      // Bradford. Using Bradford again to adapt back to D65 gives a
-      // pretty clean reversal of the transform.
-      // FIXME: if the profile whitepoint is D50 (ProPhoto...), then
-      // should we use a nicer adaptation (CAT16?) to D65?
-      dt_XYZ_D50_2_XYZ_D65(XYZ_D50, XYZ_D65);
-      // FIXME: The bulk of processing time is spent in the XYZ ->
-      // JzAzBz conversion in the 2*3 powf() in X'Y'Z' ->
-      // L'M'S'. Making a LUT for these, using _apply_trc() to do
-      // powf() work. It only needs to be accurate enough to be about
-      // on the right pixel for a diam_px x diam_px plot
-      dt_XYZ_2_JzAzBz(XYZ_D65, chromaticity);
-      break;
-    }
-    case DT_SCOPES_VEC_VECTORSCOPE_RYB:
-    {
-      dt_aligned_pixel_t RYB, rgb, HCV;
-      dt_sRGB_to_linear_sRGB(RGB, rgb);
-      _rgb2ryb(rgb, RYB, rgb2ryb_ypp);
-      dt_RGB_2_HCV(RYB, HCV);
-      const float alpha = DT_2PI_F * HCV[0];
-      chromaticity[1] = cosf(alpha) * HCV[1] * 0.01;
-      chromaticity[2] = sinf(alpha) * HCV[1] * 0.01;
-      break;
-    }
-    case DT_SCOPES_VEC_VECTORSCOPE_N:
-      dt_unreachable_codepath();
-  }
 }
 
 static void _vec_process(dt_scopes_mode_t *const self,
@@ -545,6 +425,9 @@ static void _vec_process(dt_scopes_mode_t *const self,
                                 profile->lut_out[0], profile->lutsize,
                                 rgb2ryb_ypp, &kernel_out);
 
+  // shared kernel enum for the colorpicker/live-sample overlay below
+  const dt_scopes_vec_type_t k_type = kernel_out.type;
+
   dt_aligned_pixel_t RGB = {0.f}, chromaticity;
   const dt_lib_colorpicker_statistic_t statistic =
     darktable.lib->proxy.colorpicker.statistic;
@@ -554,10 +437,10 @@ static void _vec_process(dt_scopes_mode_t *const self,
   sample = darktable.lib->proxy.colorpicker.primary_sample;
   memcpy(RGB, sample->scope[statistic], sizeof(dt_aligned_pixel_t));
 
-  _get_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
+  dt_scopes_vectorscope_chromaticity(RGB, chromaticity, k_type, vs_prof, rgb2ryb_ypp);
 
   if(vs_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-    log_scale(&chromaticity[1], &chromaticity[2], max_radius);
+    dt_scopes_vec_log_scale(&chromaticity[1], &chromaticity[2], max_radius);
 
   d->vectorscope_pt[0] = chromaticity[1];
   d->vectorscope_pt[1] = chromaticity[2];
@@ -585,10 +468,10 @@ static void _vec_process(dt_scopes_mode_t *const self,
       //find coordinates
       memcpy(RGB, sample->scope[statistic], sizeof(dt_aligned_pixel_t));
 
-      _get_chromaticity(RGB, chromaticity, vs_type, vs_prof, rgb2ryb_ypp);
+      dt_scopes_vectorscope_chromaticity(RGB, chromaticity, k_type, vs_prof, rgb2ryb_ypp);
 
       if(vs_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-        log_scale(&chromaticity[1], &chromaticity[2], max_radius);
+        dt_scopes_vec_log_scale(&chromaticity[1], &chromaticity[2], max_radius);
 
       float *sample_xy = (float *)calloc(2, sizeof(float));
 
@@ -664,7 +547,7 @@ static void _vec_draw(const dt_scopes_mode_t *const self,
   {
     float r = grid_radius * i;
     if(d->vectorscope_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-      r = baselog(r, vs_radius);
+      r = dt_scopes_vec_baselog(r, vs_radius);
     cairo_arc(cr, 0., 0., r * scale, 0., M_PI * 2.);
     cairo_stroke(cr);
   }
@@ -777,7 +660,7 @@ static void _vec_draw(const dt_scopes_mode_t *const self,
         const float span   = hw * DT_2PI_F;
         float hr = vs_radius * 0.80f;
         if(d->vectorscope_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-          hr = baselog(hr, vs_radius);
+          hr = dt_scopes_vec_baselog(hr, vs_radius);
         cairo_arc(cr, 0., 0., hr * scale, center - span, center + span);
         cairo_line_to(cr, 0., 0.);
       }
@@ -789,7 +672,7 @@ static void _vec_draw(const dt_scopes_mode_t *const self,
       {
         float hr = vs_radius * hm.length[i];
         if(d->vectorscope_scale == DT_SCOPES_VEC_SCALE_LOGARITHMIC)
-          hr = baselog(hr, vs_radius);
+          hr = dt_scopes_vec_baselog(hr, vs_radius);
         const float span1 = (i > 0
                             ? MIN(hw, (hm.angle[i] - hm.angle[i-1]) / 2.f)
                             : hw); // avoid sectors overlap
