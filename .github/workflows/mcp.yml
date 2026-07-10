@@ -1,0 +1,184 @@
+name: MCP
+
+# Continuous integration for the darktable remote-control (MCP) feature:
+# the in-process C server (src/control/remote_*.c), the Python sidecar
+# (tools/mcp/), and the live end-to-end integration harness.
+#
+# This is a SEPARATE workflow from ci.yml on purpose: ci.yml deliberately
+# path-ignores tools/* and builds with TARGET=skiptest (no ctest, no pytest),
+# so it neither triggers on sidecar changes nor runs any of these suites.
+# This workflow fills that gap without perturbing the main build matrix.
+#
+# PLATFORM COVERAGE / KNOWN GAP (read before "fixing" the missing jobs):
+#   The plan asks that macOS and Windows run the integration suite in their
+#   existing GUI test environment "rather than silently skipping". This
+#   repository has NO such environment today -- the macOS and Windows jobs in
+#   ci.yml only run `darktable --version` and a headless darktable-cli export;
+#   there is no GUI-under-a-virtual-display harness to hook into. Rather than
+#   invent fragile, unmaintained mac/win GUI jobs, the gap is called out
+#   LOUDLY here and in the task-11 report: the integration suite is
+#   Linux/Xvfb-only in CI. The suite itself is cross-platform Python and skips
+#   loudly (never silently passes) when its prerequisites are absent, so it
+#   can be run by hand on macOS/Windows GUI builds; the per-platform code
+#   audit for line endings, atomic rename, 0600 perms, loopback binding, and
+#   the liveness check is in the task-11 report's verification checklist.
+
+on:
+  push:
+    branches:
+      - master
+      - darktable-**
+    paths:
+      - "src/control/remote_*.c"
+      - "src/control/remote_*.h"
+      - "src/common/scopes.*"
+      - "src/common/crypto_random.*"
+      - "tools/mcp/**"
+      - "data/darktableconfig.xml.in"
+      - ".github/workflows/mcp.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "src/control/remote_*.c"
+      - "src/control/remote_*.h"
+      - "src/common/scopes.*"
+      - "src/common/crypto_random.*"
+      - "tools/mcp/**"
+      - "data/darktableconfig.xml.in"
+      - ".github/workflows/mcp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+
+  # Fast, dependency-light lane: the Python sidecar unit suite. No darktable
+  # build required, so this gives quick feedback on sidecar-only changes.
+  sidecar-unit:
+    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    name: sidecar-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install sidecar (editable, with dev extras)
+        run: |
+          cd tools/mcp
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Run unit tests (integration suite deselected by default)
+        run: |
+          cd tools/mcp
+          pytest -q
+
+  # Full lane: build darktable (with ctest for the C remote_* suites), then
+  # run the sidecar unit suite AND the live integration harness under Xvfb.
+  linux-integration:
+    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    name: linux-integration
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+      options: --tmpfs /tmp:exec
+    env:
+      CC: gcc-16
+      CXX: g++-16
+      SRC_DIR: ${{ github.workspace }}/src
+      BUILD_DIR: ${{ github.workspace }}/build
+      INSTALL_PREFIX: ${{ github.workspace }}/install
+      ECO: -DDONT_USE_INTERNAL_LIBRAW=ON
+      CMAKE_BUILD_TYPE: Release
+      GENERATOR: Ninja
+      # TARGET=build runs ctest (the 11 C suites, including test_remote_*),
+      # unlike ci.yml's skiptest.
+      TARGET: build
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Update base packages
+        timeout-minutes: 15
+        run: |
+          set -xe
+          rm -rf /var/lib/apt/lists/*
+          apt-get --yes update
+          apt-get --yes install eatmydata
+          eatmydata apt-get --yes upgrade
+      - name: Install compiler
+        run: eatmydata apt-get --yes install gcc-16 g++-16
+      - name: Install build dependencies
+        run: |
+          eatmydata apt-get --yes install \
+            build-essential cmake appstream-util desktop-file-utils gettext git \
+            gdb intltool libarchive-dev libatk1.0-dev libavif-dev libcairo2-dev \
+            libcolord-dev libcolord-gtk-dev libcups2-dev libcurl4-gnutls-dev \
+            libexiv2-dev libgdk-pixbuf-2.0-dev libgphoto2-dev libgraphicsmagick1-dev \
+            libgtk-3-dev libheif-dev libjpeg-dev libjson-glib-dev liblcms2-dev \
+            liblensfun-dev liblua5.4-dev libopenexr-dev libopenjp2-7-dev \
+            libosmgpsmap-1.0-dev libpango1.0-dev libpng-dev libportmidi-dev \
+            libpotrace-dev libpugixml-dev libraw-dev librsvg2-dev libsaxon-java \
+            libsdl2-dev libsecret-1-dev libsqlite3-dev libtiff5-dev libwebp-dev \
+            libx11-dev libxml2-dev libxml2-utils ninja-build perl po4a xsltproc \
+            zlib1g-dev python3-jsonschema
+      - name: Install integration harness dependencies
+        # xvfb: the display server the harness launches darktable under.
+        # dbus-x11: provides dbus-daemon for the per-instance private session
+        #           bus used by the clean-quit (M33/M42) gates.
+        # libglib2.0-bin: provides gdbus for the Remote.Quit call.
+        # python3-venv/pip: the sidecar venv.
+        run: |
+          eatmydata apt-get --yes install \
+            xvfb dbus-x11 libglib2.0-bin python3-venv python3-pip xauth
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          path: src
+          fetch-depth: 1
+      - name: Get only those submodules that are needed for build
+        run: |
+          cd src
+          git submodule init
+          git config submodule.src/tests/integration.update none
+          git submodule update
+          cd -
+      - name: Build, ctest, and install darktable
+        run: |
+          cmake -E make_directory "${BUILD_DIR}"
+          cmake -E make_directory "${INSTALL_PREFIX}"
+          ./src/.ci/ci-script.sh
+      - name: Set up the sidecar venv
+        run: |
+          cd src/tools/mcp
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e '.[dev]'
+      - name: Sidecar unit tests
+        run: |
+          cd src/tools/mcp
+          .venv/bin/pytest -q
+      - name: Live integration suite (Xvfb)
+        env:
+          # Point the harness at the built GUI binary. The harness starts its
+          # own isolated Xvfb (installed above) and its own private D-Bus bus.
+          DARKTABLE_BIN: ${{ github.workspace }}/install/bin/darktable
+        run: |
+          cd src/tools/mcp
+          .venv/bin/pytest -m integration -v
+      - name: Upload darktable logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          # The harness writes each instance's (token-redacted) darktable.log
+          # under a pytest tmp path; capture whatever is present.
+          path: /tmp/pytest-of-*/**/darktable.log
+          if-no-files-found: ignore
