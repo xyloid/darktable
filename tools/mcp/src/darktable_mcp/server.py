@@ -16,12 +16,19 @@ plus the bounded preview renderer (plan step 9):
 
     render_preview
 
+plus the scope analyzer (plan step 10):
+
+    get_scopes
+
 Each tool is a thin shape-conversion layer over one wire method call
 through `protocol.ProtocolClient`; wire results are already compact and
 model-oriented (per the protocol reference), so most tools return the wire
 `result` object close to verbatim -- except `render_preview`, which
 decodes the wire's base64 JPEG into a FastMCP `Image` so the model
-receives native image content, never a base64 text blob. Errors from the transport/protocol layer
+receives native image content, never a base64 text blob, and `get_scopes`,
+which returns MIXED content: one JSON text block with the numeric scope
+data (revision, profile, histogram statistics, per-image metadata) plus a
+native image block per rendered scope. Errors from the transport/protocol layer
 propagate as exceptions; the MCP SDK's low-level dispatcher (see
 `mcp.server.lowlevel.server.Server.call_tool`) catches any exception raised
 from a tool function and turns it into an `isError` tool result carrying
@@ -32,6 +39,7 @@ actionable hint rather than requiring callers to fish it out separately.
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -49,8 +57,13 @@ SERVER_INSTRUCTIONS = (
     "All tools require a darktable instance running with remote control "
     "enabled and, for darkroom-scoped tools, an image open in the "
     "darkroom. Mutations accept an optional `expected_revision` for "
-    "compare-and-swap against concurrent user edits."
+    "compare-and-swap against concurrent user edits. `get_scopes` returns "
+    "photographic scope analysis (histogram statistics, waveform / RGB "
+    "parade / vectorscope images) of the current darkroom preview."
 )
+
+# The four scope names compute_scopes accepts, in stable wire order.
+_SCOPE_NAMES = ("histogram", "waveform", "parade", "vectorscope")
 
 
 def build_server(
@@ -232,5 +245,77 @@ def build_server(
         # (a plan step 9 binding requirement): decode the wire base64 and
         # hand FastMCP an Image, which becomes an ImageContent block.
         return Image(data=base64.b64decode(result["data"]), format="jpeg")
+
+    # Mixed content (text + images), so structured output is explicitly off:
+    # FastMCP converts each returned list element individually -- the JSON
+    # string becomes a TextContent block, each Image an ImageContent block.
+    @app.tool(structured_output=False)
+    async def get_scopes(
+        scopes: list[str] | None = None,
+        include_summary: bool = True,
+        include_bins: bool = False,
+        include_images: bool = True,
+        image_size: int = 512,
+    ) -> list[Any]:
+        """Analyze the current darkroom preview with darktable's
+        photographic scopes and return the results the model can reason
+        about directly. `scopes` selects any non-empty subset of
+        ["histogram", "waveform", "parade", "vectorscope"] (default: all
+        four). The first content block is JSON text carrying the numeric
+        data: the `revision` the analysis derives from, `source`
+        ("final_preview"), `color_profile`, `roi`, the histogram numeric
+        summary (clip fractions, luminance percentiles, channel means) when
+        `include_summary`, 256 normalized per-channel bins when
+        `include_bins`, and each rendered scope's mime type and pixel
+        dimensions. Rendered waveform / RGB parade / vectorscope plots
+        follow as native image blocks (when `include_images`), in that
+        order. `image_size` bounds the scope images (clamped to
+        [128, 1024]). All scopes in one response derive from the same
+        preview buffer and share one revision; if no preview has been
+        computed yet the call fails with a retryable `scope_failed` --
+        retry after darktable's preview updates."""
+        if scopes is None:
+            scopes = list(_SCOPE_NAMES)
+        # The server clamps too (its contract); clamping here as well keeps
+        # the request honest and self-describing on the wire.
+        image_size = max(128, min(1024, image_size))
+        client = await _client()
+        result = await client.call(
+            "compute_scopes",
+            {
+                "scopes": scopes,
+                "include_summary": include_summary,
+                "include_bins": include_bins,
+                "include_images": include_images,
+                "image_size": image_size,
+            },
+        )
+
+        # Split the wire result into the numeric part (returned as one JSON
+        # text block -- note M39: unlike render_preview, this tool returns
+        # the revision/dimension data its docstring promises) and native
+        # image blocks (never base64 text to the model).
+        summary: dict[str, Any] = {
+            key: value
+            for key, value in result.items()
+            if key not in ("waveform", "parade", "vectorscope")
+        }
+        images: list[Image] = []
+        for name in ("waveform", "parade", "vectorscope"):
+            entry = result.get(name)
+            if not isinstance(entry, dict):
+                continue
+            img = entry.get("image")
+            if not isinstance(img, dict):
+                summary[name] = entry
+                continue
+            # metadata (mime type, dimensions) stays in the text block;
+            # the pixel payload becomes a native image block
+            summary[name] = {
+                "image": {key: value for key, value in img.items() if key != "data"}
+            }
+            images.append(Image(data=base64.b64decode(img["data"]), format="png"))
+
+        return [json.dumps(summary), *images]
 
     return app

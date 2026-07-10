@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import ImageContent
+from mcp.types import ImageContent, TextContent
 
 from conftest import WireError, load_fixture
 from darktable_mcp.server import build_server
@@ -396,6 +396,106 @@ async def test_render_preview_failure_surfaces_hint(tmp_path, fake_server_factor
     assert "preview_failed" in str(excinfo.value)
 
 
+async def test_get_scopes_returns_mixed_content(tmp_path, fake_server_factory):
+    """get_scopes returns MIXED content (design spec tool table: 'summaries
+    and MCP image content'): one JSON text block carrying the numeric data
+    -- revision, profile, histogram statistics, per-image metadata (the
+    docstring-promised data render_preview's M39 note discards) -- plus a
+    native ImageContent block per rendered scope, never base64 text."""
+    server = await fake_server_factory()
+    fixture = load_fixture("compute_scopes_response.json")
+    server.handle_from_fixture("compute_scopes", "compute_scopes_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await app.call_tool("get_scopes", {})
+
+    # unstructured-only tool: a plain content list
+    assert isinstance(result, list)
+    # first block: the JSON numeric summary
+    text_block = result[0]
+    assert isinstance(text_block, TextContent)
+    summary = json.loads(text_block.text)
+    assert summary["revision"] == 34
+    assert summary["source"] == "final_preview"
+    assert summary["color_profile"] == "linear Rec2020 RGB"
+    assert summary["roi"] == "full_image"
+    assert summary["histogram"]["luminance_percentiles"]["p50"] == 0.41
+    assert summary["histogram"]["channel_means"]["red"] == 0.46
+    # image metadata stays in the text block, base64 payload does not
+    assert summary["waveform"]["image"]["width"] == 360
+    assert summary["waveform"]["image"]["height"] == 256
+    assert "data" not in summary["waveform"]["image"]
+    assert summary["vectorscope"]["image"]["width"] == 512
+
+    # then one native image block per rendered scope, in wire order
+    image_blocks = result[1:]
+    assert len(image_blocks) == 2  # the fixture carries waveform + vectorscope
+    for block in image_blocks:
+        assert isinstance(block, ImageContent)
+        assert block.type == "image"
+        assert block.mimeType == "image/png"
+    # the image bytes round-trip the wire base64 exactly
+    assert base64.b64decode(image_blocks[0].data) == base64.b64decode(
+        fixture["result"]["waveform"]["image"]["data"]
+    )
+    assert base64.b64decode(image_blocks[1].data) == base64.b64decode(
+        fixture["result"]["vectorscope"]["image"]["data"]
+    )
+
+
+async def test_get_scopes_threads_and_clamps_params(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen: list[dict] = []
+    fixture = load_fixture("compute_scopes_response.json")
+
+    def handler(params):
+        seen.append(dict(params))
+        return fixture["result"]
+
+    server.handle("compute_scopes", handler)
+
+    app = await _built_server(tmp_path, server)
+
+    # defaults are made explicit on the wire: all four scopes, summary and
+    # images on, bins off, image_size 512
+    await app.call_tool("get_scopes", {})
+    assert seen[-1] == {
+        "scopes": ["histogram", "waveform", "parade", "vectorscope"],
+        "include_summary": True,
+        "include_bins": False,
+        "include_images": True,
+        "image_size": 512,
+    }
+
+    # a subset threads through verbatim; image_size clamps client-side too
+    await app.call_tool(
+        "get_scopes",
+        {"scopes": ["histogram"], "include_bins": True, "image_size": 10},
+    )
+    assert seen[-1]["scopes"] == ["histogram"]
+    assert seen[-1]["include_bins"] is True
+    assert seen[-1]["image_size"] == 128
+
+    await app.call_tool("get_scopes", {"image_size": 5000})
+    assert seen[-1]["image_size"] == 1024
+
+
+async def test_get_scopes_scope_failed_surfaces_hint(tmp_path, fake_server_factory):
+    """The empty-capture-slot failure (fresh darkroom, no preview yet)
+    surfaces the retryable scope_failed with its recovery hint."""
+    server = await fake_server_factory()
+    server.handle_from_fixture("compute_scopes", "compute_scopes_error_scope_failed_response.json")
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("get_scopes", {})
+
+    message = str(excinfo.value)
+    assert "scope_failed" in message
+    assert "retry" in message
+
+
 async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     app = await _built_server(tmp_path, server)
@@ -414,6 +514,7 @@ async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_ser
         "get_history",
         "undo",
         "render_preview",
+        "get_scopes",
     }
 
 
