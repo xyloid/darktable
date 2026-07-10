@@ -507,7 +507,6 @@ static void _vec_process(dt_scopes_mode_t *const self,
   // FIXME: particularly for u*v*, center on hue ring bounds rather
   // than plot center, to be able to show a larger plot?
   const float max_radius = d->vectorscope_radius;
-  const float max_diam = max_radius * 2.f;
 
   if(MAX(1, roi->width - roi->crop_right - roi->crop_x) == 1
      && MAX(1, roi->height - roi->crop_bottom - roi->crop_y) == 1)
@@ -545,7 +544,6 @@ static void _vec_process(dt_scopes_mode_t *const self,
   dt_scopes_vectorscope_compute(input, roi, vs_prof,
                                 profile->lut_out[0], profile->lutsize,
                                 rgb2ryb_ypp, &kernel_out);
-  (void)max_diam;
 
   dt_aligned_pixel_t RGB = {0.f}, chromaticity;
   const dt_lib_colorpicker_statistic_t statistic =
