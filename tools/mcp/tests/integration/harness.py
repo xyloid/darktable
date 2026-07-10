@@ -452,12 +452,39 @@ class DarktableInstance:
         """Write a token-redacted copy of the raw log to disk so it can be
         safely captured as a CI artifact. Best-effort and idempotent: the
         process has stopped writing by the time close() calls this, and a
-        missing/unreadable log simply yields no redacted copy."""
+        missing/unreadable log simply yields no redacted copy.
+
+        Redaction sources: the record the harness parsed, plus a sweep of
+        any ``session-*.json`` files still on disk -- launch can fail after
+        darktable generated a token but before the harness read the record,
+        and the ``.redacted.log`` filename must never over-promise. If no
+        token can be found anywhere, none was ever knowable to the harness;
+        the copy is prefixed with a marker saying so rather than silently
+        posing as redacted."""
         try:
             raw = self.log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
-        redacted = redact_token(raw, self._record.token if self._record else None)
+        tokens: set[str] = set()
+        if self._record and self._record.token:
+            tokens.add(self._record.token)
+        try:
+            for candidate in (self.config_dir / "mcp").glob("session-*.json"):
+                rec = discovery._parse_record(candidate)
+                if rec and rec.token:
+                    tokens.add(rec.token)
+        except OSError:
+            pass
+        redacted = raw
+        for token in tokens:
+            redacted = redact_token(redacted, token)
+        if not tokens:
+            redacted = (
+                "# NOTE: the harness learned no session token for this instance and\n"
+                "# found no discovery record on disk to recover one from (launch\n"
+                "# likely failed before token generation), so there was no token to\n"
+                "# redact from the raw log below.\n"
+            ) + redacted
         try:
             self.redacted_log_path.write_text(redacted, encoding="utf-8")
         except OSError:
