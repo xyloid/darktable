@@ -10,6 +10,12 @@ resetting a module, creating a new module instance, inspecting the history
 stack, and undoing the last change; and render a bounded JPEG preview of
 the current edit state as native MCP image content.
 
+**New here?** Start with the user & host guide,
+[`docs/remote-control.md`](docs/remote-control.md): how to enable remote
+control, how to point an MCP host at darktable (with a `mcpServers` config
+snippet), where discovery records live on each platform, how multiple
+instances are selected, the security model, and the versioning policy.
+
 This is the sidecar for plan step 5 of
 `docs/superpowers/plans/2026-07-05-darktable-mcp-implementation-plan.md`.
 It talks to darktable over the authenticated, loopback-only, framed-JSON
