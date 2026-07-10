@@ -53,6 +53,7 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .undo = dt_remote_undo,
   .render_preview_prepare = dt_remote_render_preview_prepare,
   .current_revision = dt_remote_current_revision,
+  .scopes_prepare = dt_remote_scopes_prepare,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -68,6 +69,7 @@ static dt_remote_protocol_calls_t s_calls = {
   .undo = dt_remote_undo,
   .render_preview_prepare = dt_remote_render_preview_prepare,
   .current_revision = dt_remote_current_revision,
+  .scopes_prepare = dt_remote_scopes_prepare,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -84,12 +86,15 @@ void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
 static gboolean _queue_preview_job(dt_remote_pending_t *pending,
                                    const dt_remote_preview_request_t *req,
                                    int max_px, int quality);
+static gboolean _queue_scopes_job(dt_remote_pending_t *pending,
+                                  const dt_remote_scopes_request_t *req);
 
 static const dt_remote_protocol_async_t DEFAULT_ASYNC = {
   .begin = dt_remote_async_begin,
   .abort = dt_remote_async_abort,
   .complete = dt_remote_async_complete,
   .queue_preview = _queue_preview_job,
+  .queue_scopes = _queue_scopes_job,
 };
 
 static dt_remote_protocol_async_t s_async = {
@@ -97,6 +102,7 @@ static dt_remote_protocol_async_t s_async = {
   .abort = dt_remote_async_abort,
   .complete = dt_remote_async_complete,
   .queue_preview = _queue_preview_job,
+  .queue_scopes = _queue_scopes_job,
 };
 
 void dt_remote_protocol_set_async(const dt_remote_protocol_async_t *ops)
@@ -392,12 +398,13 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // method a real handler in the allowlist below. "params" = parameter
   // mutation (set_module_params, plan step 7). "instances" =
   // create_module_instance; "history" = get_history/undo (plan step 8).
-  // "preview" = render_preview (plan step 9). Still pending: "scopes"
-  // (compute_scopes).
+  // "preview" = render_preview (plan step 9). "scopes" = compute_scopes
+  // (plan step 10).
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");
+  json_builder_add_string_value(b, "scopes");
   json_builder_end_array(b);
   json_builder_end_object(b);
 
@@ -1276,13 +1283,107 @@ static JsonNode *_handler_render_preview(JsonObject *params, dt_remote_session_t
   return NULL;
 }
 
+// Optional boolean param with a default; a present-but-non-boolean value
+// is invalid_value (strict), absent takes the default.
+static gboolean _optional_bool_default(JsonObject *params, const char *key, gboolean def,
+                                       gboolean *out, dt_remote_error_t **err)
+{
+  if(!params || !json_object_has_member(params, key)) { *out = def; return TRUE; }
+  JsonNode *node = json_object_get_member(params, key);
+  if(!node || !JSON_NODE_HOLDS_VALUE(node) || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+  {
+    if(err) *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter '%s' must be a boolean"), key);
+    return FALSE;
+  }
+  *out = json_node_get_boolean(node);
+  return TRUE;
+}
+
+static const char *const COMPUTE_SCOPES_KEYS[] =
+  { "scopes", "include_summary", "include_bins", "include_images", "image_size", NULL };
+
+// The second asynchronous handler (compute_scopes): validates params,
+// checks the darkroom precondition on the main thread (via the calls
+// table), and queues the background kernel job (via the async table),
+// deferring by returning NULL with no error set. Reuses render_preview's
+// pending lifecycle exactly.
+static JsonNode *_handler_compute_scopes(JsonObject *params, dt_remote_session_t *session,
+                                         dt_remote_pending_t *pending)
+{
+  (void)session;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, COMPUTE_SCOPES_KEYS, &err)) return _handler_fail(err);
+
+  // `scopes` is required, a non-empty array of the four known names with
+  // no duplicates (protocol reference; duplicates -> invalid_value).
+  if(!params || !json_object_has_member(params, "scopes"))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("missing required parameter 'scopes'")));
+  JsonNode *scopes_node = json_object_get_member(params, "scopes");
+  if(!scopes_node || !JSON_NODE_HOLDS_ARRAY(scopes_node))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'scopes' must be an array")));
+  JsonArray *scopes_arr = json_node_get_array(scopes_node);
+  const guint n = json_array_get_length(scopes_arr);
+  if(n == 0)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'scopes' must be non-empty")));
+
+  dt_remote_scopes_request_t req = { 0 };
+  for(guint i = 0; i < n; i++)
+  {
+    JsonNode *item = json_array_get_element(scopes_arr, i);
+    if(!item || !JSON_NODE_HOLDS_VALUE(item) || json_node_get_value_type(item) != G_TYPE_STRING)
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("'scopes' entries must be strings")));
+    const char *name = json_node_get_string(item);
+    gboolean *slot = NULL;
+    if(!g_strcmp0(name, "histogram")) slot = &req.want_histogram;
+    else if(!g_strcmp0(name, "waveform")) slot = &req.want_waveform;
+    else if(!g_strcmp0(name, "parade")) slot = &req.want_parade;
+    else if(!g_strcmp0(name, "vectorscope")) slot = &req.want_vectorscope;
+    else
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("unknown scope '%s'"), name));
+    if(*slot)
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("duplicate scope '%s'"), name));
+    *slot = TRUE;
+  }
+
+  if(!_optional_bool_default(params, "include_summary", TRUE, &req.include_summary, &err))
+    return _handler_fail(err);
+  if(!_optional_bool_default(params, "include_bins", FALSE, &req.include_bins, &err))
+    return _handler_fail(err);
+  if(!_optional_bool_default(params, "include_images", TRUE, &req.include_images, &err))
+    return _handler_fail(err);
+
+  gint64 image_size = 512;
+  if(!_optional_int_default(params, "image_size", 512, &image_size, &err)) return _handler_fail(err);
+  if(image_size < 128) image_size = 128;
+  if(image_size > 1024) image_size = 1024;
+  req.image_size = (int)image_size;
+
+  // Main-thread precondition (not_in_darkroom / no_image_open), synchronous.
+  if(!s_calls.scopes_prepare(&err)) return _handler_fail(err);
+
+  if(!pending)
+    return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
+                                    _("no async transport for this request")));
+
+  if(!s_async.queue_scopes(pending, &req))
+    return _handler_fail(_error_new(DT_REMOTE_ERR_SCOPE_FAILED,
+                                    _("could not queue the scope computation job")));
+
+  // Deferred: ownership of `pending` moved to the queued job.
+  return NULL;
+}
+
 /* ---------------------------------------------------------------------- */
 /* allowlist (internals §6: 13 entries, static, looked up by g_str_equal)  */
 /* ---------------------------------------------------------------------- */
 
-// Every method except compute_scopes (plan step 9's sibling, still
-// pending) has a handler now. A NULL handler dispatches to
-// DT_REMOTE_ERR_INTERNAL rather than crashing.
+// Every method has a real handler now (compute_scopes was the last one).
+// A NULL handler would dispatch to DT_REMOTE_ERR_INTERNAL rather than
+// crashing, but the table no longer contains any.
 static const dt_remote_method_t g_methods[] = {
   { "hello",                  FALSE, FALSE, FALSE, _handler_hello },
   { "get_state",              FALSE, FALSE, FALSE, _handler_get_state },
@@ -1296,7 +1397,7 @@ static const dt_remote_method_t g_methods[] = {
   { "get_history",            TRUE,  FALSE, FALSE, _handler_get_history },
   { "undo",                   TRUE,  TRUE,  FALSE, _handler_undo },
   { "render_preview",         TRUE,  FALSE, TRUE,  _handler_render_preview },
-  { "compute_scopes",         TRUE,  FALSE, TRUE,  NULL },
+  { "compute_scopes",         TRUE,  FALSE, TRUE,  _handler_compute_scopes },
 };
 
 static const dt_remote_method_t *_find_method(const char *name)
@@ -1347,11 +1448,15 @@ static const char *_error_code_to_wire(dt_remote_error_code_t code)
 // and the design's standing rule is to fail toward retryable (see
 // dt_remote_revision_force_bump()'s rationale) -- the worst outcome of a
 // wrongly-retryable error is one wasted retry, while wrongly-permanent
-// would strand a recoverable client. scope_failed stays non-retryable
-// until compute_scopes exists to define its failure modes.
+// would strand a recoverable client. scope_failed follows the same
+// fail-toward-retryable rule (ratified: pin retryable=TRUE
+// unconditionally): the empty-capture-slot, cancelled and encode-failure
+// modes are all transient conditions another preview run or retry
+// resolves.
 static gboolean _error_code_retryable(dt_remote_error_code_t code)
 {
-  return code == DT_REMOTE_ERR_REVISION_CONFLICT || code == DT_REMOTE_ERR_PREVIEW_FAILED;
+  return code == DT_REMOTE_ERR_REVISION_CONFLICT || code == DT_REMOTE_ERR_PREVIEW_FAILED
+         || code == DT_REMOTE_ERR_SCOPE_FAILED;
 }
 
 // The shared envelope body: `wire_code`/`retryable` given directly, for
@@ -1699,6 +1804,304 @@ static gboolean _queue_preview_job(dt_remote_pending_t *pending,
   // disposed the job, which ran _preview_job_params_free -> the pending
   // was already released through the discarded-completion path above, so
   // the caller must NOT fail the request a second time.
+  dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, job);
+  return TRUE;
+}
+
+/* ---------------------------------------------------------------------- */
+/* compute_scopes: response shaping + background job plumbing              */
+/* ---------------------------------------------------------------------- */
+
+// Proactive frame-cap check for the composed scopes response: the base64
+// PNGs dominate; bins add ~3*256 numbers (< 40 KiB serialized worst case)
+// and the summary/envelope a few hundred bytes -- all covered by generous
+// slack. Mirrors dt_remote_protocol_preview_fits_frame's rationale.
+#define DT_REMOTE_SCOPES_ENVELOPE_SLACK ((size_t)65536)
+
+static size_t _b64_len(size_t n)
+{
+  return ((n + 2) / 3) * 4;
+}
+
+static gboolean _scopes_fits_frame(const dt_remote_scopes_result_t *r)
+{
+  size_t total = DT_REMOTE_SCOPES_ENVELOPE_SLACK;
+  if(r->waveform.present) total += _b64_len(r->waveform.png_len);
+  if(r->parade.present) total += _b64_len(r->parade.png_len);
+  if(r->vectorscope.present) total += _b64_len(r->vectorscope.png_len);
+  return total <= (size_t)DT_REMOTE_MAX_FRAME;
+}
+
+static void _scopes_image_to_json(JsonBuilder *b, const char *key,
+                                  const dt_remote_scopes_image_t *img)
+{
+  json_builder_set_member_name(b, key);
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "image");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "mime_type");
+  json_builder_add_string_value(b, "image/png");
+  json_builder_set_member_name(b, "width");
+  json_builder_add_int_value(b, img->width);
+  json_builder_set_member_name(b, "height");
+  json_builder_add_int_value(b, img->height);
+  json_builder_set_member_name(b, "data");
+  gchar *b64 = g_base64_encode(img->png, img->png_len);
+  json_builder_add_string_value(b, b64);
+  g_free(b64);
+  json_builder_end_object(b);
+  json_builder_end_object(b);
+}
+
+JsonNode *dt_remote_protocol_build_scopes_response(gint64 request_id,
+                                                   const dt_remote_scopes_result_t *result,
+                                                   const dt_remote_error_t *error)
+{
+  if(result)
+  {
+    if(!_scopes_fits_frame(result))
+      return _build_error_wire(TRUE, request_id, "request_too_large",
+                               FALSE /* per the reference's retryable table */,
+                               _("scope images are too large to send; retry with a smaller image_size"),
+                               NULL);
+
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+
+    // Normative top-level fields (design spec "Scope analysis"): every
+    // response states its revision, source stage, color profile and ROI.
+    json_builder_set_member_name(b, "revision");
+    json_builder_add_int_value(b, (gint64)result->revision);
+    json_builder_set_member_name(b, "source");
+    json_builder_add_string_value(b, result->source ? result->source : "final_preview");
+    json_builder_set_member_name(b, "color_profile");
+    json_builder_add_string_value(b, result->color_profile ? result->color_profile : "");
+    json_builder_set_member_name(b, "roi");
+    json_builder_add_string_value(b, result->roi ? result->roi : "full_image");
+
+    if(result->has_histogram)
+    {
+      json_builder_set_member_name(b, "histogram");
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "bins");
+      json_builder_add_int_value(b, DT_SCOPES_HISTOGRAM_BINS);
+      if(result->has_histogram_summary)
+      {
+        const dt_scopes_histogram_summary_t *s = &result->histogram_summary;
+        json_builder_set_member_name(b, "black_clip_fraction");
+        json_builder_add_double_value(b, s->black_clip_fraction);
+        json_builder_set_member_name(b, "white_clip_fraction");
+        json_builder_add_double_value(b, s->white_clip_fraction);
+        json_builder_set_member_name(b, "luminance_percentiles");
+        json_builder_begin_object(b);
+        json_builder_set_member_name(b, "p01");
+        json_builder_add_double_value(b, s->p01);
+        json_builder_set_member_name(b, "p50");
+        json_builder_add_double_value(b, s->p50);
+        json_builder_set_member_name(b, "p99");
+        json_builder_add_double_value(b, s->p99);
+        json_builder_end_object(b);
+        json_builder_set_member_name(b, "channel_means");
+        json_builder_begin_object(b);
+        json_builder_set_member_name(b, "red");
+        json_builder_add_double_value(b, s->mean_red);
+        json_builder_set_member_name(b, "green");
+        json_builder_add_double_value(b, s->mean_green);
+        json_builder_set_member_name(b, "blue");
+        json_builder_add_double_value(b, s->mean_blue);
+        json_builder_end_object(b);
+      }
+      if(result->has_histogram_bins)
+      {
+        // 256 normalized [0,1] bins per RGB channel (design spec: raw
+        // counts excluded -- verbose and preview-resolution-dependent).
+        static const char *const chan_names[3] = { "red", "green", "blue" };
+        json_builder_set_member_name(b, "channel_bins");
+        json_builder_begin_object(b);
+        for(int ch = 0; ch < 3; ch++)
+        {
+          json_builder_set_member_name(b, chan_names[ch]);
+          json_builder_begin_array(b);
+          for(int bin = 0; bin < DT_SCOPES_HISTOGRAM_BINS; bin++)
+            json_builder_add_double_value(b, result->histogram_bins[ch][bin]);
+          json_builder_end_array(b);
+        }
+        json_builder_end_object(b);
+      }
+      json_builder_end_object(b);
+    }
+
+    if(result->waveform.present) _scopes_image_to_json(b, "waveform", &result->waveform);
+    if(result->parade.present) _scopes_image_to_json(b, "parade", &result->parade);
+    if(result->vectorscope.present) _scopes_image_to_json(b, "vectorscope", &result->vectorscope);
+
+    json_builder_end_object(b);
+    JsonNode *node = json_builder_get_root(b);
+    g_object_unref(b);
+    return _build_success(TRUE, request_id, node);
+  }
+
+  if(error) return _build_error(TRUE, request_id, error->code, error->message, error->details_json);
+
+  return _build_error(TRUE, request_id, DT_REMOTE_ERR_INTERNAL,
+                      _("scopes completion carried no result"), NULL);
+}
+
+void dt_remote_protocol_finish_scopes(dt_remote_pending_t *pending,
+                                      dt_remote_scopes_result_t *result,
+                                      dt_remote_error_t *error)
+{
+  if(!pending)
+  {
+    dt_remote_scopes_result_free(result);
+    dt_remote_error_free(error);
+    return;
+  }
+
+  if(g_cancellable_is_cancelled(pending->cancellable))
+  {
+    // Disconnect/close won the race: release buffers and the pending
+    // without writing to the closing session (same as finish_preview).
+    dt_remote_scopes_result_free(result);
+    dt_remote_error_free(error);
+    s_async.complete(pending, NULL);
+    return;
+  }
+
+  // Deliberately NO completion-time revision drift check here (unlike
+  // dt_remote_protocol_finish_preview): every scope in the result derives
+  // from the one retained capture buffer and carries the revision stamped
+  // at its push, by construction -- the design spec states "If darkroom
+  // state changes during computation, the result remains valid for its
+  // reported revision."
+
+  JsonNode *response;
+  if(result || error)
+  {
+    response = dt_remote_protocol_build_scopes_response(pending->request_id, result, error);
+  }
+  else
+  {
+    // Job discarded before it ever ran (job-system teardown): answer
+    // retryably rather than dangling until disconnect.
+    dt_remote_error_t *discarded =
+      _error_new(DT_REMOTE_ERR_SCOPE_FAILED, _("scope computation job was discarded"));
+    response = dt_remote_protocol_build_scopes_response(pending->request_id, NULL, discarded);
+    dt_remote_error_free(discarded);
+  }
+
+  dt_remote_scopes_result_free(result);
+  dt_remote_error_free(error);
+  s_async.complete(pending, response);
+}
+
+// -- the production DT_JOB_QUEUE_SYSTEM_BG scopes job -----------------------
+//
+// Same lifecycle as the preview job above (generalized Task 9 machinery):
+// the QUEUED->RUNNING / QUEUED->RECLAIMED handshake is shared with the
+// pending through pending->handshake, so dt_remote_server_stop()'s reclaim
+// walk -- which is keyed only on p->handshake, not on the job type -- sees
+// scopes pendings exactly the way it sees preview pendings.
+
+typedef struct _scopes_job_params_t
+{
+  dt_remote_pending_t *pending;          // owned until handed to the completion
+  dt_remote_job_handshake_t *handshake;  // shared with pending->handshake
+  dt_remote_scopes_request_t req;
+} _scopes_job_params_t;
+
+typedef struct _scopes_completion_t
+{
+  dt_remote_pending_t *pending;
+  dt_remote_scopes_result_t *result;   // owned, nullable
+  dt_remote_error_t *error;            // owned, nullable
+} _scopes_completion_t;
+
+static gboolean _scopes_completion_invoke(gpointer data)
+{
+  _scopes_completion_t *c = data;
+  dt_remote_protocol_finish_scopes(c->pending, c->result, c->error);
+  g_free(c);
+  return G_SOURCE_REMOVE;
+}
+
+// Marshals one scopes completion to the GLib main context. Same
+// g_idle_source_new() + g_source_attach(NULL) discipline as
+// _preview_queue_completion (NEVER g_main_context_invoke -- see that
+// function's comment for why: invoke would run the main-thread-asserting
+// completion inline on a worker during stop()'s drain).
+static void _scopes_queue_completion(dt_remote_pending_t *pending,
+                                     dt_remote_scopes_result_t *result,
+                                     dt_remote_error_t *error)
+{
+  _scopes_completion_t *c = g_new0(_scopes_completion_t, 1);
+  c->pending = pending;
+  c->result = result;
+  c->error = error;
+
+  GSource *source = g_idle_source_new();
+  g_source_set_callback(source, _scopes_completion_invoke, c, NULL);
+  g_source_attach(source, NULL);  // default context; never runs inline here
+  g_source_unref(source);
+}
+
+static int32_t _scopes_job_run(dt_job_t *job)
+{
+  _scopes_job_params_t *p = dt_control_job_get_params(job);
+
+  // Claim QUEUED -> RUNNING; if stop() already reclaimed (QUEUED ->
+  // RECLAIMED) the pending was released on the main thread and must not
+  // be touched here (see _preview_job_run).
+  if(!dt_remote_job_handshake_claim_run(p->handshake))
+    return 0;
+
+  dt_remote_pending_t *pending = p->pending;
+  p->pending = NULL;  // ownership transfers to the completion queued below
+
+  dt_remote_scopes_result_t *result = NULL;
+  dt_remote_error_t *error = NULL;
+
+  if(!g_cancellable_is_cancelled(pending->cancellable))
+    dt_remote_scopes_execute(&p->req, pending->cancellable, &result, &error);
+
+  _scopes_queue_completion(pending, result, error);
+  // `pending` must not be touched past this point.
+  return 0;
+}
+
+static void _scopes_job_params_free(void *data)
+{
+  _scopes_job_params_t *p = data;
+  // Job discarded without ever running: claim it first so we do not race
+  // stop()'s reclaim; if we win, release the pending through the normal
+  // completion path (neither result nor error -> retryable scope_failed)
+  // so io_refs/pending_requests accounting stays balanced.
+  if(p->pending && dt_remote_job_handshake_claim_run(p->handshake))
+    _scopes_queue_completion(p->pending, NULL, NULL);
+  dt_remote_job_handshake_unref(p->handshake);
+  g_free(p);
+}
+
+static gboolean _queue_scopes_job(dt_remote_pending_t *pending,
+                                  const dt_remote_scopes_request_t *req)
+{
+  dt_job_t *job = dt_control_job_create(_scopes_job_run, "remote-edit scope computation");
+  if(!job) return FALSE;
+
+  _scopes_job_params_t *p = g_new0(_scopes_job_params_t, 1);
+  p->pending = pending;
+  // Shared reclaim handshake, published on the pending exactly like the
+  // preview job's, so the type-agnostic reclaim walk in
+  // dt_remote_server_stop() covers scopes jobs too.
+  p->handshake = dt_remote_job_handshake_new();       // refcount 1 (job side)
+  pending->handshake = p->handshake;
+  dt_remote_job_handshake_ref(pending->handshake);    // refcount 2 (pending side)
+  p->req = *req;
+  dt_control_job_set_params(job, p, _scopes_job_params_free);
+
+  // Same queue + failure semantics as _queue_preview_job: even a failed
+  // add has disposed the job (releasing the pending via params_free), so
+  // the caller must not fail the request a second time.
   dt_control_add_job(DT_JOB_QUEUE_SYSTEM_BG, job);
   return TRUE;
 }

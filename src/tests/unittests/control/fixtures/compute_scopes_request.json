@@ -1,0 +1,11 @@
+{
+  "id": 40,
+  "method": "compute_scopes",
+  "params": {
+    "scopes": ["histogram", "waveform", "parade", "vectorscope"],
+    "include_summary": true,
+    "include_bins": false,
+    "include_images": true,
+    "image_size": 512
+  }
+}

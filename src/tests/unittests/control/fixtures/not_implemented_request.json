@@ -1,5 +1,5 @@
 {
   "id": 9,
-  "method": "compute_scopes",
-  "params": { "scopes": ["histogram"] }
+  "method": "export_image",
+  "params": { "path": "/tmp/out.jpg" }
 }

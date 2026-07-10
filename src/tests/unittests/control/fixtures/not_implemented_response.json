@@ -2,8 +2,8 @@
   "id": 9,
   "ok": false,
   "error": {
-    "code": "internal",
-    "message": "method 'compute_scopes' is not implemented yet",
+    "code": "invalid_value",
+    "message": "unknown method 'export_image'",
     "retryable": false
   }
 }

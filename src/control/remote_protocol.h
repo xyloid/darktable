@@ -37,6 +37,7 @@
 #pragma once
 
 #include "control/remote_edit.h"
+#include "control/remote_scopes.h"
 
 #include <glib.h>
 #include <json-glib/json-glib.h>
@@ -113,6 +114,8 @@ typedef struct dt_remote_protocol_calls_t
   // check): if it differs from the revision the preview was stamped with,
   // darkroom state drifted during the render and the result is discarded.
   uint64_t (*current_revision)(void);
+  // compute_scopes main-thread precondition (not_in_darkroom/no_image_open).
+  gboolean (*scopes_prepare)(dt_remote_error_t **error);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to
@@ -139,6 +142,11 @@ typedef struct dt_remote_protocol_async_t
   gboolean (*queue_preview)(dt_remote_pending_t *pending,
                             const dt_remote_preview_request_t *req,
                             int max_px, int quality);
+  // compute_scopes' second async method reuses the same begin/abort/
+  // complete lifecycle and the same DT_JOB_QUEUE_SYSTEM_BG + reclaim
+  // handshake machinery as queue_preview -- only the job payload differs.
+  gboolean (*queue_scopes)(dt_remote_pending_t *pending,
+                           const dt_remote_scopes_request_t *req);
 } dt_remote_protocol_async_t;
 
 /** overrides the async transport table (test seam only). Pass NULL to
@@ -188,6 +196,38 @@ JsonNode *dt_remote_protocol_build_preview_response(gint64 request_id,
 void dt_remote_protocol_finish_preview(dt_remote_pending_t *pending,
                                        dt_remote_preview_t *preview,
                                        dt_remote_error_t *error);
+
+/* ---------------------------------------------------------------------- */
+/* compute_scopes response shaping (pure; exposed for unit tests)          */
+/* ---------------------------------------------------------------------- */
+
+/** Builds compute_scopes' complete wire response for `request_id`:
+ * exactly one of `result`/`error` should be non-NULL (both borrowed). A
+ * `result` becomes the success envelope carrying top-level `revision`,
+ * `source`, `color_profile`, `roi` and one key per requested scope
+ * (histogram numeric summary and/or normalized bins; waveform/parade/
+ * vectorscope PNG image objects {mime_type,width,height,data}); if the
+ * composed response would exceed the frame cap it degrades to
+ * request_too_large (retryable false). An `error` maps through the
+ * standard error envelope (scope_failed is retryable). Both NULL degrades
+ * to an internal-error envelope. Pure: unit-testable against fixtures. */
+JsonNode *dt_remote_protocol_build_scopes_response(gint64 request_id,
+                                                   const dt_remote_scopes_result_t *result,
+                                                   const dt_remote_error_t *error);
+
+/** The main-thread completion of a scopes job (invoked via the idle-source
+ * dispatch, or directly by tests): takes ownership of `result` and
+ * `error`. If the pending's cancellable has fired, releases both and
+ * completes with no response; otherwise builds the response and completes.
+ * Unlike render_preview there is NO completion-time revision drift check:
+ * every scope derives from one captured buffer and stays valid for its
+ * stamped revision by construction (design spec: "If darkroom state
+ * changes during computation, the result remains valid for its reported
+ * revision"). Completion always goes through the async transport table, so
+ * the pending is released exactly once. */
+void dt_remote_protocol_finish_scopes(dt_remote_pending_t *pending,
+                                      dt_remote_scopes_result_t *result,
+                                      dt_remote_error_t *error);
 
 /* ---------------------------------------------------------------------- */
 /* dispatch entry point                                                    */

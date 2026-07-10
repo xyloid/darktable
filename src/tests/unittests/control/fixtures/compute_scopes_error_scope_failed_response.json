@@ -1,0 +1,9 @@
+{
+  "id": 40,
+  "ok": false,
+  "error": {
+    "code": "scope_failed",
+    "message": "no preview buffer captured yet; retry after the preview updates",
+    "retryable": true
+  }
+}

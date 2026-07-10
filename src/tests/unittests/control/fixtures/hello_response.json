@@ -9,7 +9,8 @@
       "params",
       "instances",
       "history",
-      "preview"
+      "preview",
+      "scopes"
     ]
   }
 }

@@ -114,6 +114,7 @@ FILE(GLOB SOURCE_FILES
   "control/remote_frame.c"
   "control/remote_protocol.c"
   "control/remote_revision.c"
+  "control/remote_scopes.c"
   "control/remote_server.c"
   "control/signal.c"
   "develop/blend.c"

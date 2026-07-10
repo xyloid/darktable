@@ -1,0 +1,41 @@
+{
+  "id": 40,
+  "ok": true,
+  "result": {
+    "revision": 34,
+    "source": "final_preview",
+    "color_profile": "linear Rec2020 RGB",
+    "roi": "full_image",
+    "histogram": {
+      "bins": 256,
+      "black_clip_fraction": 0.0012,
+      "white_clip_fraction": 0.0041,
+      "luminance_percentiles": {
+        "p01": 0.02,
+        "p50": 0.41,
+        "p99": 0.98
+      },
+      "channel_means": {
+        "red": 0.46,
+        "green": 0.42,
+        "blue": 0.37
+      }
+    },
+    "waveform": {
+      "image": {
+        "mime_type": "image/png",
+        "width": 360,
+        "height": 256,
+        "data": "c3R1Yi1wbmctYnl0ZXMtZm9yLXNjb3Blcy13YXZlZm9ybQ=="
+      }
+    },
+    "vectorscope": {
+      "image": {
+        "mime_type": "image/png",
+        "width": 512,
+        "height": 512,
+        "data": "c3R1Yi1wbmctYnl0ZXMtZm9yLXNjb3Blcy12ZWN0b3JzY29wZQ=="
+      }
+    }
+  }
+}

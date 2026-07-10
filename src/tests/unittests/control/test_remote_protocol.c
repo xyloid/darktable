@@ -587,13 +587,14 @@ static void test_hello_success(void **state)
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
   // "params" (step 7) + "instances"/"history" (step 8) + "preview"
-  // (step 9); "scopes" is still pending its handler.
+  // (step 9) + "scopes" (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 4);
+  assert_int_equal(json_array_get_length(caps), 5);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "instances");
   assert_string_equal(json_array_get_string_element(caps, 2), "history");
   assert_string_equal(json_array_get_string_element(caps, 3), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 4), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1843,6 +1844,21 @@ static gboolean fake_queue_preview(dt_remote_pending_t *pending,
   return g_queue_preview_result;
 }
 
+// compute_scopes' half of the same fake transport (step 10): records the
+// queued request so the deferral/clamping tests can assert on it.
+static int g_queue_scopes_calls;
+static dt_remote_scopes_request_t g_queued_scopes_req;
+static gboolean g_queue_scopes_result;
+
+static gboolean fake_queue_scopes(dt_remote_pending_t *pending,
+                                  const dt_remote_scopes_request_t *req)
+{
+  assert_ptr_equal(pending, &g_fake_pending);
+  g_queue_scopes_calls++;
+  g_queued_scopes_req = *req;
+  return g_queue_scopes_result;
+}
+
 static void _install_fake_async(gboolean queue_result)
 {
   g_async_begin_calls = 0;
@@ -1852,12 +1868,16 @@ static void _install_fake_async(gboolean queue_result)
   g_queued_max_px = g_queued_quality = 0;
   memset(&g_queued_req, 0, sizeof(g_queued_req));
   g_queue_preview_result = queue_result;
+  g_queue_scopes_calls = 0;
+  memset(&g_queued_scopes_req, 0, sizeof(g_queued_scopes_req));
+  g_queue_scopes_result = queue_result;
 
   static const dt_remote_protocol_async_t ops = {
     .begin = fake_async_begin,
     .abort = fake_async_abort,
     .complete = fake_async_complete,
     .queue_preview = fake_queue_preview,
+    .queue_scopes = fake_queue_scopes,
   };
   dt_remote_protocol_set_async(&ops);
 }
@@ -2347,6 +2367,452 @@ static void test_finish_preview_cancelled_releases_without_writing(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* compute_scopes (plan step 10) -- the second asynchronous method         */
+/* ---------------------------------------------------------------------- */
+
+static gboolean stub_scopes_prepare_ok(dt_remote_error_t **error)
+{
+  (void)error;
+  return TRUE;
+}
+
+static gboolean stub_scopes_prepare_not_in_darkroom(dt_remote_error_t **error)
+{
+  if(error) *error = _make_error(DT_REMOTE_ERR_NOT_IN_DARKROOM, g_strdup("no darkroom view is active"));
+  return FALSE;
+}
+
+// deferral with defaults: include_summary TRUE, include_bins FALSE,
+// include_images TRUE, image_size 512 (wire contract), and the async
+// lifecycle mirrors render_preview exactly (begin with the request id,
+// queue once, NULL return, no abort).
+static void test_compute_scopes_defers_with_defaults(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  JsonNode *resp = _dispatch_inline_maybe_deferred(
+    "{\"id\":40,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[\"histogram\"]}}");
+  assert_null(resp);   // deferred
+
+  assert_int_equal(g_async_begin_calls, 1);
+  assert_int_equal(g_async_begin_request_id, 40);
+  assert_int_equal(g_queue_scopes_calls, 1);
+  assert_int_equal(g_async_abort_calls, 0);
+
+  assert_true(g_queued_scopes_req.want_histogram);
+  assert_false(g_queued_scopes_req.want_waveform);
+  assert_false(g_queued_scopes_req.want_parade);
+  assert_false(g_queued_scopes_req.want_vectorscope);
+  assert_true(g_queued_scopes_req.include_summary);
+  assert_false(g_queued_scopes_req.include_bins);
+  assert_true(g_queued_scopes_req.include_images);
+  assert_int_equal(g_queued_scopes_req.image_size, 512);
+
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+static void test_compute_scopes_request_fixture_defers(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  JsonNode *request_node = _load_fixture("compute_scopes_request.json");
+  JsonNode *resp = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_null(resp);   // deferred
+
+  assert_int_equal(g_queue_scopes_calls, 1);
+  assert_true(g_queued_scopes_req.want_histogram);
+  assert_true(g_queued_scopes_req.want_waveform);
+  assert_true(g_queued_scopes_req.want_parade);
+  assert_true(g_queued_scopes_req.want_vectorscope);
+  assert_int_equal(g_queued_scopes_req.image_size, 512);
+
+  json_node_unref(request_node);
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+// image_size is clamped to [128, 1024], not rejected (wire contract).
+static void test_compute_scopes_clamps_image_size(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  assert_null(_dispatch_inline_maybe_deferred(
+    "{\"id\":41,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"waveform\"],\"image_size\":10}}"));
+  assert_int_equal(g_queued_scopes_req.image_size, 128);
+
+  assert_null(_dispatch_inline_maybe_deferred(
+    "{\"id\":42,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"waveform\"],\"image_size\":5000}}"));
+  assert_int_equal(g_queued_scopes_req.image_size, 1024);
+
+  assert_int_equal(g_queue_scopes_calls, 2);
+
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+// the validation matrix: missing/empty/duplicate/unknown scopes, wrong
+// shapes for every param, strict unknown-key rejection -- all invalid_value,
+// none reaching the queue.
+static void test_compute_scopes_validation_matrix(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  // scopes: missing / not an array / empty / non-string entry
+  _assert_inline_error("{\"id\":50,\"method\":\"compute_scopes\",\"params\":{}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":51,\"method\":\"compute_scopes\",\"params\":{\"scopes\":\"histogram\"}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":52,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[]}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":53,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[7]}}", "invalid_value");
+
+  // unknown scope name; duplicate scope name (protocol reference: both invalid_value)
+  _assert_inline_error(
+    "{\"id\":54,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[\"histogramme\"]}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":55,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\",\"histogram\"]}}", "invalid_value");
+
+  // wrong types for the optional params
+  _assert_inline_error(
+    "{\"id\":56,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\"],\"include_summary\":\"yes\"}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":57,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\"],\"include_bins\":1}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":58,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\"],\"include_images\":\"no\"}}", "invalid_value");
+  _assert_inline_error(
+    "{\"id\":59,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\"],\"image_size\":512.5}}", "invalid_value");
+
+  // strict params: unknown key
+  _assert_inline_error(
+    "{\"id\":60,\"method\":\"compute_scopes\","
+    "\"params\":{\"scopes\":[\"histogram\"],\"format\":\"png\"}}", "invalid_value");
+
+  assert_int_equal(g_queue_scopes_calls, 0);
+  // every validation failure aborts the pre-registered pending
+  assert_int_equal(g_async_begin_calls, g_async_abort_calls);
+
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+static void test_compute_scopes_error_not_in_darkroom(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_not_in_darkroom };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+
+  _assert_inline_error(
+    "{\"id\":61,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[\"histogram\"]}}",
+    "not_in_darkroom");
+  assert_int_equal(g_queue_scopes_calls, 0);
+  assert_int_equal(g_async_abort_calls, 1);
+
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+// queueing failure maps to scope_failed, retryable TRUE (the ratified
+// unconditional rule)
+static void test_compute_scopes_error_queue_failure(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(FALSE);  // queue_scopes reports failure
+
+  JsonNode *resp = _dispatch_inline_maybe_deferred(
+    "{\"id\":62,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[\"histogram\"]}}");
+  assert_non_null(resp);
+  JsonObject *obj = json_node_get_object(resp);
+  assert_false(json_object_get_boolean_member(obj, "ok"));
+  JsonObject *error = json_object_get_object_member(obj, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"), "scope_failed");
+  assert_true(json_object_get_boolean_member(error, "retryable"));
+  json_node_unref(resp);
+
+  assert_int_equal(g_queue_scopes_calls, 1);
+  assert_int_equal(g_async_abort_calls, 1);
+
+  dt_remote_protocol_set_calls(NULL);
+  dt_remote_protocol_set_async(NULL);
+}
+
+static void test_compute_scopes_without_transport_is_internal_error(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .scopes_prepare = stub_scopes_prepare_ok };
+  dt_remote_protocol_set_calls(&calls);
+  dt_remote_protocol_set_async(NULL);  // real transport: begin(NULL session) -> NULL pending
+
+  _assert_inline_error(
+    "{\"id\":63,\"method\":\"compute_scopes\",\"params\":{\"scopes\":[\"histogram\"]}}", "internal");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// -- response shaping (pure) ----------------------------------------------
+
+static const char SCOPES_WAVE_STUB[] = "stub-png-bytes-for-scopes-waveform";
+static const char SCOPES_VEC_STUB[] = "stub-png-bytes-for-scopes-vectorscope";
+
+// a canned result carrying the design-spec example numbers; string/buffer
+// fields point at static storage (build_scopes_response only borrows)
+static dt_remote_scopes_result_t _canned_scopes_result(void)
+{
+  dt_remote_scopes_result_t r = { 0 };
+  r.revision = 34;
+  r.source = (char *)"final_preview";
+  r.color_profile = (char *)"linear Rec2020 RGB";
+  r.roi = (char *)"full_image";
+  r.has_histogram = TRUE;
+  r.has_histogram_summary = TRUE;
+  r.histogram_summary.bins = 256;
+  r.histogram_summary.black_clip_fraction = 0.0012;
+  r.histogram_summary.white_clip_fraction = 0.0041;
+  r.histogram_summary.p01 = 0.02;
+  r.histogram_summary.p50 = 0.41;
+  r.histogram_summary.p99 = 0.98;
+  r.histogram_summary.mean_red = 0.46;
+  r.histogram_summary.mean_green = 0.42;
+  r.histogram_summary.mean_blue = 0.37;
+  r.waveform.present = TRUE;
+  r.waveform.png = (uint8_t *)SCOPES_WAVE_STUB;
+  r.waveform.png_len = strlen(SCOPES_WAVE_STUB);
+  r.waveform.width = 360;
+  r.waveform.height = 256;
+  r.vectorscope.present = TRUE;
+  r.vectorscope.png = (uint8_t *)SCOPES_VEC_STUB;
+  r.vectorscope.png_len = strlen(SCOPES_VEC_STUB);
+  r.vectorscope.width = 512;
+  r.vectorscope.height = 512;
+  return r;
+}
+
+static void test_build_scopes_response_success_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_scopes_result_t r = _canned_scopes_result();
+
+  JsonNode *actual = dt_remote_protocol_build_scopes_response(40, &r, NULL);
+  JsonNode *expected = _load_fixture("compute_scopes_response.json");
+  assert_true(_json_equal(actual, expected));
+
+  json_node_unref(actual);
+  json_node_unref(expected);
+}
+
+// include_bins: 256 normalized bins per channel under histogram.channel_bins
+static void test_build_scopes_response_bins_shape(void **state)
+{
+  (void)state;
+  dt_remote_scopes_result_t r = { 0 };
+  r.revision = 7;
+  r.has_histogram = TRUE;
+  r.has_histogram_bins = TRUE;
+  for(int b = 0; b < DT_SCOPES_HISTOGRAM_BINS; b++)
+  {
+    r.histogram_bins[0][b] = 1.0f;
+    r.histogram_bins[1][b] = 0.5f;
+    r.histogram_bins[2][b] = 0.0f;
+  }
+
+  JsonNode *actual = dt_remote_protocol_build_scopes_response(41, &r, NULL);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  JsonObject *hist = json_object_get_object_member(result, "histogram");
+  assert_int_equal((int)json_object_get_int_member(hist, "bins"), 256);
+  JsonObject *bins = json_object_get_object_member(hist, "channel_bins");
+  JsonArray *red = json_object_get_array_member(bins, "red");
+  JsonArray *green = json_object_get_array_member(bins, "green");
+  JsonArray *blue = json_object_get_array_member(bins, "blue");
+  assert_int_equal((int)json_array_get_length(red), 256);
+  assert_int_equal((int)json_array_get_length(green), 256);
+  assert_int_equal((int)json_array_get_length(blue), 256);
+  assert_true(json_array_get_double_element(red, 0) > 0.99);
+  assert_true(json_array_get_double_element(green, 0) > 0.49);
+  assert_true(json_array_get_double_element(blue, 0) < 0.01);
+
+  json_node_unref(actual);
+}
+
+// the empty-capture-slot error envelope: scope_failed, retryable pinned TRUE
+static void test_build_scopes_response_error_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_error_t error = {
+    .code = DT_REMOTE_ERR_SCOPE_FAILED,
+    .message = (char *)"no preview buffer captured yet; retry after the preview updates",
+  };
+
+  JsonNode *actual = dt_remote_protocol_build_scopes_response(40, NULL, &error);
+  JsonNode *expected = _load_fixture("compute_scopes_error_scope_failed_response.json");
+  assert_true(_json_equal(actual, expected));
+
+  json_node_unref(actual);
+  json_node_unref(expected);
+}
+
+// over-cap composed response degrades to request_too_large (retryable false)
+static void test_build_scopes_response_too_large(void **state)
+{
+  (void)state;
+  dt_remote_scopes_result_t r = { 0 };
+  r.revision = 34;
+  const size_t huge = (size_t)DT_REMOTE_MAX_FRAME;  // inflates past the cap in base64
+  r.waveform.present = TRUE;
+  r.waveform.png = g_malloc0(huge);
+  r.waveform.png_len = huge;
+  r.waveform.width = 4096;
+  r.waveform.height = 4096;
+
+  JsonNode *actual = dt_remote_protocol_build_scopes_response(40, &r, NULL);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *error = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"), "request_too_large");
+  assert_false(json_object_get_boolean_member(error, "retryable"));
+
+  json_node_unref(actual);
+  g_free(r.waveform.png);
+}
+
+// -- completion against a real (fake-transport-free) session --------------
+
+// The deliberate contrast with render_preview: finish_scopes performs NO
+// completion-time revision drift check. Install a calls table whose live
+// revision (35) differs from the result's stamped revision (34): the
+// response must still be the SUCCESS envelope carrying revision 34 -- all
+// scopes derive from the one captured buffer and stay valid for its stamped
+// revision (design spec). This is also the multi-scope revision-coherence
+// test: one revision for the whole response.
+static void test_finish_scopes_sends_framed_response_without_drift_check(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);  // the real async transport
+  dt_remote_protocol_calls_t calls = { .current_revision = stub_current_revision_drifted };
+  dt_remote_protocol_set_calls(&calls);
+
+  dt_remote_session_t *s = _fake_session();
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 40);
+
+  // heap-allocated copy of the canned result (finish takes ownership)
+  dt_remote_scopes_result_t *r = g_malloc0(sizeof(dt_remote_scopes_result_t));
+  *r = _canned_scopes_result();
+  r->source = g_strdup("final_preview");
+  r->color_profile = g_strdup("linear Rec2020 RGB");
+  r->roi = g_strdup("full_image");
+  r->waveform.png = g_malloc(strlen(SCOPES_WAVE_STUB));
+  memcpy(r->waveform.png, SCOPES_WAVE_STUB, strlen(SCOPES_WAVE_STUB));
+  r->vectorscope.png = g_malloc(strlen(SCOPES_VEC_STUB));
+  memcpy(r->vectorscope.png, SCOPES_VEC_STUB, strlen(SCOPES_VEC_STUB));
+
+  dt_remote_protocol_finish_scopes(pending, r, NULL);  // takes ownership
+
+  JsonParser *parser = NULL;
+  JsonObject *resp = _parse_single_queued_frame(s, &parser);
+  JsonNode *expected = _load_fixture("compute_scopes_response.json");
+  assert_true(_json_equal(json_parser_get_root(parser), expected));
+  // and explicitly: the response carries the STAMPED revision, success,
+  // despite the live revision having moved on
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  assert_int_equal((int)json_object_get_int_member(result, "revision"), 34);
+  json_node_unref(expected);
+  g_object_unref(parser);
+
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 0);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// cancellation-on-disconnect for scopes: release everything, write nothing
+static void test_finish_scopes_cancelled_releases_without_writing(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);
+
+  dt_remote_session_t *s = _fake_session();
+  s->io_refs = 1;
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 40);
+
+  dt_remote_session_request_close(s);
+  assert_true(g_cancellable_is_cancelled(pending->cancellable));
+
+  dt_remote_scopes_result_t *r = g_malloc0(sizeof(dt_remote_scopes_result_t));
+  r->revision = 34;
+  r->source = g_strdup("final_preview");
+  r->color_profile = g_strdup("linear Rec2020 RGB");
+  r->roi = g_strdup("full_image");
+  r->waveform.present = TRUE;
+  r->waveform.png = g_malloc(1024 * 1024);  // a result buffer that must be released
+  r->waveform.png_len = 1024 * 1024;
+
+  dt_remote_protocol_finish_scopes(pending, r, NULL);
+
+  assert_int_equal((int)g_queue_get_length(s->write_queue), 0);  // nothing written
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 1);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+}
+
+// a job discarded before running (neither result nor error) answers a
+// retryable scope_failed instead of leaving the request dangling
+static void test_finish_scopes_discarded_job_fails_retryable(void **state)
+{
+  (void)state;
+  dt_remote_protocol_set_async(NULL);
+
+  dt_remote_session_t *s = _fake_session();
+  s->pending_requests = 1;
+  dt_remote_pending_t *pending = dt_remote_async_begin(s, 40);
+
+  dt_remote_protocol_finish_scopes(pending, NULL, NULL);
+
+  JsonParser *parser = NULL;
+  JsonObject *resp = _parse_single_queued_frame(s, &parser);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *error = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"), "scope_failed");
+  assert_true(json_object_get_boolean_member(error, "retryable"));
+  g_object_unref(parser);
+
+  assert_int_equal(s->pending_requests, 0);
+  assert_int_equal(s->io_refs, 0);
+  assert_int_equal((int)s->pendings->len, 0);
+
+  _fake_session_free(s);
+}
+
+/* ---------------------------------------------------------------------- */
 /* dispatch-level envelope validation                                      */
 /* ---------------------------------------------------------------------- */
 
@@ -2376,6 +2842,12 @@ static void test_error_unknown_method(void **state)
   _assert_dispatch_matches("error_unknown_method_request.json", "error_unknown_method_response.json");
 }
 
+// compute_scopes (the last unimplemented method) gained its handler in plan
+// step 10, so a "not implemented" method no longer exists in the allowlist.
+// A method this build does not know about surfaces through the dispatcher's
+// existing unknown-method contract (invalid_value, non-retryable) -- this
+// fixture pair documents that a plausible FUTURE method name gets exactly
+// that treatment rather than a crash or a dangling request.
 static void test_method_not_implemented_yet(void **state)
 {
   (void)state;
@@ -2433,8 +2905,10 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
   assert_non_null(preview->handler);  // implemented in plan step 9
 
   const dt_remote_method_t *scopes = dt_remote_protocol_lookup_method("compute_scopes");
+  assert_true(scopes->needs_darkroom);
+  assert_false(scopes->is_mutation);
   assert_true(scopes->is_async);
-  assert_null(scopes->handler);  // still pending (the not-implemented fixture uses it)
+  assert_non_null(scopes->handler);  // implemented in plan step 10
 }
 
 int main(int argc, char *argv[])
@@ -2515,6 +2989,20 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_finish_preview_revision_drift_fails_retryable),
     cmocka_unit_test(test_finish_preview_no_drift_succeeds),
     cmocka_unit_test(test_finish_preview_cancelled_releases_without_writing),
+    cmocka_unit_test(test_compute_scopes_defers_with_defaults),
+    cmocka_unit_test(test_compute_scopes_request_fixture_defers),
+    cmocka_unit_test(test_compute_scopes_clamps_image_size),
+    cmocka_unit_test(test_compute_scopes_validation_matrix),
+    cmocka_unit_test(test_compute_scopes_error_not_in_darkroom),
+    cmocka_unit_test(test_compute_scopes_error_queue_failure),
+    cmocka_unit_test(test_compute_scopes_without_transport_is_internal_error),
+    cmocka_unit_test(test_build_scopes_response_success_matches_fixture),
+    cmocka_unit_test(test_build_scopes_response_bins_shape),
+    cmocka_unit_test(test_build_scopes_response_error_matches_fixture),
+    cmocka_unit_test(test_build_scopes_response_too_large),
+    cmocka_unit_test(test_finish_scopes_sends_framed_response_without_drift_check),
+    cmocka_unit_test(test_finish_scopes_cancelled_releases_without_writing),
+    cmocka_unit_test(test_finish_scopes_discarded_job_fails_retryable),
 
     cmocka_unit_test(test_error_missing_id),
     cmocka_unit_test(test_error_invalid_id_type),

@@ -25,6 +25,7 @@
 #include "control/control.h"
 #include "control/remote_discovery.h"
 #include "control/remote_revision.h"
+#include "control/remote_scopes.h"
 
 #include <json-glib/json-glib.h>
 #include <pthread.h>
@@ -784,6 +785,7 @@ void dt_remote_server_stop(dt_remote_server_t *server)
   if(!server) return;
 
   dt_remote_revision_disconnect();
+  dt_remote_scopes_capture_reset();
 
   g_socket_service_stop(server->service);
 
