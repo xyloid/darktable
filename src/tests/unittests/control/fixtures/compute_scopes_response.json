@@ -29,6 +29,14 @@
         "data": "c3R1Yi1wbmctYnl0ZXMtZm9yLXNjb3Blcy13YXZlZm9ybQ=="
       }
     },
+    "parade": {
+      "image": {
+        "mime_type": "image/png",
+        "width": 1080,
+        "height": 256,
+        "data": "c3R1Yi1wbmctYnl0ZXMtZm9yLXNjb3Blcy1wYXJhZGU="
+      }
+    },
     "vectorscope": {
       "image": {
         "mime_type": "image/png",

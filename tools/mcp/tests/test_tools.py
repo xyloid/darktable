@@ -425,22 +425,53 @@ async def test_get_scopes_returns_mixed_content(tmp_path, fake_server_factory):
     assert summary["waveform"]["image"]["width"] == 360
     assert summary["waveform"]["image"]["height"] == 256
     assert "data" not in summary["waveform"]["image"]
+    assert summary["parade"]["image"]["width"] == 1080
     assert summary["vectorscope"]["image"]["width"] == 512
 
     # then one native image block per rendered scope, in wire order
     image_blocks = result[1:]
-    assert len(image_blocks) == 2  # the fixture carries waveform + vectorscope
+    assert len(image_blocks) == 3  # the fixture carries waveform + parade + vectorscope
     for block in image_blocks:
         assert isinstance(block, ImageContent)
         assert block.type == "image"
         assert block.mimeType == "image/png"
-    # the image bytes round-trip the wire base64 exactly
-    assert base64.b64decode(image_blocks[0].data) == base64.b64decode(
-        fixture["result"]["waveform"]["image"]["data"]
-    )
-    assert base64.b64decode(image_blocks[1].data) == base64.b64decode(
-        fixture["result"]["vectorscope"]["image"]["data"]
-    )
+    # the image bytes round-trip the wire base64 exactly, in wire order
+    for block, name in zip(image_blocks, ("waveform", "parade", "vectorscope")):
+        assert base64.b64decode(block.data) == base64.b64decode(
+            fixture["result"][name]["image"]["data"]
+        )
+
+
+async def test_get_scopes_keyed_imageless_scope_does_not_crash(tmp_path, fake_server_factory):
+    """An image scope requested with include_images=false comes back keyed
+    but without an "image" member (a minimal {"image_size": N} metadata
+    object). The tool must not crash: the metadata object stays in the JSON
+    text block and produces no ImageContent."""
+    server = await fake_server_factory()
+
+    def handler(_params):
+        return {
+            "revision": 5,
+            "source": "final_preview",
+            "color_profile": "linear Rec2020 RGB",
+            "roi": "full_image",
+            "histogram": {"bins": 256},
+            "waveform": {"image_size": 512},
+            "parade": {"image_size": 512},
+            "vectorscope": {"image_size": 512},
+        }
+
+    server.handle("compute_scopes", handler)
+    app = await _built_server(tmp_path, server)
+
+    result = await app.call_tool("get_scopes", {"include_images": False})
+
+    assert isinstance(result, list)
+    # no image blocks -- every scope was imageless
+    assert len(result) == 1
+    summary = json.loads(result[0].text)
+    for name in ("waveform", "parade", "vectorscope"):
+        assert summary[name] == {"image_size": 512}
 
 
 async def test_get_scopes_threads_and_clamps_params(tmp_path, fake_server_factory):

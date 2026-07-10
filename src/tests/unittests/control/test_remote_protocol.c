@@ -2575,6 +2575,7 @@ static void test_compute_scopes_without_transport_is_internal_error(void **state
 // -- response shaping (pure) ----------------------------------------------
 
 static const char SCOPES_WAVE_STUB[] = "stub-png-bytes-for-scopes-waveform";
+static const char SCOPES_PARADE_STUB[] = "stub-png-bytes-for-scopes-parade";
 static const char SCOPES_VEC_STUB[] = "stub-png-bytes-for-scopes-vectorscope";
 
 // a canned result carrying the design-spec example numbers; string/buffer
@@ -2597,11 +2598,22 @@ static dt_remote_scopes_result_t _canned_scopes_result(void)
   r.histogram_summary.mean_red = 0.46;
   r.histogram_summary.mean_green = 0.42;
   r.histogram_summary.mean_blue = 0.37;
+  // all four scopes requested with include_images -> one key each, images
+  // present (matches compute_scopes_request.json / _response.json)
+  r.want_waveform = TRUE;
+  r.want_parade = TRUE;
+  r.want_vectorscope = TRUE;
+  r.image_size = 512;
   r.waveform.present = TRUE;
   r.waveform.png = (uint8_t *)SCOPES_WAVE_STUB;
   r.waveform.png_len = strlen(SCOPES_WAVE_STUB);
   r.waveform.width = 360;
   r.waveform.height = 256;
+  r.parade.present = TRUE;
+  r.parade.png = (uint8_t *)SCOPES_PARADE_STUB;
+  r.parade.png_len = strlen(SCOPES_PARADE_STUB);
+  r.parade.width = 1080;
+  r.parade.height = 256;
   r.vectorscope.present = TRUE;
   r.vectorscope.png = (uint8_t *)SCOPES_VEC_STUB;
   r.vectorscope.png_len = strlen(SCOPES_VEC_STUB);
@@ -2654,6 +2666,37 @@ static void test_build_scopes_response_bins_shape(void **state)
   assert_true(json_array_get_double_element(red, 0) > 0.99);
   assert_true(json_array_get_double_element(green, 0) > 0.49);
   assert_true(json_array_get_double_element(blue, 0) < 0.01);
+
+  json_node_unref(actual);
+}
+
+// finding 3: an image scope requested with include_images=false still emits
+// its key -- a minimal {"image_size": N} metadata object (no "image"), so
+// the response contains one key per requested scope (protocol reference).
+static void test_build_scopes_response_imageless_keys(void **state)
+{
+  (void)state;
+  dt_remote_scopes_result_t r = { 0 };
+  r.revision = 12;
+  r.want_waveform = TRUE;
+  r.want_parade = TRUE;
+  r.want_vectorscope = TRUE;
+  r.image_size = 512;
+  // no .present, no histogram -> only the three imageless image keys
+
+  JsonNode *actual = dt_remote_protocol_build_scopes_response(42, &r, NULL);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+
+  const char *const keys[3] = { "waveform", "parade", "vectorscope" };
+  for(int i = 0; i < 3; i++)
+  {
+    assert_true(json_object_has_member(result, keys[i]));
+    JsonObject *o = json_object_get_object_member(result, keys[i]);
+    assert_false(json_object_has_member(o, "image"));
+    assert_int_equal((int)json_object_get_int_member(o, "image_size"), 512);
+  }
 
   json_node_unref(actual);
 }
@@ -2727,6 +2770,8 @@ static void test_finish_scopes_sends_framed_response_without_drift_check(void **
   r->roi = g_strdup("full_image");
   r->waveform.png = g_malloc(strlen(SCOPES_WAVE_STUB));
   memcpy(r->waveform.png, SCOPES_WAVE_STUB, strlen(SCOPES_WAVE_STUB));
+  r->parade.png = g_malloc(strlen(SCOPES_PARADE_STUB));
+  memcpy(r->parade.png, SCOPES_PARADE_STUB, strlen(SCOPES_PARADE_STUB));
   r->vectorscope.png = g_malloc(strlen(SCOPES_VEC_STUB));
   memcpy(r->vectorscope.png, SCOPES_VEC_STUB, strlen(SCOPES_VEC_STUB));
 
@@ -2998,6 +3043,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_compute_scopes_without_transport_is_internal_error),
     cmocka_unit_test(test_build_scopes_response_success_matches_fixture),
     cmocka_unit_test(test_build_scopes_response_bins_shape),
+    cmocka_unit_test(test_build_scopes_response_imageless_keys),
     cmocka_unit_test(test_build_scopes_response_error_matches_fixture),
     cmocka_unit_test(test_build_scopes_response_too_large),
     cmocka_unit_test(test_finish_scopes_sends_framed_response_without_drift_check),

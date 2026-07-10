@@ -1832,24 +1832,40 @@ static gboolean _scopes_fits_frame(const dt_remote_scopes_result_t *r)
   return total <= (size_t)DT_REMOTE_MAX_FRAME;
 }
 
+// Emits one key for a requested image scope (waveform/parade/vectorscope).
+// With include_images the value carries the rendered PNG
+// ({"image": {mime_type,width,height,data}}); without it, a minimal
+// metadata object {"image_size": N} states the bounded resolution the
+// raster would use -- the smallest-surprise analogue of the histogram's
+// minimal {"bins": 256}, so the response always contains one key per
+// requested scope even when no image was rendered.
 static void _scopes_image_to_json(JsonBuilder *b, const char *key,
-                                  const dt_remote_scopes_image_t *img)
+                                  const dt_remote_scopes_image_t *img,
+                                  int image_size)
 {
   json_builder_set_member_name(b, key);
   json_builder_begin_object(b);
-  json_builder_set_member_name(b, "image");
-  json_builder_begin_object(b);
-  json_builder_set_member_name(b, "mime_type");
-  json_builder_add_string_value(b, "image/png");
-  json_builder_set_member_name(b, "width");
-  json_builder_add_int_value(b, img->width);
-  json_builder_set_member_name(b, "height");
-  json_builder_add_int_value(b, img->height);
-  json_builder_set_member_name(b, "data");
-  gchar *b64 = g_base64_encode(img->png, img->png_len);
-  json_builder_add_string_value(b, b64);
-  g_free(b64);
-  json_builder_end_object(b);
+  if(img->present)
+  {
+    json_builder_set_member_name(b, "image");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "mime_type");
+    json_builder_add_string_value(b, "image/png");
+    json_builder_set_member_name(b, "width");
+    json_builder_add_int_value(b, img->width);
+    json_builder_set_member_name(b, "height");
+    json_builder_add_int_value(b, img->height);
+    json_builder_set_member_name(b, "data");
+    gchar *b64 = g_base64_encode(img->png, img->png_len);
+    json_builder_add_string_value(b, b64);
+    g_free(b64);
+    json_builder_end_object(b);
+  }
+  else
+  {
+    json_builder_set_member_name(b, "image_size");
+    json_builder_add_int_value(b, image_size);
+  }
   json_builder_end_object(b);
 }
 
@@ -1931,9 +1947,12 @@ JsonNode *dt_remote_protocol_build_scopes_response(gint64 request_id,
       json_builder_end_object(b);
     }
 
-    if(result->waveform.present) _scopes_image_to_json(b, "waveform", &result->waveform);
-    if(result->parade.present) _scopes_image_to_json(b, "parade", &result->parade);
-    if(result->vectorscope.present) _scopes_image_to_json(b, "vectorscope", &result->vectorscope);
+    if(result->want_waveform)
+      _scopes_image_to_json(b, "waveform", &result->waveform, result->image_size);
+    if(result->want_parade)
+      _scopes_image_to_json(b, "parade", &result->parade, result->image_size);
+    if(result->want_vectorscope)
+      _scopes_image_to_json(b, "vectorscope", &result->vectorscope, result->image_size);
 
     json_builder_end_object(b);
     JsonNode *node = json_builder_get_root(b);

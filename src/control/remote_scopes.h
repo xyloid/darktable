@@ -130,6 +130,13 @@ typedef struct dt_remote_scopes_result_t
   gboolean has_histogram_bins;
   float histogram_bins[3][DT_SCOPES_HISTOGRAM_BINS];  // normalized [0,1]
 
+  // Every requested image scope emits a response key (protocol reference:
+  // "one key per requested scope"). want_* records the request so the
+  // builder can emit a minimal metadata object -- {"image_size": N}, the
+  // bounded resolution the raster would use -- for a scope requested with
+  // include_images=false. `image` carries the rendered PNG when present.
+  gboolean want_waveform, want_parade, want_vectorscope;
+  int image_size;      // clamped [128,1024]; governs the imageless metadata
   dt_remote_scopes_image_t waveform;
   dt_remote_scopes_image_t parade;
   dt_remote_scopes_image_t vectorscope;

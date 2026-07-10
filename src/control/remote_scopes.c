@@ -422,6 +422,14 @@ gboolean dt_remote_scopes_execute(const dt_remote_scopes_request_t *req,
   r->roi = g_strdup("full_image");
   r->color_profile = g_strdup(dt_colorspaces_get_name(cap->vs_prof.type, cap->vs_prof.filename));
 
+  // Record every requested image scope so the builder emits its key even
+  // when include_images=false (protocol reference: one key per requested
+  // scope). image_size is already clamped [128,1024] by the handler.
+  r->want_waveform = req->want_waveform;
+  r->want_parade = req->want_parade;
+  r->want_vectorscope = req->want_vectorscope;
+  r->image_size = req->image_size;
+
   const dt_histogram_roi_t roi = { .width = cap->width, .height = cap->height,
                                    .crop_x = 0, .crop_y = 0, .crop_right = 0, .crop_bottom = 0 };
 
