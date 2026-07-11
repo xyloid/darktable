@@ -95,7 +95,7 @@ typedef struct dt_remote_protocol_calls_t
   gboolean (*get_module_schema)(const char *op, dt_remote_module_schema_t **out,
                                 dt_remote_error_t **error);
   gboolean (*get_module_params)(const dt_remote_module_ref_t *ref, GPtrArray **out,
-                                dt_remote_error_t **error);
+                                GHashTable **semantic_out, dt_remote_error_t **error);
   gboolean (*set_module_params)(const dt_remote_module_ref_t *ref, const dt_remote_patch_t *patch,
                                 const uint64_t *expected_revision, dt_remote_mutation_result_t **out,
                                 dt_remote_error_t **error);

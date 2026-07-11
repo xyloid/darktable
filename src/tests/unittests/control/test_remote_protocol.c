@@ -319,16 +319,33 @@ static gboolean stub_get_module_schema_exposure(const char *op, dt_remote_module
 static gboolean stub_get_module_schema_unknown(const char *op, dt_remote_module_schema_t **out,
                                                dt_remote_error_t **error)
 {
-  (void)out;
+  assert_non_null(out);
+  assert_null(*out);
   if(error) *error = _make_error(DT_REMOTE_ERR_UNKNOWN_MODULE, g_strdup_printf("unknown module '%s'", op));
   return FALSE;
 }
 
-static gboolean stub_get_module_params_exposure(const dt_remote_module_ref_t *ref, GPtrArray **out,
+static gboolean stub_get_module_schema_internal(const char *op, dt_remote_module_schema_t **out,
                                                 dt_remote_error_t **error)
+{
+  (void)op;
+  assert_non_null(out);
+  assert_null(*out);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_INTERNAL,
+                         g_strdup("curve registry does not match module introspection"));
+  return FALSE;
+}
+
+static gboolean stub_get_module_params_exposure(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                GHashTable **semantic_out, dt_remote_error_t **error)
 {
   (void)ref;
   (void)error;
+  assert_non_null(out);
+  assert_null(*out);
+  assert_non_null(semantic_out);
+  assert_null(*semantic_out);
   GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
 
   dt_remote_patch_entry_t *e1 = g_malloc0(sizeof(dt_remote_patch_entry_t));
@@ -351,15 +368,33 @@ static gboolean stub_get_module_params_exposure(const dt_remote_module_ref_t *re
   g_ptr_array_add(arr, e3);
 
   *out = arr;
+  *semantic_out = g_hash_table_new(g_str_hash, g_str_equal);
   return TRUE;
 }
 
 static gboolean stub_get_module_params_unknown_module(const dt_remote_module_ref_t *ref, GPtrArray **out,
-                                                      dt_remote_error_t **error)
+                                                      GHashTable **semantic_out, dt_remote_error_t **error)
 {
-  (void)out;
+  assert_non_null(out);
+  assert_null(*out);
+  assert_non_null(semantic_out);
+  assert_null(*semantic_out);
   if(error)
     *error = _make_error(DT_REMOTE_ERR_UNKNOWN_MODULE, g_strdup_printf("unknown module '%s'", ref->op));
+  return FALSE;
+}
+
+static gboolean stub_get_module_params_internal(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  assert_non_null(out);
+  assert_null(*out);
+  assert_non_null(semantic_out);
+  assert_null(*semantic_out);
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_INTERNAL,
+                         g_strdup("curve registry does not match live module introspection"));
   return FALSE;
 }
 
@@ -792,6 +827,29 @@ static void test_get_module_schema_error_unknown_module(void **state)
   dt_remote_protocol_set_calls(NULL);
 }
 
+static void test_get_module_schema_error_internal_is_error_envelope(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_schema = stub_get_module_schema_internal };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *request_node = _load_fixture("get_module_schema_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+
+  JsonObject *response = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(response, "ok"));
+  assert_false(json_object_has_member(response, "result"));
+  JsonObject *error = json_object_get_object_member(response, "error");
+  assert_non_null(error);
+  assert_string_equal(json_object_get_string_member(error, "code"), "internal");
+  assert_true(strstr(json_object_get_string_member(error, "message"), "curve registry") != NULL);
+
+  json_node_unref(actual);
+  json_node_unref(request_node);
+  dt_remote_protocol_set_calls(NULL);
+}
+
 // wrong JSON type for the whole `params` blob: the handler still requires
 // "module", so it is reported as "missing" -- the dispatcher never even
 // attempts to interpret the non-object params value as a module name.
@@ -890,6 +948,29 @@ static void test_get_module_params_error_unknown_module(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_error_unknown_module_request.json",
                            "get_module_params_error_unknown_module_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_get_module_params_error_internal_is_error_envelope(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_params = stub_get_module_params_internal };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *request_node = _load_fixture("get_module_params_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+
+  JsonObject *response = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(response, "ok"));
+  assert_false(json_object_has_member(response, "result"));
+  JsonObject *error = json_object_get_object_member(response, "error");
+  assert_non_null(error);
+  assert_string_equal(json_object_get_string_member(error, "code"), "internal");
+  assert_true(strstr(json_object_get_string_member(error, "message"), "curve registry") != NULL);
+
+  json_node_unref(actual);
+  json_node_unref(request_node);
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -3017,12 +3098,14 @@ int main(int argc, char *argv[])
 
     cmocka_unit_test(test_get_module_schema_success),
     cmocka_unit_test(test_get_module_schema_error_unknown_module),
+    cmocka_unit_test(test_get_module_schema_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_schema_error_wrong_type_params),
     cmocka_unit_test(test_get_module_schema_error_overlong_string),
     cmocka_unit_test(test_get_module_schema_error_unknown_key),
 
     cmocka_unit_test(test_get_module_params_success),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
+    cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),
     cmocka_unit_test(test_get_module_params_error_fractional_instance),
 

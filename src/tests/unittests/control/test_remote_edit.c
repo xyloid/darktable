@@ -873,6 +873,48 @@ static void test_set_module_params_mutation_path_uses_real_denylist(void **state
   g_free(before);
 }
 
+// This MUST remain the final test in this process: curve-registry validation
+// is cached for the lifetime of the process by (adapter, params_version).
+// Deliberately cache the invalid rgbcurve/v1 result only after every other
+// test has run. The mutable introspection itself is restored immediately
+// after the call, before any assertion can abort the test early.
+static void test_schema_rgbcurve_registry_drift_fails_closed(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+  assert_non_null(intro->field);
+
+  guint8 dummy_params = 0;
+  dt_introspection_field_t *curve_nodes = NULL;
+  assert_non_null(dt_introspection_get_child(intro->field, &dummy_params,
+                                             "curve_nodes", &curve_nodes));
+  assert_non_null(curve_nodes);
+  assert_int_equal(curve_nodes->header.type, DT_INTROSPECTION_TYPE_ARRAY);
+  assert_non_null(curve_nodes->Array.field);
+  assert_int_equal(curve_nodes->Array.field->header.type, DT_INTROSPECTION_TYPE_ARRAY);
+
+  dt_introspection_field_t *native_nodes = curve_nodes->Array.field;
+  const size_t saved_count = native_nodes->Array.count;
+  native_nodes->Array.count = 0;
+
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  const gboolean ok = dt_remote_get_module_schema("rgbcurve", &schema, &err);
+
+  native_nodes->Array.count = saved_count;
+
+  assert_false(ok);
+  assert_null(schema);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  assert_non_null(err->message);
+  assert_true(strstr(err->message, "curve descriptor") != NULL);
+  dt_remote_error_free(err);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -910,6 +952,10 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_patch_apply_duplicate_field_rejected),
     cmocka_unit_test(test_patch_apply_empty_patch_rejected),
     cmocka_unit_test(test_patch_apply_null_patch_rejected),
+
+    // Keep last: this intentionally poisons rgbcurve/v1's process-lifetime
+    // registry-validation cache after restoring the temporary drift.
+    cmocka_unit_test(test_schema_rgbcurve_registry_drift_fails_closed),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);

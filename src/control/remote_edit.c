@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/undo.h"
 #include "control/control.h"
+#include "control/remote_curve.h"
 #include "control/remote_revision.h"
 #include "common/colorspaces.h"
 #include "develop/develop.h"
@@ -103,6 +104,7 @@ void dt_remote_module_schema_free(dt_remote_module_schema_t *schema)
   g_free(schema->op);
   g_free(schema->display_name);
   if(schema->fields) g_ptr_array_unref(schema->fields);
+  if(schema->semantic_fields) g_ptr_array_unref(schema->semantic_fields);
   g_free(schema);
 }
 
@@ -802,6 +804,23 @@ gboolean dt_remote_get_module_schema(const char *op,
   schema->supports_multiple_instances = !(so->flags() & IOP_FLAGS_ONE_INSTANCE);
   schema->fields = dt_remote_schema_from_introspection(linear, dt_remote_denylist_for_op(op));
 
+  GPtrArray *semantic_fields = NULL;
+  dt_remote_error_t *curve_error = NULL;
+  if(!dt_remote_curve_list_schema(so, &semantic_fields, &curve_error))
+  {
+    dt_remote_module_schema_free(schema);
+    if(error)
+      *error = curve_error;
+    else
+      dt_remote_error_free(curve_error);
+    return FALSE;
+  }
+
+  if(semantic_fields->len > 0)
+    schema->semantic_fields = semantic_fields;
+  else
+    g_ptr_array_unref(semantic_fields);
+
   *out = schema;
   return TRUE;
 }
@@ -847,6 +866,7 @@ static dt_iop_module_t *dt_remote_find_module(dt_develop_t *dev, const dt_remote
 
 gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
                                      GPtrArray **out,
+                                     GHashTable **semantic_out,
                                      dt_remote_error_t **error)
 {
   dt_develop_t *dev = NULL;
@@ -854,6 +874,14 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
 
   dt_iop_module_t *module = dt_remote_find_module(dev, ref, error);
   if(!module) return FALSE;
+
+  // Keep scalar-only callers independent of the semantic registry. When a
+  // semantic snapshot is requested, read it before allocating scalar output
+  // so any registry/introspection failure leaves both outputs untouched.
+  GHashTable *semantic_values = NULL;
+  if(semantic_out
+     && !dt_remote_curve_read_values(module, module->params, &semantic_values, error))
+    return FALSE;
 
   GPtrArray *values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
 
@@ -875,6 +903,7 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
   }
 
   *out = values;
+  if(semantic_out) *semantic_out = semantic_values;
   return TRUE;
 }
 

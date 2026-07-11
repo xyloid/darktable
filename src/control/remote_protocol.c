@@ -603,19 +603,19 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
 
   GPtrArray *values = NULL;
-  if(!s_calls.get_module_params(&ref, &values, &err)) return _handler_fail(err);
+  GHashTable *semantic_values = NULL;
+  if(!s_calls.get_module_params(&ref, &values, &semantic_values, &err)) return _handler_fail(err);
 
-  // dt_remote_get_module_params() only returns scalar values -- the wire
-  // response also needs instance_name/enabled (list_modules) and revision
-  // (get_state). Both come from the same live module list this call just
-  // walked, so a missing match here means the two calls disagreed --
-  // treat that as internal, not as if the module vanished mid-air.
+  // Semantic values are collected so registry failures reach the wire, but
+  // remain internal until semantic mutation support lands. The v1 response
+  // below therefore stays primitive-only for now.
   GPtrArray *modules = NULL;
   dt_remote_error_t *list_err = NULL;
   if(!s_calls.list_modules(&modules, &list_err))
   {
     dt_remote_error_free(list_err);
     g_ptr_array_unref(values);
+    if(semantic_values) g_hash_table_unref(semantic_values);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
                                     _("could not resolve instance metadata for '%s'/%d"), module,
                                     (int)instance));
@@ -635,6 +635,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   {
     g_ptr_array_unref(modules);
     g_ptr_array_unref(values);
+    if(semantic_values) g_hash_table_unref(semantic_values);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
                                     _("module '%s' instance %d vanished between reads"), module,
                                     (int)instance));
@@ -647,6 +648,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
     dt_remote_error_free(state_err);
     g_ptr_array_unref(modules);
     g_ptr_array_unref(values);
+    if(semantic_values) g_hash_table_unref(semantic_values);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL, _("could not read current revision")));
   }
 
@@ -678,6 +680,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   dt_remote_state_free(state);
   g_ptr_array_unref(modules);
   g_ptr_array_unref(values);
+  if(semantic_values) g_hash_table_unref(semantic_values);
   return result;
 }
 

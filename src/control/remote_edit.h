@@ -203,9 +203,12 @@ typedef struct dt_remote_module_schema_t  // <- get_module_schema
   gboolean deprecated;
   gboolean supports_multiple_instances;
   GPtrArray *fields;            // owned; dt_remote_field_t
+  GPtrArray *semantic_fields;   // owned; dt_remote_curve_schema_t
+                                // (remote_parameters.h), NULL when the op
+                                // has no registered semantic curves
 } dt_remote_module_schema_t;
 
-/** frees a module schema, including its fields. NULL-safe. */
+/** frees a module schema, including primitive and semantic fields. NULL-safe. */
 void dt_remote_module_schema_free(dt_remote_module_schema_t *schema);
 
 typedef struct dt_remote_history_item_t  // <- get_history items
@@ -369,7 +372,10 @@ gboolean dt_remote_list_modules(GPtrArray **out /* dt_remote_module_t */,
 
 /** returns the per-op parameter schema (shared by all instances of that
  * op), from the loaded module .so alone -- no darkroom/image needed.
- * Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is not loaded. */
+ * Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is not loaded. A
+ * semantic registry/introspection mismatch fails closed with the original
+ * DT_REMOTE_ERR_INTERNAL error, returning neither a primitive-only schema
+ * nor semantic fields. */
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error);
@@ -377,9 +383,15 @@ gboolean dt_remote_get_module_schema(const char *op,
 /** reads back the current scalar values of a live module instance's
  * supported fields. Fails with DT_REMOTE_ERR_NOT_IN_DARKROOM /
  * DT_REMOTE_ERR_NO_IMAGE_OPEN / DT_REMOTE_ERR_UNKNOWN_MODULE /
- * DT_REMOTE_ERR_UNKNOWN_INSTANCE as appropriate. */
+ * DT_REMOTE_ERR_UNKNOWN_INSTANCE as appropriate. `semantic_out` may be
+ * NULL to request only primitive values without consulting the semantic
+ * registry. When non-NULL, it receives a newly allocated GHashTable of
+ * name -> dt_remote_curve_value_t (free with g_hash_table_unref()); a
+ * semantic read failure fails the whole call and leaves both outputs
+ * untouched. */
 gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
                                      GPtrArray **out /* dt_remote_patch_entry_t */,
+                                     GHashTable **semantic_out /* name -> dt_remote_curve_value_t */,
                                      dt_remote_error_t **error);
 
 /* ---------------------------------------------------------------------- */
