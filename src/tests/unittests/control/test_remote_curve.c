@@ -17,12 +17,16 @@
 */
 /*
  * cmocka unit tests for the neutral semantic-parameter types
- * (src/control/remote_parameters.c/.h) and the dt_remote_patch_t
- * extension in src/control/remote_edit.h/.c.
+ * (src/control/remote_parameters.c/.h), the dt_remote_patch_t extension
+ * in src/control/remote_edit.h/.c, and the bounds-checked introspection
+ * path cursor (src/control/remote_curve.c/.h).
  *
- * This is pure data plus paired constructors/destructors -- no
- * introspection cursor, no registry, no JSON (those are later steps).
- * Coverage here:
+ * The semantic-parameter/patch types are pure data plus paired
+ * constructors/destructors -- no introspection, no registry, no JSON
+ * (those are later steps). The path cursor is the first piece that does
+ * touch introspection, walking a compiled-in path description against a
+ * loaded module's introspection tree and a live params blob. Coverage
+ * here:
  *
  *  - dt_remote_curve_schema_free(), dt_remote_curve_value_free(), and
  *    dt_remote_semantic_patch_free() on fully-populated, partially-
@@ -35,6 +39,17 @@
  *    are all unset; semantic-only and enable-only patches now count as
  *    non-empty, while the scalar-only behavior already covered by
  *    test_remote_edit.c is unchanged.
+ *  - dt_remote_path_resolve() against the real rgbcurve module .so:
+ *    nested field/array-index sequences resolve to the right offset in
+ *    a fixture params blob (curve_nodes[0][3].x, curve_num_nodes[1]),
+ *    and wrong-type segments, out-of-bounds indices, and missing
+ *    children are all rejected with DT_REMOTE_ERR_INTERNAL. rgbcurve's
+ *    curve_nodes[DT_IOP_RGBCURVE_MAX_CHANNELS][DT_IOP_RGBCURVE_MAXNODES]
+ *    is a native two-dimensional C array; per tools/introspection/ast.pm
+ *    ast_type_node::get_introspection_code() (each array dimension emits
+ *    its own DT_INTROSPECTION_TYPE_ARRAY layer, innermost first) this is
+ *    ARRAY-of-ARRAY-of-STRUCT in the introspection tree, so the path
+ *    needs two DT_REMOTE_PATH_INDEX segments in a row, not one.
  *
  * Please see README.md for more detailed documentation.
  */
@@ -48,8 +63,11 @@
 
 #include "../util/assert.h"
 
+#include "control/remote_curve.h"
 #include "control/remote_edit.h"
 #include "control/remote_parameters.h"
+
+#include "develop/imageop.h" // dt_iop_get_module_so()/dt_iop_module_so_t
 
 #ifdef _WIN32
 #include "win/main_wrapper.h"
@@ -292,6 +310,338 @@ static void test_patch_apply_null_semantic_values_scalar_only_unchanged(void **s
   g_ptr_array_unref(patch.scalar_values);
 }
 
+/* ---------------------------------------------------------------------- */
+/* dt_remote_path_resolve                                                  */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * dt_remote_path_resolve() needs a real loaded module .so: the path
+ * segments are compiled-in registry data, but resolving them means
+ * walking the *real* introspection tree generated for
+ * dt_iop_rgbcurve_params_t (src/iop/rgbcurve.c) -- a type that, like
+ * every other iop module's params struct, is private to that module's
+ * .c file and only reachable through the dlopen'ed .so's introspection
+ * API, never through a header the test could #include. So the "fixture
+ * params blob" here is a heap buffer sized from the module's own
+ * dt_introspection_t.size (documented as "size of the params struct"),
+ * not a stack instance of the real C type -- the whole point of the
+ * introspection cursor is that callers never need that type at compile
+ * time. See harness_group_setup() below for the same minimal, GUI-less,
+ * throwaway-configdir dt_init() test_remote_edit.c uses to populate
+ * darktable.iop for its one real-module test.
+ */
+
+#ifndef DT_TEST_MODULEDIR
+#error "DT_TEST_MODULEDIR must be defined by the build (see CMakeLists.txt)"
+#endif
+
+static char *s_harness_confdir = NULL;
+
+static int harness_group_setup(void **state)
+{
+  (void)state;
+  GError *gerror = NULL;
+  s_harness_confdir = g_dir_make_tmp("test_remote_curve-XXXXXX", &gerror);
+  if(!s_harness_confdir)
+  {
+    fprintf(stderr, "test_remote_curve: failed to create scratch config dir: %s\n",
+            gerror->message);
+    g_error_free(gerror);
+    return -1;
+  }
+
+  char *argv_override[] = {
+    "test_remote_curve",
+    "--configdir", s_harness_confdir,
+    "--library", ":memory:",
+    "--moduledir", DT_TEST_MODULEDIR,
+    "--conf", "write_sidecar_files=never",
+    NULL
+  };
+  int argc_override = G_N_ELEMENTS(argv_override) - 1;
+  return dt_init(argc_override, argv_override, FALSE, FALSE, NULL) ? -1 : 0;
+}
+
+static int harness_group_teardown(void **state)
+{
+  (void)state;
+  dt_cleanup();
+  if(s_harness_confdir)
+  {
+    gchar *cmd = g_strdup_printf("rm -rf '%s'", s_harness_confdir);
+    if(system(cmd) != 0)
+      fprintf(stderr, "test_remote_curve: failed to remove scratch config dir %s\n",
+              s_harness_confdir);
+    g_free(cmd);
+    g_free(s_harness_confdir);
+    s_harness_confdir = NULL;
+  }
+  return 0;
+}
+
+/* rgbcurve path segment helpers: curve_nodes is
+ * dt_iop_rgbcurve_node_t[DT_IOP_RGBCURVE_MAX_CHANNELS][DT_IOP_RGBCURVE_MAXNODES],
+ * a native two-dimensional C array. Per tools/introspection/ast.pm
+ * ast_type_node::get_introspection_code(), each array dimension of a
+ * declarator gets its own DT_INTROSPECTION_TYPE_ARRAY layer in the
+ * introspection tree (innermost/element dimension first, then wrapping
+ * outward) -- so this is ARRAY-of-ARRAY-of-STRUCT, and reaching a leaf
+ * needs two DT_REMOTE_PATH_INDEX segments in a row, not one. */
+
+static const dt_remote_path_segment_t curve_node_x_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "curve_nodes" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },  // channel 0 (R)
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },  // node 3
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+};
+static const dt_remote_introspection_path_t curve_node_x_path = {
+  .segments = curve_node_x_segments,
+  .length = G_N_ELEMENTS(curve_node_x_segments),
+};
+
+static const dt_remote_path_segment_t curve_num_nodes_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "curve_num_nodes" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },  // channel 1 (G)
+};
+static const dt_remote_introspection_path_t curve_num_nodes_path = {
+  .segments = curve_num_nodes_segments,
+  .length = G_N_ELEMENTS(curve_num_nodes_segments),
+};
+
+// wrong-type segment: curve_nodes is an ARRAY field, not a STRUCT/UNION,
+// so descending into it with a FIELD segment (instead of INDEX first)
+// must fail dt_introspection_get_child()'s type check.
+static const dt_remote_path_segment_t wrong_type_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "curve_nodes" },
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+};
+static const dt_remote_introspection_path_t wrong_type_path = {
+  .segments = wrong_type_segments,
+  .length = G_N_ELEMENTS(wrong_type_segments),
+};
+
+// out-of-bounds index: DT_IOP_RGBCURVE_MAXNODES is MAX_ANCHORS == 20, so
+// node index 999 is out of bounds for the inner array.
+static const dt_remote_path_segment_t out_of_bounds_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "curve_nodes" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 999 },
+};
+static const dt_remote_introspection_path_t out_of_bounds_path = {
+  .segments = out_of_bounds_segments,
+  .length = G_N_ELEMENTS(out_of_bounds_segments),
+};
+
+// missing child: no such top-level field on dt_iop_rgbcurve_params_t.
+static const dt_remote_path_segment_t missing_child_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "does_not_exist" },
+};
+static const dt_remote_introspection_path_t missing_child_path = {
+  .segments = missing_child_segments,
+  .length = G_N_ELEMENTS(missing_child_segments),
+};
+
+// type drift: curve_autoscale is an enum, not an array, so indexing it
+// must fail dt_introspection_access_array()'s type check.
+static const dt_remote_path_segment_t index_into_non_array_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "curve_autoscale" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_introspection_path_t index_into_non_array_path = {
+  .segments = index_into_non_array_segments,
+  .length = G_N_ELEMENTS(index_into_non_array_segments),
+};
+
+static void test_path_resolve_curve_node_x(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+  assert_non_null(intro->field);
+  assert_int_equal(intro->field->header.type, DT_INTROSPECTION_TYPE_STRUCT);
+
+  void *fixture = g_malloc0(intro->size);
+
+  const dt_introspection_field_t *out_field = NULL;
+  void *out_ptr = NULL;
+  dt_remote_error_t *err = NULL;
+
+  assert_true(dt_remote_path_resolve(&curve_node_x_path, intro->field, fixture,
+                                      &out_field, &out_ptr, &err));
+  assert_null(err);
+  assert_non_null(out_field);
+  assert_non_null(out_ptr);
+  assert_int_equal(out_field->header.type, DT_INTROSPECTION_TYPE_FLOAT);
+
+  // the resolved pointer must land strictly inside the fixture blob.
+  ptrdiff_t offset = (char *)out_ptr - (char *)fixture;
+  assert_true(offset >= 0);
+  assert_true((size_t)offset + out_field->header.size <= intro->size);
+
+  // write through the resolved pointer, then resolve the identical path
+  // again against the same fixture: the cursor must be deterministic
+  // (same offset every time) and the value read back must be exactly
+  // what was written -- proving the offset targets the temporary
+  // fixture blob, not some other/live storage.
+  *(float *)out_ptr = 0.42f;
+
+  const dt_introspection_field_t *out_field2 = NULL;
+  void *out_ptr2 = NULL;
+  assert_true(dt_remote_path_resolve(&curve_node_x_path, intro->field, fixture,
+                                      &out_field2, &out_ptr2, &err));
+  assert_null(err);
+  assert_ptr_equal(out_ptr2, out_ptr);
+  assert_float_equal(*(float *)out_ptr2, 0.42f, 1e-6);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_curve_num_nodes(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+
+  const dt_introspection_field_t *out_field = NULL;
+  void *out_ptr = NULL;
+  dt_remote_error_t *err = NULL;
+
+  assert_true(dt_remote_path_resolve(&curve_num_nodes_path, intro->field, fixture,
+                                      &out_field, &out_ptr, &err));
+  assert_null(err);
+  assert_non_null(out_field);
+  assert_non_null(out_ptr);
+  assert_int_equal(out_field->header.type, DT_INTROSPECTION_TYPE_INT);
+
+  ptrdiff_t offset = (char *)out_ptr - (char *)fixture;
+  assert_true(offset >= 0);
+  assert_true((size_t)offset + out_field->header.size <= intro->size);
+
+  *(int *)out_ptr = 5;
+  assert_int_equal(*(int *)out_ptr, 5);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_rejects_wrong_type_segment(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+  const dt_introspection_field_t *out_field = NULL;
+  void *out_ptr = NULL;
+  dt_remote_error_t *err = NULL;
+
+  assert_false(dt_remote_path_resolve(&wrong_type_path, intro->field, fixture,
+                                       &out_field, &out_ptr, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_rejects_out_of_bounds_index(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+  dt_remote_error_t *err = NULL;
+
+  assert_false(dt_remote_path_resolve(&out_of_bounds_path, intro->field, fixture,
+                                       NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_rejects_missing_child(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+  dt_remote_error_t *err = NULL;
+
+  assert_false(dt_remote_path_resolve(&missing_child_path, intro->field, fixture,
+                                       NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_rejects_index_into_non_array(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+  dt_remote_error_t *err = NULL;
+
+  assert_false(dt_remote_path_resolve(&index_into_non_array_path, intro->field, fixture,
+                                       NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+
+  g_free(fixture);
+}
+
+static void test_path_resolve_rejects_null_arguments(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *fixture = g_malloc0(intro->size);
+  dt_remote_error_t *err = NULL;
+
+  assert_false(dt_remote_path_resolve(NULL, intro->field, fixture, NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+  err = NULL;
+
+  assert_false(dt_remote_path_resolve(&curve_num_nodes_path, NULL, fixture, NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+  err = NULL;
+
+  assert_false(dt_remote_path_resolve(&curve_num_nodes_path, intro->field, NULL, NULL, NULL, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+
+  g_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -309,9 +659,16 @@ int main(void)
     cmocka_unit_test(test_patch_apply_semantic_only_patch_is_not_empty),
     cmocka_unit_test(test_patch_apply_enable_only_patch_is_not_empty),
     cmocka_unit_test(test_patch_apply_null_semantic_values_scalar_only_unchanged),
+    cmocka_unit_test(test_path_resolve_curve_node_x),
+    cmocka_unit_test(test_path_resolve_curve_num_nodes),
+    cmocka_unit_test(test_path_resolve_rejects_wrong_type_segment),
+    cmocka_unit_test(test_path_resolve_rejects_out_of_bounds_index),
+    cmocka_unit_test(test_path_resolve_rejects_missing_child),
+    cmocka_unit_test(test_path_resolve_rejects_index_into_non_array),
+    cmocka_unit_test(test_path_resolve_rejects_null_arguments),
   };
 
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

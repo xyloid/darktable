@@ -17,6 +17,13 @@ add_cmocka_test(test_remote_curve
                 SOURCES test_remote_curve.c
                 LINK_LIBRARIES lib_darktable cmocka)
 
+# test_path_resolve_* loads the real rgbcurve module .so via dt_init(); point
+# it at this build's own plugin directory instead of the (nonexistent,
+# install-layout) default relative to the test binary -- same rationale as
+# test_remote_edit's DT_TEST_MODULEDIR above.
+target_compile_definitions(test_remote_curve PRIVATE
+  DT_TEST_MODULEDIR="${CMAKE_BINARY_DIR}/lib/darktable")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_remote_curve lib_darktable)
