@@ -53,6 +53,7 @@
  *
  * Please see README.md for more detailed documentation.
  */
+#include <limits.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -931,6 +932,53 @@ static void test_curve_validate_rejects_disallowed_interpolation(void **state)
   g_array_free(points, TRUE);
 }
 
+static void test_curve_validate_rejects_negative_interpolation_without_mutating_points(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.interpolation_mask = G_MAXUINT;
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+  GArray *snapshot = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, TRUE,
+                                        (dt_remote_curve_interpolation_t)-1, &err));
+  assert_curve_error_details(err, "curve.master", -1, "interpolation_not_allowed");
+  assert_int_equal(points->len, snapshot->len);
+  assert_memory_equal(points->data, snapshot->data,
+                      points->len * sizeof(dt_remote_curve_point_t));
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+  g_array_free(snapshot, TRUE);
+}
+
+static void test_curve_validate_rejects_oversized_interpolation_without_mutating_points(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE);
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+  GArray *snapshot = make_curve_points_xy(xs, ys, 2);
+  const dt_remote_curve_interpolation_t interpolation =
+    (dt_remote_curve_interpolation_t)(sizeof(desc.interpolation_mask) * CHAR_BIT);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, TRUE, interpolation, &err));
+  assert_curve_error_details(err, "curve.master", -1, "interpolation_not_allowed");
+  assert_int_equal(points->len, snapshot->len);
+  assert_memory_equal(points->data, snapshot->data,
+                      points->len * sizeof(dt_remote_curve_point_t));
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+  g_array_free(snapshot, TRUE);
+}
+
 static void test_curve_validate_omitted_interpolation_skips_allowlist_check(void **state)
 {
   (void)state;
@@ -1327,6 +1375,8 @@ int main(void)
     cmocka_unit_test(test_curve_validate_fixed_identity_rejects_last_y_off_maximum),
     cmocka_unit_test(test_curve_validate_accepts_allowed_interpolation),
     cmocka_unit_test(test_curve_validate_rejects_disallowed_interpolation),
+    cmocka_unit_test(test_curve_validate_rejects_negative_interpolation_without_mutating_points),
+    cmocka_unit_test(test_curve_validate_rejects_oversized_interpolation_without_mutating_points),
     cmocka_unit_test(test_curve_validate_omitted_interpolation_skips_allowlist_check),
     cmocka_unit_test(test_path_resolve_curve_node_x),
     cmocka_unit_test(test_path_resolve_curve_num_nodes),

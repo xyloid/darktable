@@ -20,6 +20,7 @@
 
 #include "common/darktable.h" // _()
 
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 
@@ -371,6 +372,18 @@ gboolean dt_remote_curve_validate(const dt_remote_curve_descriptor_t *desc,
    * interpolation when none is supplied needs native introspection and is
    * Task 8's job (the other half of item 9); this function only checks
    * the allowlist, and only when the caller actually supplied a value. */
+  const gint64 interpolation_value = (gint64)interpolation;
+  const guint interpolation_mask_width = sizeof(desc->interpolation_mask) * CHAR_BIT;
+  if(has_interpolation
+     && (interpolation_value < 0
+         || (guint64)interpolation_value >= interpolation_mask_width))
+  {
+    if(error)
+      *error = dt_remote_curve_validate_error_new(
+        parameter, -1, "interpolation_not_allowed",
+        _("curve '%s' does not allow interpolation %d"), parameter, (int)interpolation);
+    return FALSE;
+  }
   if(has_interpolation && !(desc->interpolation_mask & (1u << interpolation)))
   {
     if(error)
