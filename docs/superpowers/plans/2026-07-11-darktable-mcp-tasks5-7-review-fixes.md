@@ -255,4 +255,4 @@ cd tools/mcp
 - [x] rgbcurve schema/value fixtures pass through the C dispatcher and MCP sidecar verbatim.
 - [x] All focused and full remote C suites pass.
 - [x] The MCP unit suite passes.
-- [ ] The unrelated `test_filmicrgb` linker failure is resolved or separately documented before the milestone is declared fully green.
+- [x] The unrelated `test_filmicrgb` linker failure is resolved or separately documented before the milestone is declared fully green. (Resolved 2026-07-11: upstream defect — `get_pixel` in `src/tests/unittests/util/testimg.h` was a plain C99 `inline` with no extern definition, so Debug builds failed to link; made it `static inline`. Full ctest suite now 13/13.)
