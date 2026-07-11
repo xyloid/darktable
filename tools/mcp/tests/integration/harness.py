@@ -139,13 +139,13 @@ def find_darktable_binary() -> Path | None:
 
 
 def test_image() -> Path:
-    """A small, in-repo, redistributable image to open in the darkroom.
+    """The in-repo RAW photograph used by the live darkroom tests.
 
-    ``data/pixmaps/256x256/darktable.png`` ships with darktable (so it is
-    always present and needs no new test asset) and is already used as a
-    pipeline input by the ``ci.yml`` "Check if it runs" step, so it is a
-    known-good darktable input."""
-    return find_repo_root() / "data" / "pixmaps" / "256x256" / "darktable.png"
+    Keeping this as a camera RAW, rather than the application logo, exercises
+    the same decode and develop pipeline that remote editing is intended to
+    control.
+    """
+    return find_repo_root() / "img" / "DSC07350.ARW"
 
 
 def _display_is_reachable(display: str) -> bool:
@@ -321,8 +321,9 @@ class DarktableInstance:
     def launch(self) -> "DarktableInstance":
         for sub in ("config", "cache", "output"):
             (self.workdir / sub).mkdir(parents=True, exist_ok=True)
-        image = self.workdir / "test.png"
-        shutil.copyfile(test_image(), image)
+        source_image = test_image()
+        image = self.workdir / f"test{source_image.suffix}"
+        shutil.copyfile(source_image, image)
 
         env = scrubbed_env(
             home=str(self.workdir / "home"),
@@ -542,7 +543,12 @@ async def wait_for_scopes(
     pipe (not the export pipe ``render_preview`` uses), so immediately after
     a mutation the buffer may still be for the previous revision or absent
     entirely (a retryable ``scope_failed``). This retries until the captured
-    buffer's revision catches up to the mutation we just made."""
+    buffer's revision catches up to the mutation we just made. "Caught up"
+    is ``>= expected_rev``, not ``==``: trailing DEVELOP_HISTORY_CHANGE
+    signals can advance the revision past the mutation echo's value (see
+    :func:`undo_latest`), in which case the buffer is stamped with the
+    newer revision and strict equality would never be reached (the same
+    drift race in another guise, surfacing as a poll timeout)."""
     deadline = time.monotonic() + timeout
     last_exc: Exception | None = None
     while time.monotonic() < deadline:
@@ -557,10 +563,10 @@ async def wait_for_scopes(
                     "image_size": 256,
                 },
             )
-            if result.get("revision") == expected_rev:
+            if result.get("revision", -1) >= expected_rev:
                 return result
             last_exc = AssertionError(
-                f"scopes revision {result.get('revision')} != expected {expected_rev}"
+                f"scopes revision {result.get('revision')} < expected {expected_rev}"
             )
         except ProtocolError as exc:
             if not exc.retryable:
@@ -568,6 +574,43 @@ async def wait_for_scopes(
             last_exc = exc
         await asyncio.sleep(0.5)
     raise AssertionError(f"scopes did not reach revision {expected_rev} in {timeout}s: {last_exc}")
+
+
+async def wait_for_stable_revision(
+    client: ProtocolClient,
+    *,
+    consecutive_reads: int = 5,
+    poll_interval: float = 0.2,
+    timeout: float = 4.0,
+) -> int:
+    """Return the revision after a sustained run of identical reads.
+
+    A single quiet polling interval is not enough to prove that deferred
+    DEVELOP_HISTORY_CHANGE deliveries have drained. Requiring several equal
+    reads gives those deliveries a bounded window to arrive; failure to become
+    quiescent is reported explicitly instead of silently using the last value.
+    """
+    if consecutive_reads < 2:
+        raise ValueError("consecutive_reads must be at least 2")
+
+    deadline = time.monotonic() + timeout
+    current: int | None = None
+    matching_reads = 0
+    while time.monotonic() < deadline:
+        revision = (await client.call("get_state"))["revision"]
+        if revision == current:
+            matching_reads += 1
+        else:
+            current = revision
+            matching_reads = 1
+        if matching_reads >= consecutive_reads:
+            return revision
+        await asyncio.sleep(poll_interval)
+
+    raise AssertionError(
+        f"revision did not stabilize after {timeout}s "
+        f"(last revision {current}, {matching_reads}/{consecutive_reads} matching reads)"
+    )
 
 
 async def undo_latest(client: ProtocolClient, *, retries: int = 6) -> dict:

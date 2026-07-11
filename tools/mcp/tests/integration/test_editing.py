@@ -47,7 +47,10 @@ async def test_set_module_params_advances_revision_and_history(darktable_session
 
         # get_history live path: the exposure edit is present, ordered.
         history = await client.call("get_history", {"limit": 50})
-        assert history["revision"] == result["revision"]
+        # >= not ==: trailing DEVELOP_HISTORY_CHANGE signals can advance the
+        # revision after the mutation echo returns (see harness.undo_latest),
+        # so a later read may legitimately see a newer revision.
+        assert history["revision"] >= result["revision"]
         ops = [item["op"] for item in history["items"]]
         assert "exposure" in ops
         # seq is monotonic non-decreasing (oldest -> newest).
@@ -59,8 +62,15 @@ async def test_revision_conflict_blocks_stale_mutation(darktable_session):
     """A mutation carrying a stale ``expected_revision`` is rejected with a
     retryable ``revision_conflict`` and changes nothing."""
     async with harness.connected_client(darktable_session) as client:
-        state = await client.call("get_state")
-        current = state["revision"]
+        # Settle first: trailing DEVELOP_HISTORY_CHANGE signals from earlier
+        # mutations can still advance the revision for a beat (see
+        # harness.undo_latest), which would break the ==-nothing-changed
+        # check below through no fault of the rejected mutation.
+        current = await harness.wait_for_stable_revision(client)
+        params_before = await client.call(
+            "get_module_params", {"module": "exposure", "instance": 0}
+        )
+
         with pytest.raises(ProtocolError) as excinfo:
             await client.call(
                 "set_module_params",
@@ -73,9 +83,17 @@ async def test_revision_conflict_blocks_stale_mutation(darktable_session):
             )
         assert excinfo.value.code == "revision_conflict"
         assert excinfo.value.retryable is True
-        # Nothing changed.
+        # Nothing changed: same revision (safe to assert strictly now that
+        # drift has settled and the rejected mutation emits no signals) and
+        # the parameter content is untouched.
         after = await client.call("get_state")
         assert after["revision"] == current
+        params_after = await client.call(
+            "get_module_params", {"module": "exposure", "instance": 0}
+        )
+        assert params_after["values"]["exposure"] == pytest.approx(
+            params_before["values"]["exposure"], abs=1e-6
+        )
 
 
 async def test_undo_round_trip(darktable_session):
