@@ -109,8 +109,11 @@ primitive-only clients or servers.
 These resolve the "Unresolved implementation decisions" list in the
 curve-classes design for this milestone:
 
-1. **Middle-grey transition without a work profile** — fail closed:
-   `invalid_state`, mutating nothing. No silent fallback profile.
+1. **Middle-grey transition without a work profile** — fail closed,
+   mutating nothing; no silent fallback profile. Error code is the existing
+   `unsupported_field` (the curve design assigns it "condition not
+   satisfied"), with a `constraint: "work_profile_unavailable"` detail —
+   no new wire error codes in this milestone.
 2. **`rgbcurve` mode transitions without GUI callbacks** — the adapter
    callback reproduces the two documented storage transitions (manual-RGB
    entry copies channel 0 into untouched identity G/B; middle-grey change
@@ -118,9 +121,10 @@ curve-classes design for this milestone:
    temporary params block only. Integration tests cover both transitions,
    with and without an available work profile.
 3. **Protocol versioning** — no bump. `protocol_version` stays 1. The
-   server adds `"curve_params"` to the hello `capabilities` array. The
-   sidecar sends the `curves` request member only when the capability is
-   advertised, so an older server can never silently drop the curve half of
+   server adds `"semantic_params"` and `"curve_params"` to the hello
+   `capabilities` array (both, per the curve design's protocol extension
+   section). The sidecar sends the `curves` request member only when
+   `curve_params` is advertised, so an older server can never silently drop the curve half of
    a patch: the client never sends it. This follows the protocol
    reference's additive-change rule.
 4. **Inactive semantic values** — always returned, marked `"active": false`
