@@ -100,7 +100,8 @@ jobs:
       ECO: -DDONT_USE_INTERNAL_LIBRAW=ON
       CMAKE_BUILD_TYPE: Release
       GENERATOR: Ninja
-      # TARGET=build runs ctest (the 11 C suites, including test_remote_*),
+      # TARGET=build runs ctest (the 13 C suites, including test_remote_* --
+      # milestone 2 added test_remote_curve and test_remote_curve_registry),
       # unlike ci.yml's skiptest.
       TARGET: build
       DEBIAN_FRONTEND: noninteractive

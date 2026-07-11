@@ -48,7 +48,7 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
-| `set_module_params` | `set_module_params` | atomically patch writable fields; one history item + new revision |
+| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves`); one history item + new revision |
 | `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
 | `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
@@ -75,6 +75,15 @@ stale client can't clobber a concurrent edit. `set_module_params` is atomic
 (any invalid field fails the whole patch, changing nothing) and never
 enables a disabled module implicitly -- pass `enable: true` to switch it on
 in the same history step.
+
+`set_module_params` also edits semantic curve parameters (e.g. rgbcurve's
+`curve.master`; see `get_module_schema`'s `semantic_fields`) through its
+optional `curves` argument: semantic IDs mapped to `{"points": [[x, y],
+...], "interpolation"?: "cubic_spline" | "catmull_rom" |
+"monotone_hermite"}`. This requires a darktable that advertises the
+`curve_params` hello capability; against an older darktable the tool
+refuses client-side with an upgrade message instead of silently dropping
+the curve half of a patch.
 
 ## Setup
 

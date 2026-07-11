@@ -21,9 +21,13 @@ The design spec limits `set_module_params` v1 to finite scalar `float`,
 `double`, integer, Boolean, and enum fields, including scalar leaves inside
 plainly nested structs, which are addressed by introspection's dotted names
 (`random.damping`, `center.x`). Arrays, strings, curves, coordinate blobs,
-unions, and opaque data are reported `writable: false` or omitted. A
-module's tier follows from what fraction of its user-facing controls survive
-that rule:
+unions, and opaque data are reported `writable: false` or omitted. Since
+milestone 2, *semantic parameter classes* can lift specific modules past
+that rule: an op with a registered curve adapter exposes writable
+curve-class semantic parameters (gated by the `curve_params` hello
+capability) even though its native node arrays stay `writable: false` —
+`rgbcurve` is the first. A module's tier follows from what fraction of its
+user-facing controls survive these rules:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
   scalar/enum/bool. The model can drive the module exactly as a user would.
@@ -51,7 +55,7 @@ with `instance_not_supported` (column "multi" below).
 Blending and mask parameters (`blendop`) are out of scope for every module,
 per the design spec's non-goals.
 
-## Tier 1 — full support (42 modules)
+## Tier 1 — full support (43 modules)
 
 | op | display name | multi | notes |
 |---|---|---|---|
@@ -88,6 +92,7 @@ per the design spec's non-goals.
 | `nlmeans` | astrophoto denoise | yes | patch size/strength/luma/chroma |
 | `primaries` | rgb primaries | yes | per-primary hue/purity scalars |
 | `profile_gamma` | unbreak input profile | no | log/gamma scalars + mode enum |
+| `rgbcurve` | rgb curve | yes | **milestone 2, semantic curves**: `curve.master`/`curve.red`/`curve.green`/`curve.blue` writable via `semantic_values` (`curve_params` capability); mode/compensation scalars writable; native node arrays stay read-only with `represented_by` |
 | `scalepixels` | scale pixels | no | single pixel-aspect scalar (niche, camera-specific) |
 | `shadhi` | shadows and highlights | yes | shadows/highlights/radius scalars; `flags`, `reserved2`, `low_approximation` internal |
 | `sharpen` | sharpen | yes | radius/amount/threshold |
@@ -121,7 +126,7 @@ per the design spec's non-goals.
 | `temperature` | white balance | no | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
 | `watermark` | watermark | yes | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums | `filename`/`text`/`font` strings, `color[3]` array |
 
-## Tier 3 — parameter editing excluded (11 modules)
+## Tier 3 — parameter editing excluded (10 modules)
 
 Enable/disable, reset, history, and undo remain available; `set_module_params`
 is not useful because the module's essence is unsupported data.
@@ -136,7 +141,6 @@ is not useful because the module's essence is unsupported data.
 | `lut3d` | LUT 3D | LUT file path + embedded compressed LUT blob; enums meaningless without a loaded LUT |
 | `rasterfile` | external raster masks | file-path strings |
 | `retouch` | retouch | drawn-form data (`rt_forms`); algorithm scalars only act on shapes drawn in the GUI |
-| `rgbcurve` | rgb curve | curve node arrays |
 | `rgblevels` | rgb levels | per-channel `levels` 2-D array is the whole control |
 | `tonecurve` | tone curve | L/a/b curve node arrays |
 

@@ -64,13 +64,23 @@ Result:
   "protocol_version": 1,
   "darktable_version": "5.x",
   "pid": 12345,
-  "capabilities": ["params", "instances", "history", "preview", "scopes"]
+  "capabilities": ["params", "instances", "history", "preview", "scopes",
+                   "semantic_params", "curve_params"]
 }
 ```
 
 `pid` lets the sidecar confirm it reached the instance selected during
 discovery. Capabilities gate optional features: a build that cannot render
 previews omits `"preview"` and the sidecar hides `look_at_image`.
+
+`semantic_params` advertises the semantic-parameter read surface
+(`semantic_fields` in schemas, `semantic_values` in params reads);
+`curve_params` additionally advertises writable curve-class semantic
+parameters (the `semantic_values` request member on `set_module_params`).
+The server never advertises `curve_params` without accepting that request
+member. A client must send curve patches only when `curve_params` is
+present; capability-gated optional request members do not bump
+`protocol_version` (see Maintenance).
 
 ### get_state
 
@@ -170,6 +180,17 @@ supported-operations internal denylist are scalar-typed but also
 validation is then finiteness-only. Schema responses are cacheable per
 (darktable version, module op).
 
+When the server advertises `semantic_params` and the op has semantic
+parameters, the schema additionally carries `semantic_fields`: an array of
+semantic descriptors (`name` like `"curve.master"`, `class: "curve"`,
+`x`/`y` axis ranges, a `points` limits object, the allowed
+`interpolation_values`, and optional `active_when`/`writable_when`/
+`periodic_when` conditions on scalar fields).
+Native storage fields backing a semantic parameter stay listed in `fields`
+with `writable: false` and a `represented_by` array naming the semantic IDs
+that represent them (see the `get_module_schema_rgbcurve_*` fixtures for
+the full shape).
+
 Errors: `unknown_module`.
 
 ### get_module_params
@@ -188,8 +209,16 @@ Request params: `{"module": "exposure", "instance": 0?}`.
 ```
 
 `values` contains every readable supported field (writable and denylisted
-scalars alike; unsupported shapes are absent). Errors: `unknown_module`,
-`unknown_instance`.
+scalars alike; unsupported shapes are absent).
+
+When the server advertises `semantic_params` and the op has semantic
+parameters, the result additionally carries `semantic_values`: every
+semantic ID mapped to its current value -- for curves `{"class": "curve",
+"active", "effective", "writable_now", "points": [{"x", "y"}, ...],
+"interpolation"}`. Inactive parameters (e.g. `curve.red` in linked mode)
+are always present with `active: false`, never omitted.
+
+Errors: `unknown_module`, `unknown_instance`.
 
 ### set_module_params
 
@@ -211,6 +240,35 @@ schema before anything is written; any failure means no change. `enable?`
 (default absent) explicitly enables/disables the module in the same single
 history item — parameters are never an implicit enable.
 
+When the server advertises `curve_params`, the request may also carry a
+`semantic_values?` object patching semantic curve parameters in the same
+atomic history item (and `values` may then be `{}`; at least one of the
+two must be non-empty):
+
+```json
+{
+  "semantic_values": {
+    "curve.master": {
+      "class": "curve",
+      "points": [{ "x": 0.0, "y": 0.0 }, { "x": 0.25, "y": 0.18 },
+                 { "x": 0.75, "y": 0.82 }, { "x": 1.0, "y": 1.0 }],
+      "interpolation": "MONOTONE_HERMITE"
+    }
+  }
+}
+```
+
+Each entry requires `class: "curve"`, takes 2-64 points on the wire (the
+schema's `points` limits are enforced by the engine), each point exactly
+`{x, y}` with finite numbers, and an optional `interpolation` from the
+schema's `interpolation_values` (omitted keeps the current one). A patch
+replaces the whole named curve; unnamed curves are untouched. Unknown or
+extra members anywhere in the shape are `invalid_value`; an unknown
+semantic ID is `unknown_field`; writing a curve whose `writable_when`
+condition fails (checked against the *projected* params, so a mode switch
+in the same request counts) is `unsupported_field`. Curve validation errors
+carry `details: {"parameter", "point_index", "constraint"}`.
+
 Result (values read back from live state):
 
 ```json
@@ -222,6 +280,11 @@ Result (values read back from live state):
   "revision": 32
 }
 ```
+
+When the patch carried `semantic_values`, the result echoes a
+`semantic_values` object reading back exactly the written semantic IDs
+(full value shape, as in `get_module_params`), placed between `values` and
+`revision`.
 
 Errors: `unknown_module`, `unknown_instance`, `unknown_field`,
 `unsupported_field` (known but not writable), `invalid_value`,
@@ -381,11 +444,18 @@ live in the sidecar per the design spec.
    `expected_revision`; no `steps` in v1.
 2. **Unsupported schema fields (plan decision 3):** always included with
    `writable: false`; no `include_unsupported` flag.
+3. **Capability-gated request members (milestone 2):** an optional request
+   member that a client only sends when the server advertises the matching
+   capability (e.g. `semantic_values` under `curve_params`) is an additive
+   change and does not bump `protocol_version`. Strict-params rejection of
+   the member on a server without the capability is exactly the safety this
+   relies on: a mixed patch can fail loudly, never half-apply.
 
 ## Maintenance
 
-Additive, optional response fields may be introduced without a version bump,
-per the design spec's compatibility policy. Anything that changes a field's
-meaning, requiredness, or type bumps `protocol_version`. Every change here
-must land with matching updates to the C dispatcher validation and the
-Python fixtures in the same commit.
+Additive, optional response fields — and optional *request* members gated by
+a hello capability (decision 3 above) — may be introduced without a version
+bump, per the design spec's compatibility policy. Anything that changes a
+field's meaning, requiredness, or type bumps `protocol_version`. Every
+change here must land with matching updates to the C dispatcher validation
+and the Python fixtures in the same commit.

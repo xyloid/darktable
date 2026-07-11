@@ -296,6 +296,29 @@ field fails the whole request and changes nothing) and records one history
 step. It never enables a disabled module implicitly; pass `enable: true` to
 switch the module on in the same history step.
 
+It also edits semantic curves (when darktable advertises the `curve_params`
+capability) through the optional `curves` argument. For example, a gentle
+S-curve on rgbcurve's master channel:
+
+```json
+{
+  "module": "rgbcurve",
+  "values": {},
+  "enable": true,
+  "curves": {
+    "curve.master": {
+      "points": [[0.0, 0.0], [0.25, 0.18], [0.75, 0.82], [1.0, 1.0]],
+      "interpolation": "monotone_hermite"
+    }
+  }
+}
+```
+
+Points are `[x, y]` pairs in the module's stored [0, 1] space, 2-20 per
+curve, with strictly ascending x; each patch replaces that whole curve.
+`get_module_schema`'s `semantic_fields` lists the available curve IDs, and
+`get_module_params` returns their current points under `semantic_values`.
+
 ## 11. Run the automated tests
 
 Run the Python unit suite:
