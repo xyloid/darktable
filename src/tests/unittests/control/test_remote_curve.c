@@ -53,6 +53,7 @@
  *
  * Please see README.md for more detailed documentation.
  */
+#include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -60,6 +61,7 @@
 #include <string.h>
 
 #include <cmocka.h>
+#include <json-glib/json-glib.h>
 
 #include "../util/assert.h"
 
@@ -308,6 +310,645 @@ static void test_patch_apply_null_semantic_values_scalar_only_unchanged(void **s
   dt_remote_error_free(err);
 
   g_ptr_array_unref(patch.scalar_values);
+}
+
+/* ---------------------------------------------------------------------- */
+/* dt_remote_curve_validate                                                */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * dt_remote_curve_validate() is pure (no introspection, no registry, no
+ * JSON parsing of the input), so these tests build dt_remote_curve_descriptor_t
+ * instances by hand -- no live module or dt_init() dependency, unlike the
+ * dt_remote_path_resolve() tests below. Coverage follows the curve-classes
+ * design doc's "Validation algorithm" items 3-10 (the only items this
+ * function implements; items 1-2/11-14 are later tasks -- see the header
+ * comment on dt_remote_curve_validate()).
+ */
+
+static GArray *make_curve_points_xy(const double *xs, const double *ys, guint n)
+{
+  GArray *points = g_array_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t));
+  for(guint i = 0; i < n; i++)
+  {
+    dt_remote_curve_point_t p = { xs[i], ys[i] };
+    g_array_append_val(points, p);
+  }
+  return points;
+}
+
+// Parses err->details_json and asserts its "parameter"/"constraint" members,
+// and its "point_index" member iff expected_point_index >= 0 (a negative
+// expected value asserts the member is ABSENT -- the documented convention
+// for whole-array failures like min_points/max_points and for
+// interpolation_not_allowed).
+static void assert_curve_error_details(dt_remote_error_t *err, const char *expected_parameter,
+                                       int expected_point_index, const char *expected_constraint)
+{
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(err->details_json);
+
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, err->details_json, -1, NULL));
+  JsonObject *obj = json_node_get_object(json_parser_get_root(parser));
+  assert_non_null(obj);
+
+  assert_true(json_object_has_member(obj, "parameter"));
+  assert_string_equal(json_object_get_string_member(obj, "parameter"), expected_parameter);
+
+  assert_true(json_object_has_member(obj, "constraint"));
+  assert_string_equal(json_object_get_string_member(obj, "constraint"), expected_constraint);
+
+  if(expected_point_index >= 0)
+  {
+    assert_true(json_object_has_member(obj, "point_index"));
+    assert_int_equal((gint64)json_object_get_int_member(obj, "point_index"), expected_point_index);
+  }
+  else
+  {
+    assert_false(json_object_has_member(obj, "point_index"));
+  }
+
+  g_object_unref(parser);
+}
+
+// rgbcurve-shaped descriptor: 2-20 points, spacing 0.0025 strictly greater,
+// strict ascending order, optional boundary points, all three
+// interpolations allowed. Matches Step 1's hand-built descriptor.
+static dt_remote_curve_descriptor_t make_master_curve_descriptor(void)
+{
+  dt_remote_curve_descriptor_t desc = { 0 };
+  desc.name = "curve.master";
+  desc.x.minimum = 0.0;
+  desc.x.maximum = 1.0;
+  desc.x.unit = "normalized";
+  desc.y.minimum = 0.0;
+  desc.y.maximum = 1.0;
+  desc.y.unit = "normalized";
+  desc.minimum_points = 2;
+  desc.maximum_points = 20;
+  desc.minimum_x_spacing = 0.0025;
+  desc.adjacent_spacing_rule = DT_REMOTE_SPACING_GREATER_THAN;
+  desc.minimum_wrap_spacing = 0.0;
+  desc.wrap_spacing_rule = DT_REMOTE_SPACING_NONE;
+  desc.strict_x_order = TRUE;
+  desc.boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL;
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE)
+                          | (1u << DT_REMOTE_CURVE_CATMULL_ROM)
+                          | (1u << DT_REMOTE_CURVE_MONOTONE_HERMITE);
+  desc.default_interpolation = DT_REMOTE_CURVE_CUBIC_SPLINE;
+  return desc;
+}
+
+static void test_curve_validate_accepts_well_formed_points(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 0.5, 0.9 };
+  double ys[] = { 0.2, 0.6, 0.3 };
+  GArray *points = make_curve_points_xy(xs, ys, 3);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, TRUE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+/* -- item 3: point count -- */
+
+static void test_curve_validate_rejects_too_few_points(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.5 };
+  double ys[] = { 0.5 };
+  GArray *points = make_curve_points_xy(xs, ys, 1);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", -1, "min_points");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_too_many_points(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[21], ys[21];
+  for(int i = 0; i < 21; i++)
+  {
+    xs[i] = i * 0.045; // well inside [0,1], well beyond min spacing
+    ys[i] = 0.5;
+  }
+  GArray *points = make_curve_points_xy(xs, ys, 21);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", -1, "max_points");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+/* -- item 4: non-finite / domain -- */
+
+static void test_curve_validate_rejects_nan(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, NAN };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "non_finite");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_positive_infinity(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, INFINITY };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "non_finite");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_x_outside_domain(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 1.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "domain_x");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_y_outside_domain(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, -0.3 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "domain_y");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+// no rejection here must ever touch the caller's points array.
+static void test_curve_validate_never_mutates_points_on_rejection(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 1.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+  GArray *snapshot = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_non_null(err);
+
+  assert_int_equal(points->len, snapshot->len);
+  for(guint i = 0; i < points->len; i++)
+  {
+    dt_remote_curve_point_t *a = &g_array_index(points, dt_remote_curve_point_t, i);
+    dt_remote_curve_point_t *b = &g_array_index(snapshot, dt_remote_curve_point_t, i);
+    assert_true(a->x == b->x);
+    assert_true(a->y == b->y);
+  }
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+  g_array_free(snapshot, TRUE);
+}
+
+/* -- item 5: strict ascending x -- */
+
+static void test_curve_validate_rejects_descending_x(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.5, 0.3 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "strict_order");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_duplicate_x(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.5, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "duplicate_x");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+/* -- item 6: adjacent minimum spacing -- */
+
+static void test_curve_validate_rejects_spacing_exactly_at_threshold_greater_than(void **state)
+{
+  (void)state;
+  // GREATER_THAN is strict: a delta bit-identical to minimum_x_spacing
+  // (both come from the same 0.0025 literal, so subtraction from 0.0 is
+  // exact) must be rejected, not accepted.
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.0, 0.0025 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "curve.master", 1, "adjacent_spacing");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_accepts_spacing_just_above_threshold(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.0, 0.00251 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static dt_remote_curve_descriptor_t make_at_least_spacing_descriptor(void)
+{
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.name = "test.at_least_spacing";
+  desc.adjacent_spacing_rule = DT_REMOTE_SPACING_AT_LEAST;
+  desc.minimum_x_spacing = 0.01;
+  return desc;
+}
+
+static void test_curve_validate_accepts_spacing_exactly_at_threshold_at_least(void **state)
+{
+  (void)state;
+  // AT_LEAST is inclusive: a delta bit-identical to minimum_x_spacing must
+  // be accepted (the opposite of the GREATER_THAN case above).
+  dt_remote_curve_descriptor_t desc = make_at_least_spacing_descriptor();
+  double xs[] = { 0.0, 0.01 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_spacing_below_threshold_at_least(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_at_least_spacing_descriptor();
+  double xs[] = { 0.0, 0.005 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.at_least_spacing", 1, "adjacent_spacing");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_spacing_none_skips_adjacent_check(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.adjacent_spacing_rule = DT_REMOTE_SPACING_NONE;
+  // delta 0.0001 is far below the descriptor's own (now-ignored) 0.0025
+  // minimum_x_spacing; passing proves the check is skipped, not just lax.
+  double xs[] = { 0.1, 0.1001 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+/* -- item 7: periodic wrap spacing -- */
+
+// Synthetic hue-channel-like descriptor: domain [0,1], periodic wrap
+// spacing enabled (rgbcurve does not use this -- wrap_spacing_rule is
+// DT_REMOTE_SPACING_NONE on the master descriptor above).
+static dt_remote_curve_descriptor_t make_periodic_hue_descriptor(void)
+{
+  dt_remote_curve_descriptor_t desc = { 0 };
+  desc.name = "test.hue";
+  desc.x.minimum = 0.0;
+  desc.x.maximum = 1.0;
+  desc.y.minimum = 0.0;
+  desc.y.maximum = 1.0;
+  desc.minimum_points = 2;
+  desc.maximum_points = 10;
+  desc.adjacent_spacing_rule = DT_REMOTE_SPACING_NONE;
+  desc.wrap_spacing_rule = DT_REMOTE_SPACING_GREATER_THAN;
+  desc.minimum_wrap_spacing = 0.01;
+  desc.strict_x_order = TRUE;
+  desc.boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL;
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE);
+  desc.default_interpolation = DT_REMOTE_CURVE_CUBIC_SPLINE;
+  return desc;
+}
+
+static void test_curve_validate_rejects_wrap_spacing_below_threshold(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_periodic_hue_descriptor();
+  // wrap gap = (first.x - x.min) + (x.max - last.x) = (0 - 0) + (1 - 0.995) = 0.005 < 0.01
+  double xs[] = { 0.0, 0.995 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.hue", 0, "wrap_spacing");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_accepts_wrap_spacing_above_threshold(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_periodic_hue_descriptor();
+  // wrap gap = (0 - 0) + (1 - 0.98) = 0.02 > 0.01
+  double xs[] = { 0.0, 0.98 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_wrap_spacing_none_skips_wrap_check(void **state)
+{
+  (void)state;
+  // The master (rgbcurve) descriptor's wrap_spacing_rule is NONE; points
+  // sitting right at both domain edges (wrap gap 0, far below what a
+  // GREATER_THAN 0.0025 wrap rule would demand) must still pass.
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.0, 1.0 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+/* -- item 8: domain-boundary point policy -- */
+
+static void test_curve_validate_optional_boundary_accepts_interior_endpoints(void **state)
+{
+  (void)state;
+  // Already exercised by test_curve_validate_accepts_well_formed_points
+  // (first.x=0.1, last.x=0.9, neither touching the domain edges), but
+  // named explicitly here to document the OPTIONAL policy's contract.
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.2, 0.8 };
+  double ys[] = { 0.3, 0.4 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static dt_remote_curve_descriptor_t make_required_boundary_descriptor(void)
+{
+  dt_remote_curve_descriptor_t desc = { 0 };
+  desc.name = "test.required_boundary";
+  desc.x.minimum = 0.0;
+  desc.x.maximum = 1.0;
+  desc.y.minimum = 0.0;
+  desc.y.maximum = 1.0;
+  desc.minimum_points = 2;
+  desc.maximum_points = 10;
+  desc.adjacent_spacing_rule = DT_REMOTE_SPACING_NONE;
+  desc.wrap_spacing_rule = DT_REMOTE_SPACING_NONE;
+  desc.strict_x_order = TRUE;
+  desc.boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_REQUIRED;
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE);
+  desc.default_interpolation = DT_REMOTE_CURVE_CUBIC_SPLINE;
+  return desc;
+}
+
+static void test_curve_validate_required_boundary_accepts_domain_edges(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_required_boundary_descriptor();
+  // y is unconstrained under REQUIRED -- only x must hit the domain edges.
+  double xs[] = { 0.0, 1.0 };
+  double ys[] = { 0.3, 0.7 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_required_boundary_rejects_first_off_minimum(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_required_boundary_descriptor();
+  double xs[] = { 0.1, 1.0 };
+  double ys[] = { 0.3, 0.7 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.required_boundary", 0, "boundary_policy");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_required_boundary_rejects_last_off_maximum(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_required_boundary_descriptor();
+  double xs[] = { 0.0, 0.9 };
+  double ys[] = { 0.3, 0.7 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.required_boundary", 1, "boundary_policy");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static dt_remote_curve_descriptor_t make_fixed_identity_boundary_descriptor(void)
+{
+  dt_remote_curve_descriptor_t desc = make_required_boundary_descriptor();
+  desc.name = "test.fixed_identity_boundary";
+  desc.boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_FIXED_IDENTITY;
+  return desc;
+}
+
+static void test_curve_validate_fixed_identity_accepts_identity_endpoints(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_fixed_identity_boundary_descriptor();
+  double xs[] = { 0.0, 1.0 };
+  double ys[] = { 0.0, 1.0 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_fixed_identity_rejects_first_y_off_minimum(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_fixed_identity_boundary_descriptor();
+  // first.x is correct (0.0 == x.minimum) but first.y is not y.minimum.
+  double xs[] = { 0.0, 1.0 };
+  double ys[] = { 0.2, 1.0 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.fixed_identity_boundary", 0, "boundary_policy");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_fixed_identity_rejects_last_y_off_maximum(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_fixed_identity_boundary_descriptor();
+  double xs[] = { 0.0, 1.0 };
+  double ys[] = { 0.0, 0.8 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_CUBIC_SPLINE, &err));
+  assert_curve_error_details(err, "test.fixed_identity_boundary", 1, "boundary_policy");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+/* -- items 9-10: interpolation resolution / allowlist -- */
+
+static void test_curve_validate_accepts_allowed_interpolation(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, TRUE, DT_REMOTE_CURVE_MONOTONE_HERMITE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_rejects_disallowed_interpolation(void **state)
+{
+  (void)state;
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE); // only cubic spline allowed
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_validate(&desc, points, TRUE, DT_REMOTE_CURVE_CATMULL_ROM, &err));
+  assert_curve_error_details(err, "curve.master", -1, "interpolation_not_allowed");
+
+  dt_remote_error_free(err);
+  g_array_free(points, TRUE);
+}
+
+static void test_curve_validate_omitted_interpolation_skips_allowlist_check(void **state)
+{
+  (void)state;
+  // has_interpolation == FALSE: resolving/preserving the current
+  // interpolation is Task 8's job (item 9's other half), so no allowlist
+  // check runs here at all -- passing an otherwise-disallowed value in
+  // `interpolation` must not matter.
+  dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
+  desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE); // only cubic spline allowed
+  double xs[] = { 0.1, 0.5 };
+  double ys[] = { 0.2, 0.6 };
+  GArray *points = make_curve_points_xy(xs, ys, 2);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_validate(&desc, points, FALSE, DT_REMOTE_CURVE_MONOTONE_HERMITE, &err));
+  assert_null(err);
+
+  g_array_free(points, TRUE);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -659,6 +1300,34 @@ int main(void)
     cmocka_unit_test(test_patch_apply_semantic_only_patch_is_not_empty),
     cmocka_unit_test(test_patch_apply_enable_only_patch_is_not_empty),
     cmocka_unit_test(test_patch_apply_null_semantic_values_scalar_only_unchanged),
+    cmocka_unit_test(test_curve_validate_accepts_well_formed_points),
+    cmocka_unit_test(test_curve_validate_rejects_too_few_points),
+    cmocka_unit_test(test_curve_validate_rejects_too_many_points),
+    cmocka_unit_test(test_curve_validate_rejects_nan),
+    cmocka_unit_test(test_curve_validate_rejects_positive_infinity),
+    cmocka_unit_test(test_curve_validate_rejects_x_outside_domain),
+    cmocka_unit_test(test_curve_validate_rejects_y_outside_domain),
+    cmocka_unit_test(test_curve_validate_never_mutates_points_on_rejection),
+    cmocka_unit_test(test_curve_validate_rejects_descending_x),
+    cmocka_unit_test(test_curve_validate_rejects_duplicate_x),
+    cmocka_unit_test(test_curve_validate_rejects_spacing_exactly_at_threshold_greater_than),
+    cmocka_unit_test(test_curve_validate_accepts_spacing_just_above_threshold),
+    cmocka_unit_test(test_curve_validate_accepts_spacing_exactly_at_threshold_at_least),
+    cmocka_unit_test(test_curve_validate_rejects_spacing_below_threshold_at_least),
+    cmocka_unit_test(test_curve_validate_spacing_none_skips_adjacent_check),
+    cmocka_unit_test(test_curve_validate_rejects_wrap_spacing_below_threshold),
+    cmocka_unit_test(test_curve_validate_accepts_wrap_spacing_above_threshold),
+    cmocka_unit_test(test_curve_validate_wrap_spacing_none_skips_wrap_check),
+    cmocka_unit_test(test_curve_validate_optional_boundary_accepts_interior_endpoints),
+    cmocka_unit_test(test_curve_validate_required_boundary_accepts_domain_edges),
+    cmocka_unit_test(test_curve_validate_required_boundary_rejects_first_off_minimum),
+    cmocka_unit_test(test_curve_validate_required_boundary_rejects_last_off_maximum),
+    cmocka_unit_test(test_curve_validate_fixed_identity_accepts_identity_endpoints),
+    cmocka_unit_test(test_curve_validate_fixed_identity_rejects_first_y_off_minimum),
+    cmocka_unit_test(test_curve_validate_fixed_identity_rejects_last_y_off_maximum),
+    cmocka_unit_test(test_curve_validate_accepts_allowed_interpolation),
+    cmocka_unit_test(test_curve_validate_rejects_disallowed_interpolation),
+    cmocka_unit_test(test_curve_validate_omitted_interpolation_skips_allowlist_check),
     cmocka_unit_test(test_path_resolve_curve_node_x),
     cmocka_unit_test(test_path_resolve_curve_num_nodes),
     cmocka_unit_test(test_path_resolve_rejects_wrong_type_segment),
