@@ -9,8 +9,8 @@ read-only introspection tools, named per the implementation plan:
 
 plus the darkroom mutation tools (plan steps 7-8):
 
-    set_module_enabled, reset_module, create_module_instance,
-    get_history, undo
+    set_module_params, set_module_enabled, reset_module,
+    create_module_instance, get_history, undo
 
 plus the bounded preview renderer (plan step 9):
 
@@ -134,6 +134,34 @@ def build_server(
         (0 for the default/only instance -- see `list_modules`)."""
         client = await _client()
         return await client.call("get_module_params", {"module": module, "instance": instance})
+
+    @app.tool()
+    async def set_module_params(
+        module: str,
+        values: dict[str, Any],
+        instance: int = 0,
+        enable: bool | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Set parameter values on one module instance, recorded as one
+        history step. `module` is the internal op name, `instance` its
+        `multi_priority`, and `values` maps writable field names (dotted
+        introspection names -- see `get_module_schema`) to new values;
+        enum fields accept their stable member name or integer value. The
+        patch is atomic: any invalid field fails the whole request with
+        `invalid_value`/`unknown_field`, changing nothing. Setting params
+        does not enable a disabled module; pass `enable` true to switch it
+        on in the same history step. Pass `expected_revision` for
+        compare-and-swap (see `set_module_enabled`). Returns the module,
+        instance, resulting `enabled` state, the `values` read back from
+        live state, and the new `revision`."""
+        params: dict[str, Any] = {"module": module, "instance": instance, "values": values}
+        if enable is not None:
+            params["enable"] = enable
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        return await client.call("set_module_params", params)
 
     @app.tool()
     async def set_module_enabled(

@@ -48,6 +48,7 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
+| `set_module_params` | `set_module_params` | atomically patch writable fields; one history item + new revision |
 | `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
 | `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
@@ -56,7 +57,7 @@ one adapter layer on top.
 | `render_preview` | `render_preview` | bounded JPEG preview of the current edit, as native image content |
 | `get_scopes` | `compute_scopes` | histogram summaries/bins plus waveform, parade, and vectorscope images |
 
-All eleven require darktable to be running with
+All twelve require darktable to be running with
 `security/enable_remote_control` set to true. The darkroom-scoped tools
 (everything except `get_current_image`) fail with a `not_in_darkroom` or
 `no_image_open` error (surfaced as an MCP tool error with an actionable
@@ -67,12 +68,13 @@ never change the edit. `render_preview` runs server-side on a background job
 and returns the JPEG as an MCP image content block -- never base64 text for
 the model; `max_px` is clamped to [64, 2048], `quality` to [50, 95], and a
 `request_too_large` error means retry with a smaller `max_px`. The
-mutating tools (`set_module_enabled`, `reset_module`,
+mutating tools (`set_module_params`, `set_module_enabled`, `reset_module`,
 `create_module_instance`, `undo`) advance the session revision; each
 mutating call may take an `expected_revision` for compare-and-swap so a
-stale client can't clobber a concurrent edit. The private protocol's
-`set_module_params` method is implemented but is not currently registered as
-an MCP tool.
+stale client can't clobber a concurrent edit. `set_module_params` is atomic
+(any invalid field fails the whole patch, changing nothing) and never
+enables a disabled module implicitly -- pass `enable: true` to switch it on
+in the same history step.
 
 ## Setup
 

@@ -281,6 +281,7 @@ The sidecar currently exposes these Claude Code tools:
 | Category | Tools |
 |---|---|
 | state and introspection | `get_current_image`, `list_modules`, `get_module_schema`, `get_module_params` |
+| editing | `set_module_params` |
 | module lifecycle | `set_module_enabled`, `reset_module`, `create_module_instance` |
 | history | `get_history`, `undo` |
 | visual feedback | `render_preview`, `get_scopes` |
@@ -290,11 +291,10 @@ revision. Prefer compare-and-swap with `expected_revision` so a stale request
 cannot overwrite a newer GUI or MCP edit. `undo` always requires the revision
 that the caller most recently observed.
 
-Important current limitation: the private darktable protocol implements
-`set_module_params`, but the Python sidecar does not yet register it as an MCP
-tool. Claude Code can inspect numeric module parameters and can enable, reset,
-duplicate, or undo modules, but it cannot currently set an arbitrary numeric
-parameter such as exposure through the MCP surface.
+`set_module_params` patches writable scalar fields atomically (any invalid
+field fails the whole request and changes nothing) and records one history
+step. It never enables a disabled module implicitly; pass `enable: true` to
+switch the module on in the same history step.
 
 ## 11. Run the automated tests
 

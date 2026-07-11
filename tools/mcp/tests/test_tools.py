@@ -222,6 +222,122 @@ async def test_set_module_enabled_revision_conflict_surfaces_hint(tmp_path, fake
     assert "re-read state and retry" in message  # the actionable hint text
 
 
+async def test_set_module_params_returns_wire_result(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    fixture = load_fixture("set_module_params_response.json")
+    server.handle_from_fixture("set_module_params", "set_module_params_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(
+        app,
+        "set_module_params",
+        {"module": "exposure", "values": {"exposure": 0.7, "black": -0.002}},
+    )
+
+    assert result == fixture["result"]
+
+
+async def test_set_module_params_threads_params(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": params["values"],
+            "revision": 5,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    # enable and expected_revision omitted -> must not appear in the wire
+    # params; instance defaults to 0.
+    await app.call_tool(
+        "set_module_params", {"module": "exposure", "values": {"exposure": 1.25}}
+    )
+
+    assert seen == {"module": "exposure", "instance": 0, "values": {"exposure": 1.25}}
+
+
+async def test_set_module_params_includes_optional_members_when_given(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": params["values"],
+            "revision": 9,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "exposure",
+            "instance": 2,
+            "values": {"exposure": 0.3},
+            "enable": True,
+            "expected_revision": 8,
+        },
+    )
+
+    assert seen == {
+        "module": "exposure",
+        "instance": 2,
+        "values": {"exposure": 0.3},
+        "enable": True,
+        "expected_revision": 8,
+    }
+
+
+async def test_set_module_params_revision_conflict_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+
+    def handler(_params):
+        raise WireError(
+            "revision_conflict", "expected revision 30 does not match current state", retryable=True
+        )
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params", {"module": "exposure", "values": {"exposure": 1.0}}
+        )
+
+    message = str(excinfo.value)
+    assert "revision_conflict" in message
+    assert "re-read state and retry" in message  # the actionable hint text
+
+
+async def test_set_module_params_invalid_value_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    server.handle_from_fixture(
+        "set_module_params", "set_module_params_error_invalid_value_response.json"
+    )
+
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params", {"module": "exposure", "values": {"exposure": 99.0}}
+        )
+
+    assert "invalid_value" in str(excinfo.value)
+
+
 async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("reset_module_response.json")
@@ -539,6 +655,7 @@ async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_ser
         "list_modules",
         "get_module_schema",
         "get_module_params",
+        "set_module_params",
         "set_module_enabled",
         "reset_module",
         "create_module_instance",

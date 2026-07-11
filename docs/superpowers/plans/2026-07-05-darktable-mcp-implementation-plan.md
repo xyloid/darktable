@@ -583,9 +583,10 @@ must resolve them:
 
 1. ~~Undo policy~~ — resolved in the protocol reference: compare-and-undo
    with a required `expected_revision`; no multi-step undo in v1.
-2. Whether setting parameters may explicitly enable a module in the same
-   request. (The protocol reference specifies an explicit `enable` member;
-   confirm during implementation.)
+2. ~~Enable-with-set~~ — confirmed in implementation: `set_module_params`
+   takes an explicit optional `enable` member (never enables implicitly)
+   and records one history item; exercised live in
+   `tools/mcp/tests/integration/test_editing.py`.
 3. ~~Unsupported schema fields~~ — resolved in the protocol reference:
    always included with `writable: false`, no opt-in flag.
 4. ~~Cryptographic random source~~ — resolved in the remote-edit internals
