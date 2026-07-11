@@ -20,7 +20,6 @@
 
 #include "common/darktable.h" // _()
 
-#include <json-glib/json-glib.h>
 #include <math.h>
 #include <stdarg.h>
 
@@ -54,12 +53,17 @@ static dt_remote_error_t *dt_remote_curve_error_new(dt_remote_error_code_t code,
 // strings documented on dt_remote_curve_validate()), and "point_index"
 // (only when point_index >= 0 -- the documented convention: omitted for
 // whole-array failures and for interpolation_not_allowed, present and
-// 0-based otherwise). Mirrors the JsonBuilder + JsonGenerator idiom already
-// used for wire payloads elsewhere (e.g. remote_discovery.c's advertisement
-// beacon): build with JsonBuilder, serialize with JsonGenerator, and hand
-// the resulting string to details_json exactly like every other
-// dt_remote_error_t producer -- _build_error_wire() in remote_protocol.c
-// re-parses it before splicing it into the wire envelope.
+// 0-based otherwise).
+//
+// The JSON is hand-built with g_strdup_printf() rather than a JSON library:
+// remote_curve* files must never include JSON, socket, or MCP headers, and
+// every value placed into this string is either a compiled-in descriptor
+// name (dt_remote_curve_descriptor_t::name, never request-controlled), a
+// small non-negative int (point_index), or one of the fixed C string
+// literals passed as `constraint` by callers in this file (e.g.
+// "min_points", "non_finite", "adjacent_spacing"). None of these can
+// contain characters that require JSON escaping, so no escaping helper is
+// used or introduced.
 static dt_remote_error_t *dt_remote_curve_validate_error_new(const char *parameter, int point_index,
                                                              const char *constraint,
                                                              const char *format, ...)
@@ -77,28 +81,12 @@ static dt_remote_error_t *dt_remote_curve_validate_error_new(const char *paramet
   error->message = g_strdup_vprintf(format, args);
   va_end(args);
 
-  JsonBuilder *b = json_builder_new();
-  json_builder_begin_object(b);
-
-  json_builder_set_member_name(b, "parameter");
-  json_builder_add_string_value(b, parameter ? parameter : "");
-
   if(point_index >= 0)
-  {
-    json_builder_set_member_name(b, "point_index");
-    json_builder_add_int_value(b, point_index);
-  }
-
-  json_builder_set_member_name(b, "constraint");
-  json_builder_add_string_value(b, constraint);
-
-  json_builder_end_object(b);
-
-  JsonGenerator *gen = json_generator_new();
-  json_generator_set_root(gen, json_builder_get_root(b));
-  error->details_json = json_generator_to_data(gen, NULL);
-  g_object_unref(gen);
-  g_object_unref(b);
+    error->details_json = g_strdup_printf("{\"parameter\":\"%s\",\"point_index\":%d,\"constraint\":\"%s\"}",
+                                          parameter ? parameter : "", point_index, constraint);
+  else
+    error->details_json = g_strdup_printf("{\"parameter\":\"%s\",\"constraint\":\"%s\"}",
+                                          parameter ? parameter : "", constraint);
 
   return error;
 }
