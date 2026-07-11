@@ -207,6 +207,21 @@ static void test_registry_resolves_manual_rgb_enum_name(void **state)
 /* of the shared "rgbcurve" adapter/cache slot used by the tests above.    */
 /* ---------------------------------------------------------------------- */
 
+typedef struct priv_curve_node_t
+{
+  float x;
+  float y;
+} priv_curve_node_t;
+
+typedef struct priv_curve_params_t
+{
+  priv_curve_node_t nodes[4];
+  int count;
+  int type;
+  int version;
+  int mode;
+} priv_curve_params_t;
+
 static const dt_remote_path_segment_t s_priv_nodes_segments[] = {
   { .type = DT_REMOTE_PATH_FIELD, .value.field = "nodes" },
 };
@@ -299,26 +314,27 @@ static const dt_remote_curve_module_adapter_t s_priv_adapter = {
 // "good" tree: nodes is an array of {x,y} float structs (the correct shape).
 static dt_introspection_field_t s_priv_leaf_x = {
   .Float = { .header = { .type = DT_INTROSPECTION_TYPE_FLOAT, .type_name = "float", .name = "nodes.x",
-                        .field_name = "x", .description = "", .size = sizeof(float), .offset = 0, .so = NULL },
+                        .field_name = "x", .description = "", .size = sizeof(float),
+                        .offset = G_STRUCT_OFFSET(priv_curve_node_t, x), .so = NULL },
             .Min = 0.0f, .Max = 1.0f, .Default = 0.0f }
 };
 static dt_introspection_field_t s_priv_leaf_y = {
   .Float = { .header = { .type = DT_INTROSPECTION_TYPE_FLOAT, .type_name = "float", .name = "nodes.y",
-                        .field_name = "y", .description = "", .size = sizeof(float), .offset = sizeof(float),
-                        .so = NULL },
+                        .field_name = "y", .description = "", .size = sizeof(float),
+                        .offset = G_STRUCT_OFFSET(priv_curve_node_t, y), .so = NULL },
             .Min = 0.0f, .Max = 1.0f, .Default = 0.0f }
 };
 static dt_introspection_field_t *s_priv_node_struct_fields[] = { &s_priv_leaf_x, &s_priv_leaf_y, NULL };
 static dt_introspection_field_t s_priv_node_struct = {
   .Struct = { .header = { .type = DT_INTROSPECTION_TYPE_STRUCT, .type_name = "node", .name = "nodes[]",
-                         .field_name = "nodes[]", .description = "", .size = sizeof(float) * 2, .offset = 0,
+                         .field_name = "nodes[]", .description = "", .size = sizeof(priv_curve_node_t), .offset = 0,
                          .so = NULL },
              .entries = 2, .fields = s_priv_node_struct_fields }
 };
 static dt_introspection_field_t s_priv_good_nodes_array = {
   .Array = { .header = { .type = DT_INTROSPECTION_TYPE_ARRAY, .type_name = "node[4]", .name = "nodes",
-                        .field_name = "nodes", .description = "", .size = sizeof(float) * 2 * 4, .offset = 0,
-                        .so = NULL },
+                        .field_name = "nodes", .description = "", .size = sizeof(priv_curve_node_t) * 4,
+                        .offset = G_STRUCT_OFFSET(priv_curve_params_t, nodes), .so = NULL },
             .count = 4, .type = DT_INTROSPECTION_TYPE_STRUCT, .field = &s_priv_node_struct }
 };
 
@@ -330,24 +346,27 @@ static dt_introspection_field_t s_priv_int_leaf = {
 };
 static dt_introspection_field_t s_priv_bad_nodes_array = {
   .Array = { .header = { .type = DT_INTROSPECTION_TYPE_ARRAY, .type_name = "int[4]", .name = "nodes",
-                        .field_name = "nodes", .description = "", .size = sizeof(int) * 4, .offset = 0,
-                        .so = NULL },
+                        .field_name = "nodes", .description = "", .size = sizeof(int) * 4,
+                        .offset = G_STRUCT_OFFSET(priv_curve_params_t, nodes), .so = NULL },
             .count = 4, .type = DT_INTROSPECTION_TYPE_INT, .field = &s_priv_int_leaf }
 };
 
 static dt_introspection_field_t s_priv_count_field = {
   .Int = { .header = { .type = DT_INTROSPECTION_TYPE_INT, .type_name = "int", .name = "count",
-                      .field_name = "count", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+                      .field_name = "count", .description = "", .size = sizeof(int),
+                      .offset = G_STRUCT_OFFSET(priv_curve_params_t, count), .so = NULL },
           .Min = 0, .Max = 100, .Default = 0 }
 };
 static dt_introspection_field_t s_priv_type_field = {
   .Int = { .header = { .type = DT_INTROSPECTION_TYPE_INT, .type_name = "int", .name = "type",
-                      .field_name = "type", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+                      .field_name = "type", .description = "", .size = sizeof(int),
+                      .offset = G_STRUCT_OFFSET(priv_curve_params_t, type), .so = NULL },
           .Min = 0, .Max = 2, .Default = 0 }
 };
 static dt_introspection_field_t s_priv_version_field = {
   .Int = { .header = { .type = DT_INTROSPECTION_TYPE_INT, .type_name = "int", .name = "version",
-                      .field_name = "version", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+                      .field_name = "version", .description = "", .size = sizeof(int),
+                      .offset = G_STRUCT_OFFSET(priv_curve_params_t, version), .so = NULL },
           .Min = 0, .Max = 100, .Default = 0 }
 };
 static dt_introspection_type_enum_tuple_t s_priv_mode_values[] = {
@@ -357,7 +376,8 @@ static dt_introspection_type_enum_tuple_t s_priv_mode_values[] = {
 };
 static dt_introspection_field_t s_priv_mode_field = {
   .Enum = { .header = { .type = DT_INTROSPECTION_TYPE_ENUM, .type_name = "mode_t", .name = "mode",
-                       .field_name = "mode", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+                       .field_name = "mode", .description = "", .size = sizeof(int),
+                       .offset = G_STRUCT_OFFSET(priv_curve_params_t, mode), .so = NULL },
             .entries = 2, .values = s_priv_mode_values, .Default = 0 }
 };
 
@@ -367,7 +387,8 @@ static dt_introspection_field_t *s_priv_good_struct_fields[] = {
 };
 static dt_introspection_field_t s_priv_good_root = {
   .Struct = { .header = { .type = DT_INTROSPECTION_TYPE_STRUCT, .type_name = "root", .name = "",
-                         .field_name = "", .description = "", .size = 0, .offset = 0, .so = NULL },
+                         .field_name = "", .description = "", .size = sizeof(priv_curve_params_t),
+                         .offset = 0, .so = NULL },
              .entries = 5, .fields = s_priv_good_struct_fields }
 };
 
@@ -376,18 +397,84 @@ static dt_introspection_field_t *s_priv_bad_struct_fields[] = {
 };
 static dt_introspection_field_t s_priv_bad_root = {
   .Struct = { .header = { .type = DT_INTROSPECTION_TYPE_STRUCT, .type_name = "root", .name = "",
-                         .field_name = "", .description = "", .size = 0, .offset = 0, .so = NULL },
+                         .field_name = "", .description = "", .size = sizeof(priv_curve_params_t),
+                         .offset = 0, .so = NULL },
              .entries = 3, .fields = s_priv_bad_struct_fields }
 };
 
 static dt_introspection_t s_priv_good_intro = {
-  .api_version = DT_INTROSPECTION_VERSION, .params_version = 1, .type_name = "root", .size = 0,
+  .api_version = DT_INTROSPECTION_VERSION, .params_version = 1, .type_name = "root",
+  .size = sizeof(priv_curve_params_t),
   .field = &s_priv_good_root, .self_size = 0, .default_params = 0
 };
 static dt_introspection_t s_priv_bad_intro = {
-  .api_version = DT_INTROSPECTION_VERSION, .params_version = 1, .type_name = "root", .size = 0,
+  .api_version = DT_INTROSPECTION_VERSION, .params_version = 1, .type_name = "root",
+  .size = sizeof(priv_curve_params_t),
   .field = &s_priv_bad_root, .self_size = 0, .default_params = 0
 };
+
+static const dt_remote_curve_module_adapter_t *s_lookup_override_adapter = NULL;
+static dt_introspection_t *s_lookup_override_intro = NULL;
+
+static const dt_remote_curve_module_adapter_t *private_lookup_override(const char *operation,
+                                                                        guint params_version)
+{
+  if(!s_lookup_override_adapter || g_strcmp0(operation, s_lookup_override_adapter->operation)
+     || params_version < s_lookup_override_adapter->minimum_params_version
+     || params_version > s_lookup_override_adapter->maximum_params_version)
+    return NULL;
+  return s_lookup_override_adapter;
+}
+
+static dt_introspection_t *private_get_introspection(void)
+{
+  return s_lookup_override_intro;
+}
+
+static int lookup_override_test_setup(void **state)
+{
+  (void)state;
+  s_lookup_override_adapter = NULL;
+  s_lookup_override_intro = NULL;
+  dt_remote_curve_registry_set_lookup_override(NULL);
+  return 0;
+}
+
+static int lookup_override_test_teardown(void **state)
+{
+  (void)state;
+  dt_remote_curve_registry_set_lookup_override(NULL);
+  s_lookup_override_adapter = NULL;
+  s_lookup_override_intro = NULL;
+  return 0;
+}
+
+static void install_private_lookup(const dt_remote_curve_module_adapter_t *adapter,
+                                   dt_introspection_t *intro)
+{
+  s_lookup_override_adapter = adapter;
+  s_lookup_override_intro = intro;
+  dt_remote_curve_registry_set_lookup_override(private_lookup_override);
+}
+
+static void init_private_module_so(dt_iop_module_so_t *so, const char *operation,
+                                   dt_introspection_t *intro)
+{
+  memset(so, 0, sizeof(*so));
+  g_strlcpy(so->op, operation, sizeof(so->op));
+  so->get_introspection = private_get_introspection;
+  s_lookup_override_intro = intro;
+}
+
+static void init_private_params(priv_curve_params_t *params, int mode)
+{
+  memset(params, 0, sizeof(*params));
+  params->nodes[0] = (priv_curve_node_t){ .x = 0.0f, .y = 0.0f };
+  params->nodes[1] = (priv_curve_node_t){ .x = 1.0f, .y = 1.0f };
+  params->count = 2;
+  params->type = 0;
+  params->mode = mode;
+}
 
 static void init_private_adapter(dt_remote_curve_descriptor_t *descriptor,
                                  dt_remote_curve_module_adapter_t *adapter)
@@ -572,9 +659,101 @@ static void test_registry_validate_rejects_whole_adapter_when_one_descriptor_is_
   assert_registry_validation_fails(&adapter, &s_priv_good_intro);
 }
 
+static const dt_remote_parameter_predicate_t s_missing_mode_predicate = {
+  .field = "missing_mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+};
+
+static void init_invalid_pair_adapter(dt_remote_curve_descriptor_t descriptors[2],
+                                      dt_remote_curve_module_adapter_t *adapter)
+{
+  descriptors[0] = s_priv_descriptor;
+  descriptors[0].name = "test.private.valid";
+  descriptors[1] = s_priv_descriptor;
+  descriptors[1].name = "test.private.invalid";
+  descriptors[1].active_when = &s_missing_mode_predicate;
+  *adapter = s_priv_adapter;
+  adapter->curves = descriptors;
+  adapter->curve_count = 2;
+}
+
 /* ---------------------------------------------------------------------- */
 /* dt_remote_curve_list_schema                                             */
 /* ---------------------------------------------------------------------- */
+
+static void test_list_schema_invalid_adapter_fails_closed_without_partial_result(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptors[2];
+  static dt_remote_curve_module_adapter_t adapter;
+  init_invalid_pair_adapter(descriptors, &adapter);
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_list_schema(&so, &schemas, &err));
+  assert_null(schemas);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
+}
+
+static void test_list_schema_unconditional_descriptor_is_writable_now(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_list_schema(&so, &schemas, &err));
+  assert_null(err);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 1);
+
+  dt_remote_curve_schema_t *schema = g_ptr_array_index(schemas, 0);
+  assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(schema->writable_when);
+
+  g_ptr_array_unref(schemas);
+}
+
+static void test_semantic_apis_without_adapter_return_successful_empty_results(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, "test.no_adapter", &s_priv_good_intro);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_list_schema(&so, &schemas, &err));
+  assert_null(err);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 0);
+  g_ptr_array_unref(schemas);
+
+  priv_curve_params_t params;
+  init_private_params(&params, 0);
+  dt_iop_module_t module;
+  memset(&module, 0, sizeof(module));
+  module.so = &so;
+  g_strlcpy(module.op, so.op, sizeof(module.op));
+
+  GHashTable *values = NULL;
+  assert_true(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(err);
+  assert_non_null(values);
+  assert_int_equal(g_hash_table_size(values), 0);
+  g_hash_table_unref(values);
+}
 
 static void test_list_schema_returns_four_conditional_entries(void **state)
 {
@@ -627,6 +806,219 @@ static void init_fake_module(dt_iop_module_t *module, dt_iop_module_so_t *so)
   memset(module, 0, sizeof(*module));
   module->so = so;
   g_strlcpy(module->op, so->op, sizeof(module->op));
+}
+
+static void test_read_values_invalid_adapter_fails_closed_without_partial_result(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptors[2];
+  static dt_remote_curve_module_adapter_t adapter;
+  init_invalid_pair_adapter(descriptors, &adapter);
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+  priv_curve_params_t params;
+  init_private_params(&params, 0);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
+}
+
+static void test_read_values_unconditional_descriptor_is_writable_now(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+  priv_curve_params_t params;
+  init_private_params(&params, 0);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(err);
+  assert_non_null(values);
+  assert_int_equal(g_hash_table_size(values), 1);
+
+  dt_remote_curve_value_t *value = g_hash_table_lookup(values, descriptor.name);
+  assert_non_null(value);
+  assert_true(value->active);
+  assert_true(value->writable_now);
+
+  g_hash_table_unref(values);
+}
+
+static void test_read_values_resolves_periodic_when(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t periodic_when = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.wrap_spacing_rule = DT_REMOTE_SPACING_GREATER_THAN;
+  descriptor.periodic_when = &periodic_when;
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+
+  for(int mode = 1; mode >= 0; mode--)
+  {
+    priv_curve_params_t params;
+    init_private_params(&params, mode);
+    GHashTable *values = NULL;
+    dt_remote_error_t *err = NULL;
+    assert_true(dt_remote_curve_read_values(&module, &params, &values, &err));
+    assert_null(err);
+
+    dt_remote_curve_value_t *value = g_hash_table_lookup(values, descriptor.name);
+    assert_non_null(value);
+    assert_int_equal(value->periodic_x, mode == 1);
+    g_hash_table_unref(values);
+  }
+}
+
+static void test_read_values_unknown_ne_enum_value_fails_closed(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t not_one = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_NE, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.active_when = &not_one;
+  install_private_lookup(&adapter, &s_priv_good_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+  priv_curve_params_t params;
+  init_private_params(&params, 99);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
+}
+
+static void test_read_values_predicate_resolution_failure_fails_closed(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t equals_one = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.active_when = &equals_one;
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_registry_validate(&adapter, &s_priv_good_intro, &err));
+  assert_null(err);
+
+  dt_introspection_field_t *drift_fields[] = {
+    &s_priv_good_nodes_array, &s_priv_count_field, &s_priv_type_field, &s_priv_version_field, NULL
+  };
+  dt_introspection_field_t drift_root = s_priv_good_root;
+  drift_root.Struct.entries = 4;
+  drift_root.Struct.fields = drift_fields;
+  dt_introspection_t drift_intro = s_priv_good_intro;
+  drift_intro.field = &drift_root;
+  install_private_lookup(&adapter, &drift_intro);
+
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &drift_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+  priv_curve_params_t params;
+  init_private_params(&params, 1);
+
+  GHashTable *values = NULL;
+  assert_false(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
+}
+
+static void test_read_values_path_resolution_failure_discards_partial_result(void **state)
+{
+  (void)state;
+  static const dt_remote_path_segment_t alternate_type_segments[] = {
+    { .type = DT_REMOTE_PATH_FIELD, .value.field = "alternate_type" },
+  };
+  static const dt_remote_introspection_path_t alternate_type_path = {
+    .segments = alternate_type_segments, .length = G_N_ELEMENTS(alternate_type_segments)
+  };
+  static dt_remote_curve_descriptor_t descriptors[2];
+  static dt_remote_curve_module_adapter_t adapter;
+  descriptors[0] = s_priv_descriptor;
+  descriptors[0].name = "test.private.first";
+  descriptors[1] = s_priv_descriptor;
+  descriptors[1].name = "test.private.second";
+  descriptors[1].native.type = alternate_type_path;
+  adapter = s_priv_adapter;
+  adapter.curves = descriptors;
+  adapter.curve_count = 2;
+
+  dt_introspection_field_t alternate_type_field = s_priv_type_field;
+  alternate_type_field.header.name = "alternate_type";
+  alternate_type_field.header.field_name = "alternate_type";
+  dt_introspection_field_t *valid_fields[] = {
+    &s_priv_good_nodes_array, &s_priv_count_field, &s_priv_type_field, &alternate_type_field,
+    &s_priv_version_field, &s_priv_mode_field, NULL
+  };
+  dt_introspection_field_t valid_root = s_priv_good_root;
+  valid_root.Struct.entries = 6;
+  valid_root.Struct.fields = valid_fields;
+  dt_introspection_t valid_intro = s_priv_good_intro;
+  valid_intro.field = &valid_root;
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_registry_validate(&adapter, &valid_intro, &err));
+  assert_null(err);
+
+  install_private_lookup(&adapter, &s_priv_good_intro);
+  dt_iop_module_so_t so;
+  init_private_module_so(&so, adapter.operation, &s_priv_good_intro);
+  dt_iop_module_t module;
+  init_fake_module(&module, &so);
+  priv_curve_params_t params;
+  init_private_params(&params, 0);
+
+  GHashTable *values = NULL;
+  assert_false(dt_remote_curve_read_values(&module, &params, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
 }
 
 static void resolve_field_or_fail(dt_introspection_t *intro, void *blob,
@@ -734,15 +1126,21 @@ static void test_read_values_automatic_mode_exposes_master_only(void **state)
   dt_remote_curve_value_t *red = g_hash_table_lookup(values, "curve.red");
   assert_non_null(red);
   assert_false(red->active);
+  assert_false(red->effective);
   assert_false(red->writable_now);
+  assert_non_null(red->points);
 
   dt_remote_curve_value_t *green = g_hash_table_lookup(values, "curve.green");
   assert_non_null(green);
   assert_false(green->active);
+  assert_false(green->effective);
+  assert_non_null(green->points);
 
   dt_remote_curve_value_t *blue = g_hash_table_lookup(values, "curve.blue");
   assert_non_null(blue);
   assert_false(blue->active);
+  assert_false(blue->effective);
+  assert_non_null(blue->points);
 
   g_hash_table_unref(values);
   g_free(blob);
@@ -778,21 +1176,26 @@ static void test_read_values_manual_mode_exposes_rgb_only(void **state)
   dt_remote_curve_value_t *master = g_hash_table_lookup(values, "curve.master");
   assert_non_null(master);
   assert_false(master->active);
+  assert_false(master->effective);
   assert_false(master->writable_now);
+  assert_non_null(master->points);
 
   dt_remote_curve_value_t *red = g_hash_table_lookup(values, "curve.red");
   assert_non_null(red);
   assert_true(red->active);
+  assert_true(red->effective);
   assert_true(red->writable_now);
 
   dt_remote_curve_value_t *green = g_hash_table_lookup(values, "curve.green");
   assert_non_null(green);
   assert_true(green->active);
+  assert_true(green->effective);
   assert_true(green->writable_now);
 
   dt_remote_curve_value_t *blue = g_hash_table_lookup(values, "curve.blue");
   assert_non_null(blue);
   assert_true(blue->active);
+  assert_true(blue->effective);
   assert_true(blue->writable_now);
 
   g_hash_table_unref(values);
@@ -1004,6 +1407,38 @@ static void test_read_values_out_of_range_curve_type_fails_closed(void **state)
   g_free(blob);
 }
 
+static void test_read_values_unknown_rgbcurve_autoscale_fails_closed(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *blob = g_malloc0(intro->size);
+  set_curve_autoscale(intro, blob, 99);
+  for(guint ch = 0; ch < 3; ch++)
+  {
+    set_curve_num_nodes(intro, blob, ch, 2);
+    set_curve_type(intro, blob, ch, 2);
+    set_curve_node(intro, blob, ch, 0, 0.0, 0.0);
+    set_curve_node(intro, blob, ch, 1, 1.0, 1.0);
+  }
+
+  dt_iop_module_t module;
+  init_fake_module(&module, so);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_read_values(&module, blob, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+
+  dt_remote_error_free(err);
+  g_free(blob);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1023,7 +1458,25 @@ int main(void)
     cmocka_unit_test(test_registry_validate_rejects_invalid_predicate_operator),
     cmocka_unit_test(test_registry_validate_accepts_all_valid_predicate_slots),
     cmocka_unit_test(test_registry_validate_rejects_whole_adapter_when_one_descriptor_is_invalid),
+    cmocka_unit_test_setup_teardown(test_list_schema_invalid_adapter_fails_closed_without_partial_result,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_list_schema_unconditional_descriptor_is_writable_now,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_semantic_apis_without_adapter_return_successful_empty_results,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test(test_list_schema_returns_four_conditional_entries),
+    cmocka_unit_test_setup_teardown(test_read_values_invalid_adapter_fails_closed_without_partial_result,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_unconditional_descriptor_is_writable_now,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_resolves_periodic_when,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_unknown_ne_enum_value_fails_closed,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_predicate_resolution_failure_fails_closed,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_path_resolution_failure_discards_partial_result,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test(test_read_values_automatic_mode_exposes_master_only),
     cmocka_unit_test(test_read_values_manual_mode_exposes_rgb_only),
     cmocka_unit_test(test_read_values_channel0_round_trips_under_master_in_automatic_mode),
@@ -1031,6 +1484,7 @@ int main(void)
     cmocka_unit_test(test_read_values_interpolation_maps_all_three_names),
     cmocka_unit_test(test_read_values_unused_capacity_not_serialized),
     cmocka_unit_test(test_read_values_out_of_range_curve_type_fails_closed),
+    cmocka_unit_test(test_read_values_unknown_rgbcurve_autoscale_fails_closed),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);

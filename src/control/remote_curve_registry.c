@@ -70,6 +70,14 @@ static dt_remote_error_t *dt_remote_curve_registry_error_new(dt_remote_error_cod
   return error;
 }
 
+static void deliver_error(dt_remote_error_t *owned_error, dt_remote_error_t **out_error)
+{
+  if(out_error)
+    *out_error = owned_error;
+  else
+    dt_remote_error_free(owned_error);
+}
+
 /* ---------------------------------------------------------------------- */
 /* rgbcurve descriptor table (curve-classes design doc SS Initial registry */
 /* mapping / rgbcurve, and the curve-design-registry-excerpt task brief)   */
@@ -341,6 +349,13 @@ static const dt_remote_curve_module_adapter_t *const s_adapters[] = {
   &s_rgbcurve_adapter,
 };
 
+static dt_remote_curve_registry_lookup_override_t s_lookup_override = NULL;
+
+void dt_remote_curve_registry_set_lookup_override(dt_remote_curve_registry_lookup_override_t lookup)
+{
+  s_lookup_override = lookup;
+}
+
 /* ---------------------------------------------------------------------- */
 /* registry lifecycle                                                      */
 /* ---------------------------------------------------------------------- */
@@ -349,6 +364,7 @@ const dt_remote_curve_module_adapter_t *
 dt_remote_curve_registry_lookup(const char *operation, guint params_version)
 {
   if(!operation) return NULL;
+  if(s_lookup_override) return s_lookup_override(operation, params_version);
 
   for(guint i = 0; i < G_N_ELEMENTS(s_adapters); i++)
   {
@@ -599,6 +615,7 @@ gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
                                      GPtrArray **out,
                                      dt_remote_error_t **error)
 {
+  if(out) *out = NULL;
   if(!module_so || !out)
   {
     if(error)
@@ -631,12 +648,16 @@ gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
 
   dt_remote_error_t *validate_error = NULL;
   const gboolean adapter_valid = dt_remote_curve_registry_validate(adapter, intro, &validate_error);
-  if(validate_error) dt_remote_error_free(validate_error);
   if(!adapter_valid)
   {
-    *out = result;
-    return TRUE;
+    g_ptr_array_unref(result);
+    if(!validate_error)
+      validate_error = dt_remote_curve_registry_error_new(
+        DT_REMOTE_ERR_INTERNAL, _("internal error: curve registry validation failed"));
+    deliver_error(validate_error, error);
+    return FALSE;
   }
+  if(validate_error) dt_remote_error_free(validate_error);
 
   for(guint i = 0; i < adapter->curve_count; i++)
   {
@@ -666,7 +687,7 @@ gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
     schema->boundary_point_policy = desc->boundary_point_policy;
     schema->interpolation_mask = desc->interpolation_mask;
     schema->default_interpolation = desc->default_interpolation;
-    schema->writability = desc->writable_when ? DT_REMOTE_WRITABLE_CONDITIONAL : DT_REMOTE_WRITABLE_NEVER;
+    schema->writability = desc->writable_when ? DT_REMOTE_WRITABLE_CONDITIONAL : DT_REMOTE_WRITABLE_NOW;
     schema->active_when = condition_from_predicate(desc->active_when);
     schema->writable_when = condition_from_predicate(desc->writable_when);
     schema->periodic_when = condition_from_predicate(desc->periodic_when);
@@ -733,26 +754,53 @@ static gboolean map_native_interpolation(gint64 native_value, dt_remote_curve_in
 // Evaluates `pred` (a single primitive-enum-field-vs-stable-enum-name
 // predicate) against `params_blob`, resolving `pred->field` as a one
 // segment path off `root` and comparing by enum *name*, never by raw
-// integer. Returns FALSE (leaving `*out_holds` untouched) only on
-// registry/introspection drift (unresolvable field, or a field that turns
-// out not to be an enum) -- callers treat that the same as "does not
-// hold" for active/writable purposes, matching the read_values contract.
+// integer. Returns FALSE with a DT_REMOTE_ERR_INTERNAL error on any
+// registry/introspection drift, including an unknown live enum value. A
+// failed resolution is never converted into a false predicate (and an NE
+// predicate therefore cannot become true merely because its live value has
+// no introspection name).
 static gboolean predicate_holds(const dt_remote_parameter_predicate_t *pred,
                                 const dt_introspection_field_t *root,
                                 void *params_blob,
-                                gboolean *out_holds)
+                                gboolean *out_holds,
+                                dt_remote_error_t **error)
 {
   const dt_remote_path_segment_t segment = { .type = DT_REMOTE_PATH_FIELD, .value.field = pred->field };
   const dt_remote_introspection_path_t path = { .segments = &segment, .length = 1 };
 
   const dt_introspection_field_t *field = NULL;
   void *ptr = NULL;
-  if(!dt_remote_path_resolve(&path, root, params_blob, &field, &ptr, NULL)) return FALSE;
-  if(field->header.type != DT_INTROSPECTION_TYPE_ENUM) return FALSE;
+  dt_remote_error_t *resolve_error = NULL;
+  if(!dt_remote_path_resolve(&path, root, params_blob, &field, &ptr, &resolve_error))
+  {
+    if(!resolve_error)
+      resolve_error = dt_remote_curve_registry_error_new(
+        DT_REMOTE_ERR_INTERNAL, _("internal error: curve predicate field '%s' did not resolve"), pred->field);
+    deliver_error(resolve_error, error);
+    return FALSE;
+  }
+  if(field->header.type != DT_INTROSPECTION_TYPE_ENUM)
+  {
+    deliver_error(dt_remote_curve_registry_error_new(
+                    DT_REMOTE_ERR_INTERNAL,
+                    _("internal error: curve predicate field '%s' is not an enum"), pred->field),
+                  error);
+    return FALSE;
+  }
 
   const int value = *(const int *)ptr;
   const char *name = dt_introspection_get_enum_name((dt_introspection_field_t *)field, value);
-  const gboolean matches = name && !g_strcmp0(name, pred->enum_name);
+  if(!name)
+  {
+    deliver_error(dt_remote_curve_registry_error_new(
+                    DT_REMOTE_ERR_INTERNAL,
+                    _("internal error: curve predicate field '%s' has unknown enum value %d"),
+                    pred->field, value),
+                  error);
+    return FALSE;
+  }
+
+  const gboolean matches = !g_strcmp0(name, pred->enum_name);
   *out_holds = (pred->op == DT_REMOTE_PREDICATE_EQ) ? matches : !matches;
   return TRUE;
 }
@@ -762,6 +810,7 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
                                      GHashTable **out,
                                      dt_remote_error_t **error)
 {
+  if(out) *out = NULL;
   if(!module || !params || !out)
   {
     if(error)
@@ -801,26 +850,38 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
 
   dt_remote_error_t *validate_error = NULL;
   const gboolean adapter_valid = dt_remote_curve_registry_validate(adapter, intro, &validate_error);
-  if(validate_error) dt_remote_error_free(validate_error);
   if(!adapter_valid)
   {
-    *out = result;
-    return TRUE;
+    g_hash_table_destroy(result);
+    if(!validate_error)
+      validate_error = dt_remote_curve_registry_error_new(
+        DT_REMOTE_ERR_INTERNAL, _("internal error: curve registry validation failed"));
+    deliver_error(validate_error, error);
+    return FALSE;
   }
+  if(validate_error) dt_remote_error_free(validate_error);
 
   void *params_blob = (void *)params;
+  dt_remote_error_t *read_error = NULL;
 
   for(guint i = 0; i < adapter->curve_count; i++)
   {
     const dt_remote_curve_descriptor_t *desc = &adapter->curves[i];
 
     gboolean active = TRUE;
-    if(desc->active_when && !predicate_holds(desc->active_when, intro->field, params_blob, &active))
-      active = FALSE;
+    if(desc->active_when
+       && !predicate_holds(desc->active_when, intro->field, params_blob, &active, &read_error))
+      goto fail;
 
-    gboolean writable_now = FALSE;
-    if(desc->writable_when && !predicate_holds(desc->writable_when, intro->field, params_blob, &writable_now))
-      writable_now = FALSE;
+    gboolean writable_now = TRUE;
+    if(desc->writable_when
+       && !predicate_holds(desc->writable_when, intro->field, params_blob, &writable_now, &read_error))
+      goto fail;
+
+    gboolean periodic_x = desc->wrap_spacing_rule != DT_REMOTE_SPACING_NONE;
+    if(desc->periodic_when
+       && !predicate_holds(desc->periodic_when, intro->field, params_blob, &periodic_x, &read_error))
+      goto fail;
 
     const dt_introspection_field_t *nodes_field = NULL;
     void *nodes_ptr = NULL;
@@ -830,10 +891,19 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
     void *type_ptr = NULL;
 
     const gboolean resolved =
-      dt_remote_path_resolve(&desc->native.nodes, intro->field, params_blob, &nodes_field, &nodes_ptr, NULL)
-      && dt_remote_path_resolve(&desc->native.count, intro->field, params_blob, &count_field, &count_ptr, NULL)
-      && dt_remote_path_resolve(&desc->native.type, intro->field, params_blob, &type_field, &type_ptr, NULL);
-    if(!resolved) continue; // shape already validated above; defensive only
+      dt_remote_path_resolve(&desc->native.nodes, intro->field, params_blob, &nodes_field, &nodes_ptr,
+                             &read_error)
+      && dt_remote_path_resolve(&desc->native.count, intro->field, params_blob, &count_field, &count_ptr,
+                                &read_error)
+      && dt_remote_path_resolve(&desc->native.type, intro->field, params_blob, &type_field, &type_ptr,
+                                &read_error);
+    if(!resolved)
+    {
+      if(!read_error)
+        read_error = dt_remote_curve_registry_error_new(
+          DT_REMOTE_ERR_INTERNAL, _("internal error: curve '%s' native path did not resolve"), desc->name);
+      goto fail;
+    }
 
     const gint64 raw_count = read_integer_leaf(count_field, count_ptr);
     const guint capacity = (guint)nodes_field->Array.count;
@@ -846,13 +916,27 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
       dt_introspection_field_t *node_struct_field = NULL;
       void *node_ptr =
         dt_introspection_access_array((dt_introspection_field_t *)nodes_field, nodes_ptr, j, &node_struct_field);
-      if(!node_ptr) break;
+      if(!node_ptr || !node_struct_field)
+      {
+        read_error = dt_remote_curve_registry_error_new(
+          DT_REMOTE_ERR_INTERNAL, _("internal error: curve '%s' node %u did not resolve"), desc->name, j);
+        g_array_unref(points);
+        goto fail;
+      }
 
       dt_introspection_field_t *x_field = NULL;
       dt_introspection_field_t *y_field = NULL;
       void *x_ptr = dt_introspection_get_child(node_struct_field, node_ptr, desc->native.x_field, &x_field);
       void *y_ptr = dt_introspection_get_child(node_struct_field, node_ptr, desc->native.y_field, &y_field);
-      if(!x_ptr || !y_ptr) break;
+      if(!x_ptr || !x_field || !is_floating_type(x_field->header.type)
+         || !y_ptr || !y_field || !is_floating_type(y_field->header.type))
+      {
+        read_error = dt_remote_curve_registry_error_new(
+          DT_REMOTE_ERR_INTERNAL, _("internal error: curve '%s' node %u coordinates did not resolve"),
+          desc->name, j);
+        g_array_unref(points);
+        goto fail;
+      }
 
       const dt_remote_curve_point_t point = { read_float_leaf(x_field, x_ptr), read_float_leaf(y_field, y_ptr) };
       g_array_append_val(points, point);
@@ -867,13 +951,11 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
       // silently substituting the descriptor default -- same convention as
       // the other internal errors in this function.
       g_array_unref(points);
-      g_hash_table_destroy(result);
-      if(error)
-        *error = dt_remote_curve_registry_error_new(
-          DT_REMOTE_ERR_INTERNAL,
-          _("internal error: curve '%s' has out-of-range native curve_type %" G_GINT64_FORMAT),
-          desc->name, raw_type);
-      return FALSE;
+      read_error = dt_remote_curve_registry_error_new(
+        DT_REMOTE_ERR_INTERNAL,
+        _("internal error: curve '%s' has out-of-range native curve_type %" G_GINT64_FORMAT),
+        desc->name, raw_type);
+      goto fail;
     }
 
     dt_remote_curve_value_t *value = g_new0(dt_remote_curve_value_t, 1);
@@ -883,13 +965,21 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
     value->active = active;
     value->effective = active;
     value->writable_now = writable_now;
-    value->periodic_x = (!desc->periodic_when && desc->wrap_spacing_rule != DT_REMOTE_SPACING_NONE);
+    value->periodic_x = periodic_x;
 
     g_hash_table_insert(result, g_strdup(desc->name), value);
   }
 
   *out = result;
   return TRUE;
+
+fail:
+  g_hash_table_destroy(result);
+  if(!read_error)
+    read_error = dt_remote_curve_registry_error_new(
+      DT_REMOTE_ERR_INTERNAL, _("internal error: curve value read failed"));
+  deliver_error(read_error, error);
+  return FALSE;
 }
 
 // clang-format off

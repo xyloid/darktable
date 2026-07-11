@@ -228,19 +228,27 @@ typedef struct dt_remote_curve_module_adapter_t
 const dt_remote_curve_module_adapter_t *
 dt_remote_curve_registry_lookup(const char *operation, guint params_version);
 
+/* Test-only/internal seam for exercising semantic reads with synthetic
+ * adapters through the public list_schema/read_values APIs. The override is
+ * process-wide and not thread-safe; tests must install it only from a
+ * single-threaded process and reset it after each test. Pass %NULL to restore
+ * the production registry lookup. Production code never sets an override. */
+typedef const dt_remote_curve_module_adapter_t *(*dt_remote_curve_registry_lookup_override_t)(
+  const char *operation, guint params_version);
+void dt_remote_curve_registry_set_lookup_override(dt_remote_curve_registry_lookup_override_t lookup);
+
 /** validates, for every descriptor on `adapter`, that its
  * native.nodes/x_field/y_field/count/type paths resolve against
  * `introspection`'s real field tree to the shapes documented on
  * dt_remote_native_curve_layout_t (nodes: array-of-structs;
  * x_field/y_field: floating members of that struct; count/type: integer-
  * or enum-compatible leaves). Every descriptor is checked -- a shape
- * mismatch on one descriptor disables only that descriptor (skipped by
- * dt_remote_curve_list_schema()/dt_remote_curve_read_values() below) and
- * does not stop the remaining descriptors from being checked. The result
- * (per-descriptor validity, and the aggregate below) is cached for the
- * process lifetime, keyed by `adapter`'s identity: `introspection` is
- * process-lifetime static data, so a shape that resolves once resolves
- * identically for the life of the process.
+ * mismatch on any descriptor disables the whole adapter/version pair, but
+ * does not stop the remaining descriptors from being checked. One aggregate
+ * result is cached for the process lifetime, keyed by (`adapter` identity,
+ * `introspection->params_version`): introspection is process-lifetime static
+ * data, so a shape that resolves once resolves identically for the life of
+ * the process.
  *
  * Returns TRUE iff every descriptor's shape is valid. Returns FALSE, with
  * `*error` set to a newly allocated DT_REMOTE_ERR_INTERNAL (caller frees
@@ -257,25 +265,27 @@ gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_
 /* is declared and implemented in Task 8.)                                 */
 /* ---------------------------------------------------------------------- */
 
-/** per (operation, params_version) schema listing: looks up the adapter for
+/** Per (operation, params_version) schema listing: looks up the adapter for
  * `module_so`'s operation/params_version, validates its registry shape
  * (dt_remote_curve_registry_validate() above, cached), then returns one
- * owned dt_remote_curve_schema_t per valid descriptor (deep-copying every
+ * owned dt_remote_curve_schema_t per descriptor (deep-copying every
  * string -- the descriptor's own strings are static and outlive nothing
- * past this call). Shape-invalid descriptors and ops with no registered
- * adapter both simply contribute no entries; neither is an error. Always
- * succeeds when `module_so` has introspection; sets `*out` to a newly
- * allocated, possibly-empty GPtrArray (owned by the caller, element
- * destructor already set to dt_remote_curve_schema_free -- free with
- * g_ptr_array_unref()). Fails only on a null argument or a module with no
- * introspection at all, with `*error` set to DT_REMOTE_ERR_INTERNAL. */
+ * past this call). An operation/version with no registered adapter succeeds
+ * with an empty result. Registry validation failure instead fails closed:
+ * no partial descriptor list is returned, `*out` remains %NULL, and `*error`
+ * is DT_REMOTE_ERR_INTERNAL. On success, sets `*out` to a newly allocated
+ * GPtrArray (owned by the caller, element destructor already set to
+ * dt_remote_curve_schema_free -- free with g_ptr_array_unref()). A descriptor
+ * without writable_when is unconditionally DT_REMOTE_WRITABLE_NOW; one with
+ * a predicate is DT_REMOTE_WRITABLE_CONDITIONAL. Null arguments and missing
+ * introspection also fail with DT_REMOTE_ERR_INTERNAL and a %NULL output. */
 gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
                                      GPtrArray **out, /* dt_remote_curve_schema_t */
                                      dt_remote_error_t **error);
 
-/** per live-instance value read: looks up + validates the adapter for
- * `module`'s operation/params_version (as above), then for every valid
- * descriptor evaluates active_when/writable_when against `params` (not
+/** Per live-instance value read: looks up + validates the adapter for
+ * `module`'s operation/params_version (as above), then for every descriptor
+ * evaluates active_when/writable_when/periodic_when against `params` (not
  * necessarily `module->params` -- callers may pass a projected/candidate
  * block) and reads the live points/count/type through
  * dt_remote_path_resolve(), truncating to the active count (indices at or
@@ -284,11 +294,16 @@ gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
  * in `*out`, with `active`/`writable_now` reflecting the current mode --
  * never omitted when inactive. Native interpolation ints are mapped to
  * dt_remote_curve_interpolation_t by explicit value identity, never cast.
- * Sets `*out` to a newly allocated GHashTable (name -> owned
+ * A missing writable_when means unconditionally writable now. An operation/
+ * version with no registered adapter succeeds with an empty table. Registry
+ * validation failure, predicate/path resolution failure, or an unknown live
+ * enum value fails the whole read with DT_REMOTE_ERR_INTERNAL: any temporary
+ * values are freed and `*out` remains %NULL, never a partial result.
+ * On success, sets `*out` to a newly allocated GHashTable (name -> owned
  * dt_remote_curve_value_t, owned by the caller -- free with
  * g_hash_table_unref(), value destructor already set to
- * dt_remote_curve_value_free()). Fails only on a null argument or a module
- * with no introspection, with `*error` set to DT_REMOTE_ERR_INTERNAL. */
+ * dt_remote_curve_value_free()). Null arguments and missing introspection
+ * also fail with DT_REMOTE_ERR_INTERNAL and a %NULL output. */
 gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
                                      const void *params,
                                      GHashTable **out, /* name -> dt_remote_curve_value_t */
