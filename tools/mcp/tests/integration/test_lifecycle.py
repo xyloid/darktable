@@ -60,8 +60,9 @@ async def test_get_state_is_darkroom_with_image(darktable_session):
         state = await client.call("get_state")
     assert state["view"] == "darkroom"
     assert state["image"] is not None
-    assert state["image"]["filename"] == "test.png"
-    assert state["image"]["width"] == 256 and state["image"]["height"] == 256
+    # The harness copies the repo's RAW fixture as test<original suffix>.
+    assert state["image"]["filename"] == "test" + harness.test_image().suffix
+    assert state["image"]["width"] > 0 and state["image"]["height"] > 0
     assert isinstance(state["revision"], int)
 
 
