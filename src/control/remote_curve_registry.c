@@ -801,7 +801,21 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
 
     const gint64 raw_type = read_integer_leaf(type_field, type_ptr);
     dt_remote_curve_interpolation_t interpolation = desc->default_interpolation;
-    map_native_interpolation(raw_type, &interpolation);
+    if(!map_native_interpolation(raw_type, &interpolation))
+    {
+      // registry/introspection drift: the live curve_type value is none of
+      // the known native interpolation IDs. Fail closed rather than
+      // silently substituting the descriptor default -- same convention as
+      // the other internal errors in this function.
+      g_array_unref(points);
+      g_hash_table_destroy(result);
+      if(error)
+        *error = dt_remote_curve_registry_error_new(
+          DT_REMOTE_ERR_INTERNAL,
+          _("internal error: curve '%s' has out-of-range native curve_type %" G_GINT64_FORMAT),
+          desc->name, raw_type);
+      return FALSE;
+    }
 
     dt_remote_curve_value_t *value = g_new0(dt_remote_curve_value_t, 1);
     value->name = g_strdup(desc->name);

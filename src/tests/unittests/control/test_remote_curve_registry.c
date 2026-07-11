@@ -45,7 +45,9 @@
  *    IDs; channel 0 round-trips under curve.master in automatic mode and
  *    under curve.red in manual mode; all three native interpolation ints
  *    map to the right name; native capacity beyond curve_num_nodes[ch] is
- *    never serialized.
+ *    never serialized; an out-of-range native curve_type value fails the
+ *    whole call closed with DT_REMOTE_ERR_INTERNAL rather than silently
+ *    substituting the descriptor's default interpolation.
  *
  * Please see README.md for more detailed documentation.
  */
@@ -780,6 +782,37 @@ static void test_read_values_unused_capacity_not_serialized(void **state)
   g_free(blob);
 }
 
+static void test_read_values_out_of_range_curve_type_fails_closed(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *blob = g_malloc0(intro->size);
+  set_curve_autoscale(intro, blob, AUTOMATIC_RGB);
+  set_curve_num_nodes(intro, blob, 0, 2);
+  set_curve_type(intro, blob, 0, 99); // out of range: none of 0/1/2
+  set_curve_node(intro, blob, 0, 0, 0.0, 0.0);
+  set_curve_node(intro, blob, 0, 1, 1.0, 1.0);
+
+  dt_iop_module_t module;
+  init_fake_module(&module, so);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_read_values(&module, blob, &values, &err));
+  assert_null(values);
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  assert_non_null(err->message);
+  assert_true(strlen(err->message) > 0);
+
+  dt_remote_error_free(err);
+  g_free(blob);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -797,6 +830,7 @@ int main(void)
     cmocka_unit_test(test_read_values_channel0_round_trips_under_red_in_manual_mode),
     cmocka_unit_test(test_read_values_interpolation_maps_all_three_names),
     cmocka_unit_test(test_read_values_unused_capacity_not_serialized),
+    cmocka_unit_test(test_read_values_out_of_range_curve_type_fails_closed),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
