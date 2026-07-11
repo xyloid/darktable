@@ -1,6 +1,8 @@
 # darktable MCP Tasks 5–7 Review Fixes — Tracking Plan
 
-**Status:** Not started
+**Status:** Complete (2026-07-11) — all six tasks landed; see the commit
+history from `remote_curve: harden curve validation and versioned registry
+checks` through `darktable-mcp: cover semantic schema and value passthrough`.
 
 **Scope:** Fix every finding from the review of Milestone 2 Tasks 5 and 6, plus the unfinished Task 7 implementation.
 
@@ -34,14 +36,14 @@
 - Modify: `src/control/remote_curve.c`
 - Test: `src/tests/unittests/control/test_remote_curve.c`
 
-- [ ] Add an explicit range check for supplied `dt_remote_curve_interpolation_t` values before computing a mask bit.
-- [ ] Return `DT_REMOTE_ERR_INVALID_VALUE` with `constraint: "interpolation_not_allowed"` for negative values.
-- [ ] Return the same error for values greater than or equal to the bit width of `interpolation_mask`.
-- [ ] Perform `1u << interpolation` only after the range check succeeds.
-- [ ] Add a test for `(dt_remote_curve_interpolation_t)-1`.
-- [ ] Add a test for an oversized interpolation value.
-- [ ] Confirm the existing allowed, disallowed, and omitted-interpolation tests still pass.
-- [ ] Run `ctest --test-dir build -R test_remote_curve --output-on-failure`.
+- [x] Add an explicit range check for supplied `dt_remote_curve_interpolation_t` values before computing a mask bit.
+- [x] Return `DT_REMOTE_ERR_INVALID_VALUE` with `constraint: "interpolation_not_allowed"` for negative values.
+- [x] Return the same error for values greater than or equal to the bit width of `interpolation_mask`.
+- [x] Perform `1u << interpolation` only after the range check succeeds.
+- [x] Add a test for `(dt_remote_curve_interpolation_t)-1`.
+- [x] Add a test for an oversized interpolation value.
+- [x] Confirm the existing allowed, disallowed, and omitted-interpolation tests still pass.
+- [x] Run `ctest --test-dir build -R test_remote_curve --output-on-failure`.
 
 **Acceptance:** No caller-controlled interpolation value can cause an invalid shift, and every invalid value is rejected without modifying the point array.
 
@@ -54,22 +56,22 @@
 - Modify: `src/control/remote_curve_registry.c`
 - Test: `src/tests/unittests/control/test_remote_curve_registry.c`
 
-- [ ] Replace the adapter-pointer-only cache key with `(adapter identity, params_version)`.
-- [ ] Cache one aggregate valid/invalid result for each adapter/version pair.
-- [ ] Remove per-descriptor partial-success behavior.
-- [ ] Validate every descriptor's nodes, count, and interpolation paths.
-- [ ] Validate that the node element is a struct and that `x`/`y` are supported floating leaves.
-- [ ] Validate that native node capacity is at least `maximum_points`.
-- [ ] Validate the optional internal-version path when present.
-- [ ] Validate `active_when`, `writable_when`, and `periodic_when` predicate fields.
-- [ ] Reject missing predicate fields.
-- [ ] Reject predicate fields that are not enums.
-- [ ] Reject invalid predicate operators.
-- [ ] Resolve each configured predicate enum name through introspection and reject unknown names.
-- [ ] Add a test proving a bad version-1 introspection does not poison a good version-2 result for the same adapter.
-- [ ] Add a test proving repeated validation of one adapter/version uses its cached result.
-- [ ] Add tests for missing fields, wrong field types, unknown enum names, and insufficient native capacity.
-- [ ] Run `ctest --test-dir build -R test_remote_curve_registry --output-on-failure`.
+- [x] Replace the adapter-pointer-only cache key with `(adapter identity, params_version)`.
+- [x] Cache one aggregate valid/invalid result for each adapter/version pair.
+- [x] Remove per-descriptor partial-success behavior.
+- [x] Validate every descriptor's nodes, count, and interpolation paths.
+- [x] Validate that the node element is a struct and that `x`/`y` are supported floating leaves.
+- [x] Validate that native node capacity is at least `maximum_points`.
+- [x] Validate the optional internal-version path when present.
+- [x] Validate `active_when`, `writable_when`, and `periodic_when` predicate fields.
+- [x] Reject missing predicate fields.
+- [x] Reject predicate fields that are not enums.
+- [x] Reject invalid predicate operators.
+- [x] Resolve each configured predicate enum name through introspection and reject unknown names.
+- [x] Add a test proving a bad version-1 introspection does not poison a good version-2 result for the same adapter.
+- [x] Add a test proving repeated validation of one adapter/version uses its cached result.
+- [x] Add tests for missing fields, wrong field types, unknown enum names, and insufficient native capacity.
+- [x] Run `ctest --test-dir build -R test_remote_curve_registry --output-on-failure`.
 
 **Acceptance:** Validation is isolated per parameter version, checks all compiled registry data, and disables the entire adapter when any descriptor is invalid.
 
@@ -83,20 +85,20 @@
 - Modify: `src/control/remote_curve.h`
 - Test: `src/tests/unittests/control/test_remote_curve_registry.c`
 
-- [ ] Make `dt_remote_curve_list_schema()` propagate registry validation failures.
-- [ ] Free temporary results and leave `*out` unset on failure.
-- [ ] Never return a partial semantic schema list.
-- [ ] Make `dt_remote_curve_read_values()` propagate registry validation failures.
-- [ ] Abort with `DT_REMOTE_ERR_INTERNAL` on predicate-resolution or path-resolution failure.
-- [ ] Never silently mark a predicate inactive because resolution failed.
-- [ ] Never silently omit a failed descriptor.
-- [ ] Treat an unknown live enum value as `DT_REMOTE_ERR_INTERNAL`; an `NE` predicate must not become true when enum-name resolution returns `NULL`.
-- [ ] Treat a missing `writable_when` predicate as unconditional writability (`DT_REMOTE_WRITABLE_NOW` / `writable_now == TRUE`).
-- [ ] Resolve `periodic_when` when producing live semantic values.
-- [ ] Add a real-rgbcurve test with an unknown raw `curve_autoscale` value and expect `DT_REMOTE_ERR_INTERNAL`.
-- [ ] Add an unconditional synthetic descriptor test for schema and live writability.
-- [ ] Confirm automatic/manual RGB polarity and inactive-value behavior remain unchanged.
-- [ ] Run `ctest --test-dir build -R test_remote_curve_registry --output-on-failure`.
+- [x] Make `dt_remote_curve_list_schema()` propagate registry validation failures.
+- [x] Free temporary results and leave `*out` unset on failure.
+- [x] Never return a partial semantic schema list.
+- [x] Make `dt_remote_curve_read_values()` propagate registry validation failures.
+- [x] Abort with `DT_REMOTE_ERR_INTERNAL` on predicate-resolution or path-resolution failure.
+- [x] Never silently mark a predicate inactive because resolution failed.
+- [x] Never silently omit a failed descriptor.
+- [x] Treat an unknown live enum value as `DT_REMOTE_ERR_INTERNAL`; an `NE` predicate must not become true when enum-name resolution returns `NULL`.
+- [x] Treat a missing `writable_when` predicate as unconditional writability (`DT_REMOTE_WRITABLE_NOW` / `writable_now == TRUE`).
+- [x] Resolve `periodic_when` when producing live semantic values.
+- [x] Add a real-rgbcurve test with an unknown raw `curve_autoscale` value and expect `DT_REMOTE_ERR_INTERNAL`.
+- [x] Add an unconditional synthetic descriptor test for schema and live writability.
+- [x] Confirm automatic/manual RGB polarity and inactive-value behavior remain unchanged.
+- [x] Run `ctest --test-dir build -R test_remote_curve_registry --output-on-failure`.
 
 **Acceptance:** A semantic read either returns the complete validated adapter result or an internal error; it never returns a partial or fail-open result.
 
@@ -112,15 +114,15 @@
 - Test: `src/tests/unittests/control/test_remote_protocol.c`
 - Fixture: add an internal-error schema response fixture if useful for the dispatcher pattern
 
-- [ ] Stop freeing and suppressing `curve_error` in `dt_remote_get_module_schema()`.
-- [ ] On semantic schema failure, free the partially constructed module schema.
-- [ ] Leave `*out` unset, propagate the original error, and return `FALSE`.
-- [ ] Keep primitive-only mutation independent of semantic registry validity.
-- [ ] Retain fail-closed semantic handling in `dt_remote_get_module_params()`.
-- [ ] Add a final-process rgbcurve schema test that temporarily introduces introspection drift, expects `DT_REMOTE_ERR_INTERNAL`, and restores the introspection immediately.
-- [ ] Add a dispatcher test proving an internal schema error produces an error envelope, not a successful primitive-only schema.
-- [ ] Assert all failure output pointers remain `NULL`.
-- [ ] Run `ctest --test-dir build -R 'test_remote_(edit|protocol)' --output-on-failure`.
+- [x] Stop freeing and suppressing `curve_error` in `dt_remote_get_module_schema()`.
+- [x] On semantic schema failure, free the partially constructed module schema.
+- [x] Leave `*out` unset, propagate the original error, and return `FALSE`.
+- [x] Keep primitive-only mutation independent of semantic registry validity.
+- [x] Retain fail-closed semantic handling in `dt_remote_get_module_params()`.
+- [x] Add a final-process rgbcurve schema test that temporarily introduces introspection drift, expects `DT_REMOTE_ERR_INTERNAL`, and restores the introspection immediately.
+- [x] Add a dispatcher test proving an internal schema error produces an error envelope, not a successful primitive-only schema.
+- [x] Assert all failure output pointers remain `NULL`.
+- [x] Run `ctest --test-dir build -R 'test_remote_(edit|protocol)' --output-on-failure`.
 
 **Acceptance:** Registry drift is visible as an actionable internal error at the wire boundary, while unrelated primitive mutation paths remain functional.
 
@@ -134,16 +136,16 @@
 - Modify later: `src/tests/unittests/control/fixtures/hello_response.json`
 - Depends on: Milestone Tasks 8 and 9 mutation engine and `semantic_values` parsing
 
-- [ ] Do not merge or ship the current Task 7 state independently.
-- [ ] Move production hello advertisement of `semantic_params` and `curve_params` to the activation step after Tasks 8 and 9 are complete.
-- [ ] Do not advertise curve schemas as writable until semantic mutation is accepted and applied atomically.
-- [ ] Complete Task 8's semantic mutation engine.
-- [ ] Complete Task 9's `semantic_values` parser and dispatcher integration.
-- [ ] Verify a valid semantic curve request reaches the mutation engine.
-- [ ] Activate `semantic_params`, `curve_params`, semantic schema/value members, and writable curve schemas together.
-- [ ] Restore the `represented_by` threading in `dt_remote_get_module_schema()` (dropped during the Task 4 rewrite of `remote_edit.c`) in the same activation change, and cover it with a final-process test so live responses match the fixtures.
-- [ ] Update the hello fixture only in that activation change.
-- [ ] Add a regression test: whenever hello contains `curve_params`, a valid `semantic_values` request must not fail unknown-key validation.
+- [x] Do not merge or ship the current Task 7 state independently.
+- [x] Move production hello advertisement of `semantic_params` and `curve_params` to the activation step after Tasks 8 and 9 are complete.
+- [x] Do not advertise curve schemas as writable until semantic mutation is accepted and applied atomically.
+- [x] Complete Task 8's semantic mutation engine.
+- [x] Complete Task 9's `semantic_values` parser and dispatcher integration.
+- [x] Verify a valid semantic curve request reaches the mutation engine.
+- [x] Activate `semantic_params`, `curve_params`, semantic schema/value members, and writable curve schemas together.
+- [x] Restore the `represented_by` threading in `dt_remote_get_module_schema()` (dropped during the Task 4 rewrite of `remote_edit.c`) in the same activation change, and cover it with a final-process test so live responses match the fixtures.
+- [x] Update the hello fixture only in that activation change.
+- [x] Add a regression test: whenever hello contains `curve_params`, a valid `semantic_values` request must not fail unknown-key validation.
 
 **Acceptance:** There is no mergeable or deployable state in which the server advertises curve editing but rejects the advertised request member.
 
@@ -159,14 +161,14 @@
   - `src/tests/unittests/control/fixtures/get_module_schema_rgbcurve_response.json`
   - `src/tests/unittests/control/fixtures/get_module_params_rgbcurve_response.json`
 
-- [ ] Add both rgbcurve fixtures to the shared protocol passthrough coverage.
-- [ ] Add a tool test proving `get_module_schema` returns `semantic_fields` verbatim.
-- [ ] Assert native fields retain `represented_by` verbatim.
-- [ ] Add a tool test proving `get_module_params` returns all four `semantic_values` verbatim.
-- [ ] Assert inactive curves remain present with `active: false`.
-- [ ] Assert point objects and uppercase interpolation names remain unchanged.
-- [ ] Retain the existing exposure tests and confirm primitive-only responses omit semantic members.
-- [ ] Run `cd tools/mcp && .venv/bin/pytest -q`.
+- [x] Add both rgbcurve fixtures to the shared protocol passthrough coverage.
+- [x] Add a tool test proving `get_module_schema` returns `semantic_fields` verbatim.
+- [x] Assert native fields retain `represented_by` verbatim.
+- [x] Add a tool test proving `get_module_params` returns all four `semantic_values` verbatim.
+- [x] Assert inactive curves remain present with `active: false`.
+- [x] Assert point objects and uppercase interpolation names remain unchanged.
+- [x] Retain the existing exposure tests and confirm primitive-only responses omit semantic members.
+- [x] Run `cd tools/mcp && .venv/bin/pytest -q`.
 
 **Acceptance:** Both the protocol client and MCP tools demonstrably pass the new semantic response members through without reshaping or dropping them.
 
@@ -178,9 +180,9 @@
 - [x] `remote_curve: fail closed on descriptor and predicate drift`
 - [x] `remote_edit: propagate semantic registry failures`
 - [x] Milestone Task 8 mutation commit (`remote_curve: rgbcurve adapter callbacks and atomic apply path`).
-- [ ] Milestone Task 9: `remote_protocol: semantic_values mutation parsing and read-back`
-- [ ] `remote_protocol: activate semantic curve capabilities and read responses`
-- [ ] `darktable-mcp: cover semantic schema and value passthrough`
+- [x] Milestone Task 9: `remote_protocol: semantic_values mutation parsing and read-back`
+- [x] `remote_protocol: activate semantic curve capabilities and read responses`
+- [x] `darktable-mcp: cover semantic schema and value passthrough`
 
 ## Execution order (agreed 2026-07-11)
 
@@ -239,18 +241,18 @@ cd tools/mcp
 
 ### Optional sanitizer check
 
-- [ ] Run the focused curve validator suite under UBSan when a sanitizer build is available.
+- [x] Run the focused curve validator suite under UBSan when a sanitizer build is available.
 
 ## Final acceptance checklist
 
-- [ ] Registry drift always produces `internal`, never partial semantic output.
-- [ ] Missing or invalid predicates cannot become active or writable.
-- [ ] Unknown live enum values fail closed.
-- [ ] Registry cache results cannot cross parameter versions.
-- [ ] Invalid interpolation cannot trigger undefined behavior.
-- [ ] `curve_params` is never advertised before semantic mutation works.
-- [ ] Existing non-curve fixtures remain unchanged.
-- [ ] rgbcurve schema/value fixtures pass through the C dispatcher and MCP sidecar verbatim.
-- [ ] All focused and full remote C suites pass.
-- [ ] The MCP unit suite passes.
+- [x] Registry drift always produces `internal`, never partial semantic output.
+- [x] Missing or invalid predicates cannot become active or writable.
+- [x] Unknown live enum values fail closed.
+- [x] Registry cache results cannot cross parameter versions.
+- [x] Invalid interpolation cannot trigger undefined behavior.
+- [x] `curve_params` is never advertised before semantic mutation works.
+- [x] Existing non-curve fixtures remain unchanged.
+- [x] rgbcurve schema/value fixtures pass through the C dispatcher and MCP sidecar verbatim.
+- [x] All focused and full remote C suites pass.
+- [x] The MCP unit suite passes.
 - [ ] The unrelated `test_filmicrgb` linker failure is resolved or separately documented before the milestone is declared fully green.
