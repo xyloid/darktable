@@ -19,10 +19,12 @@
 #include "control/remote_curve.h"
 
 #include "common/darktable.h" // _()
+#include "develop/imageop.h"
 
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <string.h>
 
 /* ---------------------------------------------------------------------- */
 /* error helper                                                           */
@@ -370,8 +372,8 @@ gboolean dt_remote_curve_validate(const dt_remote_curve_descriptor_t *desc,
 
   /* items 9-10: interpolation. Resolving/preserving the *current*
    * interpolation when none is supplied needs native introspection and is
-   * Task 8's job (the other half of item 9); this function only checks
-   * the allowlist, and only when the caller actually supplied a value. */
+   * handled by the apply engine below; this pure helper only checks the
+   * allowlist when the caller supplied a value. */
   const gint64 interpolation_value = (gint64)interpolation;
   const guint interpolation_mask_width = sizeof(desc->interpolation_mask) * CHAR_BIT;
   if(has_interpolation
@@ -393,6 +395,507 @@ gboolean dt_remote_curve_validate(const dt_remote_curve_descriptor_t *desc,
     return FALSE;
   }
 
+  return TRUE;
+}
+
+/* ---------------------------------------------------------------------- */
+/* semantic curve mutation engine                                         */
+/* ---------------------------------------------------------------------- */
+
+static void deliver_curve_error(dt_remote_error_t *owned_error, dt_remote_error_t **out_error)
+{
+  if(out_error)
+    *out_error = owned_error;
+  else
+    dt_remote_error_free(owned_error);
+}
+
+static dt_remote_error_t *curve_parameter_error_new(dt_remote_error_code_t code,
+                                                    const char *parameter,
+                                                    const char *constraint,
+                                                    const char *format, ...)
+  G_GNUC_PRINTF(4, 5);
+
+static dt_remote_error_t *curve_parameter_error_new(dt_remote_error_code_t code,
+                                                    const char *parameter,
+                                                    const char *constraint,
+                                                    const char *format, ...)
+{
+  dt_remote_error_t *error = g_new0(dt_remote_error_t, 1);
+  error->code = code;
+  va_list args;
+  va_start(args, format);
+  error->message = g_strdup_vprintf(format, args);
+  va_end(args);
+  if(parameter && constraint)
+    error->details_json = g_strdup_printf("{\"parameter\":\"%s\",\"constraint\":\"%s\"}",
+                                          parameter, constraint);
+  return error;
+}
+
+static gboolean is_curve_integer_leaf(dt_introspection_type_t type)
+{
+  switch(type)
+  {
+    case DT_INTROSPECTION_TYPE_CHAR:
+    case DT_INTROSPECTION_TYPE_INT8:
+    case DT_INTROSPECTION_TYPE_UINT8:
+    case DT_INTROSPECTION_TYPE_SHORT:
+    case DT_INTROSPECTION_TYPE_USHORT:
+    case DT_INTROSPECTION_TYPE_INT:
+    case DT_INTROSPECTION_TYPE_UINT:
+    case DT_INTROSPECTION_TYPE_LONG:
+    case DT_INTROSPECTION_TYPE_ULONG:
+    case DT_INTROSPECTION_TYPE_ENUM:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+static gboolean is_curve_floating_leaf(dt_introspection_type_t type)
+{
+  return type == DT_INTROSPECTION_TYPE_FLOAT || type == DT_INTROSPECTION_TYPE_DOUBLE;
+}
+
+static gboolean read_curve_integer_leaf(const dt_introspection_field_t *field,
+                                        const void *ptr,
+                                        gint64 *out)
+{
+  if(!field || !ptr || !out) return FALSE;
+  switch(field->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_CHAR: *out = *(const char *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_INT8: *out = *(const int8_t *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_UINT8: *out = *(const uint8_t *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_SHORT: *out = *(const short *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_USHORT: *out = *(const unsigned short *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_INT: *out = *(const int *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_UINT: *out = *(const unsigned int *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_LONG: *out = *(const long *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_ULONG: *out = (gint64)*(const unsigned long *)ptr; return TRUE;
+    case DT_INTROSPECTION_TYPE_ENUM: *out = *(const int *)ptr; return TRUE;
+    default: return FALSE;
+  }
+}
+
+static gboolean write_curve_integer_leaf(const dt_introspection_field_t *field,
+                                         void *ptr,
+                                         gint64 value)
+{
+  if(!field || !ptr) return FALSE;
+  switch(field->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_CHAR: *(char *)ptr = (char)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_INT8: *(int8_t *)ptr = (int8_t)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_UINT8: *(uint8_t *)ptr = (uint8_t)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_SHORT: *(short *)ptr = (short)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_USHORT: *(unsigned short *)ptr = (unsigned short)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_INT: *(int *)ptr = (int)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_UINT: *(unsigned int *)ptr = (unsigned int)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_LONG: *(long *)ptr = (long)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_ULONG: *(unsigned long *)ptr = (unsigned long)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_ENUM: *(int *)ptr = (int)value; return TRUE;
+    default: return FALSE;
+  }
+}
+
+static gboolean write_curve_float_leaf(const dt_introspection_field_t *field,
+                                       void *ptr,
+                                       double value)
+{
+  if(!field || !ptr) return FALSE;
+  switch(field->header.type)
+  {
+    case DT_INTROSPECTION_TYPE_FLOAT: *(float *)ptr = (float)value; return TRUE;
+    case DT_INTROSPECTION_TYPE_DOUBLE: *(double *)ptr = value; return TRUE;
+    default: return FALSE;
+  }
+}
+
+static gboolean map_native_curve_interpolation(gint64 native,
+                                               dt_remote_curve_interpolation_t *out)
+{
+  switch(native)
+  {
+    case 0: *out = DT_REMOTE_CURVE_CUBIC_SPLINE; return TRUE;
+    case 1: *out = DT_REMOTE_CURVE_CATMULL_ROM; return TRUE;
+    case 2: *out = DT_REMOTE_CURVE_MONOTONE_HERMITE; return TRUE;
+    default: return FALSE;
+  }
+}
+
+static gboolean map_remote_curve_interpolation(dt_remote_curve_interpolation_t interpolation,
+                                               gint64 *out)
+{
+  switch(interpolation)
+  {
+    case DT_REMOTE_CURVE_CUBIC_SPLINE: *out = 0; return TRUE;
+    case DT_REMOTE_CURVE_CATMULL_ROM: *out = 1; return TRUE;
+    case DT_REMOTE_CURVE_MONOTONE_HERMITE: *out = 2; return TRUE;
+    default: return FALSE;
+  }
+}
+
+static gboolean curve_predicate_holds(const dt_remote_parameter_predicate_t *predicate,
+                                      const dt_introspection_field_t *root,
+                                      void *params,
+                                      gboolean *out,
+                                      dt_remote_error_t **error)
+{
+  if(!predicate)
+  {
+    *out = TRUE;
+    return TRUE;
+  }
+
+  const dt_remote_path_segment_t segment = {
+    .type = DT_REMOTE_PATH_FIELD, .value.field = predicate->field,
+  };
+  const dt_remote_introspection_path_t path = { .segments = &segment, .length = 1 };
+  const dt_introspection_field_t *field = NULL;
+  void *ptr = NULL;
+  if(!dt_remote_path_resolve(&path, root, params, &field, &ptr, error)) return FALSE;
+  if(!field || field->header.type != DT_INTROSPECTION_TYPE_ENUM
+     || (predicate->op != DT_REMOTE_PREDICATE_EQ && predicate->op != DT_REMOTE_PREDICATE_NE))
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: curve predicate '%s' drifted from introspection"),
+                          predicate->field ? predicate->field : ""),
+                        error);
+    return FALSE;
+  }
+
+  const char *live_name = dt_introspection_get_enum_name((dt_introspection_field_t *)field,
+                                                          *(const int *)ptr);
+  if(!live_name)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: curve predicate '%s' has an unknown enum value"),
+                          predicate->field),
+                        error);
+    return FALSE;
+  }
+  const gboolean equal = !g_strcmp0(live_name, predicate->enum_name);
+  *out = predicate->op == DT_REMOTE_PREDICATE_EQ ? equal : !equal;
+  return TRUE;
+}
+
+static const dt_remote_curve_descriptor_t *find_curve_descriptor(
+  const dt_remote_curve_module_adapter_t *adapter,
+  const char *name)
+{
+  if(!adapter || !name) return NULL;
+  for(guint i = 0; i < adapter->curve_count; i++)
+    if(!g_strcmp0(adapter->curves[i].name, name)) return &adapter->curves[i];
+  return NULL;
+}
+
+static gboolean patch_mentions_prepare_field(const dt_remote_curve_module_adapter_t *adapter,
+                                             const dt_remote_patch_t *patch)
+{
+  for(guint i = 0; patch->scalar_values && i < patch->scalar_values->len; i++)
+  {
+    const dt_remote_patch_entry_t *entry = g_ptr_array_index(patch->scalar_values, i);
+    for(guint j = 0; entry && j < adapter->prepare_field_count; j++)
+      if(!g_strcmp0(entry->name, adapter->prepare_fields[j])) return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean resolve_curve_native(const dt_remote_curve_descriptor_t *desc,
+                                     const dt_introspection_field_t *root,
+                                     void *params,
+                                     const dt_introspection_field_t **nodes_field,
+                                     void **nodes_ptr,
+                                     const dt_introspection_field_t **count_field,
+                                     void **count_ptr,
+                                     const dt_introspection_field_t **type_field,
+                                     void **type_ptr,
+                                     dt_remote_error_t **error)
+{
+  return dt_remote_path_resolve(&desc->native.nodes, root, params,
+                                nodes_field, nodes_ptr, error)
+         && dt_remote_path_resolve(&desc->native.count, root, params,
+                                   count_field, count_ptr, error)
+         && dt_remote_path_resolve(&desc->native.type, root, params,
+                                   type_field, type_ptr, error);
+}
+
+static gboolean write_curve_patch(const dt_remote_curve_descriptor_t *desc,
+                                  const dt_introspection_field_t *root,
+                                  void *params,
+                                  const dt_remote_curve_patch_t *curve,
+                                  dt_remote_error_t **error)
+{
+  if(!dt_remote_curve_validate(desc, curve->points, curve->has_interpolation,
+                               curve->interpolation, error))
+    return FALSE;
+
+  const dt_introspection_field_t *nodes_field = NULL;
+  const dt_introspection_field_t *count_field = NULL;
+  const dt_introspection_field_t *type_field = NULL;
+  void *nodes_ptr = NULL;
+  void *count_ptr = NULL;
+  void *type_ptr = NULL;
+  if(!resolve_curve_native(desc, root, params, &nodes_field, &nodes_ptr,
+                           &count_field, &count_ptr, &type_field, &type_ptr, error))
+    return FALSE;
+
+  if(!nodes_field || nodes_field->header.type != DT_INTROSPECTION_TYPE_ARRAY
+     || !is_curve_integer_leaf(count_field->header.type)
+     || !is_curve_integer_leaf(type_field->header.type))
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: curve '%s' native layout drifted"), desc->name),
+                        error);
+    return FALSE;
+  }
+
+  dt_remote_curve_interpolation_t interpolation = curve->interpolation;
+  if(!curve->has_interpolation)
+  {
+    gint64 native_type = 0;
+    if(!read_curve_integer_leaf(type_field, type_ptr, &native_type)
+       || !map_native_curve_interpolation(native_type, &interpolation))
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_INTERNAL,
+                            _("internal error: curve '%s' has an unknown native interpolation"),
+                            desc->name),
+                          error);
+      return FALSE;
+    }
+    if(!dt_remote_curve_validate(desc, curve->points, TRUE, interpolation, error)) return FALSE;
+  }
+
+  const guint count = curve->points ? curve->points->len : 0;
+  const guint capacity = (guint)nodes_field->Array.count;
+  if(count > capacity)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: curve '%s' exceeds native capacity"), desc->name),
+                        error);
+    return FALSE;
+  }
+
+  // rgbcurve padding is insignificant: deterministically clear every
+  // unused native node instead of preserving stale memory.
+  for(guint i = 0; i < capacity; i++)
+  {
+    dt_introspection_field_t *node_field = NULL;
+    void *node_ptr = dt_introspection_access_array((dt_introspection_field_t *)nodes_field,
+                                                    nodes_ptr, i, &node_field);
+    dt_introspection_field_t *x_field = NULL;
+    dt_introspection_field_t *y_field = NULL;
+    void *x_ptr = node_ptr
+      ? dt_introspection_get_child(node_field, node_ptr, desc->native.x_field, &x_field) : NULL;
+    void *y_ptr = node_ptr
+      ? dt_introspection_get_child(node_field, node_ptr, desc->native.y_field, &y_field) : NULL;
+    if(!x_ptr || !y_ptr || !is_curve_floating_leaf(x_field->header.type)
+       || !is_curve_floating_leaf(y_field->header.type))
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_INTERNAL,
+                            _("internal error: curve '%s' node %u drifted"), desc->name, i),
+                          error);
+      return FALSE;
+    }
+    const double x = i < count
+      ? g_array_index(curve->points, dt_remote_curve_point_t, i).x : 0.0;
+    const double y = i < count
+      ? g_array_index(curve->points, dt_remote_curve_point_t, i).y : 0.0;
+    if(!write_curve_float_leaf(x_field, x_ptr, x) || !write_curve_float_leaf(y_field, y_ptr, y))
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_INTERNAL,
+                            _("internal error: curve '%s' coordinate type drifted"), desc->name),
+                          error);
+      return FALSE;
+    }
+  }
+
+  gint64 native_interpolation = 0;
+  if(!map_remote_curve_interpolation(interpolation, &native_interpolation)
+     || !write_curve_integer_leaf(count_field, count_ptr, count)
+     || !write_curve_integer_leaf(type_field, type_ptr, native_interpolation))
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: curve '%s' integer layout drifted"), desc->name),
+                        error);
+    return FALSE;
+  }
+
+  if(desc->native.internal_version.length)
+  {
+    const dt_introspection_field_t *version_field = NULL;
+    void *version_ptr = NULL;
+    if(!dt_remote_path_resolve(&desc->native.internal_version, root, params,
+                               &version_field, &version_ptr, error)
+       || !write_curve_integer_leaf(version_field, version_ptr,
+                                    desc->native.internal_version_value))
+    {
+      if(!error || !*error)
+        deliver_curve_error(dt_remote_curve_error_new(
+                              DT_REMOTE_ERR_INTERNAL,
+                              _("internal error: curve '%s' version layout drifted"), desc->name),
+                            error);
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
+                                     const void *old_params,
+                                     void *new_params,
+                                     const dt_remote_patch_t *patch,
+                                     dt_remote_error_t **error)
+{
+  if(!module || !module->so || !old_params || !new_params || !patch)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: null argument to curve mutation engine")), error);
+    return FALSE;
+  }
+
+  const gboolean has_semantics = patch->semantic_values && patch->semantic_values->len > 0;
+  dt_introspection_t *intro = module->so->get_introspection
+    ? module->so->get_introspection() : NULL;
+  if(!intro || !intro->field)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: module '%s' has no curve introspection"), module->op),
+                        error);
+    return FALSE;
+  }
+
+  const dt_remote_curve_module_adapter_t *adapter =
+    dt_remote_curve_registry_lookup(module->op, (guint)intro->params_version);
+  if(!adapter)
+  {
+    if(!has_semantics) return TRUE;
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+    if(semantic && semantic->class_id != DT_REMOTE_PARAMETER_CURVE)
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            _("semantic parameter class is not writable for module '%s'"), module->op),
+                          error);
+    else
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_UNKNOWN_FIELD,
+                            _("unknown semantic curve '%s'"),
+                            semantic && semantic->value.curve.name
+                              ? semantic->value.curve.name : ""),
+                          error);
+    return FALSE;
+  }
+
+  const gboolean prepare_needed = has_semantics || patch_mentions_prepare_field(adapter, patch);
+  // A scalar-only patch unrelated to adapter preparation must remain
+  // independent of semantic registry health. Registry drift disables curve
+  // support for this operation, not its primitive field support.
+  if(!prepare_needed) return TRUE;
+  if(!dt_remote_curve_registry_validate(adapter, intro, error)) return FALSE;
+
+  const dt_remote_curve_context_t context = {
+    .module = module, .introspection = intro, .adapter = adapter,
+  };
+  if(prepare_needed && adapter->prepare
+     && !adapter->prepare(&context, old_params, new_params, patch, error))
+    return FALSE;
+
+  // Resolve every request ID before the registry-ordered write loop. This
+  // catches unknown IDs, wrong classes, and duplicates without silently
+  // dropping any request entry.
+  for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    if(!semantic)
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_INTERNAL,
+                            _("internal error: null semantic patch entry")), error);
+      return FALSE;
+    }
+    if(semantic->class_id != DT_REMOTE_PARAMETER_CURVE)
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            _("semantic parameter class is not supported by curve mutation")),
+                          error);
+      return FALSE;
+    }
+    const char *name = semantic->value.curve.name;
+    if(!find_curve_descriptor(adapter, name))
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_UNKNOWN_FIELD,
+                            _("unknown semantic curve '%s'"), name ? name : ""), error);
+      return FALSE;
+    }
+    for(guint j = 0; j < i; j++)
+    {
+      const dt_remote_semantic_patch_t *prior = g_ptr_array_index(patch->semantic_values, j);
+      if(prior && prior->class_id == DT_REMOTE_PARAMETER_CURVE
+         && !g_strcmp0(prior->value.curve.name, name))
+      {
+        deliver_curve_error(curve_parameter_error_new(
+                              DT_REMOTE_ERR_INVALID_VALUE, name, "duplicate_parameter",
+                              _("duplicate semantic curve '%s'"), name), error);
+        return FALSE;
+      }
+    }
+  }
+
+  // Apply in descriptor/registry order, never request hash/array order.
+  for(guint descriptor_index = 0; descriptor_index < adapter->curve_count; descriptor_index++)
+  {
+    const dt_remote_curve_descriptor_t *desc = &adapter->curves[descriptor_index];
+    const dt_remote_curve_patch_t *curve = NULL;
+    for(guint patch_index = 0;
+        patch->semantic_values && patch_index < patch->semantic_values->len;
+        patch_index++)
+    {
+      const dt_remote_semantic_patch_t *semantic =
+        g_ptr_array_index(patch->semantic_values, patch_index);
+      if(!g_strcmp0(semantic->value.curve.name, desc->name))
+      {
+        curve = &semantic->value.curve;
+        break;
+      }
+    }
+    if(!curve) continue;
+
+    gboolean active = TRUE;
+    gboolean writable = TRUE;
+    if(!curve_predicate_holds(desc->active_when, intro->field, new_params, &active, error)
+       || !curve_predicate_holds(desc->writable_when, intro->field, new_params, &writable, error))
+      return FALSE;
+    if(!active || !writable)
+    {
+      deliver_curve_error(curve_parameter_error_new(
+                            DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name,
+                            "condition_not_satisfied",
+                            _("semantic curve '%s' is inactive or not writable in projected state"),
+                            desc->name),
+                          error);
+      return FALSE;
+    }
+
+    if(!write_curve_patch(desc, intro->field, new_params, curve, error)) return FALSE;
+  }
+
+  if(prepare_needed && adapter->validate_completed
+     && !adapter->validate_completed(&context, new_params, error))
+    return FALSE;
   return TRUE;
 }
 

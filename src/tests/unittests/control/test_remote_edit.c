@@ -44,7 +44,9 @@
 #include "../util/assert.h"
 
 #include "common/darktable.h"
+#include "control/remote_curve.h"
 #include "control/remote_edit.h"
+#include "develop/develop.h"
 #include "develop/imageop.h"  // dt_iop_get_module_so()/dt_iop_module_so_t: real-module
                               // denylist-wiring regression test below
 
@@ -798,6 +800,363 @@ static int harness_group_teardown(void **state)
   return 0;
 }
 
+/* ---------------------------------------------------------------------- */
+/* rgbcurve scratch-transaction fixture                                   */
+/* ---------------------------------------------------------------------- */
+
+typedef struct live_rgbcurve_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+  guint history_items;
+} live_rgbcurve_fixture_t;
+
+static live_rgbcurve_fixture_t *live_rgbcurve_fixture_new(void)
+{
+  live_rgbcurve_fixture_t *fixture = g_new0(live_rgbcurve_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+  fixture->dev.gui_attached = FALSE;
+
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params,
+         fixture->module->params_size);
+  fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void live_rgbcurve_fixture_free(live_rgbcurve_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static int live_rgbcurve_test_setup(void **state)
+{
+  *state = live_rgbcurve_fixture_new();
+  return 0;
+}
+
+static int live_rgbcurve_test_teardown(void **state)
+{
+  live_rgbcurve_fixture_free(*state);
+  *state = NULL;
+  return 0;
+}
+
+static int live_rgbcurve_enum_value(live_rgbcurve_fixture_t *fixture,
+                                    const char *field_name,
+                                    const char *enum_name)
+{
+  dt_introspection_t *intro = fixture->module->so->get_introspection();
+  dt_introspection_field_t *field = NULL;
+  void *ptr = dt_introspection_get_child(intro->field, fixture->module->params,
+                                         field_name, &field);
+  assert_non_null(ptr);
+  assert_non_null(field);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+  return value;
+}
+
+static dt_remote_patch_entry_t *live_rgbcurve_enum_entry(live_rgbcurve_fixture_t *fixture,
+                                                         const char *field_name,
+                                                         const char *enum_name)
+{
+  dt_remote_patch_entry_t *entry = make_entry(field_name, (dt_remote_value_t){
+    .type = DT_REMOTE_VALUE_ENUM,
+    .v.e = { .value = live_rgbcurve_enum_value(fixture, field_name, enum_name),
+             .name = g_strdup(enum_name) },
+  });
+  return entry;
+}
+
+static dt_remote_semantic_patch_t *live_rgbcurve_curve_patch(
+  const char *name,
+  const dt_remote_curve_point_t *points,
+  guint count,
+  gboolean has_interpolation,
+  dt_remote_curve_interpolation_t interpolation)
+{
+  dt_remote_semantic_patch_t *semantic = g_new0(dt_remote_semantic_patch_t, 1);
+  semantic->class_id = DT_REMOTE_PARAMETER_CURVE;
+  semantic->value.curve.name = g_strdup(name);
+  semantic->value.curve.points = g_array_sized_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t), count);
+  g_array_append_vals(semantic->value.curve.points, points, count);
+  semantic->value.curve.has_interpolation = has_interpolation;
+  semantic->value.curve.interpolation = interpolation;
+  return semantic;
+}
+
+static void live_rgbcurve_patch_init(dt_remote_patch_t *patch)
+{
+  memset(patch, 0, sizeof(*patch));
+  patch->scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  patch->semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+}
+
+static void live_rgbcurve_patch_cleanup(dt_remote_patch_t *patch)
+{
+  g_ptr_array_unref(patch->scalar_values);
+  g_ptr_array_unref(patch->semantic_values);
+}
+
+static gboolean apply_scratch_transaction(live_rgbcurve_fixture_t *fixture,
+                                          const dt_remote_patch_t *patch,
+                                          gboolean stale_revision,
+                                          dt_remote_error_t **error)
+{
+  if(stale_revision)
+  {
+    if(error)
+    {
+      *error = g_new0(dt_remote_error_t, 1);
+      (*error)->code = DT_REMOTE_ERR_REVISION_CONFLICT;
+      (*error)->message = g_strdup("stale fixture revision");
+    }
+    return FALSE;
+  }
+
+  void *projected = g_malloc(fixture->module->params_size);
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  const gboolean ok =
+    dt_remote_patch_apply(linear, dt_remote_denylist_for_op("rgbcurve"), patch, projected, error)
+    && dt_remote_curve_apply_patch(fixture->module, fixture->module->params,
+                                   projected, patch, error);
+  if(ok)
+  {
+    memcpy(fixture->module->params, projected, fixture->module->params_size);
+    if(patch->has_enable) fixture->module->enabled = patch->enable;
+    fixture->history_items++;
+  }
+  g_free(projected);
+  return ok;
+}
+
+static void assert_live_curve_points(live_rgbcurve_fixture_t *fixture,
+                                     const char *name,
+                                     const dt_remote_curve_point_t *expected,
+                                     guint count)
+{
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_read_values(fixture->module, fixture->module->params,
+                                          &values, &error));
+  assert_null(error);
+  dt_remote_curve_value_t *value = g_hash_table_lookup(values, name);
+  assert_non_null(value);
+  assert_int_equal(value->points->len, count);
+  for(guint i = 0; i < count; i++)
+  {
+    const dt_remote_curve_point_t actual =
+      g_array_index(value->points, dt_remote_curve_point_t, i);
+    assert_float_equal(actual.x, expected[i].x, 1e-6);
+    assert_float_equal(actual.y, expected[i].y, 1e-6);
+  }
+  g_hash_table_unref(values);
+}
+
+static void test_transaction_scalar_plus_curve_patch_commits_once(void **state)
+{
+  static const dt_remote_curve_point_t red_points[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.45, .y = 0.58 }, { .x = 1.0, .y = 1.0 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  live_rgbcurve_enum_entry(fixture, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB"));
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.red", red_points, G_N_ELEMENTS(red_points), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_null(error);
+  assert_int_equal(fixture->history_items, 1);
+  assert_live_curve_points(fixture, "curve.red", red_points, G_N_ELEMENTS(red_points));
+
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_any_invalid_scalar_curve_leaves_every_field_unchanged(void **state)
+{
+  static const dt_remote_curve_point_t invalid_green[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.0025, .y = 0.2 }, { .x = 1.0, .y = 1.0 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+  const gboolean enabled_before = fixture->module->enabled;
+
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  live_rgbcurve_enum_entry(fixture, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB"));
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.green", invalid_green,
+                                            G_N_ELEMENTS(invalid_green), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  patch.has_enable = TRUE;
+  patch.enable = !enabled_before;
+
+  dt_remote_error_t *error = NULL;
+  assert_false(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_int_equal(fixture->module->enabled, enabled_before);
+  assert_int_equal(fixture->history_items, 0);
+
+  dt_remote_error_free(error);
+  g_free(before);
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_multiple_curves_produce_one_history_item(void **state)
+{
+  static const dt_remote_curve_point_t red[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.4, .y = 0.5 }, { .x = 1.0, .y = 1.0 },
+  };
+  static const dt_remote_curve_point_t green[] = {
+    { .x = 0.0, .y = 0.05 }, { .x = 0.5, .y = 0.45 }, { .x = 1.0, .y = 0.95 },
+  };
+  static const dt_remote_curve_point_t blue[] = {
+    { .x = 0.05, .y = 0.0 }, { .x = 0.6, .y = 0.7 }, { .x = 0.95, .y = 1.0 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  live_rgbcurve_enum_entry(fixture, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB"));
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.blue", blue, G_N_ELEMENTS(blue), TRUE,
+                                            DT_REMOTE_CURVE_CATMULL_ROM));
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.red", red, G_N_ELEMENTS(red), TRUE,
+                                            DT_REMOTE_CURVE_CUBIC_SPLINE));
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.green", green, G_N_ELEMENTS(green), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_null(error);
+  assert_int_equal(fixture->history_items, 1);
+  assert_live_curve_points(fixture, "curve.red", red, G_N_ELEMENTS(red));
+  assert_live_curve_points(fixture, "curve.green", green, G_N_ELEMENTS(green));
+  assert_live_curve_points(fixture, "curve.blue", blue, G_N_ELEMENTS(blue));
+
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_explicit_enable_participates_in_same_history_item(void **state)
+{
+  static const dt_remote_curve_point_t master[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.5, .y = 0.55 }, { .x = 1.0, .y = 1.0 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.master", master, G_N_ELEMENTS(master), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  patch.has_enable = TRUE;
+  patch.enable = TRUE;
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_null(error);
+  assert_true(fixture->module->enabled);
+  assert_int_equal(fixture->history_items, 1);
+
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_stale_revision_leaves_state_unchanged(void **state)
+{
+  static const dt_remote_curve_point_t master[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.5, .y = 0.6 }, { .x = 1.0, .y = 1.0 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.master", master, G_N_ELEMENTS(master), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(apply_scratch_transaction(fixture, &patch, TRUE, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_REVISION_CONFLICT);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_int_equal(fixture->history_items, 0);
+
+  dt_remote_error_free(error);
+  g_free(before);
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_read_back_equals_live_semantic_state(void **state)
+{
+  static const dt_remote_curve_point_t master[] = {
+    { .x = 0.08, .y = 0.11 }, { .x = 0.49, .y = 0.62 }, { .x = 0.96, .y = 0.9 },
+  };
+  live_rgbcurve_fixture_t *fixture = *state;
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  live_rgbcurve_curve_patch("curve.master", master, G_N_ELEMENTS(master), TRUE,
+                                            DT_REMOTE_CURVE_CATMULL_ROM));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_null(error);
+  assert_live_curve_points(fixture, "curve.master", master, G_N_ELEMENTS(master));
+  GHashTable *values = NULL;
+  assert_true(dt_remote_curve_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_curve_value_t *live = g_hash_table_lookup(values, "curve.master");
+  assert_int_equal(live->interpolation, DT_REMOTE_CURVE_CATMULL_ROM);
+
+  g_hash_table_unref(values);
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
+static void test_transaction_middle_grey_without_work_profile_fails_without_mutation(void **state)
+{
+  live_rgbcurve_fixture_t *fixture = *state;
+  assert_null(fixture->dev.full.pipe->work_profile_info);
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_patch_t patch;
+  live_rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("compensate_middle_grey",
+                             (dt_remote_value_t){ .type = DT_REMOTE_VALUE_BOOL, .v.b = TRUE }));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(apply_scratch_transaction(fixture, &patch, FALSE, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_non_null(error->details_json);
+  assert_non_null(strstr(error->details_json, "\"constraint\":\"work_profile_unavailable\""));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_int_equal(fixture->history_items, 0);
+
+  dt_remote_error_free(error);
+  g_free(before);
+  live_rgbcurve_patch_cleanup(&patch);
+}
+
 static void test_schema_marks_denylisted_fields_unwritable(void **state)
 {
   (void)state;
@@ -873,11 +1232,18 @@ static void test_set_module_params_mutation_path_uses_real_denylist(void **state
   g_free(before);
 }
 
-// This MUST remain the final test in this process: curve-registry validation
-// is cached for the lifetime of the process by (adapter, params_version).
-// Deliberately cache the invalid rgbcurve/v1 result only after every other
-// test has run. The mutable introspection itself is restored immediately
-// after the call, before any assertion can abort the test early.
+static const dt_remote_curve_module_adapter_t *s_drift_adapter = NULL;
+
+static const dt_remote_curve_module_adapter_t *drift_lookup_override(const char *operation,
+                                                                     guint params_version)
+{
+  return !g_strcmp0(operation, "rgbcurve") && params_version == 1 ? s_drift_adapter : NULL;
+}
+
+// Registry validation is cached for the lifetime of the process by adapter
+// identity. Mutation tests above correctly validate the production adapter,
+// so this case uses an otherwise-identical copied adapter as a fresh cache
+// identity while temporarily inducing native shape drift.
 static void test_schema_rgbcurve_registry_drift_fails_closed(void **state)
 {
   (void)state;
@@ -900,10 +1266,20 @@ static void test_schema_rgbcurve_registry_drift_fails_closed(void **state)
   const size_t saved_count = native_nodes->Array.count;
   native_nodes->Array.count = 0;
 
+  static dt_remote_curve_module_adapter_t drift_adapter;
+  const dt_remote_curve_module_adapter_t *production_adapter =
+    dt_remote_curve_registry_lookup("rgbcurve", (guint)intro->params_version);
+  assert_non_null(production_adapter);
+  drift_adapter = *production_adapter;
+  s_drift_adapter = &drift_adapter;
+  dt_remote_curve_registry_set_lookup_override(drift_lookup_override);
+
   dt_remote_module_schema_t *schema = NULL;
   dt_remote_error_t *err = NULL;
   const gboolean ok = dt_remote_get_module_schema("rgbcurve", &schema, &err);
 
+  dt_remote_curve_registry_set_lookup_override(NULL);
+  s_drift_adapter = NULL;
   native_nodes->Array.count = saved_count;
 
   dt_remote_module_schema_t *primitive_schema = NULL;
@@ -965,8 +1341,23 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_patch_apply_empty_patch_rejected),
     cmocka_unit_test(test_patch_apply_null_patch_rejected),
 
-    // Keep last: this intentionally poisons rgbcurve/v1's process-lifetime
-    // registry-validation cache after restoring the temporary drift.
+    cmocka_unit_test_setup_teardown(test_transaction_scalar_plus_curve_patch_commits_once,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_any_invalid_scalar_curve_leaves_every_field_unchanged,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_multiple_curves_produce_one_history_item,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_explicit_enable_participates_in_same_history_item,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_stale_revision_leaves_state_unchanged,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_read_back_equals_live_semantic_state,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_middle_grey_without_work_profile_fails_without_mutation,
+                                   live_rgbcurve_test_setup, live_rgbcurve_test_teardown),
+
+    // Keep last: the case temporarily mutates real introspection, restoring
+    // it immediately after the schema call.
     cmocka_unit_test(test_schema_rgbcurve_registry_drift_fails_closed),
   };
 

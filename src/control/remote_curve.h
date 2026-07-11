@@ -19,10 +19,9 @@
 // Introspection-touching engine pieces for the darktable MCP remote-edit
 // semantic-curve machinery: the bounds-checked path cursor that walks a
 // static, compiled-in path description against a module's introspection
-// tree and a live params blob. The registry/validator/adapter layers that
-// build on top of this cursor land in later tasks; see the curve-classes
-// design doc §Registry descriptors / §Introspection path for the
-// normative shapes this header copies verbatim.
+// tree and a live params blob, plus the registry/validator/adapter API that
+// builds on it. See the curve-classes design doc §Registry descriptors /
+// §Introspection path for the normative shapes this header follows.
 //
 // Neutral (non-introspection) curve/patch types live in
 // control/remote_parameters.h, not here -- see that header's comment for
@@ -108,12 +107,7 @@ gboolean dt_remote_path_resolve(const dt_remote_introspection_path_t *path,
 /* (the sibling type declared right after the semantic descriptor in the  */
 /* design doc, with its `prepare`/`validate_completed` callbacks and a     */
 /* forward reference to `struct dt_remote_curve_context_t`) is declared    */
-/* further below, once the descriptor types it wraps are in scope. Task 6 */
-/* constructs concrete descriptor/adapter instances (the rgbcurve table,   */
-/* in remote_curve_registry.c) and the registry/engine functions that walk */
-/* them; Task 8 defines dt_remote_curve_context_t and implements the real  */
-/* prepare/validate_completed bodies (Task 6's rgbcurve adapter instance   */
-/* points both callbacks at stubs that unconditionally return TRUE).      */
+/* further below, once the descriptor types it wraps are in scope.         */
 /* ---------------------------------------------------------------------- */
 
 typedef struct dt_remote_native_curve_layout_t
@@ -182,10 +176,8 @@ typedef struct dt_remote_curve_descriptor_t
 /* module adapter -- copied verbatim)                                      */
 /* ---------------------------------------------------------------------- */
 
-// Defined (the struct body, not just this forward declaration) in Task 8,
-// which needs live-instance/pipeline context to resolve a mode transition.
-// Forward-declared only here so the prepare/validate_completed callback
-// pointers below type-check; nothing in Task 6 defines or dereferences it.
+// Forward-declared here so the prepare/validate_completed callback pointers
+// below type-check; the body follows the adapter declaration.
 struct dt_remote_curve_context_t;
 
 struct dt_iop_module_t; // develop/imageop.h; kept a bare forward reference
@@ -215,6 +207,15 @@ typedef struct dt_remote_curve_module_adapter_t
                                  const void *new_params,
                                  dt_remote_error_t **error);
 } dt_remote_curve_module_adapter_t;
+
+/** Per-call adapter context. All pointers are borrowed for the duration of
+ * dt_remote_curve_apply_patch(); callbacks must not retain them. */
+typedef struct dt_remote_curve_context_t
+{
+  const struct dt_iop_module_t *module;
+  const dt_introspection_t *introspection;
+  const dt_remote_curve_module_adapter_t *adapter;
+} dt_remote_curve_context_t;
 
 /* ---------------------------------------------------------------------- */
 /* registry lifecycle (curve-classes design doc SS Registry lifecycle)    */
@@ -260,9 +261,7 @@ gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_
                                            dt_remote_error_t **error);
 
 /* ---------------------------------------------------------------------- */
-/* curve engine API (curve-classes design doc SS Curve engine API --       */
-/* read-only half only: list_schema/read_values. dt_remote_curve_apply_patch */
-/* is declared and implemented in Task 8.)                                 */
+/* curve engine API (curve-classes design doc SS Curve engine API)         */
 /* ---------------------------------------------------------------------- */
 
 /** Per (operation, params_version) schema listing: looks up the adapter for
@@ -309,6 +308,17 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
                                      GHashTable **out, /* name -> dt_remote_curve_value_t */
                                      dt_remote_error_t **error);
 
+/** Applies the semantic portion of `patch` to the caller-owned projected
+ * params block. Scalar entries must already have been written to
+ * `new_params`; `old_params` remains the pre-transaction block. Adapter
+ * preparation, predicate evaluation, curve validation/native writes, and
+ * completed-state validation all operate only on `new_params`. */
+gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
+                                     const void *old_params,
+                                     void *new_params,
+                                     const dt_remote_patch_t *patch,
+                                     dt_remote_error_t **error);
+
 /* ---------------------------------------------------------------------- */
 /* common curve validator (curve-classes design doc SS Validation         */
 /* algorithm, items 3-10 only)                                            */
@@ -342,13 +352,14 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
  *   9. interpolation resolution -- only the "was one supplied?" half:
  *      when `has_interpolation` is FALSE, no interpolation check runs here
  *      (resolving/preserving the *current* interpolation needs native
- *      introspection and is Task 8's job);
+ *      introspection and is handled by dt_remote_curve_apply_patch());
  *  10. when `has_interpolation` is TRUE, `interpolation` must be a set bit
  *      of `desc->interpolation_mask` ("interpolation_not_allowed").
  *
  * Items 1-2 (semantic-ID resolution, active/writable predicate evaluation)
  * and 11-14 (native introspection reads/writes, adapter validate_completed)
- * are explicitly NOT implemented here -- see Task 8.
+ * are explicitly not implemented by this pure helper; the apply engine
+ * composes them around it.
  *
  * Every rejection returns FALSE with `*error` set to a newly allocated
  * DT_REMOTE_ERR_INVALID_VALUE (caller frees with dt_remote_error_free());

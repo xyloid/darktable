@@ -70,7 +70,11 @@
 #include "control/remote_edit.h"
 #include "control/remote_parameters.h"
 
+#include "common/colorspaces.h"
+#include "common/iop_profile.h"
+#include "develop/develop.h"
 #include "develop/imageop.h" // dt_iop_get_module_so()/dt_iop_module_so_t
+#include "develop/pixelpipe.h"
 
 #ifdef _WIN32
 #include "win/main_wrapper.h"
@@ -274,9 +278,9 @@ static void test_patch_apply_semantic_only_patch_is_not_empty(void **state)
 
   dt_remote_error_t *err = NULL;
   // scalar_values is NULL, but the patch still has a semantic value, so
-  // the "values must be non-empty" gate must not fire; nothing consumes
-  // semantic_values yet (that is Task 8), so the call otherwise succeeds
-  // trivially (no scalar entries to validate/write).
+  // the "values must be non-empty" gate must not fire. Semantic content is
+  // consumed later by the curve engine; this scalar-only helper therefore
+  // succeeds trivially (no scalar entries to validate/write).
   assert_true(dt_remote_patch_apply(empty_linear, NULL, &patch, &params, &err));
   assert_null(err);
 
@@ -323,8 +327,8 @@ static void test_patch_apply_null_semantic_values_scalar_only_unchanged(void **s
  * instances by hand -- no live module or dt_init() dependency, unlike the
  * dt_remote_path_resolve() tests below. Coverage follows the curve-classes
  * design doc's "Validation algorithm" items 3-10 (the only items this
- * function implements; items 1-2/11-14 are later tasks -- see the header
- * comment on dt_remote_curve_validate()).
+ * pure helper implements; the apply engine composes items 1-2/11-14 --
+ * see the header comment on dt_remote_curve_validate()).
  */
 
 static GArray *make_curve_points_xy(const double *xs, const double *ys, guint n)
@@ -983,9 +987,9 @@ static void test_curve_validate_omitted_interpolation_skips_allowlist_check(void
 {
   (void)state;
   // has_interpolation == FALSE: resolving/preserving the current
-  // interpolation is Task 8's job (item 9's other half), so no allowlist
-  // check runs here at all -- passing an otherwise-disallowed value in
-  // `interpolation` must not matter.
+  // interpolation is the apply engine's job (item 9's other half), so no
+  // allowlist check runs here at all -- passing an otherwise-disallowed
+  // value in `interpolation` must not matter.
   dt_remote_curve_descriptor_t desc = make_master_curve_descriptor();
   desc.interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE); // only cubic spline allowed
   double xs[] = { 0.1, 0.5 };
@@ -1066,6 +1070,641 @@ static int harness_group_teardown(void **state)
     s_harness_confdir = NULL;
   }
   return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* rgbcurve mutation fixture                                               */
+/* ---------------------------------------------------------------------- */
+
+typedef struct rgbcurve_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+} rgbcurve_fixture_t;
+
+static rgbcurve_fixture_t *rgbcurve_fixture_new(void)
+{
+  rgbcurve_fixture_t *fixture = g_new0(rgbcurve_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+
+  // Keep module construction headless even though the fixture owns the
+  // three pipes a live darkroom develop would have. The adapter needs the
+  // current full pipe for work-profile lookup, not module GUI widgets.
+  fixture->dev.gui_attached = FALSE;
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgbcurve");
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params,
+         fixture->module->params_size);
+  fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void rgbcurve_fixture_free(rgbcurve_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static void *rgbcurve_field_ptr(const rgbcurve_fixture_t *fixture,
+                                void *params,
+                                const char *name,
+                                dt_introspection_field_t **out_field)
+{
+  dt_introspection_t *intro = fixture->module->so->get_introspection();
+  assert_non_null(intro);
+  assert_non_null(intro->field);
+  void *ptr = dt_introspection_get_child(intro->field, params, name, out_field);
+  assert_non_null(ptr);
+  assert_non_null(*out_field);
+  return ptr;
+}
+
+static int rgbcurve_enum_value(const rgbcurve_fixture_t *fixture,
+                               const char *field_name,
+                               const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  (void)rgbcurve_field_ptr(fixture, fixture->module->params, field_name, &field);
+  assert_int_equal(field->header.type, DT_INTROSPECTION_TYPE_ENUM);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+  return value;
+}
+
+static void rgbcurve_set_enum(const rgbcurve_fixture_t *fixture,
+                              void *params,
+                              const char *field_name,
+                              const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  int *ptr = rgbcurve_field_ptr(fixture, params, field_name, &field);
+  assert_int_equal(field->header.type, DT_INTROSPECTION_TYPE_ENUM);
+  assert_true(dt_introspection_get_enum_value(field, enum_name, ptr));
+}
+
+static void rgbcurve_set_bool(const rgbcurve_fixture_t *fixture,
+                              void *params,
+                              const char *field_name,
+                              gboolean value)
+{
+  dt_introspection_field_t *field = NULL;
+  gboolean *ptr = rgbcurve_field_ptr(fixture, params, field_name, &field);
+  assert_int_equal(field->header.type, DT_INTROSPECTION_TYPE_BOOL);
+  *ptr = value;
+}
+
+static void rgbcurve_write_integer_array(const rgbcurve_fixture_t *fixture,
+                                         void *params,
+                                         const char *field_name,
+                                         guint index,
+                                         int value)
+{
+  dt_introspection_field_t *array_field = NULL;
+  void *array_ptr = rgbcurve_field_ptr(fixture, params, field_name, &array_field);
+  dt_introspection_field_t *element_field = NULL;
+  int *element_ptr = dt_introspection_access_array(array_field, array_ptr, index, &element_field);
+  assert_non_null(element_ptr);
+  assert_non_null(element_field);
+  assert_int_equal(element_field->header.type, DT_INTROSPECTION_TYPE_INT);
+  *element_ptr = value;
+}
+
+static int rgbcurve_read_integer_array(const rgbcurve_fixture_t *fixture,
+                                       void *params,
+                                       const char *field_name,
+                                       guint index)
+{
+  dt_introspection_field_t *array_field = NULL;
+  void *array_ptr = rgbcurve_field_ptr(fixture, params, field_name, &array_field);
+  dt_introspection_field_t *element_field = NULL;
+  int *element_ptr = dt_introspection_access_array(array_field, array_ptr, index, &element_field);
+  assert_non_null(element_ptr);
+  assert_non_null(element_field);
+  assert_int_equal(element_field->header.type, DT_INTROSPECTION_TYPE_INT);
+  return *element_ptr;
+}
+
+static void rgbcurve_write_native_point(const rgbcurve_fixture_t *fixture,
+                                        void *params,
+                                        guint channel,
+                                        guint point,
+                                        double x,
+                                        double y)
+{
+  dt_introspection_field_t *channels_field = NULL;
+  void *channels_ptr = rgbcurve_field_ptr(fixture, params, "curve_nodes", &channels_field);
+  dt_introspection_field_t *nodes_field = NULL;
+  void *nodes_ptr = dt_introspection_access_array(channels_field, channels_ptr, channel, &nodes_field);
+  assert_non_null(nodes_ptr);
+  assert_non_null(nodes_field);
+  dt_introspection_field_t *node_field = NULL;
+  void *node_ptr = dt_introspection_access_array(nodes_field, nodes_ptr, point, &node_field);
+  assert_non_null(node_ptr);
+  assert_non_null(node_field);
+
+  dt_introspection_field_t *x_field = NULL;
+  dt_introspection_field_t *y_field = NULL;
+  float *x_ptr = dt_introspection_get_child(node_field, node_ptr, "x", &x_field);
+  float *y_ptr = dt_introspection_get_child(node_field, node_ptr, "y", &y_field);
+  assert_non_null(x_ptr);
+  assert_non_null(y_ptr);
+  assert_int_equal(x_field->header.type, DT_INTROSPECTION_TYPE_FLOAT);
+  assert_int_equal(y_field->header.type, DT_INTROSPECTION_TYPE_FLOAT);
+  *x_ptr = (float)x;
+  *y_ptr = (float)y;
+}
+
+static dt_remote_curve_point_t rgbcurve_read_native_point(const rgbcurve_fixture_t *fixture,
+                                                          void *params,
+                                                          guint channel,
+                                                          guint point)
+{
+  dt_introspection_field_t *channels_field = NULL;
+  void *channels_ptr = rgbcurve_field_ptr(fixture, params, "curve_nodes", &channels_field);
+  dt_introspection_field_t *nodes_field = NULL;
+  void *nodes_ptr = dt_introspection_access_array(channels_field, channels_ptr, channel, &nodes_field);
+  assert_non_null(nodes_ptr);
+  assert_non_null(nodes_field);
+  dt_introspection_field_t *node_field = NULL;
+  void *node_ptr = dt_introspection_access_array(nodes_field, nodes_ptr, point, &node_field);
+  assert_non_null(node_ptr);
+  assert_non_null(node_field);
+
+  dt_introspection_field_t *x_field = NULL;
+  dt_introspection_field_t *y_field = NULL;
+  float *x_ptr = dt_introspection_get_child(node_field, node_ptr, "x", &x_field);
+  float *y_ptr = dt_introspection_get_child(node_field, node_ptr, "y", &y_field);
+  assert_non_null(x_ptr);
+  assert_non_null(y_ptr);
+  return (dt_remote_curve_point_t){ .x = *x_ptr, .y = *y_ptr };
+}
+
+static void rgbcurve_set_native_curve(const rgbcurve_fixture_t *fixture,
+                                      void *params,
+                                      guint channel,
+                                      const dt_remote_curve_point_t *points,
+                                      guint count,
+                                      int interpolation)
+{
+  for(guint i = 0; i < count; i++)
+    rgbcurve_write_native_point(fixture, params, channel, i, points[i].x, points[i].y);
+  rgbcurve_write_integer_array(fixture, params, "curve_num_nodes", channel, (int)count);
+  rgbcurve_write_integer_array(fixture, params, "curve_type", channel, interpolation);
+}
+
+static dt_remote_semantic_patch_t *rgbcurve_make_curve_patch(
+  const char *name,
+  const dt_remote_curve_point_t *points,
+  guint count,
+  gboolean has_interpolation,
+  dt_remote_curve_interpolation_t interpolation)
+{
+  dt_remote_semantic_patch_t *semantic = g_new0(dt_remote_semantic_patch_t, 1);
+  semantic->class_id = DT_REMOTE_PARAMETER_CURVE;
+  semantic->value.curve.name = g_strdup(name);
+  semantic->value.curve.points = g_array_sized_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t), count);
+  g_array_append_vals(semantic->value.curve.points, points, count);
+  semantic->value.curve.has_interpolation = has_interpolation;
+  semantic->value.curve.interpolation = interpolation;
+  return semantic;
+}
+
+static dt_remote_patch_entry_t *rgbcurve_make_enum_entry(const rgbcurve_fixture_t *fixture,
+                                                         const char *field_name,
+                                                         const char *enum_name)
+{
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup(field_name);
+  entry->value.type = DT_REMOTE_VALUE_ENUM;
+  entry->value.v.e.value = rgbcurve_enum_value(fixture, field_name, enum_name);
+  entry->value.v.e.name = g_strdup(enum_name);
+  return entry;
+}
+
+static dt_remote_patch_entry_t *rgbcurve_make_bool_entry(const char *field_name, gboolean value)
+{
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup(field_name);
+  entry->value.type = DT_REMOTE_VALUE_BOOL;
+  entry->value.v.b = value;
+  return entry;
+}
+
+static void rgbcurve_patch_init(dt_remote_patch_t *patch)
+{
+  memset(patch, 0, sizeof(*patch));
+  patch->scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  patch->semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+}
+
+static void rgbcurve_patch_cleanup(dt_remote_patch_t *patch)
+{
+  g_ptr_array_unref(patch->scalar_values);
+  g_ptr_array_unref(patch->semantic_values);
+}
+
+static gboolean rgbcurve_apply_to_copy(const rgbcurve_fixture_t *fixture,
+                                       const dt_remote_patch_t *patch,
+                                       void *projected,
+                                       dt_remote_error_t **error)
+{
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  if(!dt_remote_patch_apply(linear, dt_remote_denylist_for_op("rgbcurve"), patch, projected, error))
+    return FALSE;
+  return dt_remote_curve_apply_patch(fixture->module, fixture->module->params,
+                                     projected, patch, error);
+}
+
+static dt_remote_curve_value_t *rgbcurve_read_value(const rgbcurve_fixture_t *fixture,
+                                                    void *params,
+                                                    const char *name,
+                                                    GHashTable **owned_values)
+{
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_read_values(fixture->module, params, owned_values, &error));
+  assert_null(error);
+  dt_remote_curve_value_t *value = g_hash_table_lookup(*owned_values, name);
+  assert_non_null(value);
+  return value;
+}
+
+static void assert_curve_points(const dt_remote_curve_value_t *value,
+                                const dt_remote_curve_point_t *expected,
+                                guint count,
+                                double epsilon)
+{
+  assert_int_equal(value->points->len, count);
+  for(guint i = 0; i < count; i++)
+  {
+    const dt_remote_curve_point_t actual =
+      g_array_index(value->points, dt_remote_curve_point_t, i);
+    assert_float_equal(actual.x, expected[i].x, epsilon);
+    assert_float_equal(actual.y, expected[i].y, epsilon);
+  }
+}
+
+static void test_rgbcurve_adapter_linked_mode_exposes_only_curve_master(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  assert_true(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.master"))->active);
+  assert_true(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.master"))->writable_now);
+  assert_false(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.red"))->active);
+  assert_false(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.green"))->active);
+  assert_false(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.blue"))->active);
+
+  g_hash_table_unref(values);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_manual_mode_exposes_rgb_not_master(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB");
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  assert_false(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.master"))->active);
+  assert_true(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.red"))->active);
+  assert_true(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.green"))->active);
+  assert_true(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.blue"))->active);
+
+  g_hash_table_unref(values);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_native_channel_zero_round_trips_under_correct_id(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t points[] = {
+    { .x = 0.08, .y = 0.12 }, { .x = 0.47, .y = 0.61 }, { .x = 0.93, .y = 0.88 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+  rgbcurve_write_integer_array(fixture, fixture->module->params, "curve_type", 0, 1);
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.master", points, G_N_ELEMENTS(points), FALSE,
+                                            DT_REMOTE_CURVE_CUBIC_SPLINE));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *master = rgbcurve_read_value(fixture, projected, "curve.master", &values);
+  assert_curve_points(master, points, G_N_ELEMENTS(points), 1e-6);
+  assert_int_equal(master->interpolation, DT_REMOTE_CURVE_CATMULL_ROM);
+  assert_false(((dt_remote_curve_value_t *)g_hash_table_lookup(values, "curve.red"))->active);
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_all_interpolation_names_map_correctly(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t points[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.5, .y = 0.6 }, { .x = 1.0, .y = 1.0 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+
+  for(dt_remote_curve_interpolation_t interpolation = DT_REMOTE_CURVE_CUBIC_SPLINE;
+      interpolation <= DT_REMOTE_CURVE_MONOTONE_HERMITE; interpolation++)
+  {
+    dt_remote_patch_t patch;
+    rgbcurve_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values,
+                    rgbcurve_make_curve_patch("curve.master", points, G_N_ELEMENTS(points), TRUE,
+                                              interpolation));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+    assert_null(error);
+
+    GHashTable *values = NULL;
+    dt_remote_curve_value_t *master = rgbcurve_read_value(fixture, projected, "curve.master", &values);
+    assert_int_equal(master->interpolation, interpolation);
+    assert_int_equal(rgbcurve_read_integer_array(fixture, projected, "curve_type", 0), interpolation);
+
+    memcpy(fixture->module->params, projected, fixture->module->params_size);
+    g_hash_table_unref(values);
+    g_free(projected);
+    rgbcurve_patch_cleanup(&patch);
+  }
+
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_mode_transition_multi_curve_patch_is_atomic(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t valid_red[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.4, .y = 0.5 }, { .x = 1.0, .y = 1.0 },
+  };
+  static const dt_remote_curve_point_t invalid_green[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 0.0025, .y = 0.2 }, { .x = 1.0, .y = 1.0 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  rgbcurve_make_enum_entry(fixture, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB"));
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.red", valid_red, G_N_ELEMENTS(valid_red), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.green", invalid_green, G_N_ELEMENTS(invalid_green), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_interior_endpoints_round_trip_without_normalization(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t points[] = {
+    { .x = 0.07, .y = 0.16 }, { .x = 0.5, .y = 0.42 }, { .x = 0.94, .y = 0.89 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.master", points, G_N_ELEMENTS(points), TRUE,
+                                            DT_REMOTE_CURVE_CUBIC_SPLINE));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *master = rgbcurve_read_value(fixture, projected, "curve.master", &values);
+  assert_curve_points(master, points, G_N_ELEMENTS(points), 1e-6);
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_entering_manual_copies_master_before_explicit_replacement(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t master_points[] = {
+    { .x = 0.0, .y = 0.03 }, { .x = 0.45, .y = 0.57 }, { .x = 1.0, .y = 0.97 },
+  };
+  static const dt_remote_curve_point_t identity[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 1.0, .y = 1.0 },
+  };
+  static const dt_remote_curve_point_t green_replacement[] = {
+    { .x = 0.1, .y = 0.2 }, { .x = 0.7, .y = 0.6 }, { .x = 0.95, .y = 0.9 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 0, master_points,
+                            G_N_ELEMENTS(master_points), DT_REMOTE_CURVE_CATMULL_ROM);
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 1, identity,
+                            G_N_ELEMENTS(identity), DT_REMOTE_CURVE_CUBIC_SPLINE);
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 2, identity,
+                            G_N_ELEMENTS(identity), DT_REMOTE_CURVE_CUBIC_SPLINE);
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  rgbcurve_make_enum_entry(fixture, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB"));
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.green", green_replacement,
+                                            G_N_ELEMENTS(green_replacement), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *red = rgbcurve_read_value(fixture, projected, "curve.red", &values);
+  dt_remote_curve_value_t *green = g_hash_table_lookup(values, "curve.green");
+  dt_remote_curve_value_t *blue = g_hash_table_lookup(values, "curve.blue");
+  assert_curve_points(red, master_points, G_N_ELEMENTS(master_points), 1e-6);
+  assert_curve_points(green, green_replacement, G_N_ELEMENTS(green_replacement), 1e-6);
+  assert_curve_points(blue, master_points, G_N_ELEMENTS(master_points), 1e-6);
+  assert_int_equal(blue->interpolation, DT_REMOTE_CURVE_CATMULL_ROM);
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_middle_grey_transforms_untouched_before_explicit_replacement(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t red_points[] = {
+    { .x = 0.1, .y = 0.2 }, { .x = 0.8, .y = 0.7 },
+  };
+  static const dt_remote_curve_point_t green_points[] = {
+    { .x = 0.2, .y = 0.3 }, { .x = 0.9, .y = 0.8 },
+  };
+  static const dt_remote_curve_point_t blue_points[] = {
+    { .x = 0.15, .y = 0.25 }, { .x = 0.85, .y = 0.75 },
+  };
+  static const dt_remote_curve_point_t red_replacement[] = {
+    { .x = 0.05, .y = 0.1 }, { .x = 0.95, .y = 0.9 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_MANUAL_RGB");
+  rgbcurve_set_bool(fixture, fixture->module->params, "compensate_middle_grey", FALSE);
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 0, red_points, G_N_ELEMENTS(red_points), 2);
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 1, green_points, G_N_ELEMENTS(green_points), 2);
+  rgbcurve_set_native_curve(fixture, fixture->module->params, 2, blue_points, G_N_ELEMENTS(blue_points), 2);
+
+  const dt_iop_order_iccprofile_info_t *profile =
+    dt_ioppr_set_pipe_work_profile_info(&fixture->dev, fixture->dev.full.pipe,
+                                        DT_COLORSPACE_LIN_REC2020, "", DT_INTENT_PERCEPTUAL);
+  assert_non_null(profile);
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, rgbcurve_make_bool_entry("compensate_middle_grey", TRUE));
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.red", red_replacement,
+                                            G_N_ELEMENTS(red_replacement), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *red = rgbcurve_read_value(fixture, projected, "curve.red", &values);
+  dt_remote_curve_value_t *green = g_hash_table_lookup(values, "curve.green");
+  dt_remote_curve_value_t *blue = g_hash_table_lookup(values, "curve.blue");
+  assert_curve_points(red, red_replacement, G_N_ELEMENTS(red_replacement), 1e-6);
+  for(guint i = 0; i < G_N_ELEMENTS(green_points); i++)
+  {
+    const dt_remote_curve_point_t actual =
+      g_array_index(green->points, dt_remote_curve_point_t, i);
+    assert_float_equal(actual.x, dt_ioppr_compensate_middle_grey(green_points[i].x, profile), 1e-5);
+    assert_float_equal(actual.y, dt_ioppr_compensate_middle_grey(green_points[i].y, profile), 1e-5);
+  }
+  for(guint i = 0; i < G_N_ELEMENTS(blue_points); i++)
+  {
+    const dt_remote_curve_point_t actual =
+      g_array_index(blue->points, dt_remote_curve_point_t, i);
+    assert_float_equal(actual.x, dt_ioppr_compensate_middle_grey(blue_points[i].x, profile), 1e-5);
+    assert_float_equal(actual.y, dt_ioppr_compensate_middle_grey(blue_points[i].y, profile), 1e-5);
+  }
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_invalid_green_blue_write_in_linked_mode_is_unsupported(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t points[] = {
+    { .x = 0.0, .y = 0.0 }, { .x = 1.0, .y = 1.0 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+
+  for(guint i = 0; i < 2; i++)
+  {
+    const char *name = i == 0 ? "curve.green" : "curve.blue";
+    dt_remote_patch_t patch;
+    rgbcurve_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values,
+                    rgbcurve_make_curve_patch(name, points, G_N_ELEMENTS(points), TRUE,
+                                              DT_REMOTE_CURVE_MONOTONE_HERMITE));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_false(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+    assert_non_null(error);
+    assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+    assert_non_null(error->details_json);
+    assert_non_null(strstr(error->details_json, name));
+    dt_remote_error_free(error);
+    g_free(projected);
+    rgbcurve_patch_cleanup(&patch);
+  }
+
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_rgbcurve_adapter_unused_native_capacity_is_zero_and_not_returned(void **state)
+{
+  (void)state;
+  static const dt_remote_curve_point_t points[] = {
+    { .x = 0.1, .y = 0.2 }, { .x = 0.9, .y = 0.8 },
+  };
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  rgbcurve_set_enum(fixture, fixture->module->params, "curve_autoscale", "DT_S_SCALE_AUTOMATIC_RGB");
+  for(guint i = 0; i < 20; i++)
+    rgbcurve_write_native_point(fixture, fixture->module->params, 0, i, 0.4, 0.6);
+  rgbcurve_write_integer_array(fixture, fixture->module->params, "curve_num_nodes", 0, 20);
+
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.master", points, G_N_ELEMENTS(points), TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_int_equal(rgbcurve_read_integer_array(fixture, projected, "curve_num_nodes", 0), 2);
+  for(guint i = 2; i < 20; i++)
+  {
+    const dt_remote_curve_point_t unused = rgbcurve_read_native_point(fixture, projected, 0, i);
+    assert_float_equal(unused.x, 0.0, 0.0);
+    assert_float_equal(unused.y, 0.0, 0.0);
+  }
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *master = rgbcurve_read_value(fixture, projected, "curve.master", &values);
+  assert_curve_points(master, points, G_N_ELEMENTS(points), 1e-6);
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
 }
 
 /* rgbcurve path segment helpers: curve_nodes is
@@ -1378,6 +2017,16 @@ int main(void)
     cmocka_unit_test(test_curve_validate_rejects_negative_interpolation_without_mutating_points),
     cmocka_unit_test(test_curve_validate_rejects_oversized_interpolation_without_mutating_points),
     cmocka_unit_test(test_curve_validate_omitted_interpolation_skips_allowlist_check),
+    cmocka_unit_test(test_rgbcurve_adapter_linked_mode_exposes_only_curve_master),
+    cmocka_unit_test(test_rgbcurve_adapter_manual_mode_exposes_rgb_not_master),
+    cmocka_unit_test(test_rgbcurve_adapter_native_channel_zero_round_trips_under_correct_id),
+    cmocka_unit_test(test_rgbcurve_adapter_all_interpolation_names_map_correctly),
+    cmocka_unit_test(test_rgbcurve_adapter_mode_transition_multi_curve_patch_is_atomic),
+    cmocka_unit_test(test_rgbcurve_adapter_interior_endpoints_round_trip_without_normalization),
+    cmocka_unit_test(test_rgbcurve_adapter_entering_manual_copies_master_before_explicit_replacement),
+    cmocka_unit_test(test_rgbcurve_adapter_middle_grey_transforms_untouched_before_explicit_replacement),
+    cmocka_unit_test(test_rgbcurve_adapter_invalid_green_blue_write_in_linked_mode_is_unsupported),
+    cmocka_unit_test(test_rgbcurve_adapter_unused_native_capacity_is_zero_and_not_returned),
     cmocka_unit_test(test_path_resolve_curve_node_x),
     cmocka_unit_test(test_path_resolve_curve_num_nodes),
     cmocka_unit_test(test_path_resolve_rejects_wrong_type_segment),

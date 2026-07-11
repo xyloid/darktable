@@ -638,11 +638,10 @@ gboolean dt_remote_patch_apply(const dt_introspection_field_t *linear,
       return FALSE;
   }
 
-  // Step 6 ("validate the completed parameter block"): a no-op for v1's
-  // scalar-only patches -- every field is already individually validated
-  // above and the v1 schema has no cross-field constraints. See the
-  // header comment: this is the extension point future semantic-value
-  // classes (patch->semantic_values, reserved/unused here) hook into.
+  // Scalar-only completed-state validation is a no-op: every field is
+  // already individually validated above. Semantic completed-state
+  // validation is composed by dt_remote_curve_apply_patch() in the live
+  // transaction after this helper returns.
   return TRUE;
 }
 
@@ -980,6 +979,17 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
 
   dt_introspection_field_t *linear = module->so->get_introspection_linear();
   if(!dt_remote_patch_apply(linear, dt_remote_denylist_for_op(module->op), patch, temp_params, error))
+  {
+    g_free(temp_params);
+    return FALSE;
+  }
+
+  // Curve-design transaction steps 5-7: scalar values above establish the
+  // projected state first; adapter preparation, semantic validation/native
+  // writes, and completed-state validation then operate on the same scratch
+  // block. Any failure discards both scalar and semantic changes before live
+  // params, enable state, GUI, history, or revision are touched.
+  if(!dt_remote_curve_apply_patch(module, module->params, temp_params, patch, error))
   {
     g_free(temp_params);
     return FALSE;
