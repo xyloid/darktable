@@ -121,6 +121,9 @@ typedef struct dt_remote_field_t
   dt_remote_value_t default_value;
   GPtrArray *enum_values;    // of dt_remote_enum_value_t {name,value,desc};
                             // owned, NULL unless type_name == "enum"
+  GPtrArray *represented_by; // of owned char* semantic IDs whose native
+                             // storage this field backs; owned, NULL when
+                             // no semantic parameter represents the field
 } dt_remote_field_t;
 
 /** frees a single field, including its owned default_value and

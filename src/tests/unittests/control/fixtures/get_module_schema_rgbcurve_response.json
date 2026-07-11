@@ -1,0 +1,130 @@
+{
+  "id": 30,
+  "ok": true,
+  "result": {
+    "module": "rgbcurve",
+    "display_name": "rgb curve",
+    "params_version": 1,
+    "deprecated": false,
+    "supports_multiple_instances": true,
+    "fields": [
+      {
+        "name": "curve_nodes",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["curve.master", "curve.red", "curve.green", "curve.blue"]
+      },
+      {
+        "name": "curve_num_nodes",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["curve.master", "curve.red", "curve.green", "curve.blue"]
+      },
+      {
+        "name": "curve_type",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["curve.master", "curve.red", "curve.green", "curve.blue"]
+      },
+      {
+        "name": "curve_autoscale",
+        "description": "mode",
+        "type": "enum",
+        "default": "DT_S_SCALE_AUTOMATIC_RGB",
+        "writable": true,
+        "enum_values": [
+          { "name": "DT_S_SCALE_AUTOMATIC_RGB", "value": 0, "description": "RGB, linked channels" },
+          { "name": "DT_S_SCALE_MANUAL_RGB", "value": 1, "description": "RGB, independent channels" }
+        ]
+      },
+      {
+        "name": "compensate_middle_grey",
+        "description": "compensate middle gray",
+        "type": "bool",
+        "default": false,
+        "writable": true
+      }
+    ],
+    "semantic_fields": [
+      {
+        "name": "curve.master",
+        "class": "curve",
+        "display_name": "master",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "curve_autoscale", "not_equals": "DT_S_SCALE_MANUAL_RGB" },
+        "x": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "y": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "points": {
+          "minimum": 2,
+          "maximum": 20,
+          "strict_x_order": true,
+          "minimum_x_spacing": 0.0025,
+          "minimum_x_spacing_comparison": "greater_than",
+          "boundary_point_policy": "optional"
+        },
+        "interpolation_values": ["CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"]
+      },
+      {
+        "name": "curve.red",
+        "class": "curve",
+        "display_name": "R",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "curve_autoscale", "equals": "DT_S_SCALE_MANUAL_RGB" },
+        "x": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "y": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "points": {
+          "minimum": 2,
+          "maximum": 20,
+          "strict_x_order": true,
+          "minimum_x_spacing": 0.0025,
+          "minimum_x_spacing_comparison": "greater_than",
+          "boundary_point_policy": "optional"
+        },
+        "interpolation_values": ["CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"]
+      },
+      {
+        "name": "curve.green",
+        "class": "curve",
+        "display_name": "G",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "curve_autoscale", "equals": "DT_S_SCALE_MANUAL_RGB" },
+        "x": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "y": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "points": {
+          "minimum": 2,
+          "maximum": 20,
+          "strict_x_order": true,
+          "minimum_x_spacing": 0.0025,
+          "minimum_x_spacing_comparison": "greater_than",
+          "boundary_point_policy": "optional"
+        },
+        "interpolation_values": ["CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"]
+      },
+      {
+        "name": "curve.blue",
+        "class": "curve",
+        "display_name": "B",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "curve_autoscale", "equals": "DT_S_SCALE_MANUAL_RGB" },
+        "x": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "y": { "minimum": 0.0, "maximum": 1.0, "unit": "normalized" },
+        "points": {
+          "minimum": 2,
+          "maximum": 20,
+          "strict_x_order": true,
+          "minimum_x_spacing": 0.0025,
+          "minimum_x_spacing_comparison": "greater_than",
+          "boundary_point_policy": "optional"
+        },
+        "interpolation_values": ["CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"]
+      }
+    ]
+  }
+}

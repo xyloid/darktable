@@ -85,6 +85,7 @@ void dt_remote_field_free(gpointer field_ptr)
   if(!field) return;
   dt_remote_value_clear(&field->default_value);
   if(field->enum_values) g_ptr_array_unref(field->enum_values);
+  if(field->represented_by) g_ptr_array_unref(field->represented_by);
   g_free(field);
 }
 
@@ -809,6 +810,75 @@ gboolean dt_remote_get_module_primitive_schema(const char *op,
   return TRUE;
 }
 
+// Stamps represented_by -- the wire schema's back-reference from a native
+// storage field to the semantic parameters that own it (curve design
+// SS Schema response) -- onto the primitive fields: every top-level
+// introspection field a descriptor's nodes/count/type path routes through
+// is represented by that descriptor's semantic ID, in registry order.
+// Runs only after dt_remote_curve_list_schema() advertised at least one
+// curve, so the adapter has already passed registry validation; a path
+// that does not start at a field, or a root name no schema row carries,
+// is registry/introspection drift and fails closed like every other
+// registry inconsistency.
+static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
+                                         const dt_iop_module_so_t *so,
+                                         dt_remote_error_t **error)
+{
+  dt_introspection_t *intro = so->get_introspection ? so->get_introspection() : NULL;
+  const dt_remote_curve_module_adapter_t *adapter =
+    intro ? dt_remote_curve_registry_lookup(schema->op, (guint)intro->params_version) : NULL;
+  if(!adapter)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("semantic curves advertised without a registry adapter for '%s'"),
+                                   schema->op);
+    return FALSE;
+  }
+
+  for(guint c = 0; c < adapter->curve_count; c++)
+  {
+    const dt_remote_curve_descriptor_t *desc = &adapter->curves[c];
+    const dt_remote_introspection_path_t *paths[] = { &desc->native.nodes, &desc->native.count,
+                                                      &desc->native.type };
+    for(guint p = 0; p < G_N_ELEMENTS(paths); p++)
+    {
+      if(paths[p]->length == 0 || paths[p]->segments[0].type != DT_REMOTE_PATH_FIELD)
+      {
+        if(error)
+          *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                       _("curve descriptor '%s' has a rootless native path"), desc->name);
+        return FALSE;
+      }
+      const char *root = paths[p]->segments[0].value.field;
+
+      dt_remote_field_t *field = NULL;
+      for(guint i = 0; schema->fields && i < schema->fields->len; i++)
+      {
+        dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+        if(!g_strcmp0(f->name, root)) { field = f; break; }
+      }
+      if(!field)
+      {
+        if(error)
+          *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                       _("curve descriptor '%s' routes through unknown field '%s'"),
+                                       desc->name, root);
+        return FALSE;
+      }
+
+      // one root often backs several descriptors (rgbcurve's shared
+      // channel arrays) and several paths of one descriptor -- dedupe
+      if(!field->represented_by) field->represented_by = g_ptr_array_new_with_free_func(g_free);
+      gboolean present = FALSE;
+      for(guint i = 0; !present && i < field->represented_by->len; i++)
+        present = !g_strcmp0(g_ptr_array_index(field->represented_by, i), desc->name);
+      if(!present) g_ptr_array_add(field->represented_by, g_strdup(desc->name));
+    }
+  }
+  return TRUE;
+}
+
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error)
@@ -830,7 +900,14 @@ gboolean dt_remote_get_module_schema(const char *op,
   }
 
   if(semantic_fields->len > 0)
+  {
     schema->semantic_fields = semantic_fields;
+    if(!_annotate_represented_by(schema, so, error))
+    {
+      dt_remote_module_schema_free(schema);
+      return FALSE;
+    }
+  }
   else
     g_ptr_array_unref(semantic_fields);
 

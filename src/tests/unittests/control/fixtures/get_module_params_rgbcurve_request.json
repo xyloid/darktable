@@ -1,0 +1,5 @@
+{
+  "id": 31,
+  "method": "get_module_params",
+  "params": { "module": "rgbcurve", "instance": 0 }
+}

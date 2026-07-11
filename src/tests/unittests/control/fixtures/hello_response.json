@@ -7,6 +7,8 @@
     "pid": 12345,
     "capabilities": [
       "params",
+      "semantic_params",
+      "curve_params",
       "instances",
       "history",
       "preview",

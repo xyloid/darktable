@@ -1,0 +1,61 @@
+{
+  "id": 31,
+  "ok": true,
+  "result": {
+    "module": "rgbcurve",
+    "instance": 0,
+    "instance_name": "",
+    "enabled": true,
+    "revision": 31,
+    "values": {
+      "curve_autoscale": "DT_S_SCALE_AUTOMATIC_RGB",
+      "compensate_middle_grey": false
+    },
+    "semantic_values": {
+      "curve.master": {
+        "class": "curve",
+        "active": true,
+        "effective": true,
+        "writable_now": true,
+        "points": [
+          { "x": 0.0, "y": 0.0 },
+          { "x": 1.0, "y": 1.0 }
+        ],
+        "interpolation": "MONOTONE_HERMITE"
+      },
+      "curve.red": {
+        "class": "curve",
+        "active": false,
+        "effective": false,
+        "writable_now": false,
+        "points": [
+          { "x": 0.0, "y": 0.0 },
+          { "x": 1.0, "y": 1.0 }
+        ],
+        "interpolation": "MONOTONE_HERMITE"
+      },
+      "curve.green": {
+        "class": "curve",
+        "active": false,
+        "effective": false,
+        "writable_now": false,
+        "points": [
+          { "x": 0.0, "y": 0.0 },
+          { "x": 1.0, "y": 1.0 }
+        ],
+        "interpolation": "MONOTONE_HERMITE"
+      },
+      "curve.blue": {
+        "class": "curve",
+        "active": false,
+        "effective": false,
+        "writable_now": false,
+        "points": [
+          { "x": 0.0, "y": 0.0 },
+          { "x": 1.0, "y": 1.0 }
+        ],
+        "interpolation": "MONOTONE_HERMITE"
+      }
+    }
+  }
+}

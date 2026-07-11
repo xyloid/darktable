@@ -328,6 +328,15 @@ static JsonNode *_field_to_json(const dt_remote_field_t *f)
   json_builder_set_member_name(b, "writable");
   json_builder_add_boolean_value(b, f->writable);
 
+  if(f->represented_by)
+  {
+    json_builder_set_member_name(b, "represented_by");
+    json_builder_begin_array(b);
+    for(guint i = 0; i < f->represented_by->len; i++)
+      json_builder_add_string_value(b, g_ptr_array_index(f->represented_by, i));
+    json_builder_end_array(b);
+  }
+
   if(f->enum_values)
   {
     json_builder_set_member_name(b, "enum_values");
@@ -369,6 +378,117 @@ static const char *_interpolation_name(dt_remote_curve_interpolation_t interpola
   }
 }
 
+// NULL for DT_REMOTE_SPACING_NONE -- the spacing members are then omitted.
+static const char *_spacing_comparison_name(dt_remote_spacing_rule_t rule)
+{
+  switch(rule)
+  {
+    case DT_REMOTE_SPACING_AT_LEAST: return "at_least";
+    case DT_REMOTE_SPACING_GREATER_THAN: return "greater_than";
+    default: return NULL;
+  }
+}
+
+static const char *_boundary_policy_name(dt_remote_curve_endpoint_policy_t policy)
+{
+  switch(policy)
+  {
+    case DT_REMOTE_CURVE_BOUNDARY_POINTS_REQUIRED: return "required";
+    case DT_REMOTE_CURVE_BOUNDARY_POINTS_FIXED_IDENTITY: return "fixed_identity";
+    case DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL:
+    default: return "optional";
+  }
+}
+
+// A structured field/operator/enum condition triple serializes as
+// {"field": ..., "equals"/"not_equals": ...}.
+static void _condition_to_json(JsonBuilder *b, const char *member,
+                               const dt_remote_parameter_condition_t *condition)
+{
+  if(!condition) return;
+  json_builder_set_member_name(b, member);
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "field");
+  json_builder_add_string_value(b, condition->field ? condition->field : "");
+  json_builder_set_member_name(b, condition->op == DT_REMOTE_PREDICATE_EQ ? "equals" : "not_equals");
+  json_builder_add_string_value(b, condition->enum_name ? condition->enum_name : "");
+  json_builder_end_object(b);
+}
+
+static void _curve_axis_to_json(JsonBuilder *b, const char *member,
+                                const dt_remote_curve_axis_t *axis)
+{
+  json_builder_set_member_name(b, member);
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "minimum");
+  json_builder_add_double_value(b, axis->minimum);
+  json_builder_set_member_name(b, "maximum");
+  json_builder_add_double_value(b, axis->maximum);
+  if(axis->unit)
+  {
+    json_builder_set_member_name(b, "unit");
+    json_builder_add_string_value(b, axis->unit);
+  }
+  json_builder_end_object(b);
+}
+
+static JsonNode *_curve_schema_to_json(const dt_remote_curve_schema_t *s)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, s->name ? s->name : "");
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "curve");
+  json_builder_set_member_name(b, "display_name");
+  json_builder_add_string_value(b, s->display_name ? s->display_name : "");
+
+  json_builder_set_member_name(b, "readable");
+  json_builder_add_boolean_value(b, TRUE);
+  // "writable: true means the server implements writes for the class in
+  // some valid state" -- writable_when below carries the static condition.
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, s->writability != DT_REMOTE_WRITABLE_NEVER);
+  _condition_to_json(b, "writable_when", s->writable_when);
+
+  _curve_axis_to_json(b, "x", &s->x);
+  _curve_axis_to_json(b, "y", &s->y);
+
+  json_builder_set_member_name(b, "points");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "minimum");
+  json_builder_add_int_value(b, s->minimum_points);
+  json_builder_set_member_name(b, "maximum");
+  json_builder_add_int_value(b, s->maximum_points);
+  json_builder_set_member_name(b, "strict_x_order");
+  json_builder_add_boolean_value(b, s->strict_x_order);
+  const char *spacing = _spacing_comparison_name(s->adjacent_spacing_rule);
+  if(spacing)
+  {
+    json_builder_set_member_name(b, "minimum_x_spacing");
+    json_builder_add_double_value(b, s->minimum_x_spacing);
+    json_builder_set_member_name(b, "minimum_x_spacing_comparison");
+    json_builder_add_string_value(b, spacing);
+  }
+  json_builder_set_member_name(b, "boundary_point_policy");
+  json_builder_add_string_value(b, _boundary_policy_name(s->boundary_point_policy));
+  json_builder_end_object(b);
+
+  json_builder_set_member_name(b, "interpolation_values");
+  json_builder_begin_array(b);
+  for(dt_remote_curve_interpolation_t i = DT_REMOTE_CURVE_CUBIC_SPLINE;
+      i <= DT_REMOTE_CURVE_MONOTONE_HERMITE;
+      i++)
+    if(s->interpolation_mask & (1u << i)) json_builder_add_string_value(b, _interpolation_name(i));
+  json_builder_end_array(b);
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
 static JsonNode *_curve_value_to_json(const dt_remote_curve_value_t *v)
 {
   JsonBuilder *b = json_builder_new();
@@ -405,6 +525,7 @@ static JsonNode *_curve_value_to_json(const dt_remote_curve_value_t *v)
   g_object_unref(b);
   return node;
 }
+
 /* ---------------------------------------------------------------------- */
 /* method handlers                                                         */
 /* ---------------------------------------------------------------------- */
@@ -454,8 +575,12 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // mutation (set_module_params, plan step 7). "instances" =
   // create_module_instance; "history" = get_history/undo (plan step 8).
   // "preview" = render_preview (plan step 9). "scopes" = compute_scopes
-  // (plan step 10).
+  // (plan step 10). "semantic_params"/"curve_params" (milestone 2) gate
+  // the additive semantic_fields/semantic_values wire members -- no
+  // protocol_version bump, per the milestone spec's resolved decision.
   json_builder_add_string_value(b, "params");
+  json_builder_add_string_value(b, "semantic_params");
+  json_builder_add_string_value(b, "curve_params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");
@@ -630,6 +755,17 @@ static JsonNode *_handler_get_module_schema(JsonObject *params, dt_remote_sessio
     for(guint i = 0; i < schema->fields->len; i++)
       json_builder_add_value(b, _field_to_json(g_ptr_array_index(schema->fields, i)));
   json_builder_end_array(b);
+  // optional, capability-gated ("semantic_params"/"curve_params"): ops
+  // without registered semantic curves emit no member at all -- their
+  // responses stay byte-identical to the pre-milestone-2 wire shape.
+  if(schema->semantic_fields && schema->semantic_fields->len > 0)
+  {
+    json_builder_set_member_name(b, "semantic_fields");
+    json_builder_begin_array(b);
+    for(guint i = 0; i < schema->semantic_fields->len; i++)
+      json_builder_add_value(b, _curve_schema_to_json(g_ptr_array_index(schema->semantic_fields, i)));
+    json_builder_end_array(b);
+  }
   json_builder_end_object(b);
 
   JsonNode *result = json_builder_get_root(b);
@@ -658,19 +794,22 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
 
   GPtrArray *values = NULL;
-  GHashTable *semantic_values = NULL;
-  if(!s_calls.get_module_params(&ref, &values, &semantic_values, &err)) return _handler_fail(err);
+  GHashTable *semantic = NULL;
+  if(!s_calls.get_module_params(&ref, &values, &semantic, &err)) return _handler_fail(err);
 
-  // Semantic values are collected so registry failures reach the wire, but
-  // remain internal until semantic mutation support lands. The v1 response
-  // below therefore stays primitive-only for now.
+  // dt_remote_get_module_params() returns scalar values plus the semantic
+  // curve values (milestone 2) -- the wire response also needs
+  // instance_name/enabled (list_modules) and revision (get_state). Both
+  // come from the same live module list this call just walked, so a
+  // missing match here means the two calls disagreed -- treat that as
+  // internal, not as if the module vanished mid-air.
   GPtrArray *modules = NULL;
   dt_remote_error_t *list_err = NULL;
   if(!s_calls.list_modules(&modules, &list_err))
   {
     dt_remote_error_free(list_err);
     g_ptr_array_unref(values);
-    if(semantic_values) g_hash_table_unref(semantic_values);
+    if(semantic) g_hash_table_unref(semantic);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
                                     _("could not resolve instance metadata for '%s'/%d"), module,
                                     (int)instance));
@@ -690,7 +829,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   {
     g_ptr_array_unref(modules);
     g_ptr_array_unref(values);
-    if(semantic_values) g_hash_table_unref(semantic_values);
+    if(semantic) g_hash_table_unref(semantic);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
                                     _("module '%s' instance %d vanished between reads"), module,
                                     (int)instance));
@@ -703,7 +842,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
     dt_remote_error_free(state_err);
     g_ptr_array_unref(modules);
     g_ptr_array_unref(values);
-    if(semantic_values) g_hash_table_unref(semantic_values);
+    if(semantic) g_hash_table_unref(semantic);
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL, _("could not read current revision")));
   }
 
@@ -728,6 +867,23 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
     json_builder_add_value(b, _value_to_json(&e->value));
   }
   json_builder_end_object(b);
+  // optional, capability-gated: like semantic_fields, ops without
+  // registered semantic curves emit no member. Keys are emitted sorted so
+  // repeated reads serialize identically (GHashTable iteration order is
+  // arbitrary).
+  if(semantic && g_hash_table_size(semantic) > 0)
+  {
+    json_builder_set_member_name(b, "semantic_values");
+    json_builder_begin_object(b);
+    GList *keys = g_list_sort(g_hash_table_get_keys(semantic), (GCompareFunc)g_strcmp0);
+    for(GList *k = keys; k; k = k->next)
+    {
+      json_builder_set_member_name(b, k->data);
+      json_builder_add_value(b, _curve_value_to_json(g_hash_table_lookup(semantic, k->data)));
+    }
+    g_list_free(keys);
+    json_builder_end_object(b);
+  }
   json_builder_end_object(b);
 
   JsonNode *result = json_builder_get_root(b);
@@ -735,7 +891,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
   dt_remote_state_free(state);
   g_ptr_array_unref(modules);
   g_ptr_array_unref(values);
-  if(semantic_values) g_hash_table_unref(semantic_values);
+  if(semantic) g_hash_table_unref(semantic);
   return result;
 }
 

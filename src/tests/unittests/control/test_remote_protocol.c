@@ -399,6 +399,183 @@ static gboolean stub_get_module_params_internal(const dt_remote_module_ref_t *re
   return FALSE;
 }
 
+/* --- rgbcurve semantic read-path stubs (milestone 2, task 7) ------------- */
+
+static const char *const RGBCURVE_SEMANTIC_IDS[] = { "curve.master", "curve.red", "curve.green",
+                                                     "curve.blue" };
+
+static dt_remote_parameter_condition_t *_make_condition(const char *field,
+                                                        dt_remote_predicate_operator_t op,
+                                                        const char *enum_name)
+{
+  dt_remote_parameter_condition_t *condition = g_new0(dt_remote_parameter_condition_t, 1);
+  condition->field = g_strdup(field);
+  condition->op = op;
+  condition->enum_name = g_strdup(enum_name);
+  return condition;
+}
+
+// One hand-built rgbcurve curve schema, mirroring what the real registry
+// adapter produces (remote_curve_registry.c): [0,1]^2 normalized domain,
+// 2-20 points, spacing 0.0025 strictly-greater, optional boundaries, all
+// three interpolations, conditionally writable on curve_autoscale.
+static dt_remote_curve_schema_t *_make_rgbcurve_curve_schema(const char *name, const char *display_name,
+                                                             dt_remote_predicate_operator_t op)
+{
+  dt_remote_curve_schema_t *schema = g_new0(dt_remote_curve_schema_t, 1);
+  schema->name = g_strdup(name);
+  schema->display_name = g_strdup(display_name);
+  schema->x = (dt_remote_curve_axis_t){ .minimum = 0.0, .maximum = 1.0, .unit = g_strdup("normalized") };
+  schema->y = (dt_remote_curve_axis_t){ .minimum = 0.0, .maximum = 1.0, .unit = g_strdup("normalized") };
+  schema->minimum_points = 2;
+  schema->maximum_points = 20;
+  schema->minimum_x_spacing = 0.0025;
+  schema->adjacent_spacing_rule = DT_REMOTE_SPACING_GREATER_THAN;
+  schema->strict_x_order = TRUE;
+  schema->boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL;
+  schema->interpolation_mask = (1u << DT_REMOTE_CURVE_CUBIC_SPLINE) | (1u << DT_REMOTE_CURVE_CATMULL_ROM)
+                               | (1u << DT_REMOTE_CURVE_MONOTONE_HERMITE);
+  schema->default_interpolation = DT_REMOTE_CURVE_MONOTONE_HERMITE;
+  schema->writability = DT_REMOTE_WRITABLE_CONDITIONAL;
+  schema->active_when = _make_condition("curve_autoscale", op, "DT_S_SCALE_MANUAL_RGB");
+  schema->writable_when = _make_condition("curve_autoscale", op, "DT_S_SCALE_MANUAL_RGB");
+  return schema;
+}
+
+static dt_remote_field_t *_make_represented_array_field(const char *name)
+{
+  dt_remote_field_t *field = _make_field(name, "", "array", FALSE);
+  field->represented_by = g_ptr_array_new_with_free_func(g_free);
+  for(guint i = 0; i < G_N_ELEMENTS(RGBCURVE_SEMANTIC_IDS); i++)
+    g_ptr_array_add(field->represented_by, g_strdup(RGBCURVE_SEMANTIC_IDS[i]));
+  return field;
+}
+
+static gboolean stub_get_module_schema_rgbcurve(const char *op, dt_remote_module_schema_t **out,
+                                                dt_remote_error_t **error)
+{
+  (void)op;
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup("rgbcurve");
+  schema->display_name = g_strdup("rgb curve");
+  schema->params_version = 1;
+  schema->deprecated = FALSE;
+  schema->supports_multiple_instances = TRUE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+
+  g_ptr_array_add(schema->fields, _make_represented_array_field("curve_nodes"));
+  g_ptr_array_add(schema->fields, _make_represented_array_field("curve_num_nodes"));
+  g_ptr_array_add(schema->fields, _make_represented_array_field("curve_type"));
+
+  dt_remote_field_t *autoscale = _make_field("curve_autoscale", "mode", "enum", TRUE);
+  autoscale->has_default = TRUE;
+  autoscale->default_value.type = DT_REMOTE_VALUE_ENUM;
+  autoscale->default_value.v.e.value = 0;
+  autoscale->default_value.v.e.name = g_strdup("DT_S_SCALE_AUTOMATIC_RGB");
+  autoscale->enum_values = g_ptr_array_new_with_free_func(g_free);
+  dt_remote_enum_value_t *automatic = g_malloc0(sizeof(dt_remote_enum_value_t));
+  automatic->name = (char *)"DT_S_SCALE_AUTOMATIC_RGB";
+  automatic->value = 0;
+  automatic->description = (char *)"RGB, linked channels";
+  g_ptr_array_add(autoscale->enum_values, automatic);
+  dt_remote_enum_value_t *manual = g_malloc0(sizeof(dt_remote_enum_value_t));
+  manual->name = (char *)"DT_S_SCALE_MANUAL_RGB";
+  manual->value = 1;
+  manual->description = (char *)"RGB, independent channels";
+  g_ptr_array_add(autoscale->enum_values, manual);
+  g_ptr_array_add(schema->fields, autoscale);
+
+  dt_remote_field_t *compensate = _make_field("compensate_middle_grey", "compensate middle gray",
+                                              "bool", TRUE);
+  compensate->has_default = TRUE;
+  compensate->default_value.type = DT_REMOTE_VALUE_BOOL;
+  compensate->default_value.v.b = FALSE;
+  g_ptr_array_add(schema->fields, compensate);
+
+  schema->semantic_fields = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_curve_schema_free);
+  g_ptr_array_add(schema->semantic_fields,
+                  _make_rgbcurve_curve_schema("curve.master", "master", DT_REMOTE_PREDICATE_NE));
+  g_ptr_array_add(schema->semantic_fields,
+                  _make_rgbcurve_curve_schema("curve.red", "R", DT_REMOTE_PREDICATE_EQ));
+  g_ptr_array_add(schema->semantic_fields,
+                  _make_rgbcurve_curve_schema("curve.green", "G", DT_REMOTE_PREDICATE_EQ));
+  g_ptr_array_add(schema->semantic_fields,
+                  _make_rgbcurve_curve_schema("curve.blue", "B", DT_REMOTE_PREDICATE_EQ));
+
+  *out = schema;
+  return TRUE;
+}
+
+static dt_remote_curve_value_t *_make_identity_curve_value(const char *name, gboolean active)
+{
+  dt_remote_curve_value_t *value = g_new0(dt_remote_curve_value_t, 1);
+  value->name = g_strdup(name);
+  value->points = g_array_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t));
+  const dt_remote_curve_point_t p0 = { 0.0, 0.0 };
+  const dt_remote_curve_point_t p1 = { 1.0, 1.0 };
+  g_array_append_val(value->points, p0);
+  g_array_append_val(value->points, p1);
+  value->interpolation = DT_REMOTE_CURVE_MONOTONE_HERMITE;
+  value->active = active;
+  value->effective = active;
+  value->writable_now = active;
+  return value;
+}
+
+// Automatic-RGB mode: all four semantic IDs are present (never omitted when
+// inactive -- milestone spec resolved decision 4); only curve.master is
+// active/writable.
+static gboolean stub_get_module_params_rgbcurve(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  dt_remote_patch_entry_t *autoscale = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  autoscale->name = g_strdup("curve_autoscale");
+  autoscale->value.type = DT_REMOTE_VALUE_ENUM;
+  autoscale->value.v.e.value = 0;
+  autoscale->value.v.e.name = g_strdup("DT_S_SCALE_AUTOMATIC_RGB");
+  g_ptr_array_add(arr, autoscale);
+
+  dt_remote_patch_entry_t *compensate = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  compensate->name = g_strdup("compensate_middle_grey");
+  compensate->value.type = DT_REMOTE_VALUE_BOOL;
+  compensate->value.v.b = FALSE;
+  g_ptr_array_add(arr, compensate);
+
+  GHashTable *semantic =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)dt_remote_curve_value_free);
+  g_hash_table_insert(semantic, g_strdup("curve.master"), _make_identity_curve_value("curve.master", TRUE));
+  g_hash_table_insert(semantic, g_strdup("curve.red"), _make_identity_curve_value("curve.red", FALSE));
+  g_hash_table_insert(semantic, g_strdup("curve.green"), _make_identity_curve_value("curve.green", FALSE));
+  g_hash_table_insert(semantic, g_strdup("curve.blue"), _make_identity_curve_value("curve.blue", FALSE));
+
+  *out = arr;
+  if(semantic_out) *semantic_out = semantic;
+  else g_hash_table_unref(semantic);
+  return TRUE;
+}
+
+static gboolean stub_list_modules_one_rgbcurve(GPtrArray **out, dt_remote_error_t **error)
+{
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_module_free);
+  dt_remote_module_t *m = g_malloc0(sizeof(dt_remote_module_t));
+  m->op = g_strdup("rgbcurve");
+  m->instance = 0;
+  m->instance_name = g_strdup("");
+  m->display_name = g_strdup("rgb curve");
+  m->enabled = TRUE;
+  m->deprecated = FALSE;
+  m->supports_multiple_instances = TRUE;
+  g_ptr_array_add(arr, m);
+  *out = arr;
+  return TRUE;
+}
+
 /* --- set_module_params stubs (plan step 7) ------------------------------ */
 
 // Like stub_get_module_schema_exposure but with the "black" field the wire
@@ -795,15 +972,19 @@ static void test_hello_success(void **state)
   assert_int_equal(json_object_get_int_member(result, "protocol_version"), DT_REMOTE_PROTOCOL_VERSION);
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
-  // "params" (step 7) + "instances"/"history" (step 8) + "preview"
-  // (step 9) + "scopes" (step 10) -- the full capability set.
+  // "params" (step 7) + "semantic_params"/"curve_params" (milestone 2:
+  // capability-gated semantic curve read/write) + "instances"/"history"
+  // (step 8) + "preview" (step 9) + "scopes" (step 10) -- the full
+  // capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 5);
+  assert_int_equal(json_array_get_length(caps), 7);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
-  assert_string_equal(json_array_get_string_element(caps, 1), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 2), "history");
-  assert_string_equal(json_array_get_string_element(caps, 3), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 4), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
+  assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
+  assert_string_equal(json_array_get_string_element(caps, 3), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 4), "history");
+  assert_string_equal(json_array_get_string_element(caps, 5), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 6), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1121,6 +1302,40 @@ static void test_get_module_params_error_internal_is_error_envelope(void **state
 
   json_node_unref(actual);
   json_node_unref(request_node);
+}
+
+/* --- semantic curve read path (milestone 2, task 7) ---------------------- */
+
+// rgbcurve advertises its four semantic curves in an optional
+// `semantic_fields` schema member (shape: curve design SS Schema response,
+// including represented_by on the native array fields). Ops without a
+// registry adapter -- exercised by test_get_module_schema_success above,
+// whose exposure fixture is untouched -- emit no such member.
+static void test_get_module_schema_rgbcurve_semantic_fields(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_schema = stub_get_module_schema_rgbcurve };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_schema_rgbcurve_request.json",
+                           "get_module_schema_rgbcurve_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// rgbcurve's four semantic values ride on get_module_params as an optional
+// `semantic_values` member (shape: curve design SS Value response): all
+// four IDs present, active/writable_now resolved per mode, points as
+// {"x","y"} objects, uppercase interpolation names.
+static void test_get_module_params_rgbcurve_semantic_values(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_rgbcurve,
+    .list_modules = stub_list_modules_one_rgbcurve,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_params_rgbcurve_request.json",
+                           "get_module_params_rgbcurve_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -1608,6 +1823,44 @@ static void test_set_module_params_semantic_bad_shapes(void **state)
   g_string_append(oversized, "]}}}}");
   _assert_inline_error(oversized->str, "invalid_value");
   g_string_free(oversized, TRUE);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// The activation invariant (review-fixes plan Task 5): a hello that
+// advertises curve_params and a semantic_values mutation that fails
+// unknown-key validation must never coexist. Read the capabilities off the
+// real hello response, then drive the wire-contract curve request through
+// the same dispatcher.
+static void test_hello_curve_params_implies_semantic_values_accepted(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_curve_master,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *hello_request_node = _load_fixture("hello_request.json");
+  JsonNode *hello_response = dt_remote_protocol_dispatch(json_node_get_object(hello_request_node), NULL);
+  assert_non_null(hello_response);
+  JsonObject *hello_result =
+    json_object_get_object_member(json_node_get_object(hello_response), "result");
+  JsonArray *caps = json_object_get_array_member(hello_result, "capabilities");
+  gboolean advertises_curve_params = FALSE;
+  for(guint i = 0; i < json_array_get_length(caps); i++)
+    if(!g_strcmp0(json_array_get_string_element(caps, i), "curve_params"))
+      advertises_curve_params = TRUE;
+  json_node_unref(hello_response);
+  json_node_unref(hello_request_node);
+  assert_true(advertises_curve_params);
+
+  JsonNode *request_node = _load_fixture("set_module_params_curve_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+  assert_true(json_object_get_boolean_member(json_node_get_object(actual), "ok"));
+  json_node_unref(actual);
+  json_node_unref(request_node);
 
   dt_remote_protocol_set_calls(NULL);
 }
@@ -3429,6 +3682,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_schema_error_unknown_key),
 
     cmocka_unit_test(test_get_module_params_success),
+    cmocka_unit_test(test_get_module_schema_rgbcurve_semantic_fields),
+    cmocka_unit_test(test_get_module_params_rgbcurve_semantic_values),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),
@@ -3450,6 +3705,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_curve_error_invalid_spacing),
     cmocka_unit_test(test_set_module_params_curve_error_unknown_id),
     cmocka_unit_test(test_set_module_params_semantic_bad_shapes),
+    cmocka_unit_test(test_hello_curve_params_implies_semantic_values_accepted),
 
     cmocka_unit_test(test_set_module_enabled_success),
     cmocka_unit_test(test_set_module_enabled_error_revision_conflict),

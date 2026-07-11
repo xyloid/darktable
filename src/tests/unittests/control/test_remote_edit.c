@@ -1232,6 +1232,57 @@ static void test_set_module_params_mutation_path_uses_real_denylist(void **state
   g_free(before);
 }
 
+// The production wire promise for rgbcurve (the get_module_schema_rgbcurve
+// response fixture): four semantic curves in registry order, and
+// represented_by back-references from the three native storage fields to
+// all four semantic IDs -- produced from the real adapter against the real
+// introspection, so fixture and live server cannot drift apart silently.
+static void test_schema_rgbcurve_semantic_fields_and_represented_by(void **state)
+{
+  (void)state;
+  static const char *expected_ids[] = { "curve.master", "curve.red", "curve.green", "curve.blue" };
+
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_get_module_schema("rgbcurve", &schema, &err));
+  assert_null(err);
+  assert_non_null(schema);
+  assert_non_null(schema->semantic_fields);
+  assert_int_equal(schema->semantic_fields->len, G_N_ELEMENTS(expected_ids));
+  for(guint i = 0; i < G_N_ELEMENTS(expected_ids); i++)
+  {
+    const dt_remote_curve_schema_t *curve = g_ptr_array_index(schema->semantic_fields, i);
+    assert_string_equal(curve->name, expected_ids[i]);
+  }
+
+  static const char *native_roots[] = { "curve_nodes", "curve_num_nodes", "curve_type" };
+  for(guint r = 0; r < G_N_ELEMENTS(native_roots); r++)
+  {
+    const dt_remote_field_t *field = NULL;
+    for(guint i = 0; i < schema->fields->len; i++)
+    {
+      const dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+      if(!g_strcmp0(f->name, native_roots[r])) { field = f; break; }
+    }
+    assert_non_null(field);
+    assert_false(field->writable);  // native arrays stay primitive-unwritable
+    assert_non_null(field->represented_by);
+    assert_int_equal(field->represented_by->len, G_N_ELEMENTS(expected_ids));
+    for(guint i = 0; i < G_N_ELEMENTS(expected_ids); i++)
+      assert_string_equal(g_ptr_array_index(field->represented_by, i), expected_ids[i]);
+  }
+
+  // fields no curve routes through carry no represented_by
+  for(guint i = 0; i < schema->fields->len; i++)
+  {
+    const dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, "curve_autoscale") || !g_strcmp0(f->name, "compensate_middle_grey"))
+      assert_null(f->represented_by);
+  }
+
+  dt_remote_module_schema_free(schema);
+}
+
 static const dt_remote_curve_module_adapter_t *s_drift_adapter = NULL;
 
 static const dt_remote_curve_module_adapter_t *drift_lookup_override(const char *operation,
@@ -1358,6 +1409,7 @@ int main(int argc, char *argv[])
 
     // Keep last: the case temporarily mutates real introspection, restoring
     // it immediately after the schema call.
+    cmocka_unit_test(test_schema_rgbcurve_semantic_fields_and_represented_by),
     cmocka_unit_test(test_schema_rgbcurve_registry_drift_fails_closed),
   };
 
