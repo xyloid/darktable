@@ -403,8 +403,9 @@ static gboolean stub_get_module_params_internal(const dt_remote_module_ref_t *re
 // Like stub_get_module_schema_exposure but with the "black" field the wire
 // contract's set_module_params example patches alongside "exposure" -- kept
 // separate so the get_module_schema fixture diff stays untouched.
-static gboolean stub_get_module_schema_exposure_full(const char *op, dt_remote_module_schema_t **out,
-                                                     dt_remote_error_t **error)
+static gboolean stub_get_module_primitive_schema_exposure_full(const char *op,
+                                                               dt_remote_module_schema_t **out,
+                                                               dt_remote_error_t **error)
 {
   dt_remote_module_schema_t *schema = NULL;
   if(!stub_get_module_schema_exposure(op, &schema, error)) return FALSE;
@@ -428,11 +429,11 @@ static gboolean stub_get_module_schema_exposure_full(const char *op, dt_remote_m
 // filmicrgb's "version" field: known to the schema (present, per the
 // "never omitted" rule) but forced writable:false by the per-op denylist
 // (dt_remote_denylist_for_op(), Task 1) -- exercises the same
-// unsupported_field handler path as stub_get_module_schema_exposure_full's
-// "curve", using a real denylisted op/field pair instead of a naturally
-// non-scalar type.
-static gboolean stub_get_module_schema_filmicrgb_denylisted(const char *op, dt_remote_module_schema_t **out,
-                                                             dt_remote_error_t **error)
+// unsupported_field handler path as
+// stub_get_module_primitive_schema_exposure_full's "curve", using a real
+// denylisted op/field pair instead of a naturally non-scalar type.
+static gboolean stub_get_module_primitive_schema_filmicrgb_denylisted(
+  const char *op, dt_remote_module_schema_t **out, dt_remote_error_t **error)
 {
   (void)error;
   dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
@@ -1054,7 +1055,23 @@ static void test_set_module_params_success(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_contract,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_request.json", "set_module_params_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// Scalar mutation needs only primitive field metadata. A failure in the
+// semantic schema registry must therefore remain isolated from this handler:
+// the primitive lookup and mutation engine both still run to success.
+static void test_set_module_params_semantic_schema_failure_does_not_block_primitive_mutation(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_internal,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_contract,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1069,7 +1086,7 @@ static void test_set_module_params_enum_by_name(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_enum_deflicker,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1091,7 +1108,7 @@ static void test_set_module_params_enum_by_int(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_enum_deflicker,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1116,7 +1133,7 @@ static void test_set_module_params_error_invalid_value(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_invalid_value,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1131,7 +1148,7 @@ static void test_set_module_params_error_revision_conflict(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_revision_conflict,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1146,7 +1163,7 @@ static void test_set_module_params_error_unknown_field(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_must_not_be_called,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1161,7 +1178,7 @@ static void test_set_module_params_error_unsupported_field(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_must_not_be_called,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1182,7 +1199,7 @@ static void test_set_module_params_error_denylisted_field(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_filmicrgb_denylisted,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_filmicrgb_denylisted,
     .set_module_params = stub_set_module_params_must_not_be_called,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1196,7 +1213,7 @@ static void test_set_module_params_error_bad_shapes(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_must_not_be_called,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1258,7 +1275,7 @@ static void test_set_module_params_error_unknown_module(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_unknown,
+    .get_module_primitive_schema = stub_get_module_schema_unknown,
     .set_module_params = stub_set_module_params_must_not_be_called,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -1276,7 +1293,7 @@ static void test_set_module_params_error_unknown_instance(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
-    .get_module_schema = stub_get_module_schema_exposure_full,
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
     .set_module_params = stub_set_module_params_unknown_instance,
   };
   dt_remote_protocol_set_calls(&calls);
@@ -3110,6 +3127,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_error_fractional_instance),
 
     cmocka_unit_test(test_set_module_params_success),
+    cmocka_unit_test(test_set_module_params_semantic_schema_failure_does_not_block_primitive_mutation),
     cmocka_unit_test(test_set_module_params_enum_by_name),
     cmocka_unit_test(test_set_module_params_enum_by_int),
     cmocka_unit_test(test_set_module_params_error_invalid_value),

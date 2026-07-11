@@ -774,11 +774,12 @@ gboolean dt_remote_list_modules(GPtrArray **out, dt_remote_error_t **error)
 // introspection descriptor) -- they are per-op and cacheable per
 // (darktable version, op), independent of any open image or active view,
 // so unlike list_modules/get_module_params this does not gate on
-// dt_remote_require_darkroom_image(); the protocol reference's error
-// matrix allows only unknown_module/invalid_value here.
-gboolean dt_remote_get_module_schema(const char *op,
-                                     dt_remote_module_schema_t **out,
-                                     dt_remote_error_t **error)
+// dt_remote_require_darkroom_image(). The protocol reference's normal error
+// matrix lists unknown_module/invalid_value here; semantic registry drift
+// additionally propagates DT_REMOTE_ERR_INTERNAL from the full schema path.
+gboolean dt_remote_get_module_primitive_schema(const char *op,
+                                               dt_remote_module_schema_t **out,
+                                               dt_remote_error_t **error)
 {
   if(!op || !*op)
   {
@@ -803,6 +804,18 @@ gboolean dt_remote_get_module_schema(const char *op,
   schema->deprecated = (so->flags() & IOP_FLAGS_DEPRECATED) != 0;
   schema->supports_multiple_instances = !(so->flags() & IOP_FLAGS_ONE_INSTANCE);
   schema->fields = dt_remote_schema_from_introspection(linear, dt_remote_denylist_for_op(op));
+
+  *out = schema;
+  return TRUE;
+}
+
+gboolean dt_remote_get_module_schema(const char *op,
+                                     dt_remote_module_schema_t **out,
+                                     dt_remote_error_t **error)
+{
+  dt_remote_module_schema_t *schema = NULL;
+  if(!dt_remote_get_module_primitive_schema(op, &schema, error)) return FALSE;
+  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
 
   GPtrArray *semantic_fields = NULL;
   dt_remote_error_t *curve_error = NULL;

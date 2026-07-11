@@ -370,6 +370,15 @@ gboolean dt_remote_get_state(dt_remote_state_t **out,
 gboolean dt_remote_list_modules(GPtrArray **out /* dt_remote_module_t */,
                                 dt_remote_error_t **error);
 
+/** returns only the primitive per-op parameter schema from the loaded
+ * module .so. This internal lookup deliberately does not consult semantic
+ * registries, so scalar mutation decoding remains available when semantic
+ * metadata is invalid. Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is
+ * not loaded. */
+gboolean dt_remote_get_module_primitive_schema(const char *op,
+                                               dt_remote_module_schema_t **out,
+                                               dt_remote_error_t **error);
+
 /** returns the per-op parameter schema (shared by all instances of that
  * op), from the loaded module .so alone -- no darkroom/image needed.
  * Fails with DT_REMOTE_ERR_UNKNOWN_MODULE if `op` is not loaded. A

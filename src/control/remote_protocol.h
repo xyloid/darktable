@@ -81,19 +81,21 @@ const dt_remote_method_t *dt_remote_protocol_lookup_method(const char *name);
 /* test seam: overridable remote-edit call table                           */
 /* ---------------------------------------------------------------------- */
 
-// The four read-only remote_edit entry points need a live dt_develop_t to
-// do anything interesting, which unit tests do not have. Handlers call
-// through this small function-pointer table instead of the dt_remote_*
-// symbols directly, so tests can substitute canned results and exercise
-// the dispatcher (JSON validation, envelope shape, error mapping) without
-// a running darktable. Production code never touches this -- the table
-// defaults to the real dt_remote_* functions.
+// The remote_edit entry points need loaded module metadata or a live
+// dt_develop_t to do anything interesting, which unit tests do not have.
+// Handlers call through this small function-pointer table instead of the
+// dt_remote_* symbols directly, so tests can substitute canned results and
+// exercise the dispatcher (JSON validation, envelope shape, error mapping)
+// without a running darktable. Production code never touches this -- the
+// table defaults to the real dt_remote_* functions.
 typedef struct dt_remote_protocol_calls_t
 {
   gboolean (*get_state)(dt_remote_state_t **out, dt_remote_error_t **error);
   gboolean (*list_modules)(GPtrArray **out, dt_remote_error_t **error);
   gboolean (*get_module_schema)(const char *op, dt_remote_module_schema_t **out,
                                 dt_remote_error_t **error);
+  gboolean (*get_module_primitive_schema)(const char *op, dt_remote_module_schema_t **out,
+                                          dt_remote_error_t **error);
   gboolean (*get_module_params)(const dt_remote_module_ref_t *ref, GPtrArray **out,
                                 GHashTable **semantic_out, dt_remote_error_t **error);
   gboolean (*set_module_params)(const dt_remote_module_ref_t *ref, const dt_remote_patch_t *patch,

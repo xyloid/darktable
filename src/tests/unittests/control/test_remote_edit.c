@@ -906,6 +906,11 @@ static void test_schema_rgbcurve_registry_drift_fails_closed(void **state)
 
   native_nodes->Array.count = saved_count;
 
+  dt_remote_module_schema_t *primitive_schema = NULL;
+  dt_remote_error_t *primitive_err = NULL;
+  const gboolean primitive_ok =
+    dt_remote_get_module_primitive_schema("rgbcurve", &primitive_schema, &primitive_err);
+
   assert_false(ok);
   assert_null(schema);
   assert_non_null(err);
@@ -913,6 +918,13 @@ static void test_schema_rgbcurve_registry_drift_fails_closed(void **state)
   assert_non_null(err->message);
   assert_true(strstr(err->message, "curve descriptor") != NULL);
   dt_remote_error_free(err);
+
+  assert_true(primitive_ok);
+  assert_non_null(primitive_schema);
+  assert_non_null(primitive_schema->fields);
+  assert_null(primitive_schema->semantic_fields);
+  assert_null(primitive_err);
+  dt_remote_module_schema_free(primitive_schema);
 }
 
 int main(int argc, char *argv[])

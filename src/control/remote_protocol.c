@@ -44,6 +44,7 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .get_state = dt_remote_get_state,
   .list_modules = dt_remote_list_modules,
   .get_module_schema = dt_remote_get_module_schema,
+  .get_module_primitive_schema = dt_remote_get_module_primitive_schema,
   .get_module_params = dt_remote_get_module_params,
   .set_module_params = dt_remote_set_module_params,
   .set_module_enabled = dt_remote_set_module_enabled,
@@ -60,6 +61,7 @@ static dt_remote_protocol_calls_t s_calls = {
   .get_state = dt_remote_get_state,
   .list_modules = dt_remote_list_modules,
   .get_module_schema = dt_remote_get_module_schema,
+  .get_module_primitive_schema = dt_remote_get_module_primitive_schema,
   .get_module_params = dt_remote_get_module_params,
   .set_module_params = dt_remote_set_module_params,
   .set_module_enabled = dt_remote_set_module_enabled,
@@ -869,9 +871,10 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
 
   // Resolve field types via the schema -- needed to interpret each raw
   // JSON value (e.g. distinguish an enum's stable-name/int form from a
-  // plain int field).
+  // plain int field). Scalar conversion deliberately uses the primitive
+  // schema so unrelated semantic registry failures cannot block mutation.
   dt_remote_module_schema_t *schema = NULL;
-  if(!s_calls.get_module_schema(module, &schema, &err))
+  if(!s_calls.get_module_primitive_schema(module, &schema, &err))
   {
     g_list_free(value_keys);
     return _handler_fail(err);
