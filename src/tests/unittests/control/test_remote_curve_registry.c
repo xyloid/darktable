@@ -24,15 +24,12 @@
  *    stable operation name and params_version, and returns NULL for an
  *    unknown op or an unsupported version.
  *  - dt_remote_curve_registry_validate(): passes against the real loaded
- *    rgbcurve module's introspection tree, rejects (DT_REMOTE_ERR_INTERNAL)
- *    a descriptor whose native node array is the wrong element type, and
- *    caches its result per adapter identity (a second call with a
- *    *different* introspection tree for the same adapter still returns the
- *    first, cached result -- the shape check is not re-run every call).
- *    The shape-mismatch/caching test uses a small hand-built private
- *    descriptor/adapter/introspection fixture, entirely independent of the
- *    real rgbcurve adapter, so it cannot collide with the other tests'
- *    shared use of the process-lifetime cache for the *real* adapter.
+ *    rgbcurve module's introspection tree and uses a small hand-built
+ *    private descriptor/adapter/introspection fixture to verify that
+ *    validation is comprehensive, cached per (adapter, params_version),
+ *    and rejects the whole adapter when any descriptor is invalid. The
+ *    private adapters are all distinct from the real rgbcurve adapter, so
+ *    their process-lifetime cache entries cannot collide with it.
  *  - the exact stable enum name the introspection generator assigns to
  *    DT_S_SCALE_MANUAL_RGB is confirmed against the real loaded module
  *    (tools/introspection/ast.pm emits the C enumerator token verbatim as
@@ -228,6 +225,20 @@ static const dt_remote_path_segment_t s_priv_type_segments[] = {
 static const dt_remote_introspection_path_t s_priv_type_path = {
   .segments = s_priv_type_segments, .length = G_N_ELEMENTS(s_priv_type_segments)
 };
+static const dt_remote_path_segment_t s_priv_internal_version_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "version" },
+};
+static const dt_remote_introspection_path_t s_priv_internal_version_path = {
+  .segments = s_priv_internal_version_segments,
+  .length = G_N_ELEMENTS(s_priv_internal_version_segments)
+};
+static const dt_remote_path_segment_t s_priv_missing_internal_version_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "missing_version" },
+};
+static const dt_remote_introspection_path_t s_priv_missing_internal_version_path = {
+  .segments = s_priv_missing_internal_version_segments,
+  .length = G_N_ELEMENTS(s_priv_missing_internal_version_segments)
+};
 static const dt_remote_introspection_path_t s_priv_no_path = { .segments = NULL, .length = 0 };
 
 static const dt_remote_curve_descriptor_t s_priv_descriptor = {
@@ -334,14 +345,30 @@ static dt_introspection_field_t s_priv_type_field = {
                       .field_name = "type", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
           .Min = 0, .Max = 2, .Default = 0 }
 };
+static dt_introspection_field_t s_priv_version_field = {
+  .Int = { .header = { .type = DT_INTROSPECTION_TYPE_INT, .type_name = "int", .name = "version",
+                      .field_name = "version", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+          .Min = 0, .Max = 100, .Default = 0 }
+};
+static dt_introspection_type_enum_tuple_t s_priv_mode_values[] = {
+  { .name = "MODE_ZERO", .value = 0, .description = "" },
+  { .name = "MODE_ONE", .value = 1, .description = "" },
+  { .name = NULL, .value = 0, .description = NULL },
+};
+static dt_introspection_field_t s_priv_mode_field = {
+  .Enum = { .header = { .type = DT_INTROSPECTION_TYPE_ENUM, .type_name = "mode_t", .name = "mode",
+                       .field_name = "mode", .description = "", .size = sizeof(int), .offset = 0, .so = NULL },
+            .entries = 2, .values = s_priv_mode_values, .Default = 0 }
+};
 
 static dt_introspection_field_t *s_priv_good_struct_fields[] = {
-  &s_priv_good_nodes_array, &s_priv_count_field, &s_priv_type_field, NULL
+  &s_priv_good_nodes_array, &s_priv_count_field, &s_priv_type_field,
+  &s_priv_version_field, &s_priv_mode_field, NULL
 };
 static dt_introspection_field_t s_priv_good_root = {
   .Struct = { .header = { .type = DT_INTROSPECTION_TYPE_STRUCT, .type_name = "root", .name = "",
                          .field_name = "", .description = "", .size = 0, .offset = 0, .so = NULL },
-             .entries = 3, .fields = s_priv_good_struct_fields }
+             .entries = 5, .fields = s_priv_good_struct_fields }
 };
 
 static dt_introspection_field_t *s_priv_bad_struct_fields[] = {
@@ -362,23 +389,187 @@ static dt_introspection_t s_priv_bad_intro = {
   .field = &s_priv_bad_root, .self_size = 0, .default_params = 0
 };
 
-static void test_registry_validate_rejects_shape_mismatch_and_caches_result(void **state)
+static void init_private_adapter(dt_remote_curve_descriptor_t *descriptor,
+                                 dt_remote_curve_module_adapter_t *adapter)
+{
+  *descriptor = s_priv_descriptor;
+  *adapter = s_priv_adapter;
+  adapter->curves = descriptor;
+}
+
+static void assert_registry_validation_fails(const dt_remote_curve_module_adapter_t *adapter,
+                                             const dt_introspection_t *intro)
+{
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_registry_validate(adapter, intro, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(err);
+}
+
+static void test_registry_validate_isolates_cache_by_params_version(void **state)
 {
   (void)state;
-  dt_remote_error_t *err = NULL;
-  assert_false(dt_remote_curve_registry_validate(&s_priv_adapter, &s_priv_bad_intro, &err));
-  assert_non_null(err);
-  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
-  dt_remote_error_free(err);
-  err = NULL;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  adapter.maximum_params_version = 2;
 
-  // Cached: a second call for the SAME adapter, now given the *good*
-  // introspection, still returns the first (failing) result -- proving
-  // the shape check ran once and was cached, not re-run per call.
-  assert_false(dt_remote_curve_registry_validate(&s_priv_adapter, &s_priv_good_intro, &err));
+  dt_introspection_t good_v2_intro = s_priv_good_intro;
+  good_v2_intro.params_version = 2;
+
+  assert_registry_validation_fails(&adapter, &s_priv_bad_intro);
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_registry_validate(&adapter, &good_v2_intro, &err));
+  assert_null(err);
+}
+
+static void test_registry_validate_caches_repeated_adapter_version_pair(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+
+  assert_registry_validation_fails(&adapter, &s_priv_bad_intro);
+
+  // Same adapter and params_version: the original invalid result remains
+  // authoritative even when a different tree is supplied on the repeat.
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_curve_registry_validate(&adapter, &s_priv_good_intro, &err));
   assert_non_null(err);
   assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
   dt_remote_error_free(err);
+}
+
+static void test_registry_validate_rejects_insufficient_native_capacity(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+
+  dt_introspection_field_t small_nodes = s_priv_good_nodes_array;
+  small_nodes.Array.count = descriptor.maximum_points - 1;
+  dt_introspection_field_t *small_fields[] = {
+    &small_nodes, &s_priv_count_field, &s_priv_type_field,
+    &s_priv_version_field, &s_priv_mode_field, NULL
+  };
+  dt_introspection_field_t small_root = s_priv_good_root;
+  small_root.Struct.fields = small_fields;
+  dt_introspection_t small_intro = s_priv_good_intro;
+  small_intro.field = &small_root;
+
+  assert_registry_validation_fails(&adapter, &small_intro);
+}
+
+static void test_registry_validate_rejects_missing_internal_version_path(void **state)
+{
+  (void)state;
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.native.internal_version = s_priv_missing_internal_version_path;
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
+}
+
+static void test_registry_validate_rejects_missing_predicate_field(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t predicate = {
+    .field = "missing_mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.active_when = &predicate;
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
+}
+
+static void test_registry_validate_rejects_non_enum_predicate_field(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t predicate = {
+    .field = "count", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.writable_when = &predicate;
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
+}
+
+static void test_registry_validate_rejects_unknown_predicate_enum_name(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t predicate = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_NE, .enum_name = "MODE_UNKNOWN"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.periodic_when = &predicate;
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
+}
+
+static void test_registry_validate_rejects_invalid_predicate_operator(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t predicate = {
+    .field = "mode", .op = (dt_remote_predicate_operator_t)99, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.active_when = &predicate;
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
+}
+
+static void test_registry_validate_accepts_all_valid_predicate_slots(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t equals_one = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static const dt_remote_parameter_predicate_t not_equals_zero = {
+    .field = "mode", .op = DT_REMOTE_PREDICATE_NE, .enum_name = "MODE_ZERO"
+  };
+  static dt_remote_curve_descriptor_t descriptor;
+  static dt_remote_curve_module_adapter_t adapter;
+  init_private_adapter(&descriptor, &adapter);
+  descriptor.native.internal_version = s_priv_internal_version_path;
+  descriptor.active_when = &equals_one;
+  descriptor.writable_when = &not_equals_zero;
+  descriptor.periodic_when = &equals_one;
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_curve_registry_validate(&adapter, &s_priv_good_intro, &err));
+  assert_null(err);
+}
+
+static void test_registry_validate_rejects_whole_adapter_when_one_descriptor_is_invalid(void **state)
+{
+  (void)state;
+  static const dt_remote_parameter_predicate_t missing_predicate = {
+    .field = "missing_mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "MODE_ONE"
+  };
+  static dt_remote_curve_descriptor_t descriptors[2];
+  static dt_remote_curve_module_adapter_t adapter;
+  descriptors[0] = s_priv_descriptor;
+  descriptors[1] = s_priv_descriptor;
+  descriptors[1].name = "test.private.invalid";
+  descriptors[1].active_when = &missing_predicate;
+  adapter = s_priv_adapter;
+  adapter.curves = descriptors;
+  adapter.curve_count = G_N_ELEMENTS(descriptors);
+
+  assert_registry_validation_fails(&adapter, &s_priv_good_intro);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -822,7 +1013,16 @@ int main(void)
     cmocka_unit_test(test_registry_lookup_rejects_null_operation),
     cmocka_unit_test(test_registry_validate_passes_against_real_rgbcurve_introspection),
     cmocka_unit_test(test_registry_resolves_manual_rgb_enum_name),
-    cmocka_unit_test(test_registry_validate_rejects_shape_mismatch_and_caches_result),
+    cmocka_unit_test(test_registry_validate_isolates_cache_by_params_version),
+    cmocka_unit_test(test_registry_validate_caches_repeated_adapter_version_pair),
+    cmocka_unit_test(test_registry_validate_rejects_insufficient_native_capacity),
+    cmocka_unit_test(test_registry_validate_rejects_missing_internal_version_path),
+    cmocka_unit_test(test_registry_validate_rejects_missing_predicate_field),
+    cmocka_unit_test(test_registry_validate_rejects_non_enum_predicate_field),
+    cmocka_unit_test(test_registry_validate_rejects_unknown_predicate_enum_name),
+    cmocka_unit_test(test_registry_validate_rejects_invalid_predicate_operator),
+    cmocka_unit_test(test_registry_validate_accepts_all_valid_predicate_slots),
+    cmocka_unit_test(test_registry_validate_rejects_whole_adapter_when_one_descriptor_is_invalid),
     cmocka_unit_test(test_list_schema_returns_four_conditional_entries),
     cmocka_unit_test(test_read_values_automatic_mode_exposes_master_only),
     cmocka_unit_test(test_read_values_manual_mode_exposes_rgb_only),

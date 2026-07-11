@@ -31,10 +31,11 @@
 //
 // Threading: like remote_curve.h/remote_edit.h, resolving a path against a
 // live darkroom module's params block must happen from the GTK main
-// thread. The static registry tables and the per-adapter validation cache
-// below are read-mostly, written once per (adapter) the first time it is
-// validated; like the rest of this subsystem, this file assumes single
-// (main-context) threaded access and adds no locking of its own.
+// thread. The static registry tables and the adapter/version validation cache
+// below are read-mostly, written once per (adapter, params_version) the
+// first time that pair is validated; like the rest of this subsystem, this
+// file assumes single (main-context) threaded access and adds no locking of
+// its own.
 
 #include "control/remote_curve.h"
 
@@ -361,34 +362,62 @@ dt_remote_curve_registry_lookup(const char *operation, guint params_version)
   return NULL;
 }
 
-// Process-lifetime validation cache, keyed by adapter pointer identity
-// (every adapter instance is static process-lifetime data, so pointer
-// identity is a valid, stable cache key -- no string hashing needed).
+// Process-lifetime validation cache, keyed by adapter pointer identity and
+// the introspection params version. Adapter identity alone is insufficient:
+// one adapter may cover multiple native layouts across its version range.
+typedef struct dt_remote_curve_registry_cache_key_t
+{
+  const dt_remote_curve_module_adapter_t *adapter;
+  int params_version;
+} dt_remote_curve_registry_cache_key_t;
+
 typedef struct dt_remote_curve_registry_cache_entry_t
 {
-  gboolean validated;       // TRUE once this adapter has been shape-checked
-  gboolean adapter_valid;   // TRUE iff every descriptor's shape was valid
-  gboolean *descriptor_valid; // owned; adapter->curve_count entries
+  gboolean adapter_valid; // TRUE iff every descriptor is valid for this version
 } dt_remote_curve_registry_cache_entry_t;
 
-static GHashTable *s_validation_cache = NULL; // adapter ptr -> cache entry ptr; never freed
-                                              // (process lifetime, like the
-                                              // static descriptors/adapters
-                                              // it caches results for)
+static GHashTable *s_validation_cache = NULL; // cache key -> aggregate result; never freed
+                                              // (process lifetime, like the static
+                                              // descriptors/adapters it caches results for)
+
+static guint validation_cache_key_hash(gconstpointer data)
+{
+  const dt_remote_curve_registry_cache_key_t *key = data;
+  return g_direct_hash((gpointer)key->adapter) ^ g_int_hash(&key->params_version);
+}
+
+static gboolean validation_cache_key_equal(gconstpointer left, gconstpointer right)
+{
+  const dt_remote_curve_registry_cache_key_t *a = left;
+  const dt_remote_curve_registry_cache_key_t *b = right;
+  return a->adapter == b->adapter && a->params_version == b->params_version;
+}
 
 static dt_remote_curve_registry_cache_entry_t *
-get_cache_entry(const dt_remote_curve_module_adapter_t *adapter)
+lookup_cache_entry(const dt_remote_curve_module_adapter_t *adapter, int params_version)
 {
   if(!s_validation_cache)
-    s_validation_cache = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s_validation_cache = g_hash_table_new_full(validation_cache_key_hash, validation_cache_key_equal,
+                                               g_free, g_free);
 
-  dt_remote_curve_registry_cache_entry_t *entry = g_hash_table_lookup(s_validation_cache, adapter);
-  if(!entry)
-  {
-    entry = g_new0(dt_remote_curve_registry_cache_entry_t, 1);
-    g_hash_table_insert(s_validation_cache, (gpointer)adapter, entry);
-  }
-  return entry;
+  const dt_remote_curve_registry_cache_key_t key = {
+    .adapter = adapter,
+    .params_version = params_version,
+  };
+  return g_hash_table_lookup(s_validation_cache, &key);
+}
+
+static void cache_validation_result(const dt_remote_curve_module_adapter_t *adapter,
+                                    int params_version,
+                                    gboolean adapter_valid)
+{
+  dt_remote_curve_registry_cache_key_t *key = g_new(dt_remote_curve_registry_cache_key_t, 1);
+  key->adapter = adapter;
+  key->params_version = params_version;
+
+  dt_remote_curve_registry_cache_entry_t *entry = g_new(dt_remote_curve_registry_cache_entry_t, 1);
+  entry->adapter_valid = adapter_valid;
+  g_hash_table_insert(s_validation_cache, key, entry);
 }
 
 static gboolean is_integer_or_enum_type(dt_introspection_type_t type)
@@ -416,30 +445,57 @@ static gboolean is_floating_type(dt_introspection_type_t type)
   return type == DT_INTROSPECTION_TYPE_FLOAT || type == DT_INTROSPECTION_TYPE_DOUBLE;
 }
 
-// Checks one descriptor's native layout against `root` (the module's whole
-// params struct field, DT_INTROSPECTION_TYPE_STRUCT) using the Task 4
-// cursor. `dummy_blob` is a zero-sized/dummy blob pointer purely to
-// satisfy dt_remote_path_resolve()'s signature -- only field-shape output
-// is consulted here, never the resolved pointer's pointee.
-static gboolean descriptor_shape_is_valid(const dt_remote_curve_descriptor_t *desc,
-                                          const dt_introspection_field_t *root,
-                                          void *dummy_blob)
+static gboolean predicate_is_valid(const dt_remote_parameter_predicate_t *predicate,
+                                   const dt_introspection_field_t *root,
+                                   void *dummy_blob)
 {
+  if(!predicate) return TRUE;
+
+  if(predicate->op != DT_REMOTE_PREDICATE_EQ && predicate->op != DT_REMOTE_PREDICATE_NE)
+    return FALSE;
+
+  dt_introspection_field_t *field = NULL;
+  if(!dt_introspection_get_child((dt_introspection_field_t *)root, dummy_blob,
+                                 predicate->field, &field)
+     || !field
+     || field->header.type != DT_INTROSPECTION_TYPE_ENUM
+     || !field->Enum.values)
+    return FALSE;
+
+  int unused_value = 0;
+  return dt_introspection_get_enum_value(field, predicate->enum_name, &unused_value);
+}
+
+// Checks one descriptor's native layout and optional predicates against
+// `root` (the module's whole params struct field,
+// DT_INTROSPECTION_TYPE_STRUCT). `dummy_blob` exists only to satisfy the
+// introspection cursor signatures; validation never reads its pointee.
+static gboolean descriptor_is_valid(const dt_remote_curve_descriptor_t *desc,
+                                    const dt_introspection_field_t *root,
+                                    void *dummy_blob)
+{
+  if(root->header.type != DT_INTROSPECTION_TYPE_STRUCT) return FALSE;
+
   const dt_introspection_field_t *nodes_field = NULL;
+  if(desc->native.nodes.length && !desc->native.nodes.segments) return FALSE;
   if(!dt_remote_path_resolve(&desc->native.nodes, root, dummy_blob, &nodes_field, NULL, NULL))
     return FALSE;
   if(nodes_field->header.type != DT_INTROSPECTION_TYPE_ARRAY
+     || nodes_field->Array.type != DT_INTROSPECTION_TYPE_STRUCT
      || !nodes_field->Array.field
-     || nodes_field->Array.field->header.type != DT_INTROSPECTION_TYPE_STRUCT)
+     || nodes_field->Array.field->header.type != DT_INTROSPECTION_TYPE_STRUCT
+     || nodes_field->Array.count < desc->maximum_points)
     return FALSE;
 
   const dt_introspection_field_t *count_field = NULL;
+  if(desc->native.count.length && !desc->native.count.segments) return FALSE;
   if(!dt_remote_path_resolve(&desc->native.count, root, dummy_blob, &count_field, NULL, NULL))
     return FALSE;
   if(!is_integer_or_enum_type(count_field->header.type))
     return FALSE;
 
   const dt_introspection_field_t *type_field = NULL;
+  if(desc->native.type.length && !desc->native.type.segments) return FALSE;
   if(!dt_remote_path_resolve(&desc->native.type, root, dummy_blob, &type_field, NULL, NULL))
     return FALSE;
   if(!is_integer_or_enum_type(type_field->header.type))
@@ -453,7 +509,20 @@ static gboolean descriptor_shape_is_valid(const dt_remote_curve_descriptor_t *de
   if(!x_ptr || !x_field || !is_floating_type(x_field->header.type)) return FALSE;
   if(!y_ptr || !y_field || !is_floating_type(y_field->header.type)) return FALSE;
 
-  return TRUE;
+  if(desc->native.internal_version.length)
+  {
+    if(!desc->native.internal_version.segments) return FALSE;
+
+    const dt_introspection_field_t *internal_version_field = NULL;
+    if(!dt_remote_path_resolve(&desc->native.internal_version, root, dummy_blob,
+                               &internal_version_field, NULL, NULL)
+       || !is_integer_or_enum_type(internal_version_field->header.type))
+      return FALSE;
+  }
+
+  return predicate_is_valid(desc->active_when, root, dummy_blob)
+         && predicate_is_valid(desc->writable_when, root, dummy_blob)
+         && predicate_is_valid(desc->periodic_when, root, dummy_blob);
 }
 
 gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_t *adapter,
@@ -469,31 +538,28 @@ gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_
     return FALSE;
   }
 
-  dt_remote_curve_registry_cache_entry_t *cache = get_cache_entry(adapter);
-  if(cache->validated)
+  dt_remote_curve_registry_cache_entry_t *cache =
+    lookup_cache_entry(adapter, introspection->params_version);
+  if(cache)
   {
     if(!cache->adapter_valid && error)
       *error = dt_remote_curve_registry_error_new(
         DT_REMOTE_ERR_INTERNAL,
-        _("curve adapter '%s' has one or more descriptors whose native layout does not match introspection"),
-        adapter->operation ? adapter->operation : "");
+        _("curve adapter '%s' has one or more descriptors that do not match introspection version %d"),
+        adapter->operation ? adapter->operation : "", introspection->params_version);
     return cache->adapter_valid;
   }
-
-  cache->descriptor_valid = g_new0(gboolean, adapter->curve_count);
 
   guint8 dummy_byte = 0;
   gboolean all_valid = TRUE;
   const char *first_failure = NULL;
 
-  // Every descriptor is checked -- a shape mismatch on one never stops the
-  // rest of the adapter's descriptors from being checked (and cached)
-  // too; see the header comment on this function.
+  // Check every descriptor before caching the one aggregate result. Any
+  // mismatch disables the whole adapter/version pair.
   for(guint i = 0; i < adapter->curve_count; i++)
   {
     const dt_remote_curve_descriptor_t *desc = &adapter->curves[i];
-    const gboolean ok = descriptor_shape_is_valid(desc, introspection->field, &dummy_byte);
-    cache->descriptor_valid[i] = ok;
+    const gboolean ok = descriptor_is_valid(desc, introspection->field, &dummy_byte);
     if(!ok)
     {
       all_valid = FALSE;
@@ -501,31 +567,18 @@ gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_
     }
   }
 
-  cache->validated = TRUE;
-  cache->adapter_valid = all_valid;
+  cache_validation_result(adapter, introspection->params_version, all_valid);
 
   if(!all_valid)
   {
     if(error)
       *error = dt_remote_curve_registry_error_new(
         DT_REMOTE_ERR_INTERNAL,
-        _("curve descriptor '%s' native layout does not match introspection"),
-        first_failure ? first_failure : "");
+        _("curve descriptor '%s' does not match introspection version %d"),
+        first_failure ? first_failure : "", introspection->params_version);
     return FALSE;
   }
   return TRUE;
-}
-
-// Whether descriptor `index` on `adapter` passed its shape check.
-// dt_remote_curve_registry_validate() must already have been run for
-// `adapter` (list_schema/read_values below always do this first); if it
-// has not, this conservatively reports "invalid" rather than serving an
-// unvalidated descriptor.
-static gboolean descriptor_is_valid_cached(const dt_remote_curve_module_adapter_t *adapter, guint index)
-{
-  dt_remote_curve_registry_cache_entry_t *cache = get_cache_entry(adapter);
-  if(!cache->validated || !cache->descriptor_valid) return FALSE;
-  return cache->descriptor_valid[index];
 }
 
 /* ---------------------------------------------------------------------- */
@@ -577,13 +630,16 @@ gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
   }
 
   dt_remote_error_t *validate_error = NULL;
-  dt_remote_curve_registry_validate(adapter, intro, &validate_error);
-  if(validate_error) dt_remote_error_free(validate_error); // per-descriptor cache below is authoritative
+  const gboolean adapter_valid = dt_remote_curve_registry_validate(adapter, intro, &validate_error);
+  if(validate_error) dt_remote_error_free(validate_error);
+  if(!adapter_valid)
+  {
+    *out = result;
+    return TRUE;
+  }
 
   for(guint i = 0; i < adapter->curve_count; i++)
   {
-    if(!descriptor_is_valid_cached(adapter, i)) continue;
-
     const dt_remote_curve_descriptor_t *desc = &adapter->curves[i];
     dt_remote_curve_schema_t *schema = g_new0(dt_remote_curve_schema_t, 1);
 
@@ -744,15 +800,18 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
   }
 
   dt_remote_error_t *validate_error = NULL;
-  dt_remote_curve_registry_validate(adapter, intro, &validate_error);
-  if(validate_error) dt_remote_error_free(validate_error); // per-descriptor cache below is authoritative
+  const gboolean adapter_valid = dt_remote_curve_registry_validate(adapter, intro, &validate_error);
+  if(validate_error) dt_remote_error_free(validate_error);
+  if(!adapter_valid)
+  {
+    *out = result;
+    return TRUE;
+  }
 
   void *params_blob = (void *)params;
 
   for(guint i = 0; i < adapter->curve_count; i++)
   {
-    if(!descriptor_is_valid_cached(adapter, i)) continue;
-
     const dt_remote_curve_descriptor_t *desc = &adapter->curves[i];
 
     gboolean active = TRUE;
