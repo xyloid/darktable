@@ -49,6 +49,7 @@
 
 #include "common/darktable.h"
 #include "control/remote_edit.h"
+#include "control/remote_parameters.h"
 #include "control/remote_protocol.h"
 #include "control/remote_server.h"  // session/pending definitions + the real
                                     // async lifecycle, for the finish_preview
@@ -617,6 +618,154 @@ static gboolean stub_set_module_params_must_not_be_called(const dt_remote_module
   (void)out;
   (void)error;
   fail_msg("set_module_params engine call must not be reached for a request the handler rejects");
+  return FALSE;
+}
+
+/* --- set_module_params semantic curve stubs (milestone 2 Task 9) -------- */
+
+// The set handler resolves scalar values through the *primitive* schema
+// seam, and every semantic curve request here carries empty scalar values --
+// a minimal fieldless primitive schema is the honest stub.
+static gboolean stub_get_module_primitive_schema_rgbcurve(const char *op,
+                                                          dt_remote_module_schema_t **out,
+                                                          dt_remote_error_t **error)
+{
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup(op);
+  schema->display_name = g_strdup("rgb curve");
+  schema->params_version = 1;
+  schema->supports_multiple_instances = TRUE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+  *out = schema;
+  return TRUE;
+}
+
+// The four points of the curve-design SS Mutation request example, shared
+// between the request-decode assertions and the canned read-back result.
+static const dt_remote_curve_point_t CURVE_MUTATION_POINTS[] = {
+  { 0.0, 0.0 }, { 0.25, 0.18 }, { 0.75, 0.82 }, { 1.0, 1.0 }
+};
+
+static dt_remote_curve_value_t *_make_written_master_curve_value(void)
+{
+  dt_remote_curve_value_t *value = g_new0(dt_remote_curve_value_t, 1);
+  value->name = g_strdup("curve.master");
+  value->points = g_array_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t));
+  g_array_append_vals(value->points, CURVE_MUTATION_POINTS, G_N_ELEMENTS(CURVE_MUTATION_POINTS));
+  value->interpolation = DT_REMOTE_CURVE_MONOTONE_HERMITE;
+  value->active = TRUE;
+  value->effective = TRUE;
+  value->writable_now = TRUE;
+  return value;
+}
+
+// Success stub for the curve mutation wire-contract example: asserts the
+// handler decoded semantic_values into exactly the neutral semantic patch
+// the engine must receive (one curve entry, four points, explicit
+// interpolation, no scalar entries), then answers with a canned "read back
+// from projected state" result matching set_module_params_curve_response.json.
+static gboolean stub_set_module_params_curve_master(const dt_remote_module_ref_t *ref,
+                                                    const dt_remote_patch_t *patch,
+                                                    const uint64_t *expected_revision,
+                                                    dt_remote_mutation_result_t **out,
+                                                    dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "rgbcurve");
+  assert_int_equal(ref->instance, 0);
+
+  assert_non_null(patch);
+  assert_true(!patch->scalar_values || patch->scalar_values->len == 0);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_CURVE);
+  assert_string_equal(semantic->value.curve.name, "curve.master");
+  assert_non_null(semantic->value.curve.points);
+  assert_int_equal(semantic->value.curve.points->len, G_N_ELEMENTS(CURVE_MUTATION_POINTS));
+  for(guint i = 0; i < G_N_ELEMENTS(CURVE_MUTATION_POINTS); i++)
+  {
+    const dt_remote_curve_point_t p =
+      g_array_index(semantic->value.curve.points, dt_remote_curve_point_t, i);
+    assert_float_equal(p.x, CURVE_MUTATION_POINTS[i].x, 1e-12);
+    assert_float_equal(p.y, CURVE_MUTATION_POINTS[i].y, 1e-12);
+  }
+  assert_true(semantic->value.curve.has_interpolation);
+  assert_int_equal(semantic->value.curve.interpolation, DT_REMOTE_CURVE_MONOTONE_HERMITE);
+
+  assert_non_null(expected_revision);
+  assert_int_equal((int)*expected_revision, 31);
+  assert_true(patch->has_enable);
+  assert_true(patch->enable);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup("rgbcurve");
+  result->instance = 0;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->semantic_values =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)dt_remote_curve_value_free);
+  g_hash_table_insert(result->semantic_values, g_strdup("curve.master"),
+                      _make_written_master_curve_value());
+  result->revision = 32;
+
+  *out = result;
+  return TRUE;
+}
+
+// Engine-produced validator rejection (curve design SS Validation algorithm
+// item 6): the parse layer forwards the two-point patch, the engine answers
+// invalid_value with the structured details object the validator attaches --
+// the dispatcher must map details_json onto the wire "details" member.
+static gboolean stub_set_module_params_curve_invalid_spacing(const dt_remote_module_ref_t *ref,
+                                                             const dt_remote_patch_t *patch,
+                                                             const uint64_t *expected_revision,
+                                                             dt_remote_mutation_result_t **out,
+                                                             dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)expected_revision;
+  (void)out;
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->value.curve.points->len, 2);
+  assert_false(semantic->value.curve.has_interpolation);
+
+  if(error)
+  {
+    *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE,
+                         g_strdup("curve 'curve.master' points 0 and 1 are 0.002 apart; "
+                                  "minimum is 0.0025"));
+    (*error)->details_json =
+      g_strdup("{\"parameter\":\"curve.master\",\"point_index\":1,\"constraint\":\"adjacent_spacing\"}");
+  }
+  return FALSE;
+}
+
+// Unknown semantic IDs are an engine rejection, not a parse rejection: the
+// protocol layer has no descriptor knowledge, so "curve.alpha" must reach
+// the engine and come back as unknown_field.
+static gboolean stub_set_module_params_curve_unknown_id(const dt_remote_module_ref_t *ref,
+                                                        const dt_remote_patch_t *patch,
+                                                        const uint64_t *expected_revision,
+                                                        dt_remote_mutation_result_t **out,
+                                                        dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)expected_revision;
+  (void)out;
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_string_equal(semantic->value.curve.name, "curve.alpha");
+
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_UNKNOWN_FIELD,
+                         g_strdup("unknown semantic curve 'curve.alpha'"));
   return FALSE;
 }
 
@@ -1301,6 +1450,165 @@ static void test_set_module_params_error_unknown_instance(void **state)
     "{\"id\":43,\"method\":\"set_module_params\","
     "\"params\":{\"module\":\"exposure\",\"instance\":3,\"values\":{\"exposure\":0.5}}}",
     "unknown_instance");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- set_module_params semantic_values (milestone 2 Task 9) ------------- */
+
+// The curve-design SS Mutation request example round trip: the request
+// fixture (empty scalar values, one semantic curve entry) is decoded into
+// the exact neutral patch (stub-asserted), and the stub's read-back result
+// serializes semantic_values into the exact response fixture.
+static void test_set_module_params_curve_success(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_curve_master,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_curve_request.json",
+                           "set_module_params_curve_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// The validator's structured details (parameter/point_index/constraint) must
+// survive onto the wire error envelope.
+static void test_set_module_params_curve_error_invalid_spacing(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_curve_invalid_spacing,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_curve_invalid_spacing_request.json",
+                           "set_module_params_error_curve_invalid_spacing_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_params_curve_error_unknown_id(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_curve_unknown_id,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_curve_unknown_id_request.json",
+                           "set_module_params_error_curve_unknown_id_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// Parse-layer semantic_values shape rejections (curve design
+// SS Serialization rules): every one must leave the engine untouched --
+// whole-patch atomicity starts at the protocol boundary.
+static void test_set_module_params_semantic_bad_shapes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // semantic_values not an object
+  _assert_inline_error(
+    "{\"id\":50,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},\"semantic_values\":3}}",
+    "invalid_value");
+  // semantic_values empty: with values also empty, nothing changes state
+  _assert_inline_error(
+    "{\"id\":51,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},\"semantic_values\":{}}}",
+    "invalid_value");
+  // entry not an object
+  _assert_inline_error(
+    "{\"id\":52,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":7}}}",
+    "invalid_value");
+  // class is required
+  _assert_inline_error(
+    "{\"id\":53,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0}]}}}}",
+    "invalid_value");
+  // unsupported class name
+  _assert_inline_error(
+    "{\"id\":54,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"levels\","
+    "\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0}]}}}}",
+    "invalid_value");
+  // points is required
+  _assert_inline_error(
+    "{\"id\":55,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\"}}}}",
+    "invalid_value");
+  // points must be an array
+  _assert_inline_error(
+    "{\"id\":56,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\",\"points\":true}}}}",
+    "invalid_value");
+  // point object missing y
+  _assert_inline_error(
+    "{\"id\":57,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\",\"points\":[{\"x\":0.5}]}}}}",
+    "invalid_value");
+  // point object with a member beyond exactly {x, y}
+  _assert_inline_error(
+    "{\"id\":58,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":0.0,\"y\":0.0,\"z\":0.0},{\"x\":1.0,\"y\":1.0}]}}}}",
+    "invalid_value");
+  // non-finite coordinate (1e400 overflows to +Inf on parse)
+  _assert_inline_error(
+    "{\"id\":59,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":1e400,\"y\":0.0},{\"x\":1.0,\"y\":1.0}]}}}}",
+    "invalid_value");
+  // non-numeric coordinate
+  _assert_inline_error(
+    "{\"id\":60,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":\"left\",\"y\":0.0},{\"x\":1.0,\"y\":1.0}]}}}}",
+    "invalid_value");
+  // unknown entry member
+  _assert_inline_error(
+    "{\"id\":61,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0}],\"smoothing\":1}}}}",
+    "invalid_value");
+  // unknown interpolation name
+  _assert_inline_error(
+    "{\"id\":62,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0}],"
+    "\"interpolation\":\"QUADRATIC\"}}}}",
+    "invalid_value");
+
+  // request-size cap: 65 points is rejected before the engine (the
+  // per-descriptor maximum_points bound is the engine's business; this is
+  // the protocol layer's flat pre-engine limit of 64)
+  GString *oversized = g_string_new(
+    "{\"id\":63,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"curve.master\":{\"class\":\"curve\",\"points\":[");
+  for(int i = 0; i < 65; i++)
+    g_string_append_printf(oversized, "%s{\"x\":%.6f,\"y\":0.5}", i ? "," : "", i / 64.0);
+  g_string_append(oversized, "]}}}}");
+  _assert_inline_error(oversized->str, "invalid_value");
+  g_string_free(oversized, TRUE);
+
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -3138,6 +3446,10 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_error_bad_shapes),
     cmocka_unit_test(test_set_module_params_error_unknown_module),
     cmocka_unit_test(test_set_module_params_error_unknown_instance),
+    cmocka_unit_test(test_set_module_params_curve_success),
+    cmocka_unit_test(test_set_module_params_curve_error_invalid_spacing),
+    cmocka_unit_test(test_set_module_params_curve_error_unknown_id),
+    cmocka_unit_test(test_set_module_params_semantic_bad_shapes),
 
     cmocka_unit_test(test_set_module_enabled_success),
     cmocka_unit_test(test_set_module_enabled_error_revision_conflict),

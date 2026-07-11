@@ -1,0 +1,18 @@
+{
+  "id": 41,
+  "method": "set_module_params",
+  "params": {
+    "module": "rgbcurve",
+    "instance": 0,
+    "values": {},
+    "semantic_values": {
+      "curve.master": {
+        "class": "curve",
+        "points": [
+          { "x": 0.5, "y": 0.4 },
+          { "x": 0.502, "y": 0.6 }
+        ]
+      }
+    }
+  }
+}

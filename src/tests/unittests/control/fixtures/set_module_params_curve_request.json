@@ -1,0 +1,23 @@
+{
+  "id": 40,
+  "method": "set_module_params",
+  "params": {
+    "module": "rgbcurve",
+    "instance": 0,
+    "values": {},
+    "semantic_values": {
+      "curve.master": {
+        "class": "curve",
+        "points": [
+          { "x": 0.0, "y": 0.0 },
+          { "x": 0.25, "y": 0.18 },
+          { "x": 0.75, "y": 0.82 },
+          { "x": 1.0, "y": 1.0 }
+        ],
+        "interpolation": "MONOTONE_HERMITE"
+      }
+    },
+    "expected_revision": 31,
+    "enable": true
+  }
+}

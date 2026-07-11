@@ -262,6 +262,10 @@ typedef struct dt_remote_mutation_result_t
   gboolean enabled;
   GPtrArray *values;            // dt_remote_patch_entry_t, read back; NULL
                                 // for enable/create (no values on the wire)
+  GHashTable *semantic_values;  // name -> dt_remote_curve_value_t
+                                // (remote_parameters.h), read back for exactly
+                                // the semantic IDs the patch wrote; NULL when
+                                // the patch carried no semantic entries
   uint64_t revision;
 } dt_remote_mutation_result_t;
 

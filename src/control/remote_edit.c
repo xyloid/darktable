@@ -144,6 +144,7 @@ void dt_remote_mutation_result_free(dt_remote_mutation_result_t *result)
   g_free(result->op);
   g_free(result->instance_name);
   if(result->values) g_ptr_array_unref(result->values);
+  if(result->semantic_values) g_hash_table_unref(result->semantic_values);
   g_free(result);
 }
 
@@ -995,6 +996,51 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
     return FALSE;
   }
 
+  // Semantic read-back happens against the projected block, before the
+  // commit: projected and post-commit params are byte-identical (the memcpy
+  // below), and reading here means a read failure (registry drift racing
+  // the transaction) still aborts with live state untouched. Restricted to
+  // exactly the semantic IDs the patch wrote -- the same rule the scalar
+  // read-back loop below applies to field names.
+  GHashTable *semantic_readback = NULL;
+  if(patch->semantic_values && patch->semantic_values->len > 0)
+  {
+    if(!dt_remote_curve_read_values(module, temp_params, &semantic_readback, error))
+    {
+      g_free(temp_params);
+      return FALSE;
+    }
+
+    GHashTableIter it;
+    gpointer key = NULL;
+    g_hash_table_iter_init(&it, semantic_readback);
+    while(g_hash_table_iter_next(&it, &key, NULL))
+    {
+      gboolean written = FALSE;
+      for(guint i = 0; !written && i < patch->semantic_values->len; i++)
+      {
+        const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+        written = semantic && semantic->class_id == DT_REMOTE_PARAMETER_CURVE
+                  && !g_strcmp0(semantic->value.curve.name, key);
+      }
+      if(!written) g_hash_table_iter_remove(&it);
+    }
+
+    // apply_patch just resolved every requested ID against the same
+    // registry -- an entry missing from the read is drift between the two
+    // calls, and the wire contract promises read-back for every written
+    // entry, so fail the whole transaction rather than answer partially.
+    if(g_hash_table_size(semantic_readback) != patch->semantic_values->len)
+    {
+      g_hash_table_unref(semantic_readback);
+      g_free(temp_params);
+      if(error)
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("semantic read-back is missing a written entry"));
+      return FALSE;
+    }
+  }
+
   // Step 8: copy the validated block to live params, and apply the
   // enable/disable tri-state in the same transaction -- parameters never
   // implicitly enable a disabled module (plan step 7's binding rule).
@@ -1061,6 +1107,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
     entry->value = value;
     g_ptr_array_add(result->values, entry);
   }
+  result->semantic_values = semantic_readback;
   result->revision = new_revision;
 
   *out = result;

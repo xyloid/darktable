@@ -1,0 +1,9 @@
+{
+  "id": 42,
+  "ok": false,
+  "error": {
+    "code": "unknown_field",
+    "message": "unknown semantic curve 'curve.alpha'",
+    "retryable": false
+  }
+}

@@ -21,6 +21,7 @@
 #include "common/darktable.h"  // for the _() gettext macro
 #include "control/jobs.h"           // DT_JOB_QUEUE_SYSTEM_BG render job
 #include "control/remote_frame.h"   // DT_REMOTE_MAX_FRAME (proactive size check)
+#include "control/remote_parameters.h" // semantic curve schema/value types (milestone 2)
 #include "control/remote_server.h"  // dt_remote_async_* (production async table)
 
 #include <math.h>
@@ -352,6 +353,58 @@ static JsonNode *_field_to_json(const dt_remote_field_t *f)
   return node;
 }
 
+/* ---------------------------------------------------------------------- */
+/* semantic curve schema/value -> JSON (milestone 2; wire shapes are the   */
+/* curve-classes design doc's SS Schema response / SS Value response)      */
+/* ---------------------------------------------------------------------- */
+
+static const char *_interpolation_name(dt_remote_curve_interpolation_t interpolation)
+{
+  switch(interpolation)
+  {
+    case DT_REMOTE_CURVE_CUBIC_SPLINE: return "CUBIC_SPLINE";
+    case DT_REMOTE_CURVE_CATMULL_ROM: return "CATMULL_ROM";
+    case DT_REMOTE_CURVE_MONOTONE_HERMITE: return "MONOTONE_HERMITE";
+    default: return "";  // unreachable; keep the builder well-formed
+  }
+}
+
+static JsonNode *_curve_value_to_json(const dt_remote_curve_value_t *v)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "curve");
+  json_builder_set_member_name(b, "active");
+  json_builder_add_boolean_value(b, v->active);
+  json_builder_set_member_name(b, "effective");
+  json_builder_add_boolean_value(b, v->effective);
+  json_builder_set_member_name(b, "writable_now");
+  json_builder_add_boolean_value(b, v->writable_now);
+
+  json_builder_set_member_name(b, "points");
+  json_builder_begin_array(b);
+  for(guint i = 0; v->points && i < v->points->len; i++)
+  {
+    const dt_remote_curve_point_t *p = &g_array_index(v->points, dt_remote_curve_point_t, i);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "x");
+    json_builder_add_double_value(b, p->x);
+    json_builder_set_member_name(b, "y");
+    json_builder_add_double_value(b, p->y);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+
+  json_builder_set_member_name(b, "interpolation");
+  json_builder_add_string_value(b, _interpolation_name(v->interpolation));
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
 /* ---------------------------------------------------------------------- */
 /* method handlers                                                         */
 /* ---------------------------------------------------------------------- */
@@ -804,8 +857,196 @@ bad_type:
   return FALSE;
 }
 
+// The inverse of _interpolation_name(): one wire interpolation name (curve
+// design SS Serialization rules: stable uppercase ASCII identifiers) back to
+// the neutral enum. FALSE for anything else.
+static gboolean _interpolation_from_name(const char *name, dt_remote_curve_interpolation_t *out)
+{
+  if(!g_strcmp0(name, "CUBIC_SPLINE")) { *out = DT_REMOTE_CURVE_CUBIC_SPLINE; return TRUE; }
+  if(!g_strcmp0(name, "CATMULL_ROM")) { *out = DT_REMOTE_CURVE_CATMULL_ROM; return TRUE; }
+  if(!g_strcmp0(name, "MONOTONE_HERMITE")) { *out = DT_REMOTE_CURVE_MONOTONE_HERMITE; return TRUE; }
+  return FALSE;
+}
+
+// A curve point coordinate: a JSON number (double or integer spelling), and
+// finite after parse -- 1e400-style overflow to +/-Inf is rejected here
+// rather than handed to the engine.
+static gboolean _node_to_finite_double(JsonNode *node, double *out)
+{
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)) return FALSE;
+  const GType type = json_node_get_value_type(node);
+  if(type != G_TYPE_DOUBLE && type != G_TYPE_INT64) return FALSE;
+  const double value = json_node_get_double(node);
+  if(!isfinite(value)) return FALSE;
+  *out = value;
+  return TRUE;
+}
+
+// Flat pre-engine cap on points per semantic_values entry: request-size
+// hygiene only -- the per-descriptor maximum_points bound (20 for rgbcurve)
+// is the engine validator's business.
+#define DT_REMOTE_CURVE_WIRE_POINT_CAP 64
+
+// Parses the optional "semantic_values" request member into a GPtrArray of
+// dt_remote_semantic_patch_t (curve design SS Mutation request /
+// SS Serialization rules): entries are objects with exactly
+// {class, points[, interpolation]}, class must be "curve", points are
+// objects with exactly {x, y}, both finite numbers. Duplicate semantic IDs
+// cannot survive to this point -- JsonObject keys are already unique.
+// Absent member: *out stays NULL, returns TRUE. Any violation: FALSE with
+// *err set and *out NULL -- the engine is never reached with a partially
+// parsed patch.
+static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_remote_error_t **err)
+{
+  *out = NULL;
+  if(!params || !json_object_has_member(params, "semantic_values")) return TRUE;
+
+  JsonNode *node = json_object_get_member(params, "semantic_values");
+  if(!node || !JSON_NODE_HOLDS_OBJECT(node))
+  {
+    if(err) *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'semantic_values' must be an object"));
+    return FALSE;
+  }
+  JsonObject *obj = json_node_get_object(node);
+  GList *keys = json_object_get_members(obj);
+  if(!keys)
+  {
+    if(err) *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'semantic_values' must be non-empty"));
+    return FALSE;
+  }
+
+  GPtrArray *patches = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  dt_remote_error_t *entry_err = NULL;
+  for(GList *k = keys; k && !entry_err; k = k->next)
+  {
+    const char *name = k->data;
+    JsonNode *entry_node = json_object_get_member(obj, name);
+    if(!entry_node || !JSON_NODE_HOLDS_OBJECT(entry_node))
+    {
+      entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                             _("semantic value '%s' must be an object"), name);
+      break;
+    }
+    JsonObject *entry = json_node_get_object(entry_node);
+
+    // strict member set: exactly class + points, optionally interpolation
+    GList *members = json_object_get_members(entry);
+    for(GList *m = members; m && !entry_err; m = m->next)
+      if(g_strcmp0(m->data, "class") && g_strcmp0(m->data, "points")
+         && g_strcmp0(m->data, "interpolation"))
+        entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                               _("unknown member '%s' in semantic value '%s'"),
+                               (const char *)m->data, name);
+    g_list_free(members);
+    if(entry_err) break;
+
+    // class is required in mutation values -- curve design SS Serialization
+    // rules ("to prevent future ambiguous shapes"); "curve" is the only v1
+    // writable class.
+    JsonNode *class_node = json_object_get_member(entry, "class");
+    const char *class_name =
+      (class_node && JSON_NODE_HOLDS_VALUE(class_node)
+       && json_node_get_value_type(class_node) == G_TYPE_STRING)
+        ? json_node_get_string(class_node) : NULL;
+    if(!class_name)
+    {
+      entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                             _("semantic value '%s' requires a string 'class' member"), name);
+      break;
+    }
+    if(g_strcmp0(class_name, "curve"))
+    {
+      entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                             _("unsupported class '%s' for semantic value '%s'"), class_name, name);
+      break;
+    }
+
+    JsonNode *points_node = json_object_get_member(entry, "points");
+    if(!points_node || !JSON_NODE_HOLDS_ARRAY(points_node))
+    {
+      entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                             _("semantic value '%s' requires a 'points' array"), name);
+      break;
+    }
+    JsonArray *points_array = json_node_get_array(points_node);
+    const guint n_points = json_array_get_length(points_array);
+    if(n_points > DT_REMOTE_CURVE_WIRE_POINT_CAP)
+    {
+      entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                             _("semantic value '%s' has %u points; the request limit is %d"),
+                             name, n_points, DT_REMOTE_CURVE_WIRE_POINT_CAP);
+      break;
+    }
+
+    GArray *points = g_array_sized_new(FALSE, FALSE, sizeof(dt_remote_curve_point_t), n_points);
+    for(guint i = 0; i < n_points && !entry_err; i++)
+    {
+      JsonNode *point_node = json_array_get_element(points_array, i);
+      JsonObject *point =
+        (point_node && JSON_NODE_HOLDS_OBJECT(point_node)) ? json_node_get_object(point_node) : NULL;
+      dt_remote_curve_point_t p = { 0 };
+      // curve design SS Serialization rules: "curve point objects require
+      // exactly x and y" -- a size-2 object with both members present has
+      // no room for anything else.
+      const gboolean ok = point && json_object_get_size(point) == 2
+                          && _node_to_finite_double(json_object_get_member(point, "x"), &p.x)
+                          && _node_to_finite_double(json_object_get_member(point, "y"), &p.y);
+      if(!ok)
+        entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                               _("point %u of semantic value '%s' must be an object with exactly "
+                                 "finite numeric 'x' and 'y'"), i, name);
+      else
+        g_array_append_val(points, p);
+    }
+    if(entry_err)
+    {
+      g_array_unref(points);
+      break;
+    }
+
+    gboolean has_interpolation = FALSE;
+    dt_remote_curve_interpolation_t interpolation = DT_REMOTE_CURVE_CUBIC_SPLINE;
+    if(json_object_has_member(entry, "interpolation"))
+    {
+      JsonNode *interp_node = json_object_get_member(entry, "interpolation");
+      const char *interp_name =
+        (interp_node && JSON_NODE_HOLDS_VALUE(interp_node)
+         && json_node_get_value_type(interp_node) == G_TYPE_STRING)
+          ? json_node_get_string(interp_node) : NULL;
+      if(!interp_name || !_interpolation_from_name(interp_name, &interpolation))
+      {
+        entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                               _("unknown interpolation for semantic value '%s'"), name);
+        g_array_unref(points);
+        break;
+      }
+      has_interpolation = TRUE;
+    }
+
+    dt_remote_semantic_patch_t *semantic = g_malloc0(sizeof(dt_remote_semantic_patch_t));
+    semantic->class_id = DT_REMOTE_PARAMETER_CURVE;
+    semantic->value.curve.name = g_strdup(name);
+    semantic->value.curve.points = points;
+    semantic->value.curve.has_interpolation = has_interpolation;
+    semantic->value.curve.interpolation = interpolation;
+    g_ptr_array_add(patches, semantic);
+  }
+  g_list_free(keys);
+
+  if(entry_err)
+  {
+    g_ptr_array_unref(patches);
+    if(err) *err = entry_err;
+    else dt_remote_error_free(entry_err);
+    return FALSE;
+  }
+
+  *out = patches;
+  return TRUE;
+}
+
 static const char *const SET_MODULE_PARAMS_KEYS[] =
-  { "module", "instance", "values", "expected_revision", "enable", NULL };
+  { "module", "instance", "values", "semantic_values", "expected_revision", "enable", NULL };
 
 static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_session_t *session,
                                             dt_remote_pending_t *pending)
@@ -832,8 +1073,17 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   if(!values_node || !JSON_NODE_HOLDS_OBJECT(values_node))
     return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'values' must be an object")));
   JsonObject *values_obj = json_node_get_object(values_node);
+
+  // Optional semantic_values (milestone 2 Task 9): fully validated before
+  // any engine work -- and before the "values must be non-empty" rule,
+  // which relaxes to "at least one of values/semantic_values" when a
+  // semantic patch is present (curve design SS Mutation request). Requests
+  // without the member keep today's behavior exactly.
+  GPtrArray *semantic_patches = NULL;
+  if(!_parse_semantic_values(params, &semantic_patches, &err)) return _handler_fail(err);
+
   GList *value_keys = json_object_get_members(values_obj);
-  if(!value_keys)
+  if(!value_keys && !semantic_patches)
     return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'values' must be non-empty")));
 
   gboolean have_expected_revision = FALSE;
@@ -843,11 +1093,13 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
     if(!_require_int(params, "expected_revision", &expected_revision, &err))
     {
       g_list_free(value_keys);
+      if(semantic_patches) g_ptr_array_unref(semantic_patches);
       return _handler_fail(err);
     }
     if(expected_revision < 0)
     {
       g_list_free(value_keys);
+      if(semantic_patches) g_ptr_array_unref(semantic_patches);
       return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
                                       _("'expected_revision' must not be negative")));
     }
@@ -863,6 +1115,7 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
        || json_node_get_value_type(enable_node) != G_TYPE_BOOLEAN)
     {
       g_list_free(value_keys);
+      if(semantic_patches) g_ptr_array_unref(semantic_patches);
       return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("parameter 'enable' must be a boolean")));
     }
     enable_value = json_node_get_boolean(enable_node);
@@ -877,11 +1130,13 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   if(!s_calls.get_module_primitive_schema(module, &schema, &err))
   {
     g_list_free(value_keys);
+    if(semantic_patches) g_ptr_array_unref(semantic_patches);
     return _handler_fail(err);
   }
 
   dt_remote_patch_t patch = { 0 };
   patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  patch.semantic_values = semantic_patches;  // may be NULL
   patch.has_enable = have_enable;
   patch.enable = enable_value;
 
@@ -919,6 +1174,7 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   if(convert_err)
   {
     g_ptr_array_unref(patch.scalar_values);
+    if(patch.semantic_values) g_ptr_array_unref(patch.semantic_values);
     return _handler_fail(convert_err);
   }
 
@@ -929,6 +1185,7 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   gboolean ok = s_calls.set_module_params(&ref, &patch, have_expected_revision ? &expected_u64 : NULL,
                                           &result, &err);
   g_ptr_array_unref(patch.scalar_values);
+  if(patch.semantic_values) g_ptr_array_unref(patch.semantic_values);
 
   if(!ok) return _handler_fail(err);
 
@@ -950,6 +1207,22 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
       json_builder_add_value(b, _value_to_json(&e->value));
     }
   json_builder_end_object(b);
+  // Read-back for every semantic entry the patch wrote (curve design
+  // SS Mutation request); requests without semantic_values emit no member,
+  // byte-identical to today. Keys sorted, like get_module_params.
+  if(result->semantic_values && g_hash_table_size(result->semantic_values) > 0)
+  {
+    json_builder_set_member_name(b, "semantic_values");
+    json_builder_begin_object(b);
+    GList *keys = g_list_sort(g_hash_table_get_keys(result->semantic_values), (GCompareFunc)g_strcmp0);
+    for(GList *k = keys; k; k = k->next)
+    {
+      json_builder_set_member_name(b, k->data);
+      json_builder_add_value(b, _curve_value_to_json(g_hash_table_lookup(result->semantic_values, k->data)));
+    }
+    g_list_free(keys);
+    json_builder_end_object(b);
+  }
   json_builder_set_member_name(b, "revision");
   json_builder_add_int_value(b, (gint64)result->revision);
   json_builder_end_object(b);

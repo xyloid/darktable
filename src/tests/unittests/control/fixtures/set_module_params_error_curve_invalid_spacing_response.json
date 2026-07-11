@@ -1,0 +1,14 @@
+{
+  "id": 41,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "curve 'curve.master' points 0 and 1 are 0.002 apart; minimum is 0.0025",
+    "details": {
+      "parameter": "curve.master",
+      "point_index": 1,
+      "constraint": "adjacent_spacing"
+    },
+    "retryable": false
+  }
+}
