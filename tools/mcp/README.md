@@ -15,6 +15,8 @@ the current edit state as native MCP image content.
 control, how to point an MCP host at darktable (with a `mcpServers` config
 snippet), where discovery records live on each platform, how multiple
 instances are selected, the security model, and the versioning policy.
+For a command-by-command source build and Claude Code setup on Ubuntu, use
+[`docs/ubuntu-claude-code-setup.md`](docs/ubuntu-claude-code-setup.md).
 
 This is the sidecar for plan step 5 of
 `docs/superpowers/plans/2026-07-05-darktable-mcp-implementation-plan.md`.
@@ -52,25 +54,25 @@ one adapter layer on top.
 | `get_history` | `get_history` | the active edit-history stack (metadata only, no param blobs) |
 | `undo` | `undo` | compare-and-undo the last change (requires `expected_revision`) |
 | `render_preview` | `render_preview` | bounded JPEG preview of the current edit, as native image content |
+| `get_scopes` | `compute_scopes` | histogram summaries/bins plus waveform, parade, and vectorscope images |
 
-All ten require darktable to be running with
+All eleven require darktable to be running with
 `security/enable_remote_control` set to true. The darkroom-scoped tools
 (everything except `get_current_image`) fail with a `not_in_darkroom` or
 `no_image_open` error (surfaced as an MCP tool error with an actionable
 hint, see `errors.py`) unless an image is currently open in the darkroom.
 
-The four read tools (`get_current_image`, `list_modules`,
-`get_module_schema`, `get_module_params`) never change the edit, and
-neither does `render_preview` (it renders server-side on a background job
-and returns the JPEG as an MCP image content block -- never base64 text
-for the model; `max_px` is clamped to [64, 2048], `quality` to [50, 95],
-and a `request_too_large` error means retry with a smaller `max_px`). The
+The state/schema reads, `get_history`, `render_preview`, and `get_scopes`
+never change the edit. `render_preview` runs server-side on a background job
+and returns the JPEG as an MCP image content block -- never base64 text for
+the model; `max_px` is clamped to [64, 2048], `quality` to [50, 95], and a
+`request_too_large` error means retry with a smaller `max_px`. The
 mutating tools (`set_module_enabled`, `reset_module`,
 `create_module_instance`, `undo`) advance the session revision; each
 mutating call may take an `expected_revision` for compare-and-swap so a
-stale client can't clobber a concurrent edit. Other protocol methods
-documented in the reference (`set_module_params`, `compute_scopes`, ...)
-are exposed elsewhere or reserved for a later step.
+stale client can't clobber a concurrent edit. The private protocol's
+`set_module_params` method is implemented but is not currently registered as
+an MCP tool.
 
 ## Setup
 

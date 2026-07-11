@@ -6,13 +6,15 @@ tool over a private, local, token-authenticated protocol. The companion
 [Model Context Protocol](https://modelcontextprotocol.io) tools, so an MCP
 host (Claude Desktop, Claude Code, the MCP inspector, …) — and through it an
 LLM agent — can inspect and edit your darkroom session: read the image, the
-module stack and each module's parameters, change parameters, enable/reset
-modules, create instances, walk history, undo, render a preview, and read
-photographic scopes.
+module stack and each module's parameters, enable/reset modules, create
+instances, walk history, undo, render a preview, and read photographic scopes.
 
 This document is for **users** enabling the feature and **host authors**
 wiring the sidecar up. It is not the protocol spec; the wire contract lives
 in `docs/superpowers/specs/` in the darktable source tree.
+
+For a complete source-build and Claude Code walkthrough on Ubuntu, see
+[`ubuntu-claude-code-setup.md`](ubuntu-claude-code-setup.md).
 
 > **Remote control is off by default and must be explicitly enabled.** When
 > off, darktable opens no port and writes no discovery record — there is

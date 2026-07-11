@@ -1,8 +1,4 @@
-"""Entry point: `python -m darktable_mcp` / the `darktable-mcp` console
-script. Runs the MCP server over stdio, per the plan's acceptance gate
-("an MCP inspector/client can invoke all four tools against a real
-darktable instance").
-"""
+"""Entry point for the stdio darktable MCP sidecar."""
 
 from __future__ import annotations
 
@@ -16,7 +12,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="darktable-mcp",
         description=(
-            "Read-only MCP sidecar for darktable's remote-edit protocol. "
+            "MCP sidecar for darktable's remote-edit protocol. "
             "Speaks stdio MCP to the client and framed JSON/TCP to darktable."
         ),
     )
