@@ -23,11 +23,6 @@ classifiers = [
   "Topic :: Multimedia :: Graphics :: Editors",
 ]
 
-[project.urls]
-Homepage = "https://www.darktable.org/"
-Source = "https://github.com/darktable-org/darktable"
-Documentation = "https://github.com/darktable-org/darktable/blob/master/tools/mcp/docs/remote-control.md"
-
 # `mcp` version range: floor is the exact version this package was
 # developed and tested against (1.28.1); ceiling excludes the next major,
 # since the SDK's own versioning policy is not documented as strictly
@@ -36,6 +31,11 @@ Documentation = "https://github.com/darktable-org/darktable/blob/master/tools/mc
 dependencies = [
   "mcp>=1.28.1,<2",
 ]
+
+[project.urls]
+Homepage = "https://www.darktable.org/"
+Source = "https://github.com/darktable-org/darktable"
+Documentation = "https://github.com/darktable-org/darktable/blob/master/tools/mcp/docs/remote-control.md"
 
 [project.optional-dependencies]
 dev = [

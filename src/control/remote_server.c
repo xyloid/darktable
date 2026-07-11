@@ -206,7 +206,7 @@ static gboolean _response_is_ok(JsonNode *response)
   return json_object_has_member(obj, "ok") && json_object_get_boolean_member(obj, "ok");
 }
 
-static GBytes *_serialize(JsonNode *node)
+static GBytes *dt_remote_json_serialize(JsonNode *node)
 {
   JsonGenerator *gen = json_generator_new();
   json_generator_set_root(gen, node);
@@ -292,7 +292,7 @@ static void _session_send(dt_remote_session_t *s, JsonNode *response)
   gint64 id = 0;
   if(JSON_NODE_HOLDS_OBJECT(response)) _peek_request_id(json_node_get_object(response), &has_id, &id);
 
-  GBytes *payload = _serialize(response);
+  GBytes *payload = dt_remote_json_serialize(response);
   json_node_unref(response);
 
   GBytes *framed = dt_remote_frame_encode(payload);
@@ -303,7 +303,7 @@ static void _session_send(dt_remote_session_t *s, JsonNode *response)
     dt_print(DT_DEBUG_CONTROL,
             "[remote-edit] response exceeds the frame size limit; substituting an error");
     JsonNode *fallback = _transport_error(has_id, id, "request_too_large", _("response too large to send"));
-    GBytes *fallback_payload = _serialize(fallback);
+    GBytes *fallback_payload = dt_remote_json_serialize(fallback);
     json_node_unref(fallback);
     framed = dt_remote_frame_encode(fallback_payload);
     g_bytes_unref(fallback_payload);
