@@ -110,6 +110,7 @@ FILE(GLOB SOURCE_FILES
   "control/jobs/sidecar_jobs.c"
   "control/progress.c"
   "control/remote_curve.c"
+  "control/remote_curve_registry.c"
   "control/remote_discovery.c"
   "control/remote_edit.c"
   "control/remote_frame.c"

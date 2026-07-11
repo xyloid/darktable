@@ -104,16 +104,16 @@ gboolean dt_remote_path_resolve(const dt_remote_introspection_path_t *path,
 /* ---------------------------------------------------------------------- */
 /* registry descriptor types (curve-classes design doc                    */
 /* SS Registry descriptors: "Native control-point layout", "Predicate",   */
-/* "Semantic descriptor" -- copied verbatim). Declared here because they  */
-/* are the input dt_remote_curve_validate() below consumes; nothing in    */
-/* this task constructs, resolves, or introspects them yet (that is Task  */
-/* 6's job for descriptor instances and Task 8's for the module adapter/  */
-/* registry that walks them). dt_remote_curve_module_adapter_t (the       */
-/* sibling type declared right after the semantic descriptor in the       */
-/* design doc, with its `prepare`/`validate_completed` callbacks and a    */
-/* forward reference to `struct dt_remote_curve_context_t`) is deliberately */
-/* NOT declared here -- it is out of scope until the task that defines    */
-/* dt_remote_curve_context_t.                                             */
+/* "Semantic descriptor" -- copied verbatim). dt_remote_curve_module_adapter_t */
+/* (the sibling type declared right after the semantic descriptor in the  */
+/* design doc, with its `prepare`/`validate_completed` callbacks and a     */
+/* forward reference to `struct dt_remote_curve_context_t`) is declared    */
+/* further below, once the descriptor types it wraps are in scope. Task 6 */
+/* constructs concrete descriptor/adapter instances (the rgbcurve table,   */
+/* in remote_curve_registry.c) and the registry/engine functions that walk */
+/* them; Task 8 defines dt_remote_curve_context_t and implements the real  */
+/* prepare/validate_completed bodies (Task 6's rgbcurve adapter instance   */
+/* points both callbacks at stubs that unconditionally return TRUE).      */
 /* ---------------------------------------------------------------------- */
 
 typedef struct dt_remote_native_curve_layout_t
@@ -176,6 +176,123 @@ typedef struct dt_remote_curve_descriptor_t
 // (1u << DT_REMOTE_CATMULL_ROM) | ...`. No existing `_mask` bitfield
 // precedent was found elsewhere in src/control/remote_edit.c or
 // remote_protocol.c to match; this is a fresh, straightforward convention.
+
+/* ---------------------------------------------------------------------- */
+/* module adapter (curve-classes design doc SS Semantic descriptor and     */
+/* module adapter -- copied verbatim)                                      */
+/* ---------------------------------------------------------------------- */
+
+// Defined (the struct body, not just this forward declaration) in Task 8,
+// which needs live-instance/pipeline context to resolve a mode transition.
+// Forward-declared only here so the prepare/validate_completed callback
+// pointers below type-check; nothing in Task 6 defines or dereferences it.
+struct dt_remote_curve_context_t;
+
+struct dt_iop_module_t; // develop/imageop.h; kept a bare forward reference
+                        // here (like common/introspection.h's own
+                        // `struct dt_iop_module_so_t;`) so this header does
+                        // not have to pull in the GTK-heavy imageop.h --
+                        // dt_remote_curve_read_values() below only needs a
+                        // pointer type, never the struct's layout.
+
+typedef struct dt_remote_curve_module_adapter_t
+{
+  const char *operation;
+  guint minimum_params_version;
+  guint maximum_params_version;
+  const dt_remote_curve_descriptor_t *curves;
+  guint curve_count;
+  const char *const *prepare_fields;
+  guint prepare_field_count;
+
+  gboolean (*prepare)(const struct dt_remote_curve_context_t *ctx,
+                      const void *old_params,
+                      void *new_params,
+                      const dt_remote_patch_t *patch,
+                      dt_remote_error_t **error);
+
+  gboolean (*validate_completed)(const struct dt_remote_curve_context_t *ctx,
+                                 const void *new_params,
+                                 dt_remote_error_t **error);
+} dt_remote_curve_module_adapter_t;
+
+/* ---------------------------------------------------------------------- */
+/* registry lifecycle (curve-classes design doc SS Registry lifecycle)    */
+/* ---------------------------------------------------------------------- */
+
+/** looks up the adapter registered for the stable IOP operation name
+ * `operation` at `params_version`, or %NULL if no adapter covers that
+ * (operation, params_version) pair -- including when `operation` is not a
+ * curve-bearing op at all. Native array fields on such ops remain
+ * unsupported and no semantic curve is advertised; this is not an error. */
+const dt_remote_curve_module_adapter_t *
+dt_remote_curve_registry_lookup(const char *operation, guint params_version);
+
+/** validates, for every descriptor on `adapter`, that its
+ * native.nodes/x_field/y_field/count/type paths resolve against
+ * `introspection`'s real field tree to the shapes documented on
+ * dt_remote_native_curve_layout_t (nodes: array-of-structs;
+ * x_field/y_field: floating members of that struct; count/type: integer-
+ * or enum-compatible leaves). Every descriptor is checked -- a shape
+ * mismatch on one descriptor disables only that descriptor (skipped by
+ * dt_remote_curve_list_schema()/dt_remote_curve_read_values() below) and
+ * does not stop the remaining descriptors from being checked. The result
+ * (per-descriptor validity, and the aggregate below) is cached for the
+ * process lifetime, keyed by `adapter`'s identity: `introspection` is
+ * process-lifetime static data, so a shape that resolves once resolves
+ * identically for the life of the process.
+ *
+ * Returns TRUE iff every descriptor's shape is valid. Returns FALSE, with
+ * `*error` set to a newly allocated DT_REMOTE_ERR_INTERNAL (caller frees
+ * with dt_remote_error_free()), if at least one descriptor's shape does
+ * not match -- this is always a registry/introspection drift bug, never
+ * caller error. */
+gboolean dt_remote_curve_registry_validate(const dt_remote_curve_module_adapter_t *adapter,
+                                           const dt_introspection_t *introspection,
+                                           dt_remote_error_t **error);
+
+/* ---------------------------------------------------------------------- */
+/* curve engine API (curve-classes design doc SS Curve engine API --       */
+/* read-only half only: list_schema/read_values. dt_remote_curve_apply_patch */
+/* is declared and implemented in Task 8.)                                 */
+/* ---------------------------------------------------------------------- */
+
+/** per (operation, params_version) schema listing: looks up the adapter for
+ * `module_so`'s operation/params_version, validates its registry shape
+ * (dt_remote_curve_registry_validate() above, cached), then returns one
+ * owned dt_remote_curve_schema_t per valid descriptor (deep-copying every
+ * string -- the descriptor's own strings are static and outlive nothing
+ * past this call). Shape-invalid descriptors and ops with no registered
+ * adapter both simply contribute no entries; neither is an error. Always
+ * succeeds when `module_so` has introspection; sets `*out` to a newly
+ * allocated, possibly-empty GPtrArray (owned by the caller, element
+ * destructor already set to dt_remote_curve_schema_free -- free with
+ * g_ptr_array_unref()). Fails only on a null argument or a module with no
+ * introspection at all, with `*error` set to DT_REMOTE_ERR_INTERNAL. */
+gboolean dt_remote_curve_list_schema(const struct dt_iop_module_so_t *module_so,
+                                     GPtrArray **out, /* dt_remote_curve_schema_t */
+                                     dt_remote_error_t **error);
+
+/** per live-instance value read: looks up + validates the adapter for
+ * `module`'s operation/params_version (as above), then for every valid
+ * descriptor evaluates active_when/writable_when against `params` (not
+ * necessarily `module->params` -- callers may pass a projected/candidate
+ * block) and reads the live points/count/type through
+ * dt_remote_path_resolve(), truncating to the active count (indices at or
+ * beyond the native count leaf are unused capacity and are never
+ * serialized). All four rgbcurve semantic IDs are always present as keys
+ * in `*out`, with `active`/`writable_now` reflecting the current mode --
+ * never omitted when inactive. Native interpolation ints are mapped to
+ * dt_remote_curve_interpolation_t by explicit value identity, never cast.
+ * Sets `*out` to a newly allocated GHashTable (name -> owned
+ * dt_remote_curve_value_t, owned by the caller -- free with
+ * g_hash_table_unref(), value destructor already set to
+ * dt_remote_curve_value_free()). Fails only on a null argument or a module
+ * with no introspection, with `*error` set to DT_REMOTE_ERR_INTERNAL. */
+gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
+                                     const void *params,
+                                     GHashTable **out, /* name -> dt_remote_curve_value_t */
+                                     dt_remote_error_t **error);
 
 /* ---------------------------------------------------------------------- */
 /* common curve validator (curve-classes design doc SS Validation         */
