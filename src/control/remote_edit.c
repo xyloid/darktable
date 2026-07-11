@@ -338,12 +338,55 @@ out_of_range:
   return FALSE;
 }
 
-static gboolean dt_remote_denylisted(const dt_remote_denylist_t *denylist, const char *name)
+gboolean dt_remote_denylisted(const dt_remote_denylist_t *denylist, const char *name)
 {
   if(!denylist || !denylist->names || !name) return FALSE;
   for(const char *const *n = denylist->names; *n; n++)
     if(!g_strcmp0(*n, name)) return TRUE;
   return FALSE;
+}
+
+// Per-op forced-writable:false table. Source of truth:
+// docs/superpowers/specs/2026-07-05-darktable-mcp-supported-operations.md
+// (appendix); every entry verified against src/iop/ at commit time.
+typedef struct dt_remote_op_denylist_t
+{
+  const char *op;
+  dt_remote_denylist_t denylist;
+} dt_remote_op_denylist_t;
+
+#define DENY(...) { .names = (const char *const[]){ __VA_ARGS__, NULL } }
+
+static const dt_remote_op_denylist_t s_op_denylists[] = {
+  { "ashift",          DENY("cl", "cr", "ct", "cb",
+                            "last_drawn_lines_count", "last_quad_lines") },
+  { "channelmixerrgb", DENY("x", "y", "version") },
+  { "colorcontrast",   DENY("a_offset", "b_offset", "unbound") },
+  { "colorize",        DENY("version") },
+  { "colorzones",      DENY("splines_version") },
+  { "crop",            DENY("ratio_n", "ratio_d") },
+  { "denoiseprofile",  DENY("fix_anscombe_and_nlmeans_norm", "use_new_vst",
+                            "wb_adaptive_anscombe") },
+  { "dither",          DENY("palette", "random.radius", "random.range") },
+  { "filmicrgb",       DENY("version", "spline_version") },
+  { "highlights",      DENY("blendL", "blendC") },
+  { "lens",            DENY("crop", "focal", "aperture", "distance",
+                            "has_been_set", "md_version", "reserved") },
+  { "lowpass",         DENY("unbound") },
+  { "overlay",         DENY("imgid", "dummy0", "dummy1", "dummy2") },
+  { "relight",         DENY("center") },
+  { "shadhi",          DENY("reserved2", "flags", "low_approximation") },
+  { "temperature",     DENY("preset") },
+  { "tonecurve",       DENY("tonecurve_preset", "tonecurve_unbound_ab") },
+  { "vignette",        DENY("unbound") },
+};
+
+const dt_remote_denylist_t *dt_remote_denylist_for_op(const char *op)
+{
+  if(!op) return NULL;
+  for(size_t i = 0; i < G_N_ELEMENTS(s_op_denylists); i++)
+    if(!strcmp(s_op_denylists[i].op, op)) return &s_op_denylists[i].denylist;
+  return NULL;
 }
 
 GPtrArray *dt_remote_schema_from_introspection(const dt_introspection_field_t *linear,
@@ -754,7 +797,7 @@ gboolean dt_remote_get_module_schema(const char *op,
   schema->params_version = intro ? intro->params_version : 0;
   schema->deprecated = (so->flags() & IOP_FLAGS_DEPRECATED) != 0;
   schema->supports_multiple_instances = !(so->flags() & IOP_FLAGS_ONE_INSTANCE);
-  schema->fields = dt_remote_schema_from_introspection(linear, NULL);
+  schema->fields = dt_remote_schema_from_introspection(linear, dt_remote_denylist_for_op(op));
 
   *out = schema;
   return TRUE;

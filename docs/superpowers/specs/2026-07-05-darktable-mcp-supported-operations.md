@@ -194,7 +194,7 @@ heuristic verified per module):
 
 | op | fields | reason |
 |---|---|---|
-| `ashift` | `cl`, `cr`, `ct`, `cb`, `last_drawn_lines*`, `last_quad_lines` | auto-crop results and line-fit state |
+| `ashift` | `cl`, `cr`, `ct`, `cb`, `last_drawn_lines_count` (the `last_drawn_lines`/`last_quad_lines` arrays are already excluded by type; there is no separate `last_drawn_lines_version` field) | auto-crop results and line-fit state |
 | `basecurve` | — | (curve arrays already excluded by type) |
 | `channelmixerrgb` | `x`, `y`, `version` | picker-set illuminant coords; algorithm version |
 | `colorcontrast` | `a_offset`, `b_offset`, `unbound` | no GUI, legacy |

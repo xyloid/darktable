@@ -149,6 +149,15 @@ typedef struct dt_remote_denylist_t
                              // not owned
 } dt_remote_denylist_t;
 
+/** TRUE iff `name` (a dotted introspection name) appears in `denylist`.
+ * NULL-safe: a NULL denylist, a denylist with names == NULL, or a NULL
+ * name all return FALSE (deny nothing). */
+gboolean dt_remote_denylisted(const dt_remote_denylist_t *denylist, const char *name);
+
+/** static per-op forced-writable:false table (supported-operations appendix).
+ * NULL for ops with no entry -- meaning deny nothing. */
+const dt_remote_denylist_t *dt_remote_denylist_for_op(const char *op);
+
 /* ---------------------------------------------------------------------- */
 /* result types -- mirror the wire shapes in the protocol reference        */
 /* field-for-field; the dispatcher serializes them 1:1.                    */

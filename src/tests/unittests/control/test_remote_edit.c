@@ -23,7 +23,11 @@
  * dt_remote_value_from_field() and dt_remote_value_validate_and_write()
  * against hand-built fixture dt_introspection_field_t arrays -- no
  * dt_develop_t, no live darkroom. Live-module traversal (dt_remote_get_state
- * and friends) is covered by integration tests in a later step.
+ * and friends) is covered by integration tests in a later step. The one
+ * exception is dt_remote_get_module_schema() itself: it reads the loaded
+ * module .so table (darktable.iop), which needs a real (GUI-less,
+ * data-less) dt_init() -- see the harness right before main() below. That
+ * still isn't a live darkroom/dt_develop_t, just the module registry.
  *
  * Please see README.md for more detailed documentation.
  */
@@ -39,6 +43,7 @@
 
 #include "../util/assert.h"
 
+#include "common/darktable.h"
 #include "control/remote_edit.h"
 
 #ifdef _WIN32
@@ -478,6 +483,24 @@ static void test_schema_denylist_forces_writable_false(void **state)
 }
 
 /*
+ * dt_remote_denylist_for_op() -- the static per-op forced-writable:false
+ * table (supported-operations appendix). Pure lookup, no live module
+ * needed.
+ */
+
+static void test_denylist_for_op_lookup(void **state)
+{
+  (void)state;
+  const dt_remote_denylist_t *dl = dt_remote_denylist_for_op("filmicrgb");
+  assert_non_null(dl);
+  assert_true(dt_remote_denylisted(dl, "version"));
+  assert_true(dt_remote_denylisted(dl, "spline_version"));
+  assert_false(dt_remote_denylisted(dl, "white_point_source"));
+  assert_null(dt_remote_denylist_for_op("exposure"));   // no entry: deny nothing
+  assert_null(dt_remote_denylist_for_op(NULL));
+}
+
+/*
  * dt_remote_patch_apply() -- the pure core of dt_remote_set_module_params
  * (plan step 7, internals doc §3 steps 4-6). No dt_develop_t/live module
  * involved: params_blob is just a fixture_params_t on the stack, standing
@@ -711,6 +734,90 @@ static void test_patch_apply_null_patch_rejected(void **state)
   dt_remote_error_free(err);
 }
 
+/*
+ * dt_remote_get_module_schema() -- the ONE test in this file that needs a
+ * real loaded module .so instead of the fixture_linear array above.
+ * dt_remote_get_module_schema() reads darktable.iop (via
+ * dt_iop_get_module_so()) but, per its own header comment, needs no
+ * dt_develop_t/live darkroom -- schemas are per-op-from-the-.so. So we run
+ * the smallest dt_init() that populates darktable.iop: GUI and image
+ * library both off, and a throwaway config dir so the suite never touches
+ * the developer's real ~/.config/darktable. DT_TEST_MODULEDIR (see
+ * CMakeLists.txt) points dt_init() at this build's own plugin directory --
+ * without it, dt_init() looks for plugins next to the test binary instead
+ * of in the build tree and finds none.
+ */
+
+#ifndef DT_TEST_MODULEDIR
+#error "DT_TEST_MODULEDIR must be defined by the build (see CMakeLists.txt)"
+#endif
+
+static char *s_harness_confdir = NULL;
+
+static int harness_group_setup(void **state)
+{
+  (void)state;
+  GError *error = NULL;
+  s_harness_confdir = g_dir_make_tmp("test_remote_edit-XXXXXX", &error);
+  if(!s_harness_confdir)
+  {
+    fprintf(stderr, "test_remote_edit: failed to create scratch config dir: %s\n",
+            error->message);
+    g_error_free(error);
+    return -1;
+  }
+
+  char *argv_override[] = {
+    "test_remote_edit",
+    "--configdir", s_harness_confdir,
+    "--library", ":memory:",
+    "--moduledir", DT_TEST_MODULEDIR,
+    "--conf", "write_sidecar_files=never",
+    NULL
+  };
+  int argc_override = G_N_ELEMENTS(argv_override) - 1;
+  return dt_init(argc_override, argv_override, FALSE, FALSE, NULL) ? -1 : 0;
+}
+
+static int harness_group_teardown(void **state)
+{
+  (void)state;
+  dt_cleanup();
+  if(s_harness_confdir)
+  {
+    gchar *cmd = g_strdup_printf("rm -rf '%s'", s_harness_confdir);
+    if(system(cmd) != 0)
+      fprintf(stderr, "test_remote_edit: failed to remove scratch config dir %s\n",
+              s_harness_confdir);
+    g_free(cmd);
+    g_free(s_harness_confdir);
+    s_harness_confdir = NULL;
+  }
+  return 0;
+}
+
+static void test_schema_marks_denylisted_fields_unwritable(void **state)
+{
+  (void)state;
+  // filmicrgb "version" passes the scalar type filter (it's an enum) but
+  // must come back writable == FALSE and still be PRESENT in the schema.
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_get_module_schema("filmicrgb", &schema, &err));
+  gboolean found = FALSE;
+  for(guint i = 0; i < schema->fields->len; i++)
+  {
+    dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, "version"))
+    {
+      found = TRUE;
+      assert_false(f->writable);
+    }
+  }
+  assert_true(found);
+  dt_remote_module_schema_free(schema);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -734,6 +841,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_schema_enum_members_preserved),
     cmocka_unit_test(test_schema_unsupported_types_marked_writable_false_not_omitted),
     cmocka_unit_test(test_schema_denylist_forces_writable_false),
+    cmocka_unit_test(test_denylist_for_op_lookup),
+    cmocka_unit_test(test_schema_marks_denylisted_fields_unwritable),
 
     cmocka_unit_test(test_patch_apply_single_valid_field),
     cmocka_unit_test(test_patch_apply_multiple_valid_fields),
@@ -747,7 +856,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_patch_apply_null_patch_rejected),
   };
 
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

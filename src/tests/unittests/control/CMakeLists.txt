@@ -2,6 +2,12 @@ add_cmocka_test(test_remote_edit
                 SOURCES test_remote_edit.c
                 LINK_LIBRARIES lib_darktable cmocka)
 
+# test_schema_marks_denylisted_fields_unwritable loads real module .so's via
+# dt_init(); point it at this build's own plugin directory instead of the
+# (nonexistent, install-layout) default relative to the test binary.
+target_compile_definitions(test_remote_edit PRIVATE
+  DT_TEST_MODULEDIR="${CMAKE_BINARY_DIR}/lib/darktable")
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_remote_edit lib_darktable)
