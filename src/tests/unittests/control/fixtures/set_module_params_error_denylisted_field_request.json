@@ -1,0 +1,9 @@
+{
+  "id": 22,
+  "method": "set_module_params",
+  "params": {
+    "module": "filmicrgb",
+    "instance": 0,
+    "values": { "version": 3 }
+  }
+}

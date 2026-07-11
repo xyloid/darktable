@@ -122,3 +122,17 @@ async def test_undo_round_trip(darktable_session):
         reverted = await client.call("get_module_params", {"module": "exposure", "instance": 0})
         # The edit was rolled back: exposure is no longer the value we set.
         assert reverted["values"]["exposure"] != pytest.approx(-4.5, abs=1e-4)
+
+
+async def test_denylisted_fields_read_only_live(darktable_session):
+    """filmicrgb bookkeeping fields are advertised non-writable and rejected."""
+    async with harness.connected_client(darktable_session) as client:
+        schema = await client.call("get_module_schema", {"module": "filmicrgb"})
+        by_name = {f["name"]: f for f in schema["fields"]}
+        assert by_name["version"]["writable"] is False
+        with pytest.raises(ProtocolError) as excinfo:
+            await client.call(
+                "set_module_params",
+                {"module": "filmicrgb", "instance": 0, "values": {"version": 3}},
+            )
+        assert excinfo.value.code == "unsupported_field"

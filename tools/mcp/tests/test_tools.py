@@ -338,6 +338,21 @@ async def test_set_module_params_invalid_value_surfaces_hint(tmp_path, fake_serv
     assert "invalid_value" in str(excinfo.value)
 
 
+async def test_set_module_params_denylisted_field_surfaces_hint(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    server.handle_from_fixture(
+        "set_module_params", "set_module_params_error_denylisted_field_response.json"
+    )
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params", {"module": "filmicrgb", "values": {"version": 3}}
+        )
+    message = str(excinfo.value)
+    assert "unsupported_field" in message
+    assert "writable flag" in message  # errors.py hint for unsupported_field
+
+
 async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("reset_module_response.json")

@@ -390,6 +390,30 @@ static gboolean stub_get_module_schema_exposure_full(const char *op, dt_remote_m
   return TRUE;
 }
 
+// filmicrgb's "version" field: known to the schema (present, per the
+// "never omitted" rule) but forced writable:false by the per-op denylist
+// (dt_remote_denylist_for_op(), Task 1) -- exercises the same
+// unsupported_field handler path as stub_get_module_schema_exposure_full's
+// "curve", using a real denylisted op/field pair instead of a naturally
+// non-scalar type.
+static gboolean stub_get_module_schema_filmicrgb_denylisted(const char *op, dt_remote_module_schema_t **out,
+                                                             dt_remote_error_t **error)
+{
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup(op);
+  schema->display_name = g_strdup("filmic rgb");
+  schema->params_version = 6;
+  schema->deprecated = FALSE;
+  schema->supports_multiple_instances = FALSE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+
+  g_ptr_array_add(schema->fields, _make_field("version", "color science", "enum", FALSE));
+
+  *out = schema;
+  return TRUE;
+}
+
 static const dt_remote_patch_entry_t *_find_patch_entry(const dt_remote_patch_t *patch, const char *name)
 {
   for(guint i = 0; patch->scalar_values && i < patch->scalar_values->len; i++)
@@ -1064,6 +1088,25 @@ static void test_set_module_params_error_unsupported_field(void **state)
     "{\"id\":32,\"method\":\"set_module_params\","
     "\"params\":{\"module\":\"exposure\",\"values\":{\"curve\":1.0}}}",
     "unsupported_field");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// The shared-fixture pair for a real per-op-denylisted field (filmicrgb's
+// "version", plan step 2/Task 2): same unsupported_field path as the
+// synthetic "curve" case above, engine never reached, but with the exact
+// request/response fixtures the Python sidecar's client tests reuse
+// byte-identically (tools/mcp/tests/test_tools.py::
+// test_set_module_params_denylisted_field_surfaces_hint).
+static void test_set_module_params_error_denylisted_field(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_filmicrgb_denylisted,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_denylisted_field_request.json",
+                           "set_module_params_error_denylisted_field_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -2990,6 +3033,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_error_revision_conflict),
     cmocka_unit_test(test_set_module_params_error_unknown_field),
     cmocka_unit_test(test_set_module_params_error_unsupported_field),
+    cmocka_unit_test(test_set_module_params_error_denylisted_field),
     cmocka_unit_test(test_set_module_params_error_bad_shapes),
     cmocka_unit_test(test_set_module_params_error_unknown_module),
     cmocka_unit_test(test_set_module_params_error_unknown_instance),

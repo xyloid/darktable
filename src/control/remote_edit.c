@@ -934,7 +934,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   memcpy(temp_params, module->params, module->params_size);
 
   dt_introspection_field_t *linear = module->so->get_introspection_linear();
-  if(!dt_remote_patch_apply(linear, NULL, patch, temp_params, error))
+  if(!dt_remote_patch_apply(linear, dt_remote_denylist_for_op(module->op), patch, temp_params, error))
   {
     g_free(temp_params);
     return FALSE;

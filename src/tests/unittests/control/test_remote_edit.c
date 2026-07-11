@@ -45,6 +45,8 @@
 
 #include "common/darktable.h"
 #include "control/remote_edit.h"
+#include "develop/imageop.h"  // dt_iop_get_module_so()/dt_iop_module_so_t: real-module
+                              // denylist-wiring regression test below
 
 #ifdef _WIN32
 #include "win/main_wrapper.h"
@@ -818,6 +820,59 @@ static void test_schema_marks_denylisted_fields_unwritable(void **state)
   dt_remote_module_schema_free(schema);
 }
 
+/*
+ * dt_remote_set_module_params()'s mutation-path denylist wiring: the
+ * dt_remote_patch_apply() call site must pass dt_remote_denylist_for_op(
+ * module->op), not NULL. An end-to-end call to dt_remote_set_module_params()
+ * itself needs a live GUI darkroom -- dt_remote_require_darkroom_image()
+ * gates on dt_view_get_current() == DT_VIEW_DARKROOM, and dt_view_get_current()
+ * unconditionally returns DT_VIEW_LIGHTTABLE whenever darktable.view_manager
+ * is NULL (src/views/view.c), which is exactly the state of this cmocka
+ * harness's GUI-less dt_init(..., FALSE, FALSE, ...) -- there is no test
+ * seam to fake past that gate, and inventing one is out of scope here.
+ * That full path is instead exercised live, over the wire, by
+ * tools/mcp/tests/integration/test_editing.py::
+ * test_denylisted_fields_read_only_live.
+ *
+ * The closest regression guard reachable from this headless suite: the
+ * exact (linear, denylist) composition the call site builds -- real
+ * filmicrgb introspection plus the real per-op table via
+ * dt_remote_denylist_for_op(), rather than the synthetic fixture_linear/
+ * hand-built denylist the other dt_remote_patch_apply() tests above use --
+ * still rejects a "version" entry whole, leaving the scratch params block
+ * byte-identical to what it was.
+ */
+static void test_set_module_params_mutation_path_uses_real_denylist(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("filmicrgb");
+  assert_non_null(so);
+  dt_introspection_field_t *linear = so->get_introspection_linear();
+  assert_non_null(linear);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *params = g_malloc0(intro->size);
+  void *before = g_malloc(intro->size);
+  memcpy(before, params, intro->size);
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("version", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_ENUM, .v.e = { 3, NULL } }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(linear, dt_remote_denylist_for_op(so->op), &patch, params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(params, before, intro->size);  // scratch block untouched on rejection
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+  g_free(params);
+  g_free(before);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -843,6 +898,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_schema_denylist_forces_writable_false),
     cmocka_unit_test(test_denylist_for_op_lookup),
     cmocka_unit_test(test_schema_marks_denylisted_fields_unwritable),
+    cmocka_unit_test(test_set_module_params_mutation_path_uses_real_denylist),
 
     cmocka_unit_test(test_patch_apply_single_valid_field),
     cmocka_unit_test(test_patch_apply_multiple_valid_fields),
