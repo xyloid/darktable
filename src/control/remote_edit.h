@@ -234,11 +234,13 @@ void dt_remote_patch_entry_free(gpointer entry);
 typedef struct dt_remote_patch_t
 {
   GPtrArray *scalar_values;    // dt_remote_patch_entry_t
-  GPtrArray *semantic_values;  // reserved: semantic-class patches (curves
-                               // etc., see the curve-classes design); NULL
-                               // and unused in v1, but the transaction is
-                               // written against this struct so semantic
-                               // support extends it without a rewrite
+  GPtrArray *semantic_values;  // dt_remote_semantic_patch_t (remote_parameters.h);
+                               // nullable. The neutral types exist as of this
+                               // struct, but nothing constructs or reads this
+                               // array yet -- the introspection cursor,
+                               // validator, and registry that populate and
+                               // apply it land in later steps (see the
+                               // curve-classes design)
   gboolean has_enable;
   gboolean enable;
 } dt_remote_patch_t;
@@ -316,9 +318,11 @@ gboolean dt_remote_value_validate_and_write(const dt_introspection_field_t *f,
  * above. Returns FALSE on the first rejected entry and leaves later
  * entries unprocessed:
  *
- *  - patch is NULL, or scalar_values is NULL/empty -> DT_REMOTE_ERR_INVALID_VALUE
- *    ("values must be non-empty", the wire contract's own requirement,
- *    enforced here too as a second line of defense);
+ *  - patch is NULL, or scalar_values, semantic_values, and has_enable are
+ *    all empty/unset -> DT_REMOTE_ERR_INVALID_VALUE ("values must be
+ *    non-empty", the wire contract's own requirement, enforced here too
+ *    as a second line of defense); scalar_values alone may be NULL/empty
+ *    when semantic_values is non-empty or has_enable is set;
  *  - an entry's name does not match any field in `linear` ->
  *    DT_REMOTE_ERR_UNKNOWN_FIELD;
  *  - an entry's name repeats an earlier entry in the same patch ->
@@ -332,12 +336,13 @@ gboolean dt_remote_value_validate_and_write(const dt_introspection_field_t *f,
  *    non-scalar field type) -> whatever it sets (DT_REMOTE_ERR_INVALID_VALUE
  *    or DT_REMOTE_ERR_UNSUPPORTED_FIELD).
  *
- * `patch->semantic_values` is reserved/unused in v1 (see dt_remote_patch_t)
- * and is ignored here -- "step 6, validate the completed parameter block"
- * is a no-op for v1's scalar-only patches (every field is already
+ * `patch->semantic_values` (see remote_parameters.h) is not read or
+ * applied here yet -- only its presence is consulted, for the emptiness
+ * check above. "step 6, validate the completed parameter block" is
+ * currently a no-op for scalar_values (every field is already
  * individually checked above, with no cross-field constraints in the v1
- * schema); this is the extension point future semantic-value classes
- * (curves etc.) hook into instead of forking the transaction. */
+ * scalar schema); this is the extension point future semantic-value
+ * classes (curves etc.) hook into instead of forking the transaction. */
 gboolean dt_remote_patch_apply(const dt_introspection_field_t *linear,
                                const dt_remote_denylist_t *denylist,
                                const dt_remote_patch_t *patch,

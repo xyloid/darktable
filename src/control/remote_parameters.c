@@ -1,0 +1,81 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "control/remote_parameters.h"
+
+/** frees a single condition (its two owned strings and the struct
+ * itself). NULL-safe. Internal: dt_remote_curve_schema_t is the only
+ * owner of dt_remote_parameter_condition_t instances in v1. */
+static void dt_remote_parameter_condition_free(dt_remote_parameter_condition_t *condition)
+{
+  if(!condition) return;
+  g_free(condition->field);
+  g_free(condition->enum_name);
+  g_free(condition);
+}
+
+void dt_remote_curve_schema_free(dt_remote_curve_schema_t *schema)
+{
+  if(!schema) return;
+  g_free(schema->name);
+  g_free(schema->display_name);
+  g_free(schema->description);
+  g_free(schema->x.unit);
+  g_free(schema->y.unit);
+  dt_remote_parameter_condition_free(schema->active_when);
+  dt_remote_parameter_condition_free(schema->writable_when);
+  dt_remote_parameter_condition_free(schema->periodic_when);
+  g_free(schema);
+}
+
+void dt_remote_curve_value_free(dt_remote_curve_value_t *value)
+{
+  if(!value) return;
+  g_free(value->name);
+  if(value->points) g_array_unref(value->points);
+  g_free(value);
+}
+
+void dt_remote_semantic_patch_free(gpointer patch_ptr)
+{
+  dt_remote_semantic_patch_t *patch = patch_ptr;
+  if(!patch) return;
+
+  switch(patch->class_id)
+  {
+    case DT_REMOTE_PARAMETER_CURVE:
+      g_free(patch->value.curve.name);
+      if(patch->value.curve.points) g_array_unref(patch->value.curve.points);
+      break;
+
+    // DT_REMOTE_PARAMETER_SAMPLED_RESPONSE and DT_REMOTE_PARAMETER_LEVELS
+    // have no union member yet (see remote_parameters.h); nothing to free.
+    case DT_REMOTE_PARAMETER_SAMPLED_RESPONSE:
+    case DT_REMOTE_PARAMETER_LEVELS:
+    default:
+      break;
+  }
+
+  g_free(patch);
+}
+
+// clang-format off
+// modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
+// vim: shiftwidth=2 expandtab tabstop=2 cindent
+// kate: tab-indents: off; indent-width 2; replace-tabs on; indent-mode cstyle; remove-trailing-spaces modified;
+// clang-format on

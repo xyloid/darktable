@@ -582,13 +582,16 @@ gboolean dt_remote_patch_apply(const dt_introspection_field_t *linear,
                                void *params_blob,
                                dt_remote_error_t **error)
 {
-  if(!patch || !patch->scalar_values || patch->scalar_values->len == 0)
+  const gboolean has_scalars = patch && patch->scalar_values && patch->scalar_values->len > 0;
+  const gboolean has_semantics = patch && patch->semantic_values && patch->semantic_values->len > 0;
+
+  if(!patch || (!has_scalars && !has_semantics && !patch->has_enable))
   {
     if(error) *error = dt_remote_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("values must be non-empty"));
     return FALSE;
   }
 
-  for(guint i = 0; i < patch->scalar_values->len; i++)
+  for(guint i = 0; patch->scalar_values && i < patch->scalar_values->len; i++)
   {
     const dt_remote_patch_entry_t *entry = g_ptr_array_index(patch->scalar_values, i);
 

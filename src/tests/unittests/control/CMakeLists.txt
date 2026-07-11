@@ -13,6 +13,15 @@ if(WIN32)
     _copy_required_library(test_remote_edit lib_darktable)
 endif(WIN32)
 
+add_cmocka_test(test_remote_curve
+                SOURCES test_remote_curve.c
+                LINK_LIBRARIES lib_darktable cmocka)
+
+# Windows: libs have to be copied next to the executable
+if(WIN32)
+    _copy_required_library(test_remote_curve lib_darktable)
+endif(WIN32)
+
 add_cmocka_test(test_remote_protocol
                 SOURCES test_remote_protocol.c
                 LINK_LIBRARIES lib_darktable cmocka)
