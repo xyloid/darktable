@@ -152,6 +152,51 @@ async def test_get_module_params_defaults_instance_to_zero(tmp_path, fake_server
     assert seen_params == {"module": "exposure", "instance": 0}
 
 
+async def test_get_module_schema_rgbcurve_semantic_fields_verbatim(tmp_path, fake_server_factory):
+    """Milestone 2: semantic_fields and represented_by pass through unreshaped."""
+    server = await fake_server_factory()
+    fixture = load_fixture("get_module_schema_rgbcurve_response.json")
+    server.handle_from_fixture("get_module_schema", "get_module_schema_rgbcurve_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "get_module_schema", {"module": "rgbcurve"})
+
+    assert result == fixture["result"]
+    assert result["semantic_fields"] == fixture["result"]["semantic_fields"]
+    represented = {field["name"]: field.get("represented_by") for field in result["fields"]}
+    for native in ("curve_nodes", "curve_num_nodes", "curve_type"):
+        assert represented[native] == [
+            "curve.master",
+            "curve.red",
+            "curve.green",
+            "curve.blue",
+        ]
+    # primitive-only ops keep emitting no semantic members
+    assert "semantic_fields" not in load_fixture("get_module_schema_response.json")["result"]
+
+
+async def test_get_module_params_rgbcurve_semantic_values_verbatim(tmp_path, fake_server_factory):
+    """Milestone 2: all four semantic_values entries pass through unreshaped."""
+    server = await fake_server_factory()
+    fixture = load_fixture("get_module_params_rgbcurve_response.json")
+    server.handle_from_fixture("get_module_params", "get_module_params_rgbcurve_response.json")
+
+    app = await _built_server(tmp_path, server)
+    result = await call_tool_json(app, "get_module_params", {"module": "rgbcurve", "instance": 0})
+
+    assert result == fixture["result"]
+    semantic = result["semantic_values"]
+    assert set(semantic) == {"curve.master", "curve.red", "curve.green", "curve.blue"}
+    assert semantic["curve.master"]["active"] is True
+    for inactive in ("curve.red", "curve.green", "curve.blue"):
+        assert semantic[inactive]["active"] is False  # present, never omitted
+    for value in semantic.values():
+        assert value["interpolation"] == "MONOTONE_HERMITE"  # uppercase, unchanged
+        assert all(set(point) == {"x", "y"} for point in value["points"])
+    # primitive-only ops keep emitting no semantic members
+    assert "semantic_values" not in load_fixture("get_module_params_response.json")["result"]
+
+
 async def test_set_module_enabled_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("set_module_enabled_response.json")

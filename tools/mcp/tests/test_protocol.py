@@ -82,6 +82,24 @@ async def test_hello_wrong_token_raises_protocol_error(fake_server_factory):
             "get_module_params_request.json",
             "get_module_params_response.json",
         ),
+        # milestone 2: the semantic curve members (semantic_fields,
+        # semantic_values, represented_by) ride the same passthrough --
+        # the client must not reshape or drop them.
+        (
+            "get_module_schema",
+            "get_module_schema_rgbcurve_request.json",
+            "get_module_schema_rgbcurve_response.json",
+        ),
+        (
+            "get_module_params",
+            "get_module_params_rgbcurve_request.json",
+            "get_module_params_rgbcurve_response.json",
+        ),
+        (
+            "set_module_params",
+            "set_module_params_curve_request.json",
+            "set_module_params_curve_response.json",
+        ),
     ],
 )
 async def test_success_responses_match_shared_fixtures(
