@@ -118,6 +118,24 @@ async def test_success_responses_match_shared_fixtures(
     await client.close()
 
 
+async def test_client_capabilities_populated_from_hello(fake_server_factory):
+    """`ProtocolClient.capabilities` records the hello `capabilities`
+    list once connected (empty before), so tool-side capability gates
+    can consult it without re-parsing `server_info`."""
+    hello_response = load_fixture("hello_response.json")
+    server = await fake_server_factory()
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+
+    client = ProtocolClient(_record_for(server))
+    assert client.capabilities == []  # not connected yet: nothing advertised
+
+    await client.ensure_connected()
+    assert client.capabilities == hello_response["result"]["capabilities"]
+    assert "curve_params" in client.capabilities
+
+    await client.close()
+
+
 @pytest.mark.parametrize(
     "method, params, response_fixture, expected_code",
     [

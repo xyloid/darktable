@@ -398,6 +398,123 @@ async def test_set_module_params_denylisted_field_surfaces_hint(tmp_path, fake_s
     assert "writable flag" in message  # errors.py hint for unsupported_field
 
 
+async def test_set_module_params_curves_translates_to_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """`curves` is tool-side sugar: point pairs become `{x, y}` objects,
+    interpolation is upper-cased, and every entry gains `class: "curve"`;
+    the wire request carries `semantic_values` and never a `curves`
+    member. (The no-`curves` case is pinned by
+    `test_set_module_params_threads_params`, whose exact-equality assert
+    proves no `semantic_values` member appears uninvited.)"""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 3,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "rgbcurve",
+            "values": {},
+            "curves": {
+                "curve.master": {
+                    "points": [[0.0, 0.0], [0.4, 0.5], [1.0, 1.0]],
+                    "interpolation": "cubic_spline",
+                },
+                "curve.red": {"points": [[0.0, 0.0], [1.0, 1.0]]},
+            },
+        },
+    )
+
+    assert "curves" not in seen
+    assert seen["semantic_values"] == {
+        "curve.master": {
+            "class": "curve",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 0.4, "y": 0.5}, {"x": 1.0, "y": 1.0}],
+            "interpolation": "CUBIC_SPLINE",
+        },
+        "curve.red": {
+            "class": "curve",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+        },
+    }
+
+
+async def test_set_module_params_curves_gated_on_curve_params_capability(
+    tmp_path, fake_server_factory
+):
+    """A darktable whose hello does not advertise `curve_params` (the
+    fake's default hello has `capabilities: []`) must be refused
+    client-side: clear upgrade message, and no `set_module_params` wire
+    call that the peer would reject less legibly."""
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "rgbcurve",
+                "values": {},
+                "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "curve_params" in message
+    assert "upgrade darktable" in message
+    assert calls == []
+
+
+async def test_set_module_params_curves_invalid_interpolation_fails_before_wire(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "rgbcurve",
+                "values": {},
+                "curves": {
+                    "curve.master": {
+                        "points": [[0.0, 0.0], [1.0, 1.0]],
+                        "interpolation": "bezier",
+                    }
+                },
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "unknown interpolation" in message
+    assert "CUBIC_SPLINE" in message  # the valid names are enumerated
+    assert calls == []
+    # Translation is pure client-side and runs before connect: the fake
+    # server never even saw a connection.
+    assert server.connections_seen == 0
+
+
 async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("reset_module_response.json")

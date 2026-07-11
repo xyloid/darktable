@@ -45,6 +45,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import discovery
+from .errors import TransportError
 from .protocol import ProtocolClient
 
 SERVER_NAME = "darktable-mcp"
@@ -64,6 +65,36 @@ SERVER_INSTRUCTIONS = (
 
 # The four scope names compute_scopes accepts, in stable wire order.
 _SCOPE_NAMES = ("histogram", "waveform", "parade", "vectorscope")
+
+# The interpolation names the wire accepts for semantic curve patches
+# (docs/superpowers/specs: curve design §Serialization rules).
+_INTERPOLATIONS = {"CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"}
+
+
+def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
+    """Translates the tool-side `curves` shape (point pairs, any-case
+    interpolation names) into the wire's `semantic_values` member
+    (`class: "curve"`, `{x, y}` point objects, upper-case interpolation).
+    Pure and connection-free; raises `ValueError` on an interpolation
+    name the wire would reject, so the mistake never costs a round trip.
+    """
+    out: dict[str, Any] = {}
+    for name, spec in curves.items():
+        entry: dict[str, Any] = {
+            "class": "curve",
+            "points": [{"x": x, "y": y} for x, y in spec["points"]],
+        }
+        interp = spec.get("interpolation")
+        if interp is not None:
+            interp = str(interp).upper()
+            if interp not in _INTERPOLATIONS:
+                raise ValueError(
+                    f"unknown interpolation {interp!r}; expected one of "
+                    + ", ".join(sorted(_INTERPOLATIONS))
+                )
+            entry["interpolation"] = interp
+        out[name] = entry
+    return out
 
 
 def build_server(
@@ -142,6 +173,7 @@ def build_server(
         instance: int = 0,
         enable: bool | None = None,
         expected_revision: int | None = None,
+        curves: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Set parameter values on one module instance, recorded as one
         history step. `module` is the internal op name, `instance` its
@@ -154,13 +186,37 @@ def build_server(
         on in the same history step. Pass `expected_revision` for
         compare-and-swap (see `set_module_enabled`). Returns the module,
         instance, resulting `enabled` state, the `values` read back from
-        live state, and the new `revision`."""
+        live state, and the new `revision`.
+
+        `curves` edits semantic curve parameters (see `get_module_schema`'s
+        `semantic_fields`, e.g. rgbcurve's `curve.master`) and needs a
+        darktable that advertises the `curve_params` capability. It maps
+        semantic IDs to `{"points": [[x, y], ...], "interpolation"?:
+        "cubic_spline" | "catmull_rom" | "monotone_hermite"}`. Curve
+        invariants: 2-20 points; x strictly ascending with adjacent
+        points more than 0.0025 apart; coordinates are the module's
+        stored (pre-display) space in [0, 1]; each patch replaces that
+        whole curve (unlisted curves are untouched); omitted
+        interpolation keeps the curve's current one. The response's
+        `semantic_values` reads back every written curve with points as
+        `{x, y}` objects."""
         params: dict[str, Any] = {"module": module, "instance": instance, "values": values}
         if enable is not None:
             params["enable"] = enable
         if expected_revision is not None:
             params["expected_revision"] = expected_revision
+        # Translate before connecting: a malformed `curves` argument
+        # (e.g. a bad interpolation name) fails without any wire traffic.
+        semantic_values = _wire_semantic_values(curves) if curves is not None else None
         client = await _client()
+        if semantic_values is not None:
+            await client.ensure_connected()
+            if "curve_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise curve_params; "
+                    "upgrade darktable to edit curves"
+                )
+            params["semantic_values"] = semantic_values
         return await client.call("set_module_params", params)
 
     @app.tool()

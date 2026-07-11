@@ -285,6 +285,11 @@ class ProtocolClient:
         self.client_name = client_name
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
+        # The hello `capabilities` list of the connected darktable; empty
+        # until the first successful handshake, refreshed on reconnect (a
+        # restarted darktable may advertise a different set). Callers that
+        # gate on a capability must go through `ensure_connected()` first.
+        self.capabilities: list[str] = []
         self._conn: _Connection | None = None
         self._lock = asyncio.Lock()
 
@@ -301,8 +306,17 @@ class ProtocolClient:
             request_timeout=self.request_timeout,
         )
         await conn.connect()
+        caps = (conn.server_info or {}).get("capabilities")
+        self.capabilities = [c for c in caps if isinstance(c, str)] if isinstance(caps, list) else []
         self._conn = conn
         return conn
+
+    async def ensure_connected(self) -> None:
+        """Connects (and completes the hello handshake) if not already
+        connected, so `capabilities` is populated. A no-op on a live
+        connection."""
+        async with self._lock:
+            await self._ensure_connected()
 
     async def call(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None
