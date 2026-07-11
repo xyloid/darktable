@@ -1,5 +1,13 @@
 # darktable MCP Milestone 2: Field Denylist + rgbcurve Semantic Curves — Implementation Plan
 
+**Status: Complete (2026-07-11).** All eleven tasks landed on
+`worktree-mcp-remote-edit`; Tasks 5–7 were reworked per
+`2026-07-11-darktable-mcp-tasks5-7-review-fixes.md` (same directory), which
+also records the agreed execution order for Tasks 9–11 and the resolution
+of the pre-existing `test_filmicrgb` Debug-link failure. Final
+verification: 13/13 ctest suites, 91 sidecar unit tests, 20 live
+integration tests (plus the explicit OpenCL skip).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Enforce the per-module `writable: false` field denylist, then implement semantic curve editing for `rgbcurve` end-to-end (C engine → wire protocol → MCP sidecar) behind `semantic_params`/`curve_params` capabilities.
@@ -42,11 +50,11 @@
 - Consumes: existing `dt_remote_denylist_t` (`remote_edit.h:146`), `dt_remote_denylisted()` (`remote_edit.c:341`), `dt_remote_schema_from_introspection(linear, denylist)`.
 - Produces: `const dt_remote_denylist_t *dt_remote_denylist_for_op(const char *op);` — returns `NULL` (deny nothing) for ops without an entry. Task 2 and Task 9 call this.
 
-- [ ] **Step 1: Verify the appendix against current `src/iop/` source**
+- [x] **Step 1: Verify the appendix against current `src/iop/` source**
 
 For each row of the supported-operations appendix, confirm the field still exists with that name in the module's params struct (e.g. `grep -n "version" src/iop/filmicrgb.c` inside `dt_iop_filmicrgb_params_t`). Note corrections; fields that no longer exist are dropped from the table and struck from the appendix in Step 7. Do not add new fields beyond the appendix.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 In `test_remote_edit.c` (follow the file's existing cmocka fixture pattern for schema tests):
 
@@ -86,12 +94,12 @@ static void test_schema_marks_denylisted_fields_unwritable(void **state)
 }
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 `cmake --build build -- -j$(nproc) && ctest --test-dir build -R test_remote_edit --output-on-failure`
 Expected: link/compile failure on `dt_remote_denylist_for_op` for the first test; after stubbing the declaration, `test_schema_marks_denylisted_fields_unwritable` fails on `assert_false(f->writable)`.
 
-- [ ] **Step 4: Implement the table and wire the schema path**
+- [x] **Step 4: Implement the table and wire the schema path**
 
 In `remote_edit.c`, next to `dt_remote_denylisted()`:
 
@@ -155,17 +163,17 @@ Declare in `remote_edit.h` next to the `dt_remote_denylist_t` typedef:
 const dt_remote_denylist_t *dt_remote_denylist_for_op(const char *op);
 ```
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 `cmake --build build -- -j$(nproc) && ctest --test-dir build -R test_remote_edit --output-on-failure`
 Expected: PASS, including all pre-existing tests.
 
-- [ ] **Step 6: Run the full C suite set**
+- [x] **Step 6: Run the full C suite set**
 
 `ctest --test-dir build -R 'test_remote_' --output-on-failure`
 Expected: all suites PASS (schema fixtures that asserted writability of a now-denylisted field must be updated to the new truth, not deleted).
 
-- [ ] **Step 7: Update the appendix and commit**
+- [x] **Step 7: Update the appendix and commit**
 
 Apply the Step 1 corrections to the appendix (same commit — the spec requires table and appendix to move together).
 
@@ -187,7 +195,7 @@ git commit -m "remote_edit: enforce the per-op writable:false denylist in schema
 - Consumes: `dt_remote_denylist_for_op()` from Task 1; existing `dt_remote_patch_apply(linear, denylist, patch, blob, error)`.
 - Produces: mutation-path rejection with wire code `unsupported_field`; the two fixtures, consumed byte-identically by C dispatcher tests and sidecar tests.
 
-- [ ] **Step 1: Write the failing C test**
+- [x] **Step 1: Write the failing C test**
 
 ```c
 static void test_set_module_params_rejects_denylisted_field(void **state)
@@ -205,12 +213,12 @@ static void test_set_module_params_rejects_denylisted_field(void **state)
 
 (The `...` lines follow the exact harness idiom of the neighboring `test_set_module_params_*` tests in the same file — copy their setup/teardown verbatim.)
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 `ctest --test-dir build -R test_remote_edit --output-on-failure`
 Expected: FAIL — the write currently succeeds because line 894 passes NULL.
 
-- [ ] **Step 3: Wire the call site**
+- [x] **Step 3: Wire the call site**
 
 At `remote_edit.c:894`, inside `dt_remote_set_module_params` (which knows the module's op via the resolved instance `module->op`):
 
@@ -218,7 +226,7 @@ At `remote_edit.c:894`, inside `dt_remote_set_module_params` (which knows the mo
 if(!dt_remote_patch_apply(linear, dt_remote_denylist_for_op(module->op), patch, temp_params, error))
 ```
 
-- [ ] **Step 4: Run to verify pass, then add the shared fixtures**
+- [x] **Step 4: Run to verify pass, then add the shared fixtures**
 
 `ctest --test-dir build -R test_remote_edit --output-on-failure` → PASS.
 
@@ -268,12 +276,12 @@ async def test_set_module_params_denylisted_field_surfaces_hint(tmp_path, fake_s
     assert "writable flag" in message  # errors.py hint for unsupported_field
 ```
 
-- [ ] **Step 5: Run C + Python suites**
+- [x] **Step 5: Run C + Python suites**
 
 `ctest --test-dir build -R 'test_remote_' --output-on-failure` → PASS.
 `cd tools/mcp && .venv/bin/pytest -q` → PASS.
 
-- [ ] **Step 6: Add the live integration assertion**
+- [x] **Step 6: Add the live integration assertion**
 
 In `tools/mcp/tests/integration/test_editing.py`, extend the schema-reading test (or add one) with:
 
@@ -292,7 +300,7 @@ async def test_denylisted_fields_read_only_live(darktable_session):
         assert excinfo.value.code == "unsupported_field"
 ```
 
-- [ ] **Step 7: Run live integration (needs build + Xvfb), then commit**
+- [x] **Step 7: Run live integration (needs build + Xvfb), then commit**
 
 `cd tools/mcp && .venv/bin/pytest -m integration tests/integration/test_editing.py -q` → PASS.
 
@@ -316,12 +324,12 @@ git commit -m "remote_edit: enforce the denylist on the mutation path"
 - Produces (verbatim from curve design §Neutral semantic types and §Threading and ownership; these exact names are used by Tasks 4–10): `dt_remote_parameter_class_t`, `dt_remote_writability_t`, `dt_remote_curve_interpolation_t`, `dt_remote_curve_endpoint_policy_t`, `dt_remote_spacing_rule_t`, `dt_remote_predicate_operator_t`, `dt_remote_parameter_condition_t`, `dt_remote_curve_axis_t`, `dt_remote_curve_schema_t`, `dt_remote_curve_point_t`, `dt_remote_curve_value_t`, `dt_remote_curve_patch_t`, `dt_remote_semantic_patch_t`, and `dt_remote_curve_schema_free` / `dt_remote_curve_value_free` / `dt_remote_semantic_patch_free`.
 - `dt_remote_patch_t` gains `GPtrArray *semantic_values; /* dt_remote_semantic_patch_t, nullable */` — existing callers pass NULL semantics unchanged.
 
-- [ ] **Step 1: Register the new cmocka suite** — add `test_remote_curve` to `src/tests/unittests/control/CMakeLists.txt` copying the `test_remote_edit` block (including the WIN32 copy stanza).
-- [ ] **Step 2: Write failing tests** — construct each neutral object, exercise its `_free` on fully- and partially-populated instances (NULL-safe), and assert `dt_remote_patch_t` with `semantic_values == NULL` still passes the existing "at least one scalar/enable" requirement while a patch with only semantic values also counts as non-empty.
-- [ ] **Step 3: Run to verify failure** — `ctest --test-dir build -R test_remote_curve` fails to compile.
-- [ ] **Step 4: Implement** — copy the declarations from curve design §Neutral semantic types into `remote_parameters.h` verbatim; implement constructors/destructors in `remote_parameters.c` (g_new0/g_free/g_array_unref discipline, NULL-tolerant frees). Extend `dt_remote_patch_t` and update its existing free/validate helpers ("values must be non-empty" check at `remote_edit.c:547` becomes: empty means no scalars AND no semantics AND no enable).
-- [ ] **Step 5: Run to verify pass** — `ctest --test-dir build -R 'test_remote_(curve|edit)' --output-on-failure` → PASS.
-- [ ] **Step 6: Commit** — `git commit -m "remote_parameters: neutral semantic types and patch extension"`.
+- [x] **Step 1: Register the new cmocka suite** — add `test_remote_curve` to `src/tests/unittests/control/CMakeLists.txt` copying the `test_remote_edit` block (including the WIN32 copy stanza).
+- [x] **Step 2: Write failing tests** — construct each neutral object, exercise its `_free` on fully- and partially-populated instances (NULL-safe), and assert `dt_remote_patch_t` with `semantic_values == NULL` still passes the existing "at least one scalar/enable" requirement while a patch with only semantic values also counts as non-empty.
+- [x] **Step 3: Run to verify failure** — `ctest --test-dir build -R test_remote_curve` fails to compile.
+- [x] **Step 4: Implement** — copy the declarations from curve design §Neutral semantic types into `remote_parameters.h` verbatim; implement constructors/destructors in `remote_parameters.c` (g_new0/g_free/g_array_unref discipline, NULL-tolerant frees). Extend `dt_remote_patch_t` and update its existing free/validate helpers ("values must be non-empty" check at `remote_edit.c:547` becomes: empty means no scalars AND no semantics AND no enable).
+- [x] **Step 5: Run to verify pass** — `ctest --test-dir build -R 'test_remote_(curve|edit)' --output-on-failure` → PASS.
+- [x] **Step 6: Commit** — `git commit -m "remote_parameters: neutral semantic types and patch extension"`.
 
 ### Task 4: Introspection cursor
 
@@ -345,11 +353,11 @@ gboolean dt_remote_path_resolve(const dt_remote_introspection_path_t *path,
 
   Returns the leaf introspection field and a pointer into `params_blob`; retains neither. Errors are `DT_REMOTE_ERR_INTERNAL` (registry paths are compiled-in; a bad path is registry drift, never caller error).
 
-- [ ] **Step 1: Write failing tests** (curve design §Unit tests / Introspection cursor is the checklist): resolve `curve_nodes[0][3].x` and `curve_num_nodes[1]` against a stack `dt_iop_rgbcurve_params_t` fixture via the loaded module SO's introspection; assert the returned pointer targets the fixture blob (`(char*)out_ptr - (char*)fixture` within `sizeof` bounds); reject wrong-type segment, out-of-bounds index, and missing child with `DT_REMOTE_ERR_INTERNAL`.
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** — iterate segments, `DT_REMOTE_PATH_FIELD` → `dt_introspection_get_child`, `DT_REMOTE_PATH_INDEX` → `dt_introspection_access_array`, verifying header type before each descent and bounds before each index.
-- [ ] **Step 4: Run to verify pass.**
-- [ ] **Step 5: Commit** — `git commit -m "remote_curve: bounds-checked introspection path cursor"`.
+- [x] **Step 1: Write failing tests** (curve design §Unit tests / Introspection cursor is the checklist): resolve `curve_nodes[0][3].x` and `curve_num_nodes[1]` against a stack `dt_iop_rgbcurve_params_t` fixture via the loaded module SO's introspection; assert the returned pointer targets the fixture blob (`(char*)out_ptr - (char*)fixture` within `sizeof` bounds); reject wrong-type segment, out-of-bounds index, and missing child with `DT_REMOTE_ERR_INTERNAL`.
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** — iterate segments, `DT_REMOTE_PATH_FIELD` → `dt_introspection_get_child`, `DT_REMOTE_PATH_INDEX` → `dt_introspection_access_array`, verifying header type before each descent and bounds before each index.
+- [x] **Step 4: Run to verify pass.**
+- [x] **Step 5: Commit** — `git commit -m "remote_curve: bounds-checked introspection path cursor"`.
 
 ### Task 5: Common curve validator
 
@@ -369,11 +377,11 @@ gboolean dt_remote_curve_validate(const dt_remote_curve_descriptor_t *desc,
                                   dt_remote_error_t **error);
 ```
 
-- [ ] **Step 1: Write failing tests** — one test per rule in curve design §Validation algorithm items 3–10, driven by a hand-built descriptor (2–20 points, spacing 0.0025 GREATER_THAN, strict order, optional boundaries, all-interpolations mask): under-/over-count, NaN, +inf, out-of-domain x and y, descending x, duplicate x, spacing exactly 0.0025 (rejected: rule is strictly-greater), spacing 0.00251 (accepted), disallowed interpolation vs mask, endpoints off the domain boundary accepted under `OPTIONAL` policy. Every rejection returns `DT_REMOTE_ERR_INVALID_VALUE` with `parameter`/`point_index`/`constraint` detail members and must not modify the points array.
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** the checks in the §Validation algorithm order; comparisons honor `dt_remote_spacing_rule_t` (AT_LEAST = `>=`, GREATER_THAN = `>`); periodic wrap check only when the descriptor declares it (rgbcurve does not — cover via a synthetic periodic descriptor in tests).
-- [ ] **Step 4: Run to verify pass.**
-- [ ] **Step 5: Commit** — `git commit -m "remote_curve: common control-point curve validator"`.
+- [x] **Step 1: Write failing tests** — one test per rule in curve design §Validation algorithm items 3–10, driven by a hand-built descriptor (2–20 points, spacing 0.0025 GREATER_THAN, strict order, optional boundaries, all-interpolations mask): under-/over-count, NaN, +inf, out-of-domain x and y, descending x, duplicate x, spacing exactly 0.0025 (rejected: rule is strictly-greater), spacing 0.00251 (accepted), disallowed interpolation vs mask, endpoints off the domain boundary accepted under `OPTIONAL` policy. Every rejection returns `DT_REMOTE_ERR_INVALID_VALUE` with `parameter`/`point_index`/`constraint` detail members and must not modify the points array.
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** the checks in the §Validation algorithm order; comparisons honor `dt_remote_spacing_rule_t` (AT_LEAST = `>=`, GREATER_THAN = `>`); periodic wrap check only when the descriptor declares it (rgbcurve does not — cover via a synthetic periodic descriptor in tests).
+- [x] **Step 4: Run to verify pass.**
+- [x] **Step 5: Commit** — `git commit -m "remote_curve: common control-point curve validator"`.
 
 ### Task 6: Registry, rgbcurve descriptor, read-only engine
 
@@ -404,12 +412,12 @@ gboolean dt_remote_curve_read_values(const dt_iop_module_t *module,
                                      dt_remote_error_t **error);
 ```
 
-- [ ] **Step 1: Write failing registry tests** — lookup `("rgbcurve", 1)` returns the adapter; unknown op / wrong version returns NULL; `dt_remote_curve_registry_validate` passes against the real loaded `rgbcurve` introspection and fails (with `DT_REMOTE_ERR_INTERNAL`) against a synthetic introspection where the node array is the wrong type; validation result is cached per `(op, version)`.
-- [ ] **Step 2: Write failing read-path tests** — with a params fixture in automatic-RGB mode, `read_values` exposes `curve.master` `active/writable_now == TRUE` and `curve.red/green/blue` `active == FALSE` (all four always present, per the milestone spec's resolved decision 4); in manual mode the polarity flips; channel-0 points round-trip under `curve.master`; unused native capacity (indices ≥ `curve_num_nodes[ch]`) is never serialized; interpolation ints map to the three names.
-- [ ] **Step 3: Run to verify failure.**
-- [ ] **Step 4: Implement** — the `rgbcurve` adapter table in `remote_curve_registry.c` per curve design §Initial registry mapping / `rgbcurve` (four descriptors over channels 0/0/1/2; predicates on `curve_autoscale` vs `DT_S_SCALE_MANUAL_RGB` by enum name; domain [0,1]²; 2–20 points; spacing 0.0025 GREATER_THAN; boundary policy OPTIONAL; all three interpolations; `prepare_fields = {"curve_autoscale", "compensate_middle_grey"}`; `prepare`/`validate_completed` stubs returning TRUE for now — Task 9 fills them). Native layout paths: nodes `curve_nodes[ch]`, count `curve_num_nodes[ch]`, type `curve_type[ch]`, x/y fields `"x"`/`"y"`, no internal version. Implement `list_schema` (descriptor → owned schema copies) and `read_values` (cursor reads, predicate evaluation against the supplied params).
-- [ ] **Step 5: Run to verify pass** — `ctest --test-dir build -R 'test_remote_curve' --output-on-failure`.
-- [ ] **Step 6: Commit** — `git commit -m "remote_curve: registry, rgbcurve descriptors, read-only engine"`.
+- [x] **Step 1: Write failing registry tests** — lookup `("rgbcurve", 1)` returns the adapter; unknown op / wrong version returns NULL; `dt_remote_curve_registry_validate` passes against the real loaded `rgbcurve` introspection and fails (with `DT_REMOTE_ERR_INTERNAL`) against a synthetic introspection where the node array is the wrong type; validation result is cached per `(op, version)`.
+- [x] **Step 2: Write failing read-path tests** — with a params fixture in automatic-RGB mode, `read_values` exposes `curve.master` `active/writable_now == TRUE` and `curve.red/green/blue` `active == FALSE` (all four always present, per the milestone spec's resolved decision 4); in manual mode the polarity flips; channel-0 points round-trip under `curve.master`; unused native capacity (indices ≥ `curve_num_nodes[ch]`) is never serialized; interpolation ints map to the three names.
+- [x] **Step 3: Run to verify failure.**
+- [x] **Step 4: Implement** — the `rgbcurve` adapter table in `remote_curve_registry.c` per curve design §Initial registry mapping / `rgbcurve` (four descriptors over channels 0/0/1/2; predicates on `curve_autoscale` vs `DT_S_SCALE_MANUAL_RGB` by enum name; domain [0,1]²; 2–20 points; spacing 0.0025 GREATER_THAN; boundary policy OPTIONAL; all three interpolations; `prepare_fields = {"curve_autoscale", "compensate_middle_grey"}`; `prepare`/`validate_completed` stubs returning TRUE for now — Task 9 fills them). Native layout paths: nodes `curve_nodes[ch]`, count `curve_num_nodes[ch]`, type `curve_type[ch]`, x/y fields `"x"`/`"y"`, no internal version. Implement `list_schema` (descriptor → owned schema copies) and `read_values` (cursor reads, predicate evaluation against the supplied params).
+- [x] **Step 5: Run to verify pass** — `ctest --test-dir build -R 'test_remote_curve' --output-on-failure`.
+- [x] **Step 6: Commit** — `git commit -m "remote_curve: registry, rgbcurve descriptors, read-only engine"`.
 
 ### Task 7: Wire read path — capabilities, schema and value responses
 
@@ -422,12 +430,12 @@ gboolean dt_remote_curve_read_values(const dt_iop_module_t *module,
 - Consumes: `dt_remote_curve_list_schema` / `dt_remote_curve_read_values` (Task 6).
 - Produces: hello `capabilities` gains `"semantic_params", "curve_params"`; `get_module_schema` result gains optional `semantic_fields` (shape: curve design §Schema response, including `represented_by` on the native array fields); `get_module_params` result gains optional `semantic_values` (shape: §Value response — points as `{"x":…,"y":…}` objects, uppercase interpolation names). Ops without a registry adapter emit neither member (byte-identical to today — all existing fixtures stay valid).
 
-- [ ] **Step 1: Write the two response fixtures** exactly matching curve design §Schema response / §Value response for `rgbcurve` (identity 2-point master curve, automatic mode), and failing dispatcher tests asserting (a) hello advertises both new capabilities, (b) rgbcurve schema/params responses match the fixtures byte-for-byte, (c) an `exposure` schema response is unchanged from its existing fixture.
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** serialization in `remote_protocol.c` (json-glib builders alongside the existing field serializers; condition triples serialize as `{"field": …, "not_equals"/"equals": …}`).
-- [ ] **Step 4: Run C suites; then sidecar fixture passthrough tests** in `tools/mcp/tests/test_tools.py`: `get_module_schema`/`get_module_params` return the rgbcurve fixtures' `result` verbatim (the read path needs no sidecar code change — verify, don't modify).
-- [ ] **Step 5: Run** `ctest --test-dir build -R 'test_remote_' --output-on-failure` and `cd tools/mcp && .venv/bin/pytest -q` → PASS.
-- [ ] **Step 6: Commit** — `git commit -m "remote_protocol: capability-gated semantic schema and value responses"`.
+- [x] **Step 1: Write the two response fixtures** exactly matching curve design §Schema response / §Value response for `rgbcurve` (identity 2-point master curve, automatic mode), and failing dispatcher tests asserting (a) hello advertises both new capabilities, (b) rgbcurve schema/params responses match the fixtures byte-for-byte, (c) an `exposure` schema response is unchanged from its existing fixture.
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** serialization in `remote_protocol.c` (json-glib builders alongside the existing field serializers; condition triples serialize as `{"field": …, "not_equals"/"equals": …}`).
+- [x] **Step 4: Run C suites; then sidecar fixture passthrough tests** in `tools/mcp/tests/test_tools.py`: `get_module_schema`/`get_module_params` return the rgbcurve fixtures' `result` verbatim (the read path needs no sidecar code change — verify, don't modify).
+- [x] **Step 5: Run** `ctest --test-dir build -R 'test_remote_' --output-on-failure` and `cd tools/mcp && .venv/bin/pytest -q` → PASS.
+- [x] **Step 6: Commit** — `git commit -m "remote_protocol: capability-gated semantic schema and value responses"`.
 
 ### Task 8: Mutation engine — adapter callbacks and apply path
 
@@ -449,11 +457,11 @@ gboolean dt_remote_curve_apply_patch(const dt_iop_module_t *module,
 
   called from `dt_remote_set_module_params` after scalar writes, before whole-block validation; on any failure the temporary block is discarded (existing transaction semantics).
 
-- [ ] **Step 1: Write failing adapter/transaction tests** — the curve design §Unit tests / `rgbcurve` adapter and §Transaction lists are the test inventory; implement each named case as one cmocka test. The two transition cases pin the resolved decisions: entering manual RGB copies channel 0 into untouched G/B before explicit patches apply; a middle-grey compensation change with no work profile available fails with `DT_REMOTE_ERR_UNSUPPORTED_FIELD` (details `constraint: "work_profile_unavailable"`) mutating nothing (build the no-profile case by pointing the test develop at an image with no work profile set, mirroring how existing edit tests build their darkroom fixture).
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** — `apply_patch`: resolve semantic ID → descriptor (unknown → `DT_REMOTE_ERR_UNKNOWN_FIELD`; wrong class / predicate unsatisfied against **projected** params → `DT_REMOTE_ERR_UNSUPPORTED_FIELD`), run Task 5 validator, run adapter `prepare` when a curve is present or a `prepare_fields` scalar changed, write points/count/type through the cursor (zero unused capacity — rgbcurve declares padding insignificant), then adapter `validate_completed`. The rgbcurve `prepare` reproduces the two storage transitions from curve design §Initial registry mapping using introspection accessors only (reference `rgbcurve.c` `gui_changed()` for the transition math; middle-grey transform goes through `dt_ioppr_get_pipe_work_profile_info` on the current pipe — fail `UNSUPPORTED_FIELD` with the `work_profile_unavailable` constraint detail when it returns no profile). Wire into `dt_remote_set_module_params` between scalar apply and block validation.
-- [ ] **Step 4: Run to verify pass** — all `test_remote_*` suites.
-- [ ] **Step 5: Commit** — `git commit -m "remote_curve: rgbcurve adapter callbacks and atomic apply path"`.
+- [x] **Step 1: Write failing adapter/transaction tests** — the curve design §Unit tests / `rgbcurve` adapter and §Transaction lists are the test inventory; implement each named case as one cmocka test. The two transition cases pin the resolved decisions: entering manual RGB copies channel 0 into untouched G/B before explicit patches apply; a middle-grey compensation change with no work profile available fails with `DT_REMOTE_ERR_UNSUPPORTED_FIELD` (details `constraint: "work_profile_unavailable"`) mutating nothing (build the no-profile case by pointing the test develop at an image with no work profile set, mirroring how existing edit tests build their darkroom fixture).
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** — `apply_patch`: resolve semantic ID → descriptor (unknown → `DT_REMOTE_ERR_UNKNOWN_FIELD`; wrong class / predicate unsatisfied against **projected** params → `DT_REMOTE_ERR_UNSUPPORTED_FIELD`), run Task 5 validator, run adapter `prepare` when a curve is present or a `prepare_fields` scalar changed, write points/count/type through the cursor (zero unused capacity — rgbcurve declares padding insignificant), then adapter `validate_completed`. The rgbcurve `prepare` reproduces the two storage transitions from curve design §Initial registry mapping using introspection accessors only (reference `rgbcurve.c` `gui_changed()` for the transition math; middle-grey transform goes through `dt_ioppr_get_pipe_work_profile_info` on the current pipe — fail `UNSUPPORTED_FIELD` with the `work_profile_unavailable` constraint detail when it returns no profile). Wire into `dt_remote_set_module_params` between scalar apply and block validation.
+- [x] **Step 4: Run to verify pass** — all `test_remote_*` suites.
+- [x] **Step 5: Commit** — `git commit -m "remote_curve: rgbcurve adapter callbacks and atomic apply path"`.
 
 ### Task 9: Wire mutation path — `semantic_values` parsing and dispatch
 
@@ -466,11 +474,11 @@ gboolean dt_remote_curve_apply_patch(const dt_iop_module_t *module,
 - Consumes: `dt_remote_semantic_patch_t` (Task 3), transaction (Task 8).
 - Produces: `set_module_params` accepts optional `semantic_values` (shape: curve design §Mutation request — `class` required, exactly-`x`/`y` point objects, unknown members rejected, duplicate IDs rejected, point-list cap 64 entries pre-engine); success responses include read-back `semantic_values` for every written entry. Requests without `semantic_values` are byte-identical to today.
 
-- [ ] **Step 1: Write the six fixtures** (success: 4-point `curve.master` MONOTONE_HERMITE patch mirroring §Mutation request; spacing error: two points at x 0.5000/0.5020 → `invalid_value` with `point_index`/`constraint` details; unknown ID: `curve.alpha` → `unknown_field`) and failing dispatcher tests driving each request fixture and asserting the paired response.
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** parsing per curve design §Serialization rules (finite doubles, exact member sets, `class: "curve"` required) into `dt_remote_semantic_patch_t`, dispatch through the extended transaction, serialize read-back.
-- [ ] **Step 4: Run** all C suites → PASS.
-- [ ] **Step 5: Commit** — `git commit -m "remote_protocol: semantic_values mutation parsing and read-back"`.
+- [x] **Step 1: Write the six fixtures** (success: 4-point `curve.master` MONOTONE_HERMITE patch mirroring §Mutation request; spacing error: two points at x 0.5000/0.5020 → `invalid_value` with `point_index`/`constraint` details; unknown ID: `curve.alpha` → `unknown_field`) and failing dispatcher tests driving each request fixture and asserting the paired response.
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** parsing per curve design §Serialization rules (finite doubles, exact member sets, `class: "curve"` required) into `dt_remote_semantic_patch_t`, dispatch through the extended transaction, serialize read-back.
+- [x] **Step 4: Run** all C suites → PASS.
+- [x] **Step 5: Commit** — `git commit -m "remote_protocol: semantic_values mutation parsing and read-back"`.
 
 ### Task 10: Sidecar — `curves` argument, capability gating
 
@@ -482,9 +490,9 @@ gboolean dt_remote_curve_apply_patch(const dt_iop_module_t *module,
 - Consumes: hello `capabilities` (Task 7), wire `semantic_values` (Task 9).
 - Produces: `set_module_params` tool gains `curves: dict[str, Any] | None = None`. Tool-arg shape (milestone spec) translates to wire shape: `{"curve.master": {"points": [[0.0,0.0],[0.4,0.5],[1.0,1.0]], "interpolation": "cubic_spline"}}` becomes `semantic_values` entries with `"class": "curve"`, point pairs converted to `{"x":…,"y":…}` objects, interpolation upper-cased and validated against `{CUBIC_SPLINE, CATMULL_ROM, MONOTONE_HERMITE}`. `ProtocolClient` records the hello `capabilities` list as `client.capabilities`.
 
-- [ ] **Step 1: Write failing tests** — (a) `curves` translation: fake server sees `semantic_values` with class/objects/uppercase names and no `curves` member; (b) omission: no `curves` → no `semantic_values` on the wire; (c) capability gating: fake server hello without `curve_params` → tool raises a `ToolError` mentioning `curve_params` **without any wire call** to `set_module_params`; (d) invalid interpolation name → client-side `ToolError` before any wire call; (e) exact-tool-list test still passes at twelve; (f) `test_protocol.py`: `client.capabilities` populated from hello.
-- [ ] **Step 2: Run to verify failure** — `cd tools/mcp && .venv/bin/pytest -q`.
-- [ ] **Step 3: Implement** — in `server.py`, extend the Task-10 tool with the translation helper and gate:
+- [x] **Step 1: Write failing tests** — (a) `curves` translation: fake server sees `semantic_values` with class/objects/uppercase names and no `curves` member; (b) omission: no `curves` → no `semantic_values` on the wire; (c) capability gating: fake server hello without `curve_params` → tool raises a `ToolError` mentioning `curve_params` **without any wire call** to `set_module_params`; (d) invalid interpolation name → client-side `ToolError` before any wire call; (e) exact-tool-list test still passes at twelve; (f) `test_protocol.py`: `client.capabilities` populated from hello.
+- [x] **Step 2: Run to verify failure** — `cd tools/mcp && .venv/bin/pytest -q`.
+- [x] **Step 3: Implement** — in `server.py`, extend the Task-10 tool with the translation helper and gate:
 
 ```python
 _INTERPOLATIONS = {"CUBIC_SPLINE", "CATMULL_ROM", "MONOTONE_HERMITE"}
@@ -510,8 +518,8 @@ def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
 ```
 
   and in the tool body, after `_client()`: if `curves` is given and `"curve_params" not in client.capabilities`, raise the connection-level error type the other tools use, with the message `"this darktable does not advertise curve_params; upgrade darktable to edit curves"`. Update the tool docstring with the invariants block from the milestone spec (2–20 points, strict ascending x, spacing > 0.0025, stored coordinates, whole-curve replacement, read-back points come as `{x, y}` objects).
-- [ ] **Step 4: Run to verify pass** — full `pytest -q`.
-- [ ] **Step 5: Commit** — `git commit -m "darktable-mcp: curves member on set_module_params with capability gating"`.
+- [x] **Step 4: Run to verify pass** — full `pytest -q`.
+- [x] **Step 5: Commit** — `git commit -m "darktable-mcp: curves member on set_module_params with capability gating"`.
 
 ### Task 11: Live integration, CI, and docs
 
@@ -523,17 +531,17 @@ def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
 **Interfaces:**
 - Consumes: everything above; the existing `harness.connected_client` / `darktable_session` fixtures.
 
-- [ ] **Step 1: Write the integration tests** — one test per acceptance-gate item, following curve design §Integration tests 1–7 and the milestone spec's testing list (steps 8–9, CPU/OpenCL and collapsed-GUI variants, are folded into the round-trip test via parametrization where the harness supports it; otherwise assert the CPU path and file the OpenCL variant as a skip-marked test with the reason string `"needs opencl-capable CI runner"`):
+- [x] **Step 1: Write the integration tests** — one test per acceptance-gate item, following curve design §Integration tests 1–7 and the milestone spec's testing list (steps 8–9, CPU/OpenCL and collapsed-GUI variants, are folded into the round-trip test via parametrization where the harness supports it; otherwise assert the CPU path and file the OpenCL variant as a skip-marked test with the reason string `"needs opencl-capable CI runner"`):
   - `test_rgbcurve_schema_and_identity_roundtrip` — schema advertises the four semantic IDs; identity read-back has 2 points, no native leakage (no `curve_nodes` in `semantic_values`).
   - `test_curve_patch_advances_revision_and_preview` — apply the 4-point §Mutation request curve with `expected_revision`; read-back matches; `render_preview` bytes differ from the pre-edit render.
   - `test_scalar_curve_enable_is_one_history_item` — combined patch adds exactly one `get_history` item.
   - `test_undo_restores_identity_and_mode` — one `undo` restores exact prior points and `curve_autoscale`.
   - `test_manual_mode_transition_atomicity` — switch to manual RGB + replace `curve.red` in one request; `curve.green`/`curve.blue` show the copied channel-0 identity; linked-mode write to `curve.green` fails `unsupported_field` with nothing changed.
   - `test_denylisted_and_stale_revision_untouched` — stale `expected_revision` with a curve patch changes nothing.
-- [ ] **Step 2: Run live** — `cd tools/mcp && .venv/bin/pytest -m integration -q` (rebuild `build/` first: the C side changed). Expected: PASS.
-- [ ] **Step 3: Update CI and docs** — bump the C-suite count comment in `mcp.yml` (11 → 13: `test_remote_curve`, `test_remote_curve_registry`); README tool table row for `set_module_params` mentions `curves`; Ubuntu guide §10 gains a curve example; protocol reference records the no-version-bump rule, both capabilities, and the request/response member shapes; supported-operations `rgbcurve` row notes semantic support.
-- [ ] **Step 4: Full verification** — `ctest --test-dir build -R 'test_remote_' --output-on-failure`, `pytest -q`, `pytest -m integration -q`: all PASS with pristine output.
-- [ ] **Step 5: Commit** — `git commit -m "darktable-mcp: rgbcurve live integration gates, CI suites, and docs"`.
+- [x] **Step 2: Run live** — `cd tools/mcp && .venv/bin/pytest -m integration -q` (rebuild `build/` first: the C side changed). Expected: PASS.
+- [x] **Step 3: Update CI and docs** — bump the C-suite count comment in `mcp.yml` (11 → 13: `test_remote_curve`, `test_remote_curve_registry`); README tool table row for `set_module_params` mentions `curves`; Ubuntu guide §10 gains a curve example; protocol reference records the no-version-bump rule, both capabilities, and the request/response member shapes; supported-operations `rgbcurve` row notes semantic support.
+- [x] **Step 4: Full verification** — `ctest --test-dir build -R 'test_remote_' --output-on-failure`, `pytest -q`, `pytest -m integration -q`: all PASS with pristine output.
+- [x] **Step 5: Commit** — `git commit -m "darktable-mcp: rgbcurve live integration gates, CI suites, and docs"`.
 
 ---
 
