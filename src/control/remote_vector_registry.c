@@ -42,6 +42,7 @@
 #include "common/darktable.h" // _()
 #include "develop/imageop.h" // dt_iop_module_so_t, dt_iop_module_t
 
+#include <math.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -197,6 +198,49 @@ static gboolean vector_predicate_is_valid(const dt_remote_parameter_predicate_t 
   return dt_introspection_get_enum_value(field, predicate->enum_name, &unused_value);
 }
 
+static gboolean nonempty_string(const char *value)
+{
+  return value && value[0] != '\0';
+}
+
+static gboolean vector_adapter_envelope_is_valid(
+  const dt_remote_vector_module_adapter_t *adapter,
+  const dt_iop_module_so_t *so,
+  const dt_introspection_t *intro)
+{
+  if(!nonempty_string(adapter->operation)
+     || g_strcmp0(adapter->operation, so->op)
+     || adapter->minimum_params_version > adapter->maximum_params_version
+     || intro->params_version < 0
+     || (guint)intro->params_version < adapter->minimum_params_version
+     || (guint)intro->params_version > adapter->maximum_params_version
+     || (adapter->vector_count > 0 && !adapter->vectors)
+     || (adapter->prepare_field_count > 0 && !adapter->prepare_fields))
+    return FALSE;
+
+  for(guint i = 0; i < adapter->prepare_field_count; i++)
+    if(!nonempty_string(adapter->prepare_fields[i])) return FALSE;
+  return TRUE;
+}
+
+static gboolean vector_component_metadata_is_valid(
+  const dt_remote_vector_descriptor_t *desc)
+{
+  if(!nonempty_string(desc->name) || desc->component_count == 0 || !desc->components)
+    return FALSE;
+
+  for(guint i = 0; i < desc->component_count; i++)
+  {
+    const dt_remote_vector_component_t *component = &desc->components[i];
+    if(!nonempty_string(component->name)
+       || !isfinite(component->minimum)
+       || !isfinite(component->maximum)
+       || component->minimum > component->maximum)
+      return FALSE;
+  }
+  return TRUE;
+}
+
 // Checks one descriptor's native layout (a single fixed-capacity float
 // array leaf -- never a struct-of-nodes array like a curve's) and optional
 // predicates against `root` (the module's whole params struct field,
@@ -206,6 +250,7 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
                                            const dt_introspection_field_t *root,
                                            void *dummy_blob)
 {
+  if(!vector_component_metadata_is_valid(desc)) return FALSE;
   if(root->header.type != DT_INTROSPECTION_TYPE_STRUCT) return FALSE;
 
   if(desc->native.length && !desc->native.segments) return FALSE;
@@ -280,6 +325,16 @@ gboolean dt_remote_vector_registry_validate(const dt_remote_vector_module_adapte
     if(error)
       *error = dt_remote_vector_registry_error_new(
         DT_REMOTE_ERR_INTERNAL, _("internal error: module '%s' has no introspection"), so->op);
+    return FALSE;
+  }
+
+  if(!vector_adapter_envelope_is_valid(adapter, so, intro))
+  {
+    if(error)
+      *error = dt_remote_vector_registry_error_new(
+        DT_REMOTE_ERR_INTERNAL,
+        _("vector adapter metadata does not match module '%s' introspection version %d"),
+        so->op, intro->params_version);
     return FALSE;
   }
 

@@ -476,10 +476,12 @@ static void test_vector_validate_levels_accepts_gap_exactly_at_flt_epsilon(void 
 #endif
 
 static char *s_harness_confdir = NULL;
+static GPtrArray *s_registry_test_allocations = NULL;
 
 static int harness_group_setup(void **state)
 {
   (void)state;
+  s_registry_test_allocations = g_ptr_array_new_with_free_func(g_free);
   GError *gerror = NULL;
   s_harness_confdir = g_dir_make_tmp("test_remote_vector-XXXXXX", &gerror);
   if(!s_harness_confdir)
@@ -505,6 +507,7 @@ static int harness_group_teardown(void **state)
 {
   (void)state;
   dt_cleanup();
+  g_clear_pointer(&s_registry_test_allocations, g_ptr_array_unref);
   if(s_harness_confdir)
   {
     gchar *cmd = g_strdup_printf("rm -rf '%s'", s_harness_confdir);
@@ -608,6 +611,36 @@ static dt_remote_vector_descriptor_t make_color_descriptor(void)
   return desc;
 }
 
+static dt_remote_vector_module_adapter_t *new_test_adapter(
+  dt_remote_vector_descriptor_t **out_descriptor)
+{
+  dt_remote_vector_descriptor_t *descriptor = g_new(dt_remote_vector_descriptor_t, 1);
+  *descriptor = make_color_descriptor();
+  dt_remote_vector_module_adapter_t *adapter = g_new0(dt_remote_vector_module_adapter_t, 1);
+  *adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders",
+    .minimum_params_version = 4,
+    .maximum_params_version = 4,
+    .vectors = descriptor,
+    .vector_count = 1,
+  };
+  g_ptr_array_add(s_registry_test_allocations, descriptor);
+  g_ptr_array_add(s_registry_test_allocations, adapter);
+  *out_descriptor = descriptor;
+  return adapter;
+}
+
+static void assert_vector_registry_rejects(
+  const dt_remote_vector_module_adapter_t *adapter,
+  const dt_iop_module_so_t *so)
+{
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(error);
+}
+
 static gboolean s_validate_completed_result = TRUE;
 static int s_validate_completed_calls = 0;
 
@@ -673,6 +706,110 @@ static const dt_remote_curve_module_adapter_t *colliding_curve_lookup_override(c
 /* ---------------------------------------------------------------------- */
 /* dt_remote_vector_registry_validate                                      */
 /* ---------------------------------------------------------------------- */
+
+static void test_registry_validate_rejects_invalid_adapter_envelope(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *null_vectors = new_test_adapter(&descriptor);
+  null_vectors->vectors = NULL;
+  assert_vector_registry_rejects(null_vectors, so);
+
+  dt_remote_vector_module_adapter_t *null_prepare = new_test_adapter(&descriptor);
+  null_prepare->prepare_field_count = 1;
+  null_prepare->prepare_fields = NULL;
+  assert_vector_registry_rejects(null_prepare, so);
+
+  static const char *const empty_prepare[] = { "" };
+  dt_remote_vector_module_adapter_t *empty_prepare_name = new_test_adapter(&descriptor);
+  empty_prepare_name->prepare_field_count = 1;
+  empty_prepare_name->prepare_fields = empty_prepare;
+  assert_vector_registry_rejects(empty_prepare_name, so);
+
+  dt_remote_vector_module_adapter_t *wrong_operation = new_test_adapter(&descriptor);
+  wrong_operation->operation = "watermark";
+  assert_vector_registry_rejects(wrong_operation, so);
+
+  dt_remote_vector_module_adapter_t *null_operation = new_test_adapter(&descriptor);
+  null_operation->operation = NULL;
+  assert_vector_registry_rejects(null_operation, so);
+
+  dt_remote_vector_module_adapter_t *empty_operation = new_test_adapter(&descriptor);
+  empty_operation->operation = "";
+  assert_vector_registry_rejects(empty_operation, so);
+
+  dt_remote_vector_module_adapter_t *reversed_versions = new_test_adapter(&descriptor);
+  reversed_versions->minimum_params_version = 5;
+  reversed_versions->maximum_params_version = 4;
+  assert_vector_registry_rejects(reversed_versions, so);
+
+  dt_remote_vector_module_adapter_t *outside_version = new_test_adapter(&descriptor);
+  outside_version->minimum_params_version = 1;
+  outside_version->maximum_params_version = 3;
+  assert_vector_registry_rejects(outside_version, so);
+}
+
+static void test_registry_validate_rejects_invalid_descriptor_metadata(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+
+  dt_remote_vector_module_adapter_t *null_name = new_test_adapter(&descriptor);
+  descriptor->name = NULL;
+  assert_vector_registry_rejects(null_name, so);
+
+  dt_remote_vector_module_adapter_t *empty_name = new_test_adapter(&descriptor);
+  descriptor->name = "";
+  assert_vector_registry_rejects(empty_name, so);
+
+  dt_remote_vector_module_adapter_t *zero_components = new_test_adapter(&descriptor);
+  descriptor->component_count = 0;
+  assert_vector_registry_rejects(zero_components, so);
+
+  dt_remote_vector_module_adapter_t *null_components = new_test_adapter(&descriptor);
+  descriptor->components = NULL;
+  assert_vector_registry_rejects(null_components, so);
+
+  static const dt_remote_vector_component_t null_component_name[] = {
+    { NULL, 0.0, 1.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_component_name = new_test_adapter(&descriptor);
+  descriptor->components = null_component_name;
+  assert_vector_registry_rejects(bad_component_name, so);
+
+  static const dt_remote_vector_component_t empty_component_name[] = {
+    { "", 0.0, 1.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_empty_component_name = new_test_adapter(&descriptor);
+  descriptor->components = empty_component_name;
+  assert_vector_registry_rejects(bad_empty_component_name, so);
+
+  static const dt_remote_vector_component_t reversed_bounds[] = {
+    { "red", 1.0, 0.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_bounds = new_test_adapter(&descriptor);
+  descriptor->components = reversed_bounds;
+  assert_vector_registry_rejects(bad_bounds, so);
+
+  static const dt_remote_vector_component_t nan_bounds[] = {
+    { "red", NAN, 1.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_nan_bounds = new_test_adapter(&descriptor);
+  descriptor->components = nan_bounds;
+  assert_vector_registry_rejects(bad_nan_bounds, so);
+
+  static const dt_remote_vector_component_t infinite_bounds[] = {
+    { "red", 0.0, INFINITY }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_infinite_bounds = new_test_adapter(&descriptor);
+  descriptor->components = infinite_bounds;
+  assert_vector_registry_rejects(bad_infinite_bounds, so);
+}
 
 static void test_registry_validate_passes_for_well_formed_descriptor(void **state)
 {
@@ -1553,6 +1690,8 @@ int main(void)
     cmocka_unit_test(test_vector_validate_levels_rejects_gap_below_flt_epsilon),
     cmocka_unit_test(test_vector_validate_levels_accepts_gap_exactly_at_flt_epsilon),
 
+    cmocka_unit_test(test_registry_validate_rejects_invalid_adapter_envelope),
+    cmocka_unit_test(test_registry_validate_rejects_invalid_descriptor_metadata),
     cmocka_unit_test(test_registry_validate_passes_for_well_formed_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_smaller_than_component_count),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_mismatch),

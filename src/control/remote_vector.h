@@ -145,17 +145,24 @@ typedef const dt_remote_vector_module_adapter_t *(*dt_remote_vector_registry_loo
   const char *operation, guint params_version);
 void dt_remote_vector_registry_set_lookup_override(dt_remote_vector_registry_lookup_override_t lookup);
 
-/** validates, for every descriptor on `adapter`, that its native path
- * resolves against `so`'s real introspection tree to a float array leaf of
- * length >= component_count, with native_capacity equal to that resolved
+/** validates that `adapter`'s nonempty operation matches `so`, and that the
+ * nonnegative introspection params version is within its ordered inclusive
+ * version range; that positive vector/prepare-field counts have non-NULL
+ * backing pointers and every prepare-field ID is nonempty; and, for every
+ * descriptor, that its ID and all component IDs are nonempty, its positive
+ * component count has a non-NULL component array, and every component has
+ * finite, ordered minimum/maximum bounds. It then validates that each native
+ * path resolves against `so`'s real introspection tree to a float array leaf
+ * of length >= component_count, with native_capacity equal to that resolved
  * array length exactly; that no two descriptors on `adapter` share a name;
- * that no descriptor's name collides with a curve semantic ID registered
- * for the same (operation, params_version) pair (queried through
+ * that no descriptor's name collides with a curve semantic ID registered for
+ * the same (operation, params_version) pair (queried through
  * dt_remote_curve_registry_lookup()); that every COLOR descriptor carries a
  * non-NULL color_space; and that every LEVELS descriptor has
- * strictly_increasing set. One aggregate result is cached for the process
- * lifetime, keyed by (`adapter` identity, introspection's params_version) --
- * same caching convention as dt_remote_curve_registry_validate().
+ * strictly_increasing set. Invalid metadata fails closed before its pointer
+ * is traversed. One aggregate result is cached for the process lifetime,
+ * keyed by (`adapter` identity, introspection's params_version) -- same
+ * caching convention as dt_remote_curve_registry_validate().
  *
  * Returns TRUE iff every check above passes. Returns FALSE, with `*error`
  * set to a newly allocated DT_REMOTE_ERR_INTERNAL (caller frees with
