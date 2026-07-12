@@ -241,6 +241,24 @@ static gboolean vector_component_metadata_is_valid(
   return TRUE;
 }
 
+static gboolean vector_subtype_metadata_is_valid(
+  const dt_remote_vector_descriptor_t *desc)
+{
+  switch(desc->subtype)
+  {
+    case DT_REMOTE_VECTOR_PLAIN:
+      return !desc->color_space && !desc->strictly_increasing && desc->minimum_gap == 0.0;
+    case DT_REMOTE_VECTOR_COLOR:
+      return nonempty_string(desc->color_space)
+             && !desc->strictly_increasing && desc->minimum_gap == 0.0;
+    case DT_REMOTE_VECTOR_LEVELS:
+      return !desc->color_space && desc->strictly_increasing
+             && isfinite(desc->minimum_gap) && desc->minimum_gap >= 0.0;
+    default:
+      return FALSE;
+  }
+}
+
 // Checks one descriptor's native layout (a single fixed-capacity float
 // array leaf -- never a struct-of-nodes array like a curve's) and optional
 // predicates against `root` (the module's whole params struct field,
@@ -251,6 +269,7 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
                                            void *dummy_blob)
 {
   if(!vector_component_metadata_is_valid(desc)) return FALSE;
+  if(!vector_subtype_metadata_is_valid(desc)) return FALSE;
   if(root->header.type != DT_INTROSPECTION_TYPE_STRUCT) return FALSE;
 
   if(desc->native.length && !desc->native.segments) return FALSE;
@@ -258,14 +277,15 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
   const dt_introspection_field_t *array_field = NULL;
   if(!dt_remote_path_resolve(&desc->native, root, dummy_blob, &array_field, NULL, NULL))
     return FALSE;
-  if(array_field->header.type != DT_INTROSPECTION_TYPE_ARRAY
-     || array_field->Array.type != DT_INTROSPECTION_TYPE_FLOAT)
+  if(!array_field
+     || array_field->header.type != DT_INTROSPECTION_TYPE_ARRAY
+     || array_field->Array.type != DT_INTROSPECTION_TYPE_FLOAT
+     || !array_field->Array.field
+     || array_field->Array.field->header.type != DT_INTROSPECTION_TYPE_FLOAT
+     || array_field->Array.field->header.size != sizeof(float))
     return FALSE;
   if((guint)array_field->Array.count < desc->component_count) return FALSE;
   if((guint)array_field->Array.count != desc->native_capacity) return FALSE;
-
-  if(desc->subtype == DT_REMOTE_VECTOR_COLOR && !desc->color_space) return FALSE;
-  if(desc->subtype == DT_REMOTE_VECTOR_LEVELS && !desc->strictly_increasing) return FALSE;
 
   return vector_predicate_is_valid(desc->active_when, root, dummy_blob)
          && vector_predicate_is_valid(desc->writable_when, root, dummy_blob);

@@ -477,6 +477,22 @@ static void test_vector_validate_levels_accepts_gap_exactly_at_flt_epsilon(void 
 
 static char *s_harness_confdir = NULL;
 static GPtrArray *s_registry_test_allocations = NULL;
+static dt_introspection_t *s_private_vector_intro = NULL;
+
+static dt_introspection_t *private_vector_get_introspection(void)
+{
+  return s_private_vector_intro;
+}
+
+static void init_private_vector_so(dt_iop_module_so_t *out,
+                                   const char *operation,
+                                   dt_introspection_t *intro)
+{
+  memset(out, 0, sizeof(*out));
+  g_strlcpy(out->op, operation, sizeof(out->op));
+  out->get_introspection = private_vector_get_introspection;
+  s_private_vector_intro = intro;
+}
 
 static int harness_group_setup(void **state)
 {
@@ -533,6 +549,7 @@ static int lookup_override_test_teardown(void **state)
   (void)state;
   dt_remote_vector_registry_set_lookup_override(NULL);
   dt_remote_curve_registry_set_lookup_override(NULL);
+  s_private_vector_intro = NULL;
   return 0;
 }
 
@@ -585,6 +602,25 @@ static const dt_remote_introspection_path_t s_frame_color_path = {
   .segments = s_frame_color_segments, .length = G_N_ELEMENTS(s_frame_color_segments)
 };
 
+static const dt_remote_path_segment_t s_size_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "size" },
+};
+static const dt_remote_introspection_path_t s_size_path = {
+  .segments = s_size_segments, .length = G_N_ELEMENTS(s_size_segments),
+};
+static const dt_remote_path_segment_t s_aspect_text_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "aspect_text" },
+};
+static const dt_remote_introspection_path_t s_aspect_text_path = {
+  .segments = s_aspect_text_segments, .length = G_N_ELEMENTS(s_aspect_text_segments),
+};
+static const dt_remote_path_segment_t s_missing_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "missing_vector_field" },
+};
+static const dt_remote_introspection_path_t s_missing_path = {
+  .segments = s_missing_segments, .length = G_N_ELEMENTS(s_missing_segments),
+};
+
 static const dt_remote_vector_component_t s_rgb_components[] = {
   { .name = "red", .minimum = 0.0, .maximum = 1.0 },
   { .name = "green", .minimum = 0.0, .maximum = 1.0 },
@@ -594,6 +630,11 @@ static const dt_remote_vector_component_t s_rgb_components[] = {
 static const dt_remote_vector_component_t s_rg_components[] = {
   { .name = "red", .minimum = 0.0, .maximum = 1.0 },
   { .name = "green", .minimum = 0.0, .maximum = 1.0 },
+};
+
+static const dt_remote_vector_component_t s_rgba_components[] = {
+  { "red", 0.0, 1.0 }, { "green", 0.0, 1.0 },
+  { "blue", 0.0, 1.0 }, { "alpha", 0.0, 1.0 },
 };
 
 // Base fixture descriptor: three components, full native capacity, no
@@ -809,6 +850,148 @@ static void test_registry_validate_rejects_invalid_descriptor_metadata(void **st
   dt_remote_vector_module_adapter_t *bad_infinite_bounds = new_test_adapter(&descriptor);
   descriptor->components = infinite_bounds;
   assert_vector_registry_rejects(bad_infinite_bounds, so);
+}
+
+static void test_registry_validate_rejects_invalid_subtype_metadata(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+
+  dt_remote_vector_module_adapter_t *unknown = new_test_adapter(&descriptor);
+  descriptor->subtype = (dt_remote_vector_subtype_t)99;
+  assert_vector_registry_rejects(unknown, so);
+
+  dt_remote_vector_module_adapter_t *plain_color_space = new_test_adapter(&descriptor);
+  descriptor->color_space = "display_rgb";
+  assert_vector_registry_rejects(plain_color_space, so);
+
+  dt_remote_vector_module_adapter_t *plain_ordering = new_test_adapter(&descriptor);
+  descriptor->strictly_increasing = TRUE;
+  assert_vector_registry_rejects(plain_ordering, so);
+
+  dt_remote_vector_module_adapter_t *plain_gap = new_test_adapter(&descriptor);
+  descriptor->minimum_gap = FLT_EPSILON;
+  assert_vector_registry_rejects(plain_gap, so);
+
+  dt_remote_vector_module_adapter_t *empty_color_space = new_test_adapter(&descriptor);
+  descriptor->subtype = DT_REMOTE_VECTOR_COLOR;
+  descriptor->color_space = "";
+  assert_vector_registry_rejects(empty_color_space, so);
+
+  dt_remote_vector_module_adapter_t *color_ordering = new_test_adapter(&descriptor);
+  descriptor->subtype = DT_REMOTE_VECTOR_COLOR;
+  descriptor->color_space = "display_rgb";
+  descriptor->strictly_increasing = TRUE;
+  assert_vector_registry_rejects(color_ordering, so);
+
+  dt_remote_vector_module_adapter_t *levels_color_space = new_test_adapter(&descriptor);
+  descriptor->subtype = DT_REMOTE_VECTOR_LEVELS;
+  descriptor->strictly_increasing = TRUE;
+  descriptor->color_space = "display_rgb";
+  assert_vector_registry_rejects(levels_color_space, so);
+
+  const double bad_gaps[] = { -FLT_EPSILON, NAN, INFINITY };
+  for(guint i = 0; i < G_N_ELEMENTS(bad_gaps); i++)
+  {
+    dt_remote_vector_module_adapter_t *levels_gap = new_test_adapter(&descriptor);
+    descriptor->subtype = DT_REMOTE_VECTOR_LEVELS;
+    descriptor->strictly_increasing = TRUE;
+    descriptor->minimum_gap = bad_gaps[i];
+    assert_vector_registry_rejects(levels_gap, so);
+  }
+}
+
+static void test_registry_validate_accepts_valid_color_and_levels_metadata(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_error_t *error = NULL;
+
+  dt_remote_vector_module_adapter_t *color = new_test_adapter(&descriptor);
+  descriptor->subtype = DT_REMOTE_VECTOR_COLOR;
+  descriptor->color_space = "display_rgb";
+  assert_true(dt_remote_vector_registry_validate(color, so, &error));
+  assert_null(error);
+
+  const double valid_gaps[] = { 0.0, FLT_EPSILON };
+  for(guint i = 0; i < G_N_ELEMENTS(valid_gaps); i++)
+  {
+    dt_remote_vector_module_adapter_t *levels = new_test_adapter(&descriptor);
+    descriptor->subtype = DT_REMOTE_VECTOR_LEVELS;
+    descriptor->strictly_increasing = TRUE;
+    descriptor->minimum_gap = valid_gaps[i];
+    assert_true(dt_remote_vector_registry_validate(levels, so, &error));
+    assert_null(error);
+  }
+}
+
+static void test_registry_validate_isolates_native_layout_failures(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+
+  dt_remote_vector_module_adapter_t *missing = new_test_adapter(&descriptor);
+  descriptor->native = s_missing_path;
+  assert_vector_registry_rejects(missing, so);
+
+  dt_remote_vector_module_adapter_t *scalar = new_test_adapter(&descriptor);
+  descriptor->native = s_size_path;
+  descriptor->component_count = 1;
+  descriptor->components = s_rgb_components;
+  descriptor->native_capacity = 1;
+  assert_vector_registry_rejects(scalar, so);
+
+  dt_remote_vector_module_adapter_t *char_array = new_test_adapter(&descriptor);
+  descriptor->native = s_aspect_text_path;
+  descriptor->native_capacity = 20;
+  assert_vector_registry_rejects(char_array, so);
+
+  dt_remote_vector_module_adapter_t *count_overflow = new_test_adapter(&descriptor);
+  descriptor->component_count = 4;
+  descriptor->components = s_rgba_components;
+  descriptor->native_capacity = 3;
+  assert_vector_registry_rejects(count_overflow, so);
+
+  dt_remote_vector_module_adapter_t *capacity_mismatch = new_test_adapter(&descriptor);
+  descriptor->component_count = 2;
+  descriptor->components = s_rg_components;
+  descriptor->native_capacity = 4;
+  assert_vector_registry_rejects(capacity_mismatch, so);
+}
+
+static void test_registry_validate_rejects_missing_float_element_descriptor(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_introspection_t broken_intro = *so->get_introspection();
+  dt_introspection_field_t broken_root = *broken_intro.field;
+  dt_introspection_field_t broken_color = { 0 };
+  dt_introspection_field_t **fields =
+    g_new(dt_introspection_field_t *, broken_root.Struct.entries + 1);
+  for(guint i = 0; i <= broken_root.Struct.entries; i++)
+  {
+    fields[i] = broken_root.Struct.fields[i];
+    if(fields[i] && !g_strcmp0(fields[i]->header.field_name, "color"))
+    {
+      broken_color = *fields[i];
+      broken_color.Array.field = NULL;
+      fields[i] = &broken_color;
+    }
+  }
+  broken_root.Struct.fields = fields;
+  broken_intro.field = &broken_root;
+  dt_iop_module_so_t private_so;
+  init_private_vector_so(&private_so, "borders", &broken_intro);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *missing_element = new_test_adapter(&descriptor);
+  assert_vector_registry_rejects(missing_element, &private_so);
+  s_private_vector_intro = NULL;
+  g_free(fields);
 }
 
 static void test_registry_validate_passes_for_well_formed_descriptor(void **state)
@@ -1692,6 +1875,10 @@ int main(void)
 
     cmocka_unit_test(test_registry_validate_rejects_invalid_adapter_envelope),
     cmocka_unit_test(test_registry_validate_rejects_invalid_descriptor_metadata),
+    cmocka_unit_test(test_registry_validate_rejects_invalid_subtype_metadata),
+    cmocka_unit_test(test_registry_validate_accepts_valid_color_and_levels_metadata),
+    cmocka_unit_test(test_registry_validate_isolates_native_layout_failures),
+    cmocka_unit_test(test_registry_validate_rejects_missing_float_element_descriptor),
     cmocka_unit_test(test_registry_validate_passes_for_well_formed_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_smaller_than_component_count),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_mismatch),
