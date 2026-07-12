@@ -188,8 +188,10 @@ semantic descriptors (`name` like `"curve.master"`, `class: "curve"`,
 `periodic_when` conditions on scalar fields).
 Native storage fields backing a semantic parameter stay listed in `fields`
 with `writable: false` and a `represented_by` array naming the semantic IDs
-that represent them (see the `get_module_schema_rgbcurve_*` fixtures for
-the full shape).
+that represent them. This applies uniformly across the curve-bearing ops
+(`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`) — see the
+`get_module_schema_rgbcurve_*` fixtures for the full shape; the other three
+ops follow the identical wire shape with their own field/semantic names.
 
 Errors: `unknown_module`.
 
@@ -458,4 +460,6 @@ a hello capability (decision 3 above) — may be introduced without a version
 bump, per the design spec's compatibility policy. Anything that changes a
 field's meaning, requiredness, or type bumps `protocol_version`. Every
 change here must land with matching updates to the C dispatcher validation
-and the Python fixtures in the same commit.
+and the Python fixtures in the same commit. New curve-bearing ops are
+registry entries in `src/control/remote_curve_registry.c` and require no
+protocol change — the wire shape documented above already generalizes.

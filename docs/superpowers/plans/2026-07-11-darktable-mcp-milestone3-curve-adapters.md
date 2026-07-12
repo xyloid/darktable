@@ -1,5 +1,14 @@
 # darktable MCP Milestone 3 — Curve Adapters for tonecurve, colorzones, basecurve — Implementation Plan
 
+**Status: Complete (2026-07-11).** All six tasks landed on
+`worktree-mcp-remote-edit`: registry descriptor tables and adapter
+callbacks for tonecurve, colorzones, and basecurve; unit and live
+integration coverage; and documentation. `atrous` and `rgblevels` were
+explicitly excluded (fixed-band parallel arrays and levels triples,
+respectively, don't fit the curve-adapter layout). Final verification:
+13/13 ctest suites, 91 sidecar unit tests, 23 live integration tests plus
+the explicit OpenCL skip.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Extend the milestone-2 semantic curve machinery to the three remaining
@@ -78,7 +87,7 @@ milestone-3 module needs verbatim.
   - `static gboolean adapter_resolve_node(const dt_remote_curve_descriptor_t *desc, const dt_introspection_field_t *nodes_field, void *nodes_ptr, guint index, float **x, float **y)`
   - `static gboolean adapter_validate_active_curves(const struct dt_remote_curve_context_t *ctx, const void *new_params, dt_remote_error_t **error)`
 
-- [ ] **Step 1: Rename the generic helpers**
+- [x] **Step 1: Rename the generic helpers**
 
 In `src/control/remote_curve_registry.c`, rename (declaration, definition,
 and every call site — `grep -n` each old name to find them all):
@@ -105,12 +114,12 @@ rgbcurve-specific error string:
 Update `s_rgbcurve_adapter`'s member to
 `.validate_completed = adapter_validate_active_curves,`.
 
-- [ ] **Step 2: Build and run the full C suite**
+- [x] **Step 2: Build and run the full C suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build`
 Expected: `100% tests passed, 0 tests failed out of 13`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/control/remote_curve_registry.c
@@ -149,7 +158,7 @@ the module itself maintains.
 - Consumes: Task 1's `adapter_*` helpers.
 - Produces: registry entries `s_tonecurve_adapter` (op `"tonecurve"`, versions 5..5), semantic IDs `"curve.lightness"`, `"curve.a"`, `"curve.b"`.
 
-- [ ] **Step 1: Write the failing registry tests**
+- [x] **Step 1: Write the failing registry tests**
 
 In `test_remote_curve_registry.c`, after the existing rgbcurve tests, add
 (reusing that file's existing harness — the real module `.so` loads via
@@ -219,12 +228,12 @@ static void test_tonecurve_schema_lists_lightness_then_a_then_b(void **state)
 
 Register the three tests in the file's `cmocka_unit_test` group list.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R test_remote_curve_registry --output-on-failure`
 Expected: FAIL — `dt_remote_curve_registry_lookup("tonecurve", 5)` returns NULL (no adapter yet).
 
-- [ ] **Step 3: Write the failing apply-path tests**
+- [x] **Step 3: Write the failing apply-path tests**
 
 In `test_remote_curve.c`, first generalize the fixture constructor so other
 ops can reuse the whole helper family: change `rgbcurve_fixture_new(void)` to
@@ -323,7 +332,7 @@ static void test_tonecurve_adapter_mode_flip_and_ab_write_in_one_patch(void **st
 
 Register both in the group list.
 
-- [ ] **Step 4: Run to verify they fail**
+- [x] **Step 4: Run to verify they fail**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R test_remote_curve --output-on-failure`
 Expected: the two new tonecurve tests FAIL (no adapter: patch containing
@@ -332,7 +341,7 @@ Expected: the two new tonecurve tests FAIL (no adapter: patch containing
 error-code assertion and the mode-flip test fails on `assert_true`); the
 refactored rgbcurve tests still PASS.
 
-- [ ] **Step 5: Implement the tonecurve registry section**
+- [x] **Step 5: Implement the tonecurve registry section**
 
 In `remote_curve_registry.c`, after the rgbcurve adapter table and before
 `s_adapters[]`, add:
@@ -457,12 +466,12 @@ static const dt_remote_curve_module_adapter_t *const s_adapters[] = {
 };
 ```
 
-- [ ] **Step 6: Run all curve suites, then the full suite**
+- [x] **Step 6: Run all curve suites, then the full suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R 'test_remote_curve' --output-on-failure && ctest --test-dir build`
 Expected: all new tests PASS; `100% tests passed, 0 tests failed out of 13`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/control/remote_curve_registry.c \
@@ -518,7 +527,7 @@ Three design decisions, each mirroring the module or the design doc:
 - Consumes: Task 1 helpers; Task 2's `ADAPTER_CHANNEL_PATH` macro and test fixture `adapter_fixture_new`.
 - Produces: `s_colorzones_adapter` (op `"colorzones"`, versions 5..5), IDs `"curve.lightness"`, `"curve.chroma"`, `"curve.hue"`.
 
-- [ ] **Step 1: Write the failing registry tests**
+- [x] **Step 1: Write the failing registry tests**
 
 In `test_remote_curve_registry.c` add:
 
@@ -558,7 +567,7 @@ static void test_colorzones_schema_all_writable_and_conditionally_periodic(void 
 }
 ```
 
-- [ ] **Step 2: Write the failing apply-path tests**
+- [x] **Step 2: Write the failing apply-path tests**
 
 In `test_remote_curve.c` add:
 
@@ -677,13 +686,13 @@ static void test_colorzones_adapter_select_by_change_resets_curves(void **state)
 on the C implicit conversion the file already uses elsewhere.) Register all
 tests from Steps 1–2 in their group lists.
 
-- [ ] **Step 3: Run to verify the new tests fail**
+- [x] **Step 3: Run to verify the new tests fail**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R 'test_remote_curve' --output-on-failure`
 Expected: new colorzones tests FAIL (no adapter → schema list empty /
 unknown semantic curve); everything else PASSES.
 
-- [ ] **Step 4: Implement the colorzones registry section**
+- [x] **Step 4: Implement the colorzones registry section**
 
 After the tonecurve section in `remote_curve_registry.c`:
 
@@ -917,12 +926,12 @@ static const dt_remote_curve_module_adapter_t s_colorzones_adapter = {
 
 Add `&s_colorzones_adapter,` to `s_adapters[]`.
 
-- [ ] **Step 5: Run all curve suites, then the full suite**
+- [x] **Step 5: Run all curve suites, then the full suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R 'test_remote_curve' --output-on-failure && ctest --test-dir build`
 Expected: all PASS, 13/13.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/control/remote_curve_registry.c \
@@ -951,7 +960,7 @@ Camera presets ship adjacent gaps ~0.001 (e.g. the Nikon D7200 preset:
 - Consumes: Task 1 helpers, Task 2 macro/fixture.
 - Produces: `s_basecurve_adapter` (op `"basecurve"`, versions 6..6), ID `"curve.master"`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `test_remote_curve_registry.c`:
 
@@ -1022,12 +1031,12 @@ static void test_basecurve_adapter_master_write_leaves_reserved_channels_untouch
 
 Register both.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R 'test_remote_curve' --output-on-failure`
 Expected: the two new tests FAIL (registry lookup NULL / unknown semantic curve).
 
-- [ ] **Step 3: Implement the basecurve registry section**
+- [x] **Step 3: Implement the basecurve registry section**
 
 After the colorzones section:
 
@@ -1086,17 +1095,17 @@ static const dt_remote_curve_module_adapter_t s_basecurve_adapter = {
 
 Add `&s_basecurve_adapter,` to `s_adapters[]` (now 4 entries).
 
-- [ ] **Step 4: Run all curve suites, then the full suite**
+- [x] **Step 4: Run all curve suites, then the full suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R 'test_remote_curve' --output-on-failure && ctest --test-dir build`
 Expected: all PASS, 13/13.
 
-- [ ] **Step 5: Run the Python unit suite (regression only — no sidecar change)**
+- [x] **Step 5: Run the Python unit suite (regression only — no sidecar change)**
 
 Run: `cd tools/mcp && .venv/bin/pytest -q && cd ../..`
 Expected: `91 passed` (same as before; nothing sidecar-side depends on which ops carry curves).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/control/remote_curve_registry.c \
@@ -1122,7 +1131,7 @@ cross-file imports of test helpers are not available).
 **Interfaces:**
 - Consumes: wire methods `get_module_schema`/`get_module_params`/`set_module_params`/`undo` exactly as `test_curves.py` does; semantic IDs from Tasks 2–4.
 
-- [ ] **Step 1: Write the integration tests**
+- [x] **Step 1: Write the integration tests**
 
 Create `tools/mcp/tests/integration/test_curves_milestone3.py`:
 
@@ -1270,7 +1279,7 @@ these tests must speak the same dialect. Note the wire member is
 `semantic_values` (this layer sits below the sidecar's `curves`
 translation, same as `test_curves.py`).
 
-- [ ] **Step 2: Run the live suite**
+- [x] **Step 2: Run the live suite**
 
 Run: `cd tools/mcp && DARKTABLE_BIN=$PWD/../../build/bin/darktable .venv/bin/pytest -m integration -q; cd ../..`
 Expected: previous 20 tests + 3 new all PASS (plus the pre-existing OpenCL skip).
@@ -1278,7 +1287,7 @@ If a new test fails, debug with `superpowers:systematic-debugging` — the
 most likely real defect this suite can catch is the colorzones wrap-check
 caveat from Task 3 (agreed fallback documented there).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tools/mcp/tests/integration/test_curves_milestone3.py
@@ -1297,7 +1306,7 @@ git commit -m "mcp tests: milestone 3 live curve gates for tonecurve, colorzones
 - Modify: `tools/mcp/docs/remote-control.md`
 - Modify: `docs/superpowers/plans/2026-07-11-darktable-mcp-milestone3-curve-adapters.md` (this file — status header when done)
 
-- [ ] **Step 1: supported-operations tier moves**
+- [x] **Step 1: supported-operations tier moves**
 
 In `2026-07-05-darktable-mcp-supported-operations.md`:
 - Move `tonecurve` and `colorzones` from Tier 3 to Tier 1; move `basecurve`
@@ -1315,7 +1324,7 @@ In `2026-07-05-darktable-mcp-supported-operations.md`:
   new native layout kind) and `rgblevels` (levels triples — needs a levels
   class), both explicitly out of the curve-adapter pattern's reach.
 
-- [ ] **Step 2: protocol reference touch-up**
+- [x] **Step 2: protocol reference touch-up**
 
 In `2026-07-05-darktable-mcp-protocol-reference.md`, where `semantic_fields`
 / `semantic_values` name rgbcurve as the curve-bearing op, generalize to
@@ -1325,7 +1334,7 @@ untouched. Add one line to the Maintenance section: new curve ops are
 registry entries in `src/control/remote_curve_registry.c` and require no
 protocol change.
 
-- [ ] **Step 3: sidecar docs**
+- [x] **Step 3: sidecar docs**
 
 - `tools/mcp/README.md`: in the `curves` paragraph, replace the
   rgbcurve-only phrasing with the four-module list and note that
@@ -1340,7 +1349,7 @@ protocol change.
   milestone 3 extended the same `curve_params` capability to tonecurve,
   colorzones, and basecurve with no version bump.
 
-- [ ] **Step 4: Final full verification**
+- [x] **Step 4: Final full verification**
 
 Run all three suites:
 ```bash
@@ -1351,7 +1360,7 @@ cd ../..
 ```
 Expected: 13/13 C suites; 91 unit; 23 integration passed + 1 OpenCL skip.
 
-- [ ] **Step 5: Mark this plan complete and commit**
+- [x] **Step 5: Mark this plan complete and commit**
 
 Add a `**Status: Complete (<date>).**` header under this plan's title
 (matching the milestone-2 plan's convention), tick all checkboxes, then:

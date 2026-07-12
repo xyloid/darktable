@@ -26,7 +26,8 @@ milestone 2, *semantic parameter classes* can lift specific modules past
 that rule: an op with a registered curve adapter exposes writable
 curve-class semantic parameters (gated by the `curve_params` hello
 capability) even though its native node arrays stay `writable: false` —
-`rgbcurve` is the first. A module's tier follows from what fraction of its
+`rgbcurve` (milestone 2) then `tonecurve`, `colorzones`, and `basecurve`
+(milestone 3). A module's tier follows from what fraction of its
 user-facing controls survive these rules:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
@@ -55,12 +56,13 @@ with `instance_not_supported` (column "multi" below).
 Blending and mask parameters (`blendop`) are out of scope for every module,
 per the design spec's non-goals.
 
-## Tier 1 — full support (43 modules)
+## Tier 1 — full support (46 modules)
 
 | op | display name | multi | notes |
 |---|---|---|---|
 | `agx` | AgX | yes | scene-referred tone mapper; look + curve + primaries, all scalars |
 | `ashift` | rotate and perspective | no | rotation/lens shift/shear scalars; line-fit state internal (appendix) |
+| `basecurve` | base curve | yes | **milestone 3, semantic curves**: `curve.master` via `semantic_values`; fusion scalars writable; reserved native channels stay hidden |
 | `bilat` | local contrast | yes | mode enum + detail scalars |
 | `bilateral` | surface blur | yes | radius + per-channel sigmas |
 | `bloom` | bloom | yes | size/threshold/strength |
@@ -73,6 +75,7 @@ per the design spec's non-goals.
 | `colorequal` | color equalizer | yes | per-hue-band saturation/hue/brightness as named scalars — ideal for "make the greens less yellow" |
 | `colorize` | colorize | yes | hue/saturation/lightness; `version` internal |
 | `colorreconstruct` | color reconstruction | yes | threshold/spatial/range scalars; op is the CMake/plugin name (`colorreconstruction.c` is the source filename) |
+| `colorzones` | color zones | yes | **milestone 3, semantic curves**: `curve.lightness`/`curve.chroma`/`curve.hue`; periodic when select-by is hue; select-by change resets curves like the GUI |
 | `crop` | crop | no | normalized cx/cy/cw/ch; ratio ints are GUI aspect presets (caution) |
 | `defringe` | defringe | yes | radius/threshold + mode enum |
 | `demosaic` | demosaic | no | raw only; method enums + capture-sharpen scalars |
@@ -99,15 +102,15 @@ per the design spec's non-goals.
 | `sigmoid` | sigmoid | yes | contrast/skew + per-primary attenuation, all scalars/enums |
 | `soften` | soften | yes | orton-effect scalars |
 | `splittoning` | split-toning | yes | shadow/highlight hue+saturation, balance, compress |
+| `tonecurve` | tone curve | yes | **milestone 3, semantic curves**: `curve.lightness` always, `curve.a`/`curve.b` in independent-Lab mode; color-space scalar writable |
 | `toneequal` | tone equalizer | yes | nine named EV-band scalars — the natural target for "lift the shadows" |
 | `velvia` | velvia | yes | strength + mid-tones bias |
 | `vignette` | vignetting | yes | scale/falloff/brightness/saturation/shape + `center.x`/`center.y` (dotted, rangeless — finiteness-only validation); `unbound` internal |
 
-## Tier 2 — partial support (18 modules)
+## Tier 2 — partial support (17 modules)
 
 | op | display name | multi | supported | unsupported / caveats |
 |---|---|---|---|---|
-| `basecurve` | base curve | yes | exposure-fusion controls (`exposure_fusion`, `exposure_stops`, `exposure_bias`), `preserve_colors` enum | curve node arrays (`basecurve`, `basecurve_nodes`, `basecurve_type`) |
 | `borders` | framing | yes | `aspect`, `size`, `pos_h`, `pos_v`, frame scalars, `basis` enum | `color[3]`/`frame_color[3]` arrays; unused `*_text` strings |
 | `channelmixerrgb` | color calibration | yes | illuminant/adaptation enums, `temperature`, `gamut`, `clip` — usable for conversational white balance | per-channel mixing arrays (`red[4]`…`grey[4]`); illuminant `x`,`y` set by picker |
 | `colorbalance` | color balance | yes | `saturation`, `contrast`, `grey`, `saturation_out`, mode enum | `lift`/`gamma`/`gain` arrays (the module's core) |
@@ -126,23 +129,26 @@ per the design spec's non-goals.
 | `temperature` | white balance | no | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
 | `watermark` | watermark | yes | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums | `filename`/`text`/`font` strings, `color[3]` array |
 
-## Tier 3 — parameter editing excluded (10 modules)
+## Tier 3 — parameter editing excluded (8 modules)
 
 Enable/disable, reset, history, and undo remain available; `set_module_params`
-is not useful because the module's essence is unsupported data.
+is not useful because the module's essence is unsupported data. The two
+remaining curve-shaped entries here are explicitly out of the curve-adapter
+pattern's reach: `atrous`'s per-band controls are fixed parallel arrays, not
+a control-point curve, and would need a new native layout kind; `rgblevels`'
+per-channel data is levels triples (black/grey/white), not curve nodes, and
+would need a levels parameter class instead.
 
 | op | display name | why excluded |
 |---|---|---|
 | `atrous` | contrast equalizer | per-band spline curves (`x`/`y` 2-D arrays) |
 | `colorchecker` | color look up table | source/target Lab patch tables |
 | `colormapping` | color mapping | acquired source/target histograms and cluster statistics; scalars meaningless without GUI acquisition |
-| `colorzones` | color zones | per-channel curve node arrays |
 | `liquify` | liquify | serialized warp-node coordinate blob |
 | `lut3d` | LUT 3D | LUT file path + embedded compressed LUT blob; enums meaningless without a loaded LUT |
 | `rasterfile` | external raster masks | file-path strings |
 | `retouch` | retouch | drawn-form data (`rt_forms`); algorithm scalars only act on shapes drawn in the GUI |
 | `rgblevels` | rgb levels | per-channel `levels` 2-D array is the whole control |
-| `tonecurve` | tone curve | L/a/b curve node arrays |
 
 ## Deprecated (16 modules)
 

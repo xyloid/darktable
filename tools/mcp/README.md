@@ -76,14 +76,18 @@ stale client can't clobber a concurrent edit. `set_module_params` is atomic
 enables a disabled module implicitly -- pass `enable: true` to switch it on
 in the same history step.
 
-`set_module_params` also edits semantic curve parameters (e.g. rgbcurve's
-`curve.master`; see `get_module_schema`'s `semantic_fields`) through its
+`set_module_params` also edits semantic curve parameters through its
 optional `curves` argument: semantic IDs mapped to `{"points": [[x, y],
 ...], "interpolation"?: "cubic_spline" | "catmull_rom" |
-"monotone_hermite"}`. This requires a darktable that advertises the
-`curve_params` hello capability; against an older darktable the tool
-refuses client-side with an upgrade message instead of silently dropping
-the curve half of a patch.
+"monotone_hermite"}`. Four modules currently expose curve semantics —
+`rgbcurve` (`curve.master`/`curve.red`/`curve.green`/`curve.blue`),
+`tonecurve` (`curve.lightness`, plus `curve.a`/`curve.b` in independent-Lab
+mode), `colorzones` (`curve.lightness`/`curve.chroma`/`curve.hue`), and
+`basecurve` (`curve.master`) — and `get_module_schema`'s `semantic_fields`
+is the authoritative source of each module's curve IDs. This requires a
+darktable that advertises the `curve_params` hello capability; against an
+older darktable the tool refuses client-side with an upgrade message
+instead of silently dropping the curve half of a patch.
 
 ## Setup
 

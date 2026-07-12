@@ -211,7 +211,9 @@ off. Removing/stopping the sidecar from your MCP host removes the client end.
   never sends a curve patch to a darktable that does not advertise
   `curve_params`, so an older server can never silently drop the curve
   half of a mixed patch -- the tool call fails client-side with an
-  upgrade message instead.
+  upgrade message instead. Milestone 3 extended the same `curve_params`
+  capability to `tonecurve`, `colorzones`, and `basecurve` (joining
+  `rgbcurve` from milestone 2) with no version bump.
 * **darktable:** this feature targets the darktable release it ships in
   (5.x and later) on Linux, macOS, and Windows. The server reports its
   `darktable_version` in the handshake; schema responses are cacheable per

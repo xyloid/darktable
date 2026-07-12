@@ -339,6 +339,11 @@ curve, with strictly ascending x; each patch replaces that whole curve.
 `get_module_schema`'s `semantic_fields` lists the available curve IDs, and
 `get_module_params` returns their current points under `semantic_values`.
 
+The same `curves` argument drives `tonecurve` (`curve.lightness`, plus
+`curve.a`/`curve.b` in independent-Lab mode), `colorzones`
+(`curve.lightness`/`curve.chroma`/`curve.hue`, periodic when selecting by
+hue), and `basecurve` (`curve.master`).
+
 ## 11. Run the automated tests
 
 Run the Python unit suite:
