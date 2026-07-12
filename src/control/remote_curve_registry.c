@@ -908,6 +908,8 @@ static gboolean colorzones_prepare(const struct dt_remote_curve_context_t *ctx,
   // in src/iop/colorzones.c) because the stored x axis changes meaning.
   // Mirror it on the projected block; explicit semantic curves in the same
   // request are written after prepare and overwrite these defaults.
+  // Unlike the GUI's _reset_parameters we deliberately do NOT reset
+  // strength/mode: prepare runs after scalar writes and must not clobber them.
   return colorzones_reset_curves(ctx, new_params, new_channel == new_hue, error);
 }
 
@@ -937,6 +939,12 @@ static gboolean colorzones_validate_completed(const struct dt_remote_curve_conte
     if(n < 2) continue;
     const dt_remote_curve_point_t first = g_array_index(value->points, dt_remote_curve_point_t, 0);
     const dt_remote_curve_point_t last = g_array_index(value->points, dt_remote_curve_point_t, n - 1);
+    // Known residual: the GUI clamps a hue curve's combined edge gap to
+    // exactly DT_IOP_COLORZONES_MIN_X_DISTANCE, so a pre-existing GUI-drawn
+    // hue curve with nodes pinned to both edges fails this strict check on
+    // any later MCP patch. Per the milestone 3 plan, if real states like
+    // that surface, the agreed fallback is relaxing the threshold to
+    // `> 0.0` — do not invent a third behavior.
     const double wrap_gap = (first.x - desc->x.minimum) + (desc->x.maximum - last.x);
     if(!(wrap_gap > COLORZONES_MIN_X_DISTANCE))
     {

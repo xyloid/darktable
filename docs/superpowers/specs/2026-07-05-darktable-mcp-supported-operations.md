@@ -75,7 +75,7 @@ per the design spec's non-goals.
 | `colorequal` | color equalizer | yes | per-hue-band saturation/hue/brightness as named scalars — ideal for "make the greens less yellow" |
 | `colorize` | colorize | yes | hue/saturation/lightness; `version` internal |
 | `colorreconstruct` | color reconstruction | yes | threshold/spatial/range scalars; op is the CMake/plugin name (`colorreconstruction.c` is the source filename) |
-| `colorzones` | color zones | yes | **milestone 3, semantic curves**: `curve.lightness`/`curve.chroma`/`curve.hue`; periodic when select-by is hue; select-by change resets curves like the GUI |
+| `colorzones` | color zones | yes | **milestone 3, semantic curves**: `curve.lightness`/`curve.chroma`/`curve.hue`; periodic when select-by is hue; select-by change resets the curves (but not strength/mode, unlike the GUI's full reset) |
 | `crop` | crop | no | normalized cx/cy/cw/ch; ratio ints are GUI aspect presets (caution) |
 | `defringe` | defringe | yes | radius/threshold + mode enum |
 | `demosaic` | demosaic | no | raw only; method enums + capture-sharpen scalars |
@@ -209,7 +209,7 @@ heuristic verified per module):
 | `channelmixerrgb` | `x`, `y`, `version` | picker-set illuminant coords; algorithm version |
 | `colorcontrast` | `a_offset`, `b_offset`, `unbound` | no GUI, legacy |
 | `colorize` | `version` | internal versioning |
-| `colorzones` | `splines_version` | internal versioning |
+| `colorzones` | `splines_version` | internal versioning; semantic curve writes stamp it to V2, so untouched curves in a legacy V1 edit are re-rendered under V2 spline math |
 | `crop` | `ratio_n`, `ratio_d` | GUI aspect-preset state; writable only with care |
 | `denoiseprofile` | `a[3]`, `b[3]` (arrays), `fix_anscombe_and_nlmeans_norm`, `use_new_vst`, `wb_adaptive_anscombe` | camera-profile fit; backward-compat switches |
 | `dither` | `palette`, `random.radius`, `random.range` | reserved for future extensions |
