@@ -232,10 +232,11 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
  * against `desc`:
  *
  *   - `values->len` must equal `desc->component_count` ("count_mismatch");
- *   - each component must fall within its own [minimum, maximum] domain,
- *     inclusive ("domain") -- compared entirely in double precision, so a
- *     value like 2.00000001 against a maximum of 2.0 is correctly rejected
- *     even though both would round to the same float;
+ *   - every component must be finite ("non_finite");
+ *   - each finite component must fall within its own [minimum, maximum]
+ *     domain, inclusive ("domain") -- compared entirely in double precision,
+ *     so a value like 2.00000001 against a maximum of 2.0 is correctly
+ *     rejected even though both would round to the same float;
  *   - when `desc->subtype` is DT_REMOTE_VECTOR_LEVELS, each adjacent pair
  *     must be strictly increasing ("unordered" when the delta is <= 0) and
  *     the gap must be at least `desc->minimum_gap` ("gap" when the delta is

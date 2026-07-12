@@ -21,6 +21,7 @@
 #include "common/darktable.h" // _()
 #include "develop/imageop.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -145,6 +146,14 @@ gboolean dt_remote_vector_validate(const dt_remote_vector_descriptor_t *desc,
   {
     const double value = g_array_index(values, double, i);
     const dt_remote_vector_component_t *component = &desc->components[i];
+    if(!isfinite(value))
+    {
+      if(error)
+        *error = dt_remote_vector_validate_error_new(
+          parameter, (int)i, "non_finite",
+          _("vector '%s' component %u has a non-finite value"), parameter, i);
+      return FALSE;
+    }
     if(value < component->minimum || value > component->maximum)
     {
       if(error)

@@ -301,6 +301,42 @@ static void test_vector_validate_accepts_component_exactly_at_maximum(void **sta
   g_array_free(array, TRUE);
 }
 
+static void test_vector_validate_rejects_non_finite_components(void **state)
+{
+  (void)state;
+  const double invalid[] = { NAN, INFINITY, -INFINITY };
+
+  for(guint i = 0; i < G_N_ELEMENTS(invalid); i++)
+  {
+    dt_remote_vector_descriptor_t desc = make_plain_descriptor();
+    const double raw[] = { 0.5, invalid[i], 0.0 };
+    GArray *values = make_values(raw, G_N_ELEMENTS(raw));
+    GArray *before = make_values(raw, G_N_ELEMENTS(raw));
+    dt_remote_error_t *error = NULL;
+
+    assert_false(dt_remote_vector_validate(&desc, values, &error));
+    assert_vector_error_details(error, "vector.plain", 1, "non_finite");
+    assert_memory_equal(values->data, before->data, values->len * sizeof(double));
+
+    dt_remote_error_free(error);
+    g_array_unref(before);
+    g_array_unref(values);
+  }
+}
+
+static void test_vector_validate_accepts_exact_finite_minima(void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_plain_descriptor();
+  const double raw[] = { 0.0, 0.0, -1.0 };
+  GArray *values = make_values(raw, G_N_ELEMENTS(raw));
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_vector_validate(&desc, values, &error));
+  assert_null(error);
+  g_array_unref(values);
+}
+
 static void test_vector_validate_never_mutates_values_on_rejection(void **state)
 {
   (void)state;
@@ -336,6 +372,26 @@ static dt_remote_vector_descriptor_t make_levels_descriptor(double minimum_gap)
   desc.strictly_increasing = TRUE;
   desc.minimum_gap = minimum_gap;
   return desc;
+}
+
+static void test_vector_validate_levels_rejects_nan_in_every_position(void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_levels_descriptor((double)FLT_EPSILON);
+
+  for(guint bad_index = 0; bad_index < desc.component_count; bad_index++)
+  {
+    double raw[] = { 0.1, 0.5, 0.9 };
+    raw[bad_index] = NAN;
+    GArray *values = make_values(raw, G_N_ELEMENTS(raw));
+    dt_remote_error_t *error = NULL;
+
+    assert_false(dt_remote_vector_validate(&desc, values, &error));
+    assert_vector_error_details(error, "vector.levels", (int)bad_index, "non_finite");
+
+    dt_remote_error_free(error);
+    g_array_unref(values);
+  }
 }
 
 static void test_vector_validate_levels_accepts_strictly_increasing(void **state)
@@ -1487,6 +1543,9 @@ int main(void)
     cmocka_unit_test(test_vector_validate_rejects_component_below_minimum),
     cmocka_unit_test(test_vector_validate_rejects_component_above_maximum_at_double_boundary),
     cmocka_unit_test(test_vector_validate_accepts_component_exactly_at_maximum),
+    cmocka_unit_test(test_vector_validate_rejects_non_finite_components),
+    cmocka_unit_test(test_vector_validate_levels_rejects_nan_in_every_position),
+    cmocka_unit_test(test_vector_validate_accepts_exact_finite_minima),
     cmocka_unit_test(test_vector_validate_never_mutates_values_on_rejection),
     cmocka_unit_test(test_vector_validate_levels_accepts_strictly_increasing),
     cmocka_unit_test(test_vector_validate_levels_rejects_unordered),
