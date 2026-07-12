@@ -1288,6 +1288,15 @@ static void test_list_schema_no_adapter_yields_null_and_succeeds(void **state)
   assert_null(fields);
 }
 
+static const dt_remote_parameter_predicate_t active_predicate = {
+  .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_EQ,
+  .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_PORTRAIT",
+};
+static const dt_remote_parameter_predicate_t writable_predicate = {
+  .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_NE,
+  .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_LANDSCAPE",
+};
+
 static void test_list_schema_converts_descriptors_in_registry_order(void **state)
 {
   (void)state;
@@ -1297,12 +1306,16 @@ static void test_list_schema_converts_descriptors_in_registry_order(void **state
   static dt_remote_vector_descriptor_t descriptors[2];
   descriptors[0] = make_color_descriptor();
   descriptors[0].name = "vector.first";
+  descriptors[0].description = "first description";
+  descriptors[0].active_when = &active_predicate;
+  descriptors[0].writable_when = &writable_predicate;
   descriptors[1] = make_color_descriptor();
   descriptors[1].name = "vector.second";
   descriptors[1].native = s_frame_color_path;
-  descriptors[1].subtype = DT_REMOTE_VECTOR_COLOR;
-  descriptors[1].color_space = "display_rgb";
-  descriptors[1].writable_when = NULL;
+  descriptors[1].subtype = DT_REMOTE_VECTOR_LEVELS;
+  descriptors[1].strictly_increasing = TRUE;
+  descriptors[1].minimum_gap = FLT_EPSILON;
+  descriptors[1].color_space = NULL;
   static dt_remote_vector_module_adapter_t adapter;
   adapter = (dt_remote_vector_module_adapter_t){
     .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
@@ -1323,12 +1336,28 @@ static void test_list_schema_converts_descriptors_in_registry_order(void **state
   assert_string_equal(second->name, "vector.second");
   assert_int_equal(first->subtype, DT_REMOTE_VECTOR_PLAIN);
   assert_null(first->color_space);
+  assert_string_equal(first->display_name, "Color");
+  assert_string_equal(first->description, "first description");
+  assert_int_equal(first->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+  assert_non_null(first->active_when);
+  assert_non_null(first->writable_when);
+  assert_ptr_not_equal(first->active_when, descriptors[0].active_when);
+  assert_ptr_not_equal(first->writable_when, descriptors[0].writable_when);
+  assert_string_equal(first->active_when->field, active_predicate.field);
+  assert_string_equal(first->writable_when->enum_name, writable_predicate.enum_name);
   assert_int_equal(first->components->len, 3);
-  assert_string_equal(
-    g_array_index(first->components, dt_remote_vector_component_schema_t, 0).name, "red");
-  assert_int_equal(second->subtype, DT_REMOTE_VECTOR_COLOR);
-  assert_string_equal(second->color_space, "display_rgb");
-  assert_int_equal(first->writability, DT_REMOTE_WRITABLE_NOW);
+  for(guint i = 0; i < descriptors[0].component_count; i++)
+  {
+    const dt_remote_vector_component_schema_t component =
+      g_array_index(first->components, dt_remote_vector_component_schema_t, i);
+    assert_string_equal(component.name, descriptors[0].components[i].name);
+    assert_float_equal(component.minimum, descriptors[0].components[i].minimum, 0.0);
+    assert_float_equal(component.maximum, descriptors[0].components[i].maximum, 0.0);
+  }
+  assert_int_equal(second->subtype, DT_REMOTE_VECTOR_LEVELS);
+  assert_true(second->strictly_increasing);
+  assert_float_equal(second->minimum_gap, (double)FLT_EPSILON, 0.0);
+  assert_null(second->color_space);
 
   g_ptr_array_unref(fields);
 }
@@ -1342,6 +1371,23 @@ static void init_fake_module(dt_iop_module_t *module, dt_iop_module_so_t *so)
   memset(module, 0, sizeof(*module));
   module->so = so;
   g_strlcpy(module->op, so->op, sizeof(module->op));
+}
+
+static void write_color_component(const borders_fixture_t *fixture,
+                                  void *params,
+                                  const char *field_name,
+                                  guint index,
+                                  float value)
+{
+  dt_introspection_field_t *array_field = NULL;
+  void *array_ptr = dt_introspection_get_child(
+    fixture->module->so->get_introspection()->field, params, field_name, &array_field);
+  dt_introspection_field_t *element_field = NULL;
+  float *element_ptr = dt_introspection_access_array(array_field, array_ptr, index,
+                                                     &element_field);
+  assert_non_null(element_ptr);
+  assert_int_equal(element_field->header.type, DT_INTROSPECTION_TYPE_FLOAT);
+  *element_ptr = value;
 }
 
 static void test_read_values_widens_floats_to_doubles(void **state)
@@ -1509,6 +1555,54 @@ static void test_read_values_evaluates_active_and_writable_predicates_independen
     assert_int_equal(second->writable_now, second_writable[i]);
     g_hash_table_unref(values);
   }
+  borders_fixture_free(fixture);
+}
+
+static void test_read_values_reads_multiple_descriptors_independently(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  static dt_remote_vector_descriptor_t descriptors[2];
+  descriptors[0] = make_color_descriptor();
+  descriptors[0].name = "vector.first";
+  descriptors[1] = make_color_descriptor();
+  descriptors[1].name = "vector.second";
+  descriptors[1].native = s_frame_color_path;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = descriptors, .vector_count = 2,
+  };
+  install_vector_adapter(&adapter);
+
+  const float color[] = { 0.1f, 0.2f, 0.3f };
+  const float frame[] = { 0.7f, 0.8f, 0.9f };
+  for(guint i = 0; i < 3; i++)
+  {
+    write_color_component(fixture, fixture->module->params, "color", i, color[i]);
+    write_color_component(fixture, fixture->module->params, "frame_color", i, frame[i]);
+  }
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params,
+                                           &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *first = g_hash_table_lookup(values, "vector.first");
+  dt_remote_vector_value_t *second = g_hash_table_lookup(values, "vector.second");
+  assert_non_null(first);
+  assert_non_null(second);
+  assert_true(first->active);
+  assert_true(first->effective);
+  assert_true(first->writable_now);
+  assert_true(second->active);
+  assert_true(second->effective);
+  assert_true(second->writable_now);
+  for(guint i = 0; i < 3; i++)
+  {
+    assert_float_equal(g_array_index(first->values, double, i), color[i], 0.0);
+    assert_float_equal(g_array_index(second->values, double, i), frame[i], 0.0);
+  }
+  g_hash_table_unref(values);
   borders_fixture_free(fixture);
 }
 
@@ -2117,6 +2211,9 @@ int main(void)
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_read_values_evaluates_active_and_writable_predicates_independently,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_read_values_reads_multiple_descriptors_independently,
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_read_values_no_adapter_returns_empty_table,
                                     lookup_override_test_setup, lookup_override_test_teardown),
