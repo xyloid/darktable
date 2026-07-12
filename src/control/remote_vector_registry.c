@@ -284,8 +284,8 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
      || array_field->Array.field->header.type != DT_INTROSPECTION_TYPE_FLOAT
      || array_field->Array.field->header.size != sizeof(float))
     return FALSE;
-  if((guint)array_field->Array.count < desc->component_count) return FALSE;
-  if((guint)array_field->Array.count != desc->native_capacity) return FALSE;
+  if(array_field->Array.count < (size_t)desc->component_count) return FALSE;
+  if(array_field->Array.count != (size_t)desc->native_capacity) return FALSE;
 
   return vector_predicate_is_valid(desc->active_when, root, dummy_blob)
          && vector_predicate_is_valid(desc->writable_when, root, dummy_blob);

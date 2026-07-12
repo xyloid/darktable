@@ -903,6 +903,20 @@ static void test_registry_validate_rejects_invalid_subtype_metadata(void **state
   }
 }
 
+static void test_registry_validate_rejects_color_with_nonzero_minimum_gap(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+
+  dt_remote_vector_module_adapter_t *color = new_test_adapter(&descriptor);
+  descriptor->subtype = DT_REMOTE_VECTOR_COLOR;
+  descriptor->color_space = "display_rgb";
+  descriptor->minimum_gap = FLT_EPSILON;
+  assert_vector_registry_rejects(color, so);
+}
+
 static void test_registry_validate_accepts_valid_color_and_levels_metadata(void **state)
 {
   (void)state;
@@ -964,13 +978,17 @@ static void test_registry_validate_isolates_native_layout_failures(void **state)
   assert_vector_registry_rejects(capacity_mismatch, so);
 }
 
-static void test_registry_validate_rejects_missing_float_element_descriptor(void **state)
+static void assert_registry_rejects_private_color_array(gboolean has_element_descriptor,
+                                                        dt_introspection_type_t element_type,
+                                                        size_t array_count)
 {
-  (void)state;
   dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
   dt_introspection_t broken_intro = *so->get_introspection();
   dt_introspection_field_t broken_root = *broken_intro.field;
   dt_introspection_field_t broken_color = { 0 };
+  dt_introspection_field_t broken_element = { 0 };
+  gboolean found_color = FALSE;
   dt_introspection_field_t **fields =
     g_new(dt_introspection_field_t *, broken_root.Struct.entries + 1);
   for(guint i = 0; i <= broken_root.Struct.entries; i++)
@@ -979,19 +997,54 @@ static void test_registry_validate_rejects_missing_float_element_descriptor(void
     if(fields[i] && !g_strcmp0(fields[i]->header.field_name, "color"))
     {
       broken_color = *fields[i];
-      broken_color.Array.field = NULL;
+      assert_non_null(broken_color.Array.field);
+      broken_element = *broken_color.Array.field;
+      broken_element.header.type = element_type;
+      broken_color.Array.field = has_element_descriptor ? &broken_element : NULL;
+      broken_color.Array.count = array_count;
       fields[i] = &broken_color;
+      found_color = TRUE;
     }
   }
+  assert_true(found_color);
   broken_root.Struct.fields = fields;
   broken_intro.field = &broken_root;
   dt_iop_module_so_t private_so;
   init_private_vector_so(&private_so, "borders", &broken_intro);
   dt_remote_vector_descriptor_t *descriptor = NULL;
-  dt_remote_vector_module_adapter_t *missing_element = new_test_adapter(&descriptor);
-  assert_vector_registry_rejects(missing_element, &private_so);
+  dt_remote_vector_module_adapter_t *adapter = new_test_adapter(&descriptor);
+  dt_remote_error_t *error = NULL;
+  const gboolean valid = dt_remote_vector_registry_validate(adapter, &private_so, &error);
   s_private_vector_intro = NULL;
   g_free(fields);
+
+  assert_false(valid);
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(error);
+}
+
+static void test_registry_validate_rejects_missing_float_element_descriptor(void **state)
+{
+  (void)state;
+  assert_registry_rejects_private_color_array(FALSE, DT_INTROSPECTION_TYPE_FLOAT, 3);
+}
+
+static void test_registry_validate_rejects_nonfloat_element_descriptor(void **state)
+{
+  (void)state;
+  assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_CHAR, 3);
+}
+
+static void test_registry_validate_rejects_oversized_native_count(void **state)
+{
+  (void)state;
+  if(sizeof(size_t) <= sizeof(guint)) return;
+
+  const size_t oversized_count =
+    (size_t)G_MAXUINT + 1 + G_N_ELEMENTS(s_rgb_components);
+  assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_FLOAT,
+                                              oversized_count);
 }
 
 static void test_registry_validate_passes_for_well_formed_descriptor(void **state)
@@ -1011,29 +1064,6 @@ static void test_registry_validate_passes_for_well_formed_descriptor(void **stat
   dt_remote_error_t *err = NULL;
   assert_true(dt_remote_vector_registry_validate(&adapter, so, &err));
   assert_null(err);
-}
-
-static void test_registry_validate_rejects_native_capacity_smaller_than_component_count(void **state)
-{
-  (void)state;
-  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
-  assert_non_null(so);
-
-  static dt_remote_vector_descriptor_t descriptor;
-  descriptor = make_color_descriptor();
-  descriptor.component_count = 4; // "color" is only float[3]
-  descriptor.native_capacity = 4;
-  static dt_remote_vector_module_adapter_t adapter;
-  adapter = (dt_remote_vector_module_adapter_t){
-    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
-    .vectors = &descriptor, .vector_count = 1,
-  };
-
-  dt_remote_error_t *err = NULL;
-  assert_false(dt_remote_vector_registry_validate(&adapter, so, &err));
-  assert_non_null(err);
-  assert_int_equal(err->code, DT_REMOTE_ERR_INTERNAL);
-  dt_remote_error_free(err);
 }
 
 static void test_registry_validate_rejects_native_capacity_mismatch(void **state)
@@ -1876,11 +1906,13 @@ int main(void)
     cmocka_unit_test(test_registry_validate_rejects_invalid_adapter_envelope),
     cmocka_unit_test(test_registry_validate_rejects_invalid_descriptor_metadata),
     cmocka_unit_test(test_registry_validate_rejects_invalid_subtype_metadata),
+    cmocka_unit_test(test_registry_validate_rejects_color_with_nonzero_minimum_gap),
     cmocka_unit_test(test_registry_validate_accepts_valid_color_and_levels_metadata),
     cmocka_unit_test(test_registry_validate_isolates_native_layout_failures),
     cmocka_unit_test(test_registry_validate_rejects_missing_float_element_descriptor),
+    cmocka_unit_test(test_registry_validate_rejects_nonfloat_element_descriptor),
+    cmocka_unit_test(test_registry_validate_rejects_oversized_native_count),
     cmocka_unit_test(test_registry_validate_passes_for_well_formed_descriptor),
-    cmocka_unit_test(test_registry_validate_rejects_native_capacity_smaller_than_component_count),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_mismatch),
     cmocka_unit_test(test_registry_validate_rejects_duplicate_names_within_adapter),
     cmocka_unit_test_setup_teardown(test_registry_validate_rejects_name_colliding_with_curve_registry,
