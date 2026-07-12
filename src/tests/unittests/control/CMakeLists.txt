@@ -45,6 +45,22 @@ if(WIN32)
     _copy_required_library(test_remote_curve_registry lib_darktable)
 endif(WIN32)
 
+add_cmocka_test(test_remote_vector
+                SOURCES test_remote_vector.c
+                LINK_LIBRARIES lib_darktable cmocka)
+
+# test_registry_* / test_vector_adapter_* load the real borders module .so
+# via dt_init(); point it at this build's own plugin directory instead of
+# the (nonexistent, install-layout) default relative to the test binary --
+# same rationale as test_remote_curve's DT_TEST_MODULEDIR above.
+target_compile_definitions(test_remote_vector PRIVATE
+  DT_TEST_MODULEDIR="${CMAKE_BINARY_DIR}/lib/darktable")
+
+# Windows: libs have to be copied next to the executable
+if(WIN32)
+    _copy_required_library(test_remote_vector lib_darktable)
+endif(WIN32)
+
 add_cmocka_test(test_remote_protocol
                 SOURCES test_remote_protocol.c
                 LINK_LIBRARIES lib_darktable cmocka)

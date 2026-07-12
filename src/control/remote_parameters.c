@@ -51,6 +51,32 @@ void dt_remote_curve_value_free(dt_remote_curve_value_t *value)
   g_free(value);
 }
 
+void dt_remote_vector_schema_free(dt_remote_vector_schema_t *schema)
+{
+  if(!schema) return;
+  g_free(schema->name);
+  g_free(schema->display_name);
+  g_free(schema->description);
+  g_free(schema->color_space);
+  if(schema->components)
+  {
+    for(guint i = 0; i < schema->components->len; i++)
+      g_free(g_array_index(schema->components, dt_remote_vector_component_schema_t, i).name);
+    g_array_unref(schema->components);
+  }
+  dt_remote_parameter_condition_free(schema->active_when);
+  dt_remote_parameter_condition_free(schema->writable_when);
+  g_free(schema);
+}
+
+void dt_remote_vector_value_free(dt_remote_vector_value_t *value)
+{
+  if(!value) return;
+  g_free(value->name);
+  if(value->values) g_array_unref(value->values);
+  g_free(value);
+}
+
 void dt_remote_semantic_patch_free(gpointer patch_ptr)
 {
   dt_remote_semantic_patch_t *patch = patch_ptr;
@@ -94,6 +120,22 @@ dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_curve(dt_remote_curve_
   return wrapper;
 }
 
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_vector(dt_remote_vector_schema_t *s)
+{
+  dt_remote_semantic_schema_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_schema_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_VECTOR;
+  wrapper->u.vector = s;
+  return wrapper;
+}
+
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_vector(dt_remote_vector_value_t *v)
+{
+  dt_remote_semantic_value_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_value_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_VECTOR;
+  wrapper->u.vector = v;
+  return wrapper;
+}
+
 void dt_remote_semantic_schema_free(gpointer schema_ptr)
 {
   dt_remote_semantic_schema_t *schema = schema_ptr;
@@ -103,6 +145,10 @@ void dt_remote_semantic_schema_free(gpointer schema_ptr)
   {
     case DT_REMOTE_PARAMETER_CURVE:
       dt_remote_curve_schema_free(schema->u.curve);
+      break;
+
+    case DT_REMOTE_PARAMETER_VECTOR:
+      dt_remote_vector_schema_free(schema->u.vector);
       break;
 
     // no other class has a union member yet (see remote_parameters.h);
@@ -123,6 +169,10 @@ void dt_remote_semantic_value_free(gpointer value_ptr)
   {
     case DT_REMOTE_PARAMETER_CURVE:
       dt_remote_curve_value_free(value->u.curve);
+      break;
+
+    case DT_REMOTE_PARAMETER_VECTOR:
+      dt_remote_vector_value_free(value->u.vector);
       break;
 
     // no other class has a union member yet (see remote_parameters.h);

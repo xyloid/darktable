@@ -173,6 +173,66 @@ typedef struct dt_remote_curve_value_t
 void dt_remote_curve_value_free(dt_remote_curve_value_t *value);
 
 /* ---------------------------------------------------------------------- */
+/* vector schema                                                           */
+/* ---------------------------------------------------------------------- */
+
+typedef enum dt_remote_vector_subtype_t
+{
+  DT_REMOTE_VECTOR_PLAIN = 0,
+  DT_REMOTE_VECTOR_COLOR,
+  DT_REMOTE_VECTOR_LEVELS
+} dt_remote_vector_subtype_t;
+
+typedef struct dt_remote_vector_component_schema_t
+{
+  char *name;                 // owned
+  double minimum;
+  double maximum;
+} dt_remote_vector_component_schema_t;
+
+typedef struct dt_remote_vector_schema_t
+{
+  char *name;                 // stable semantic ID, for example "vector.wb_coeffs"
+  char *display_name;         // presentation label
+  char *description;          // nullable
+  dt_remote_vector_subtype_t subtype;
+  char *color_space;          // owned, nullable; non-NULL iff subtype COLOR ("display_rgb")
+  GArray *components;         // dt_remote_vector_component_schema_t, owned (owned names)
+  gboolean strictly_increasing; // subtype LEVELS ordering
+  double minimum_gap;         // absolute, at-least; 0.0 = none; LEVELS only
+  dt_remote_writability_t writability;
+  dt_remote_parameter_condition_t *active_when;   // owned, nullable
+  dt_remote_parameter_condition_t *writable_when; // owned, nullable
+} dt_remote_vector_schema_t;
+
+/** frees a vector schema, including its components' owned names, its two
+ * optional conditions, and the schema struct itself. NULL-safe. */
+void dt_remote_vector_schema_free(dt_remote_vector_schema_t *schema);
+
+/* ---------------------------------------------------------------------- */
+/* vector value                                                            */
+/* ---------------------------------------------------------------------- */
+
+typedef struct dt_remote_vector_value_t
+{
+  char *name;                 // owned semantic ID
+  GArray *values;              // double, owned
+  gboolean active;
+  gboolean effective;
+  gboolean writable_now;
+} dt_remote_vector_value_t;
+
+// `active` means the semantic vector exists in the current mode.
+// `effective` means processing currently consumes it. `writable_now` is
+// resolved against the projected params block and may differ from the
+// per-op schema's general capability -- same conventions as the curve
+// value type above.
+
+/** frees a vector value, including its owned name and values array, and
+ * the value struct itself. NULL-safe. */
+void dt_remote_vector_value_free(dt_remote_vector_value_t *value);
+
+/* ---------------------------------------------------------------------- */
 /* semantic patch                                                           */
 /* ---------------------------------------------------------------------- */
 
@@ -225,13 +285,13 @@ void dt_remote_semantic_patch_free(gpointer patch_ptr);
 typedef struct dt_remote_semantic_schema_t
 {
   dt_remote_parameter_class_t class_id;
-  union { dt_remote_curve_schema_t *curve; } u;   // owned
+  union { dt_remote_curve_schema_t *curve; dt_remote_vector_schema_t *vector; } u;   // owned
 } dt_remote_semantic_schema_t;
 
 typedef struct dt_remote_semantic_value_t
 {
   dt_remote_parameter_class_t class_id;
-  union { dt_remote_curve_value_t *curve; } u;    // owned
+  union { dt_remote_curve_value_t *curve; dt_remote_vector_value_t *vector; } u;    // owned
 } dt_remote_semantic_value_t;
 
 /** wraps an owned curve schema in a DT_REMOTE_PARAMETER_CURVE-tagged
@@ -241,6 +301,14 @@ dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_curve(dt_remote_curv
 /** wraps an owned curve value in a DT_REMOTE_PARAMETER_CURVE-tagged
  * wrapper, taking ownership of `v`. */
 dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_curve(dt_remote_curve_value_t *v);
+
+/** wraps an owned vector schema in a DT_REMOTE_PARAMETER_VECTOR-tagged
+ * wrapper, taking ownership of `s`. */
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_vector(dt_remote_vector_schema_t *s);
+
+/** wraps an owned vector value in a DT_REMOTE_PARAMETER_VECTOR-tagged
+ * wrapper, taking ownership of `v`. */
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_vector(dt_remote_vector_value_t *v);
 
 /** frees a tagged semantic schema wrapper and its class-specific owned
  * payload. GDestroyNotify-able. NULL-safe. */
