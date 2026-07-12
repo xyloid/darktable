@@ -164,9 +164,11 @@ void dt_remote_vector_registry_set_lookup_override(dt_remote_vector_registry_loo
  * that no descriptor's name collides with a curve semantic ID registered for
  * the same (operation, params_version) pair (queried through
  * dt_remote_curve_registry_lookup()). Invalid metadata fails closed before
- * its pointer is traversed. One aggregate result is cached for the process
- * lifetime, keyed by (`adapter` identity, introspection's params_version) --
- * same caching convention as dt_remote_curve_registry_validate().
+ * its pointer is traversed. The intrinsic adapter/descriptor validation
+ * result is cached for the process lifetime, keyed by (`adapter` identity,
+ * introspection's params_version) -- same caching convention as
+ * dt_remote_curve_registry_validate(). Cross-class uniqueness is evaluated
+ * on every call so it reflects the current curve-registry lookup state.
  *
  * Returns TRUE iff every check above passes. Returns FALSE, with `*error`
  * set to a newly allocated DT_REMOTE_ERR_INTERNAL (caller frees with

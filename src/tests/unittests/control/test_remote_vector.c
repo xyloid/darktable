@@ -1152,6 +1152,56 @@ static void test_registry_validate_rejects_name_colliding_with_curve_registry(vo
   dt_remote_curve_registry_set_lookup_override(NULL);
 }
 
+static void test_registry_validate_rechecks_curve_collision_after_cached_success(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *adapter = new_test_adapter(&descriptor);
+  descriptor->name = "vector.color";
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+  dt_remote_curve_registry_set_lookup_override(colliding_curve_lookup_override);
+  assert_vector_registry_rejects(adapter, so);
+  dt_remote_curve_registry_set_lookup_override(NULL);
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_registry_validate_does_not_cache_curve_collision(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *adapter = new_test_adapter(&descriptor);
+  descriptor->name = "vector.color";
+
+  dt_remote_curve_registry_set_lookup_override(colliding_curve_lookup_override);
+  assert_vector_registry_rejects(adapter, so);
+  dt_remote_curve_registry_set_lookup_override(NULL);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_registry_validate_retains_intrinsic_cached_result(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *adapter = new_test_adapter(&descriptor);
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+  descriptor->native = s_missing_path;
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
 static void test_registry_validate_rejects_color_without_color_space(void **state)
 {
   (void)state;
@@ -1929,6 +1979,15 @@ int main(void)
     cmocka_unit_test(test_registry_validate_rejects_duplicate_names_within_adapter),
     cmocka_unit_test_setup_teardown(test_registry_validate_rejects_name_colliding_with_curve_registry,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_registry_validate_rechecks_curve_collision_after_cached_success,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_registry_validate_does_not_cache_curve_collision,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_registry_validate_retains_intrinsic_cached_result,
+      lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test(test_registry_validate_rejects_color_without_color_space),
     cmocka_unit_test(test_registry_validate_accepts_color_with_color_space),
     cmocka_unit_test(test_registry_validate_rejects_levels_without_strictly_increasing),

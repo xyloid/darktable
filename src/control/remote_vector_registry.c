@@ -32,10 +32,10 @@
 // Threading: like remote_vector.h/remote_curve.h/remote_edit.h, resolving a
 // path against a live darkroom module's params block must happen from the
 // GTK main thread. The static registry table and the adapter/version
-// validation cache below are read-mostly, written once per (adapter,
-// params_version) the first time that pair is validated; like the rest of
-// this subsystem, this file assumes single (main-context) threaded access
-// and adds no locking of its own.
+// intrinsic validation cache below is read-mostly, written once per
+// (adapter, params_version) the first time that pair is validated; like the
+// rest of this subsystem, this file assumes single (main-context) threaded
+// access and adds no locking of its own.
 
 #include "control/remote_vector.h"
 
@@ -119,9 +119,10 @@ dt_remote_vector_registry_lookup(const char *operation, guint params_version)
   return NULL;
 }
 
-// Process-lifetime validation cache, keyed by adapter pointer identity and
-// the introspection params version -- same convention as
-// remote_curve_registry.c's own cache.
+// Process-lifetime intrinsic validation cache, keyed by adapter pointer
+// identity and the introspection params version -- same convention as
+// remote_curve_registry.c's own cache. Cross-class uniqueness is mutable
+// under the registry lookup overrides and is therefore not cached.
 typedef struct dt_remote_vector_registry_cache_key_t
 {
   const dt_remote_vector_module_adapter_t *adapter;
@@ -130,12 +131,12 @@ typedef struct dt_remote_vector_registry_cache_key_t
 
 typedef struct dt_remote_vector_registry_cache_entry_t
 {
-  gboolean adapter_valid; // TRUE iff every check passed for this version
+  gboolean adapter_valid; // TRUE iff every intrinsic check passed for this version
 } dt_remote_vector_registry_cache_entry_t;
 
-static GHashTable *s_validation_cache = NULL; // cache key -> aggregate result; never freed
-                                              // (process lifetime, like the static
-                                              // descriptors/adapters it caches results for)
+static GHashTable *s_validation_cache = NULL; // cache key -> intrinsic result; never freed
+                                              // (process lifetime, like the static descriptors/
+                                              // adapters it caches results for)
 
 static guint validation_cache_key_hash(gconstpointer data)
 {
@@ -360,54 +361,43 @@ gboolean dt_remote_vector_registry_validate(const dt_remote_vector_module_adapte
 
   dt_remote_vector_registry_cache_entry_t *cache =
     lookup_cache_entry(adapter, intro->params_version);
-  if(cache)
+  if(!cache)
   {
-    if(!cache->adapter_valid && error)
-      *error = dt_remote_vector_registry_error_new(
-        DT_REMOTE_ERR_INTERNAL,
-        _("vector adapter '%s' has one or more descriptors that do not match introspection version %d"),
-        adapter->operation ? adapter->operation : "", intro->params_version);
-    return cache->adapter_valid;
+    gboolean intrinsic_valid = TRUE;
+    const char *first_failure = NULL;
+    if(vector_adapter_has_duplicate_names(adapter, &first_failure)) intrinsic_valid = FALSE;
+    guint8 dummy_byte = 0;
+    for(guint i = 0; i < adapter->vector_count; i++)
+    {
+      const dt_remote_vector_descriptor_t *desc = &adapter->vectors[i];
+      if(!vector_descriptor_is_valid(desc, intro->field, &dummy_byte))
+      {
+        intrinsic_valid = FALSE;
+        if(!first_failure) first_failure = desc->name;
+      }
+    }
+    cache_validation_result(adapter, intro->params_version, intrinsic_valid);
+    cache = lookup_cache_entry(adapter, intro->params_version);
   }
 
-  gboolean all_valid = TRUE;
-  const char *first_failure = NULL;
-
-  const char *duplicate_name = NULL;
-  if(vector_adapter_has_duplicate_names(adapter, &duplicate_name))
+  if(!cache->adapter_valid)
   {
-    all_valid = FALSE;
-    first_failure = duplicate_name;
+    deliver_error(dt_remote_vector_registry_error_new(
+                    DT_REMOTE_ERR_INTERNAL,
+                    _("vector adapter '%s' does not match introspection version %d"),
+                    adapter->operation, intro->params_version),
+                  error);
+    return FALSE;
   }
 
   const char *collision_name = NULL;
   if(vector_names_collide_with_curve(adapter, (guint)intro->params_version, &collision_name))
   {
-    all_valid = FALSE;
-    if(!first_failure) first_failure = collision_name;
-  }
-
-  guint8 dummy_byte = 0;
-  for(guint i = 0; i < adapter->vector_count; i++)
-  {
-    const dt_remote_vector_descriptor_t *desc = &adapter->vectors[i];
-    const gboolean ok = vector_descriptor_is_valid(desc, intro->field, &dummy_byte);
-    if(!ok)
-    {
-      all_valid = FALSE;
-      if(!first_failure) first_failure = desc->name;
-    }
-  }
-
-  cache_validation_result(adapter, intro->params_version, all_valid);
-
-  if(!all_valid)
-  {
-    if(error)
-      *error = dt_remote_vector_registry_error_new(
-        DT_REMOTE_ERR_INTERNAL,
-        _("vector descriptor '%s' does not match introspection version %d"),
-        first_failure ? first_failure : "", intro->params_version);
+    deliver_error(dt_remote_vector_registry_error_new(
+                    DT_REMOTE_ERR_INTERNAL,
+                    _("semantic vector '%s' collides with a curve ID"),
+                    collision_name ? collision_name : ""),
+                  error);
     return FALSE;
   }
   return TRUE;
