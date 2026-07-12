@@ -166,6 +166,26 @@ Start darktable from a terminal:
   --conf write_sidecar_files=never
 ```
 
+```sh
+env \             
+-u GTK_PATH \           
+-u GTK_EXE_PREFIX \   
+-u GTK_DATA_PREFIX \             
+-u GTK_IM_MODULE_FILE \                   
+-u GIO_MODULE_DIR \           
+-u GDK_PIXBUF_MODULE_FILE \
+-u GDK_PIXBUF_MODULEDIR \
+-u LOCPATH \
+-u LD_LIBRARY_PATH \
+-u LD_PRELOAD \
+"$DARKTABLE_BIN" \
+  --configdir "$DT_CONFIG" \
+  --cachedir "$DT_CACHE" \
+  --library "$DT_CONFIG/library.db" \
+  --conf security/enable_remote_control=TRUE \
+  --conf write_sidecar_files=never
+```
+
 To open a photograph immediately, append its absolute path:
 
 ```sh
