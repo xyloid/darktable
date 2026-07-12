@@ -743,11 +743,238 @@ static const dt_remote_curve_module_adapter_t s_tonecurve_adapter = {
   .validate_completed = adapter_validate_active_curves,
 };
 
-// The full adapter table. rgbcurve and tonecurve for now; a future op adds
-// another entry here, not a parallel lookup mechanism.
+/* ---------------------------------------------------------------------- */
+/* colorzones descriptor table (curve-classes design doc SS Initial        */
+/* registry mapping / colorzones). Params v5: curve[3][20] node structs,   */
+/* curve_num_nodes[3], curve_type[3]; the `channel` enum ("select by")     */
+/* picks the shared input x axis for all three output curves and makes     */
+/* them periodic when it is hue.                                           */
+/* ---------------------------------------------------------------------- */
+
+ADAPTER_CHANNEL_PATH(s_cz_nodes_ch0, "curve", 0)
+ADAPTER_CHANNEL_PATH(s_cz_nodes_ch1, "curve", 1)
+ADAPTER_CHANNEL_PATH(s_cz_nodes_ch2, "curve", 2)
+ADAPTER_CHANNEL_PATH(s_cz_count_ch0, "curve_num_nodes", 0)
+ADAPTER_CHANNEL_PATH(s_cz_count_ch1, "curve_num_nodes", 1)
+ADAPTER_CHANNEL_PATH(s_cz_count_ch2, "curve_num_nodes", 2)
+ADAPTER_CHANNEL_PATH(s_cz_type_ch0, "curve_type", 0)
+ADAPTER_CHANNEL_PATH(s_cz_type_ch1, "curve_type", 1)
+ADAPTER_CHANNEL_PATH(s_cz_type_ch2, "curve_type", 2)
+
+static const dt_remote_path_segment_t s_cz_version_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "splines_version" },
+};
+static const dt_remote_introspection_path_t s_cz_version_path = {
+  .segments = s_cz_version_segments, .length = G_N_ELEMENTS(s_cz_version_segments)
+};
+
+static const dt_remote_parameter_predicate_t s_colorzones_hue_predicate = {
+  .field = "channel", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "DT_IOP_COLORZONES_h"
+};
+
+// src/iop/colorzones.c: DT_IOP_COLORZONES_MIN_X_DISTANCE (0.0025f) and
+// DT_IOP_COLORZONES_SPLINES_V2 (1) are private to the module; mirrored
+// here and pinned by test_colorzones_adapter_write_stamps_splines_version_v2.
+#define COLORZONES_MIN_X_DISTANCE 0.0025
+#define COLORZONES_SPLINES_V2 1
+
+// wrap_spacing_rule stays NONE: the same stored curves are legitimately
+// edge-pinned (wrap gap exactly 0) under the non-hue select-by axes -- the
+// module's own non-periodic defaults. colorzones_validate_completed()
+// enforces the wrap gap only when select-by is hue.
+#define COLORZONES_DESCRIPTOR_COMMON                                         \
+    .x = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },           \
+    .y = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },           \
+    .minimum_points = 2,                                                     \
+    .maximum_points = 20,                                                    \
+    .minimum_x_spacing = COLORZONES_MIN_X_DISTANCE,                          \
+    .adjacent_spacing_rule = DT_REMOTE_SPACING_GREATER_THAN,                 \
+    .minimum_wrap_spacing = 0.0,                                             \
+    .wrap_spacing_rule = DT_REMOTE_SPACING_NONE,                             \
+    .strict_x_order = TRUE,                                                  \
+    .boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL,       \
+    .interpolation_mask = RGBCURVE_INTERPOLATION_MASK,                       \
+    .default_interpolation = DT_REMOTE_CURVE_CATMULL_ROM,                    \
+    .active_when = NULL,                                                     \
+    .writable_when = NULL,                                                   \
+    .periodic_when = &s_colorzones_hue_predicate
+
+static const dt_remote_curve_descriptor_t s_colorzones_curves[] = {
+  {
+    .name = "curve.lightness",
+    .display_name_msgid = N_("lightness"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_cz_nodes_ch0, .count = s_cz_count_ch0, .type = s_cz_type_ch0,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_cz_version_path,
+                .internal_version_value = COLORZONES_SPLINES_V2 },
+    COLORZONES_DESCRIPTOR_COMMON,
+  },
+  {
+    .name = "curve.chroma",
+    .display_name_msgid = N_("chroma"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_cz_nodes_ch1, .count = s_cz_count_ch1, .type = s_cz_type_ch1,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_cz_version_path,
+                .internal_version_value = COLORZONES_SPLINES_V2 },
+    COLORZONES_DESCRIPTOR_COMMON,
+  },
+  {
+    .name = "curve.hue",
+    .display_name_msgid = N_("hue"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_cz_nodes_ch2, .count = s_cz_count_ch2, .type = s_cz_type_ch2,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_cz_version_path,
+                .internal_version_value = COLORZONES_SPLINES_V2 },
+    COLORZONES_DESCRIPTOR_COMMON,
+  },
+};
+
+static gboolean colorzones_read_channel(const dt_remote_curve_context_t *ctx,
+                                        const void *params,
+                                        int *out,
+                                        int *hue_value,
+                                        dt_remote_error_t **error)
+{
+  const dt_introspection_field_t *field = NULL;
+  void *ptr = NULL;
+  if(!adapter_resolve_top(ctx, (void *)params, "channel", &field, &ptr, error)) return FALSE;
+  if(field->header.type != DT_INTROSPECTION_TYPE_ENUM
+     || !dt_introspection_get_enum_value((dt_introspection_field_t *)field,
+                                         "DT_IOP_COLORZONES_h", hue_value))
+    return adapter_fail_internal(error, _("colorzones channel enum drifted from introspection"));
+  *out = *(const int *)ptr;
+  return TRUE;
+}
+
+// Mirrors _reset_parameters()/_reset_nodes() in src/iop/colorzones.c: two
+// CATMULL_ROM nodes per output curve at y = 0.5, x pinned to the domain
+// edges when the select-by axis is not periodic and pulled inside it
+// (0.25/0.75) when it is.
+static gboolean colorzones_reset_curves(const dt_remote_curve_context_t *ctx,
+                                        void *params,
+                                        gboolean periodic,
+                                        dt_remote_error_t **error)
+{
+  for(guint i = 0; i < ctx->adapter->curve_count; i++)
+  {
+    const dt_remote_curve_descriptor_t *desc = &ctx->adapter->curves[i];
+    const dt_introspection_field_t *nodes_field = NULL;
+    const dt_introspection_field_t *count_field = NULL;
+    const dt_introspection_field_t *type_field = NULL;
+    void *nodes_ptr = NULL;
+    void *count_ptr = NULL;
+    void *type_ptr = NULL;
+    if(!adapter_resolve_native(ctx, desc, params, &nodes_field, &nodes_ptr,
+                               &count_field, &count_ptr, &type_field, &type_ptr, error))
+      return FALSE;
+    if(count_field->header.type != DT_INTROSPECTION_TYPE_INT
+       || type_field->header.type != DT_INTROSPECTION_TYPE_INT)
+      return adapter_fail_internal(error, _("colorzones channel layout drifted from introspection"));
+
+    for(guint k = 0; k < 2; k++)
+    {
+      float *x = NULL;
+      float *y = NULL;
+      if(!adapter_resolve_node(desc, nodes_field, nodes_ptr, k, &x, &y))
+        return adapter_fail_internal(error, _("colorzones node layout drifted from introspection"));
+      *x = periodic ? (k ? 0.75f : 0.25f) : (k ? 1.0f : 0.0f);
+      *y = 0.5f;
+    }
+    *(int *)count_ptr = 2;
+    *(int *)type_ptr = 1; // CATMULL_ROM (src/common/curve_tools.h)
+  }
+  return TRUE;
+}
+
+static gboolean colorzones_prepare(const struct dt_remote_curve_context_t *ctx,
+                                   const void *old_params,
+                                   void *new_params,
+                                   const dt_remote_patch_t *patch,
+                                   dt_remote_error_t **error)
+{
+  (void)patch;
+  int old_channel = 0;
+  int new_channel = 0;
+  int old_hue = 0;
+  int new_hue = 0;
+  if(!colorzones_read_channel(ctx, old_params, &old_channel, &old_hue, error)
+     || !colorzones_read_channel(ctx, new_params, &new_channel, &new_hue, error))
+    return FALSE;
+  if(old_channel == new_channel) return TRUE;
+  // The GUI resets every output curve when select-by changes (gui_changed()
+  // in src/iop/colorzones.c) because the stored x axis changes meaning.
+  // Mirror it on the projected block; explicit semantic curves in the same
+  // request are written after prepare and overwrite these defaults.
+  return colorzones_reset_curves(ctx, new_params, new_channel == new_hue, error);
+}
+
+static gboolean colorzones_validate_completed(const struct dt_remote_curve_context_t *ctx,
+                                              const void *new_params,
+                                              dt_remote_error_t **error)
+{
+  if(!adapter_validate_active_curves(ctx, new_params, error)) return FALSE;
+
+  int channel = 0;
+  int hue_value = 0;
+  if(!colorzones_read_channel(ctx, new_params, &channel, &hue_value, error)) return FALSE;
+  if(channel != hue_value) return TRUE;
+
+  GHashTable *values = NULL;
+  if(!dt_remote_curve_read_values(ctx->module, new_params, &values, error)) return FALSE;
+  for(guint i = 0; i < ctx->adapter->curve_count; i++)
+  {
+    const dt_remote_curve_descriptor_t *desc = &ctx->adapter->curves[i];
+    const dt_remote_curve_value_t *value = g_hash_table_lookup(values, desc->name);
+    if(!value)
+    {
+      g_hash_table_unref(values);
+      return adapter_fail_internal(error, _("completed curve value disappeared from registry"));
+    }
+    const guint n = value->points->len;
+    if(n < 2) continue;
+    const dt_remote_curve_point_t first = g_array_index(value->points, dt_remote_curve_point_t, 0);
+    const dt_remote_curve_point_t last = g_array_index(value->points, dt_remote_curve_point_t, n - 1);
+    const double wrap_gap = (first.x - desc->x.minimum) + (desc->x.maximum - last.x);
+    if(!(wrap_gap > COLORZONES_MIN_X_DISTANCE))
+    {
+      g_hash_table_unref(values);
+      dt_remote_error_t *wrap_error = dt_remote_curve_registry_error_new(
+        DT_REMOTE_ERR_INVALID_VALUE,
+        _("curve '%s' periodic wrap gap is %.17g; minimum is %.17g"),
+        desc->name, wrap_gap, (double)COLORZONES_MIN_X_DISTANCE);
+      wrap_error->details_json = g_strdup_printf(
+        "{\"parameter\":\"%s\",\"constraint\":\"wrap_spacing\"}", desc->name);
+      deliver_error(wrap_error, error);
+      return FALSE;
+    }
+  }
+  g_hash_table_unref(values);
+  return TRUE;
+}
+
+static const char *const s_colorzones_prepare_fields[] = { "channel" };
+
+static const dt_remote_curve_module_adapter_t s_colorzones_adapter = {
+  .operation = "colorzones",
+  .minimum_params_version = 5,
+  .maximum_params_version = 5,
+  .curves = s_colorzones_curves,
+  .curve_count = G_N_ELEMENTS(s_colorzones_curves),
+  .prepare_fields = s_colorzones_prepare_fields,
+  .prepare_field_count = G_N_ELEMENTS(s_colorzones_prepare_fields),
+  .prepare = colorzones_prepare,
+  .validate_completed = colorzones_validate_completed,
+};
+
+// The full adapter table. rgbcurve, tonecurve, and colorzones for now; a
+// future op adds another entry here, not a parallel lookup mechanism.
 static const dt_remote_curve_module_adapter_t *const s_adapters[] = {
   &s_rgbcurve_adapter,
   &s_tonecurve_adapter,
+  &s_colorzones_adapter,
 };
 
 static dt_remote_curve_registry_lookup_override_t s_lookup_override = NULL;

@@ -1773,6 +1773,119 @@ static void test_tonecurve_adapter_mode_flip_and_ab_write_in_one_patch(void **st
   rgbcurve_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* colorzones adapter                                                      */
+/* ---------------------------------------------------------------------- */
+
+static void test_colorzones_adapter_periodic_flag_follows_select_by(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = adapter_fixture_new("colorzones");
+  // default select-by is hue: all three curves periodic, defaults 0.25/0.75
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *hue =
+    rgbcurve_read_value(fixture, fixture->module->params, "curve.hue", &values);
+  assert_true(hue->periodic_x);
+  const dt_remote_curve_point_t hue_defaults[] = { { 0.25, 0.5 }, { 0.75, 0.5 } };
+  assert_curve_points(hue, hue_defaults, 2, 1e-6);
+  g_hash_table_unref(values);
+
+  rgbcurve_set_enum(fixture, fixture->module->params, "channel", "DT_IOP_COLORZONES_L");
+  values = NULL;
+  hue = rgbcurve_read_value(fixture, fixture->module->params, "curve.hue", &values);
+  assert_false(hue->periodic_x);
+  g_hash_table_unref(values);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_colorzones_adapter_rejects_zero_wrap_gap_in_hue_mode(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = adapter_fixture_new("colorzones");
+
+  const dt_remote_curve_point_t pinned[] = { { 0.0, 0.4 }, { 1.0, 0.6 } };
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.hue", pinned, 2, FALSE, 0));
+
+  void *projected = g_malloc0(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(error->details_json);
+  assert_non_null(strstr(error->details_json, "wrap_spacing"));
+  dt_remote_error_free(error);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_colorzones_adapter_write_stamps_splines_version_v2(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = adapter_fixture_new("colorzones");
+  // simulate a legacy V1 edit
+  dt_introspection_field_t *version_field = NULL;
+  int *version_ptr = rgbcurve_field_ptr(fixture, fixture->module->params,
+                                        "splines_version", &version_field);
+  *version_ptr = 0; // DT_IOP_COLORZONES_SPLINES_V1
+
+  const dt_remote_curve_point_t points[] = { { 0.2, 0.45 }, { 0.8, 0.55 } };
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.chroma", points, 2, FALSE, 0));
+
+  void *projected = g_malloc0(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  int *projected_version = rgbcurve_field_ptr(fixture, projected,
+                                              "splines_version", &version_field);
+  assert_int_equal(*projected_version, 1); // DT_IOP_COLORZONES_SPLINES_V2
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
+static void test_colorzones_adapter_select_by_change_resets_curves(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = adapter_fixture_new("colorzones");
+  // put a recognizable non-default shape on the hue curve first
+  const dt_remote_curve_point_t custom[] = { { 0.3, 0.4 }, { 0.7, 0.6 } };
+  dt_remote_patch_t warmup;
+  rgbcurve_patch_init(&warmup);
+  g_ptr_array_add(warmup.semantic_values,
+                  rgbcurve_make_curve_patch("curve.hue", custom, 2, FALSE, 0));
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &warmup, fixture->module->params, &error));
+  assert_null(error);
+  rgbcurve_patch_cleanup(&warmup);
+
+  // scalar-only select-by change: prepare must reset all output curves to
+  // the new axis's edge-pinned defaults, mirroring the GUI
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  rgbcurve_make_enum_entry(fixture, "channel", "DT_IOP_COLORZONES_L"));
+  void *projected = g_malloc0(fixture->module->params_size);
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *hue = rgbcurve_read_value(fixture, projected, "curve.hue", &values);
+  const dt_remote_curve_point_t reset_defaults[] = { { 0.0, 0.5 }, { 1.0, 0.5 } };
+  assert_curve_points(hue, reset_defaults, 2, 1e-6);
+  assert_int_equal(hue->interpolation, DT_REMOTE_CURVE_CATMULL_ROM);
+  g_hash_table_unref(values);
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
 /* rgbcurve path segment helpers: curve_nodes is
  * dt_iop_rgbcurve_node_t[DT_IOP_RGBCURVE_MAX_CHANNELS][DT_IOP_RGBCURVE_MAXNODES],
  * a native two-dimensional C array. Per tools/introspection/ast.pm
@@ -2095,6 +2208,10 @@ int main(void)
     cmocka_unit_test(test_rgbcurve_adapter_unused_native_capacity_is_zero_and_not_returned),
     cmocka_unit_test(test_tonecurve_adapter_ab_write_in_linked_mode_is_unsupported),
     cmocka_unit_test(test_tonecurve_adapter_mode_flip_and_ab_write_in_one_patch),
+    cmocka_unit_test(test_colorzones_adapter_periodic_flag_follows_select_by),
+    cmocka_unit_test(test_colorzones_adapter_rejects_zero_wrap_gap_in_hue_mode),
+    cmocka_unit_test(test_colorzones_adapter_write_stamps_splines_version_v2),
+    cmocka_unit_test(test_colorzones_adapter_select_by_change_resets_curves),
     cmocka_unit_test(test_path_resolve_curve_node_x),
     cmocka_unit_test(test_path_resolve_curve_num_nodes),
     cmocka_unit_test(test_path_resolve_rejects_wrong_type_segment),

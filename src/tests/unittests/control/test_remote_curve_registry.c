@@ -1503,6 +1503,45 @@ static void test_tonecurve_schema_lists_lightness_then_a_then_b(void **state)
   g_ptr_array_unref(schemas);
 }
 
+/* ---------------------------------------------------------------------- */
+/* colorzones adapter (curve-classes design doc SS Initial registry        */
+/* mapping / colorzones)                                                   */
+/* ---------------------------------------------------------------------- */
+
+static void test_registry_lookup_finds_colorzones_only_at_version_5(void **state)
+{
+  (void)state;
+  const dt_remote_curve_module_adapter_t *adapter = dt_remote_curve_registry_lookup("colorzones", 5);
+  assert_non_null(adapter);
+  assert_int_equal(adapter->curve_count, 3);
+  assert_null(dt_remote_curve_registry_lookup("colorzones", 4));
+}
+
+static void test_colorzones_schema_all_writable_and_conditionally_periodic(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("colorzones");
+  assert_non_null(so);
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_int_equal(schemas->len, 3);
+  const char *expected_names[] = { "curve.lightness", "curve.chroma", "curve.hue" };
+  for(guint i = 0; i < 3; i++)
+  {
+    const dt_remote_curve_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_false(schema->periodic_x); // conditional, so not unconditionally periodic
+    assert_non_null(schema->periodic_when);
+    assert_string_equal(schema->periodic_when->field, "channel");
+    assert_string_equal(schema->periodic_when->enum_name, "DT_IOP_COLORZONES_h");
+    assert_int_equal(schema->default_interpolation, DT_REMOTE_CURVE_CATMULL_ROM);
+  }
+  g_ptr_array_unref(schemas);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1552,6 +1591,8 @@ int main(void)
     cmocka_unit_test(test_registry_lookup_finds_tonecurve_only_at_version_5),
     cmocka_unit_test(test_registry_resolves_tonecurve_manual_enum_name),
     cmocka_unit_test(test_tonecurve_schema_lists_lightness_then_a_then_b),
+    cmocka_unit_test(test_registry_lookup_finds_colorzones_only_at_version_5),
+    cmocka_unit_test(test_colorzones_schema_all_writable_and_conditionally_periodic),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
