@@ -206,9 +206,10 @@ typedef struct dt_remote_module_schema_t  // <- get_module_schema
   gboolean deprecated;
   gboolean supports_multiple_instances;
   GPtrArray *fields;            // owned; dt_remote_field_t
-  GPtrArray *semantic_fields;   // owned; dt_remote_curve_schema_t
+  GPtrArray *semantic_fields;   // owned; class-tagged
+                                // dt_remote_semantic_schema_t
                                 // (remote_parameters.h), NULL when the op
-                                // has no registered semantic curves
+                                // has no registered semantic parameters
 } dt_remote_module_schema_t;
 
 /** frees a module schema, including primitive and semantic fields. NULL-safe. */
@@ -265,7 +266,8 @@ typedef struct dt_remote_mutation_result_t
   gboolean enabled;
   GPtrArray *values;            // dt_remote_patch_entry_t, read back; NULL
                                 // for enable/create (no values on the wire)
-  GHashTable *semantic_values;  // name -> dt_remote_curve_value_t
+  GHashTable *semantic_values;  // name -> class-tagged
+                                // dt_remote_semantic_value_t
                                 // (remote_parameters.h), read back for exactly
                                 // the semantic IDs the patch wrote; NULL when
                                 // the patch carried no semantic entries
@@ -402,12 +404,12 @@ gboolean dt_remote_get_module_schema(const char *op,
  * DT_REMOTE_ERR_UNKNOWN_INSTANCE as appropriate. `semantic_out` may be
  * NULL to request only primitive values without consulting the semantic
  * registry. When non-NULL, it receives a newly allocated GHashTable of
- * name -> dt_remote_curve_value_t (free with g_hash_table_unref()); a
- * semantic read failure fails the whole call and leaves both outputs
- * untouched. */
+ * name -> class-tagged dt_remote_semantic_value_t (free with
+ * g_hash_table_unref()); a semantic read failure fails the whole call
+ * and leaves both outputs untouched. */
 gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
                                      GPtrArray **out /* dt_remote_patch_entry_t */,
-                                     GHashTable **semantic_out /* name -> dt_remote_curve_value_t */,
+                                     GHashTable **semantic_out /* name -> dt_remote_semantic_value_t */,
                                      dt_remote_error_t **error);
 
 /* ---------------------------------------------------------------------- */

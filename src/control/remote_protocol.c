@@ -526,6 +526,35 @@ static JsonNode *_curve_value_to_json(const dt_remote_curve_value_t *v)
   return node;
 }
 
+// The semantic_fields/semantic_values containers carry class-tagged
+// wrappers (remote_parameters.h); serialization switches on the tag.
+// Only the curve arm exists today -- the milestone 4 vector class
+// replaces the g_assert_not_reached() arms when it lands.
+
+static JsonNode *_semantic_schema_to_json(const dt_remote_semantic_schema_t *w)
+{
+  switch(w->class_id)
+  {
+    case DT_REMOTE_PARAMETER_CURVE:
+      return _curve_schema_to_json(w->u.curve);
+    default:
+      g_assert_not_reached();
+      return NULL;
+  }
+}
+
+static JsonNode *_semantic_value_to_json(const dt_remote_semantic_value_t *w)
+{
+  switch(w->class_id)
+  {
+    case DT_REMOTE_PARAMETER_CURVE:
+      return _curve_value_to_json(w->u.curve);
+    default:
+      g_assert_not_reached();
+      return NULL;
+  }
+}
+
 /* ---------------------------------------------------------------------- */
 /* method handlers                                                         */
 /* ---------------------------------------------------------------------- */
@@ -763,7 +792,7 @@ static JsonNode *_handler_get_module_schema(JsonObject *params, dt_remote_sessio
     json_builder_set_member_name(b, "semantic_fields");
     json_builder_begin_array(b);
     for(guint i = 0; i < schema->semantic_fields->len; i++)
-      json_builder_add_value(b, _curve_schema_to_json(g_ptr_array_index(schema->semantic_fields, i)));
+      json_builder_add_value(b, _semantic_schema_to_json(g_ptr_array_index(schema->semantic_fields, i)));
     json_builder_end_array(b);
   }
   json_builder_end_object(b);
@@ -879,7 +908,7 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
     for(GList *k = keys; k; k = k->next)
     {
       json_builder_set_member_name(b, k->data);
-      json_builder_add_value(b, _curve_value_to_json(g_hash_table_lookup(semantic, k->data)));
+      json_builder_add_value(b, _semantic_value_to_json(g_hash_table_lookup(semantic, k->data)));
     }
     g_list_free(keys);
     json_builder_end_object(b);
@@ -1374,7 +1403,7 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
     for(GList *k = keys; k; k = k->next)
     {
       json_builder_set_member_name(b, k->data);
-      json_builder_add_value(b, _curve_value_to_json(g_hash_table_lookup(result->semantic_values, k->data)));
+      json_builder_add_value(b, _semantic_value_to_json(g_hash_table_lookup(result->semantic_values, k->data)));
     }
     g_list_free(keys);
     json_builder_end_object(b);

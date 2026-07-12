@@ -1251,8 +1251,9 @@ static void test_schema_rgbcurve_semantic_fields_and_represented_by(void **state
   assert_int_equal(schema->semantic_fields->len, G_N_ELEMENTS(expected_ids));
   for(guint i = 0; i < G_N_ELEMENTS(expected_ids); i++)
   {
-    const dt_remote_curve_schema_t *curve = g_ptr_array_index(schema->semantic_fields, i);
-    assert_string_equal(curve->name, expected_ids[i]);
+    const dt_remote_semantic_schema_t *wrapped = g_ptr_array_index(schema->semantic_fields, i);
+    assert_int_equal(wrapped->class_id, DT_REMOTE_PARAMETER_CURVE);
+    assert_string_equal(wrapped->u.curve->name, expected_ids[i]);
   }
 
   static const char *native_roots[] = { "curve_nodes", "curve_num_nodes", "curve_type" };

@@ -493,15 +493,19 @@ static gboolean stub_get_module_schema_rgbcurve(const char *op, dt_remote_module
   compensate->default_value.v.b = FALSE;
   g_ptr_array_add(schema->fields, compensate);
 
-  schema->semantic_fields = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_curve_schema_free);
+  schema->semantic_fields = g_ptr_array_new_with_free_func(dt_remote_semantic_schema_free);
   g_ptr_array_add(schema->semantic_fields,
-                  _make_rgbcurve_curve_schema("curve.master", "master", DT_REMOTE_PREDICATE_NE));
+                  dt_remote_semantic_schema_wrap_curve(
+                    _make_rgbcurve_curve_schema("curve.master", "master", DT_REMOTE_PREDICATE_NE)));
   g_ptr_array_add(schema->semantic_fields,
-                  _make_rgbcurve_curve_schema("curve.red", "R", DT_REMOTE_PREDICATE_EQ));
+                  dt_remote_semantic_schema_wrap_curve(
+                    _make_rgbcurve_curve_schema("curve.red", "R", DT_REMOTE_PREDICATE_EQ)));
   g_ptr_array_add(schema->semantic_fields,
-                  _make_rgbcurve_curve_schema("curve.green", "G", DT_REMOTE_PREDICATE_EQ));
+                  dt_remote_semantic_schema_wrap_curve(
+                    _make_rgbcurve_curve_schema("curve.green", "G", DT_REMOTE_PREDICATE_EQ)));
   g_ptr_array_add(schema->semantic_fields,
-                  _make_rgbcurve_curve_schema("curve.blue", "B", DT_REMOTE_PREDICATE_EQ));
+                  dt_remote_semantic_schema_wrap_curve(
+                    _make_rgbcurve_curve_schema("curve.blue", "B", DT_REMOTE_PREDICATE_EQ)));
 
   *out = schema;
   return TRUE;
@@ -547,11 +551,15 @@ static gboolean stub_get_module_params_rgbcurve(const dt_remote_module_ref_t *re
   g_ptr_array_add(arr, compensate);
 
   GHashTable *semantic =
-    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)dt_remote_curve_value_free);
-  g_hash_table_insert(semantic, g_strdup("curve.master"), _make_identity_curve_value("curve.master", TRUE));
-  g_hash_table_insert(semantic, g_strdup("curve.red"), _make_identity_curve_value("curve.red", FALSE));
-  g_hash_table_insert(semantic, g_strdup("curve.green"), _make_identity_curve_value("curve.green", FALSE));
-  g_hash_table_insert(semantic, g_strdup("curve.blue"), _make_identity_curve_value("curve.blue", FALSE));
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  g_hash_table_insert(semantic, g_strdup("curve.master"),
+                      dt_remote_semantic_value_wrap_curve(_make_identity_curve_value("curve.master", TRUE)));
+  g_hash_table_insert(semantic, g_strdup("curve.red"),
+                      dt_remote_semantic_value_wrap_curve(_make_identity_curve_value("curve.red", FALSE)));
+  g_hash_table_insert(semantic, g_strdup("curve.green"),
+                      dt_remote_semantic_value_wrap_curve(_make_identity_curve_value("curve.green", FALSE)));
+  g_hash_table_insert(semantic, g_strdup("curve.blue"),
+                      dt_remote_semantic_value_wrap_curve(_make_identity_curve_value("curve.blue", FALSE)));
 
   *out = arr;
   if(semantic_out) *semantic_out = semantic;
@@ -884,9 +892,9 @@ static gboolean stub_set_module_params_curve_master(const dt_remote_module_ref_t
   result->enabled = TRUE;
   result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
   result->semantic_values =
-    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)dt_remote_curve_value_free);
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
   g_hash_table_insert(result->semantic_values, g_strdup("curve.master"),
-                      _make_written_master_curve_value());
+                      dt_remote_semantic_value_wrap_curve(_make_written_master_curve_value()));
   result->revision = 32;
 
   *out = result;

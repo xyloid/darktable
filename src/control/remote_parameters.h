@@ -203,6 +203,45 @@ typedef struct dt_remote_semantic_patch_t
  * `dt_remote_patch_t.semantic_values` GPtrArray. NULL-safe. */
 void dt_remote_semantic_patch_free(gpointer patch_ptr);
 
+/* ---------------------------------------------------------------------- */
+/* tagged semantic schema/value wrappers                                    */
+/* ---------------------------------------------------------------------- */
+
+// Class-tagged containers for semantic schemas/values as they travel
+// through dt_remote_module_schema_t.semantic_fields and
+// dt_remote_mutation_result_t.semantic_values (remote_edit.h). The curve
+// engine keeps producing plain curve types; producers wrap at the
+// insertion sites and the JSON layer unwraps by switching on `class_id`.
+// Purely internal shape -- the wire is unchanged.
+
+typedef struct dt_remote_semantic_schema_t
+{
+  dt_remote_parameter_class_t class_id;
+  union { dt_remote_curve_schema_t *curve; } u;   // owned
+} dt_remote_semantic_schema_t;
+
+typedef struct dt_remote_semantic_value_t
+{
+  dt_remote_parameter_class_t class_id;
+  union { dt_remote_curve_value_t *curve; } u;    // owned
+} dt_remote_semantic_value_t;
+
+/** wraps an owned curve schema in a DT_REMOTE_PARAMETER_CURVE-tagged
+ * wrapper, taking ownership of `s`. */
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_curve(dt_remote_curve_schema_t *s);
+
+/** wraps an owned curve value in a DT_REMOTE_PARAMETER_CURVE-tagged
+ * wrapper, taking ownership of `v`. */
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_curve(dt_remote_curve_value_t *v);
+
+/** frees a tagged semantic schema wrapper and its class-specific owned
+ * payload. GDestroyNotify-able. NULL-safe. */
+void dt_remote_semantic_schema_free(gpointer schema_ptr);
+
+/** frees a tagged semantic value wrapper and its class-specific owned
+ * payload. GDestroyNotify-able. NULL-safe. */
+void dt_remote_semantic_value_free(gpointer value_ptr);
+
 G_END_DECLS
 
 // clang-format off

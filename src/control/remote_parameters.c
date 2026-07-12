@@ -74,6 +74,62 @@ void dt_remote_semantic_patch_free(gpointer patch_ptr)
   g_free(patch);
 }
 
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_curve(dt_remote_curve_schema_t *s)
+{
+  dt_remote_semantic_schema_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_schema_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_CURVE;
+  wrapper->u.curve = s;
+  return wrapper;
+}
+
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_curve(dt_remote_curve_value_t *v)
+{
+  dt_remote_semantic_value_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_value_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_CURVE;
+  wrapper->u.curve = v;
+  return wrapper;
+}
+
+void dt_remote_semantic_schema_free(gpointer schema_ptr)
+{
+  dt_remote_semantic_schema_t *schema = schema_ptr;
+  if(!schema) return;
+
+  switch(schema->class_id)
+  {
+    case DT_REMOTE_PARAMETER_CURVE:
+      dt_remote_curve_schema_free(schema->u.curve);
+      break;
+
+    // no other class has a union member yet (see remote_parameters.h);
+    // nothing beyond the wrapper to free.
+    default:
+      break;
+  }
+
+  g_free(schema);
+}
+
+void dt_remote_semantic_value_free(gpointer value_ptr)
+{
+  dt_remote_semantic_value_t *value = value_ptr;
+  if(!value) return;
+
+  switch(value->class_id)
+  {
+    case DT_REMOTE_PARAMETER_CURVE:
+      dt_remote_curve_value_free(value->u.curve);
+      break;
+
+    // no other class has a union member yet (see remote_parameters.h);
+    // nothing beyond the wrapper to free.
+    default:
+      break;
+  }
+
+  g_free(value);
+}
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

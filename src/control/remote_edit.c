@@ -879,6 +879,39 @@ static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
   return TRUE;
 }
 
+// The curve engine (remote_curve.h) keeps producing plain curve
+// schemas/values; the two helpers below convert its output containers
+// into the class-tagged wrapper shape the semantic_fields/semantic_values
+// members carry (remote_parameters.h). Both consume their input
+// container: element ownership moves into the wrappers.
+
+static GPtrArray *_wrap_curve_schemas(GPtrArray *curves)
+{
+  GPtrArray *wrapped = g_ptr_array_new_full(curves->len, dt_remote_semantic_schema_free);
+  for(guint i = 0; i < curves->len; i++)
+    g_ptr_array_add(wrapped, dt_remote_semantic_schema_wrap_curve(g_ptr_array_index(curves, i)));
+  g_ptr_array_set_free_func(curves, NULL);  // elements now owned by the wrappers
+  g_ptr_array_unref(curves);
+  return wrapped;
+}
+
+static GHashTable *_wrap_curve_values(GHashTable *curves)
+{
+  GHashTable *wrapped =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  GHashTableIter it;
+  gpointer key = NULL;
+  gpointer value = NULL;
+  g_hash_table_iter_init(&it, curves);
+  while(g_hash_table_iter_next(&it, &key, &value))
+  {
+    g_hash_table_iter_steal(&it);  // key and value ownership move below
+    g_hash_table_insert(wrapped, key, dt_remote_semantic_value_wrap_curve(value));
+  }
+  g_hash_table_unref(curves);
+  return wrapped;
+}
+
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error)
@@ -901,7 +934,7 @@ gboolean dt_remote_get_module_schema(const char *op,
 
   if(semantic_fields->len > 0)
   {
-    schema->semantic_fields = semantic_fields;
+    schema->semantic_fields = _wrap_curve_schemas(semantic_fields);
     if(!_annotate_represented_by(schema, so, error))
     {
       dt_remote_module_schema_free(schema);
@@ -993,7 +1026,7 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
   }
 
   *out = values;
-  if(semantic_out) *semantic_out = semantic_values;
+  if(semantic_out) *semantic_out = _wrap_curve_values(semantic_values);
   return TRUE;
 }
 
@@ -1184,7 +1217,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
     entry->value = value;
     g_ptr_array_add(result->values, entry);
   }
-  result->semantic_values = semantic_readback;
+  result->semantic_values = semantic_readback ? _wrap_curve_values(semantic_readback) : NULL;
   result->revision = new_revision;
 
   *out = result;
