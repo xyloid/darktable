@@ -980,6 +980,7 @@ static void test_registry_validate_isolates_native_layout_failures(void **state)
 
 static void assert_registry_rejects_private_color_array(gboolean has_element_descriptor,
                                                         dt_introspection_type_t element_type,
+                                                        size_t element_size,
                                                         size_t array_count)
 {
   dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
@@ -1000,6 +1001,7 @@ static void assert_registry_rejects_private_color_array(gboolean has_element_des
       assert_non_null(broken_color.Array.field);
       broken_element = *broken_color.Array.field;
       broken_element.header.type = element_type;
+      broken_element.header.size = element_size;
       broken_color.Array.field = has_element_descriptor ? &broken_element : NULL;
       broken_color.Array.count = array_count;
       fields[i] = &broken_color;
@@ -1027,13 +1029,22 @@ static void assert_registry_rejects_private_color_array(gboolean has_element_des
 static void test_registry_validate_rejects_missing_float_element_descriptor(void **state)
 {
   (void)state;
-  assert_registry_rejects_private_color_array(FALSE, DT_INTROSPECTION_TYPE_FLOAT, 3);
+  assert_registry_rejects_private_color_array(FALSE, DT_INTROSPECTION_TYPE_FLOAT,
+                                              sizeof(float), 3);
 }
 
 static void test_registry_validate_rejects_nonfloat_element_descriptor(void **state)
 {
   (void)state;
-  assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_CHAR, 3);
+  assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_CHAR,
+                                              sizeof(float), 3);
+}
+
+static void test_registry_validate_rejects_wrong_float_element_size(void **state)
+{
+  (void)state;
+  assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_FLOAT,
+                                              sizeof(float) + 1, 3);
 }
 
 static void test_registry_validate_rejects_oversized_native_count(void **state)
@@ -1044,7 +1055,7 @@ static void test_registry_validate_rejects_oversized_native_count(void **state)
   const size_t oversized_count =
     (size_t)G_MAXUINT + 1 + G_N_ELEMENTS(s_rgb_components);
   assert_registry_rejects_private_color_array(TRUE, DT_INTROSPECTION_TYPE_FLOAT,
-                                              oversized_count);
+                                              sizeof(float), oversized_count);
 }
 
 static void test_registry_validate_passes_for_well_formed_descriptor(void **state)
@@ -1911,6 +1922,7 @@ int main(void)
     cmocka_unit_test(test_registry_validate_isolates_native_layout_failures),
     cmocka_unit_test(test_registry_validate_rejects_missing_float_element_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_nonfloat_element_descriptor),
+    cmocka_unit_test(test_registry_validate_rejects_wrong_float_element_size),
     cmocka_unit_test(test_registry_validate_rejects_oversized_native_count),
     cmocka_unit_test(test_registry_validate_passes_for_well_formed_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_mismatch),
