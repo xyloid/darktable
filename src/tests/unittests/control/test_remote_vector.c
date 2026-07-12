@@ -685,6 +685,10 @@ static void assert_vector_registry_rejects(
 static gboolean s_validate_completed_result = TRUE;
 static int s_validate_completed_calls = 0;
 
+static const float s_expected_completed_color[] = { 0.11f, 0.22f, 0.33f };
+static const float s_expected_completed_frame[] = { 0.44f, 0.55f, 0.66f };
+static gboolean s_validate_completed_force_reject = FALSE;
+
 static gboolean test_validate_completed(const struct dt_remote_vector_context_t *ctx,
                                         const void *new_params,
                                         dt_remote_error_t **error)
@@ -699,6 +703,51 @@ static gboolean test_validate_completed(const struct dt_remote_vector_context_t 
       *error = g_new0(dt_remote_error_t, 1);
       (*error)->code = DT_REMOTE_ERR_INVALID_VALUE;
       (*error)->message = g_strdup("test_validate_completed rejected");
+    }
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean validate_completed_observes_both_vectors(
+  const struct dt_remote_vector_context_t *ctx,
+  const void *new_params,
+  dt_remote_error_t **error)
+{
+  s_validate_completed_calls++;
+  const dt_remote_introspection_path_t paths[] = { s_color_path, s_frame_color_path };
+  const float *expected[] = { s_expected_completed_color, s_expected_completed_frame };
+  for(guint path_index = 0; path_index < G_N_ELEMENTS(paths); path_index++)
+  {
+    const dt_introspection_field_t *field = NULL;
+    void *ptr = NULL;
+    if(!dt_remote_path_resolve(&paths[path_index], ctx->introspection->field,
+                               (void *)new_params, &field, &ptr, error))
+      return FALSE;
+    for(guint component = 0; component < 3; component++)
+    {
+      dt_introspection_field_t *element = NULL;
+      const float *value = dt_introspection_access_array(
+        (dt_introspection_field_t *)field, ptr, component, &element);
+      if(!value || !element || *value != expected[path_index][component])
+      {
+        if(error)
+        {
+          *error = g_new0(dt_remote_error_t, 1);
+          (*error)->code = DT_REMOTE_ERR_INVALID_VALUE;
+          (*error)->message = g_strdup("validate_completed ran before both vector writes");
+        }
+        return FALSE;
+      }
+    }
+  }
+  if(s_validate_completed_force_reject)
+  {
+    if(error)
+    {
+      *error = g_new0(dt_remote_error_t, 1);
+      (*error)->code = DT_REMOTE_ERR_INVALID_VALUE;
+      (*error)->message = g_strdup("test rejected completed vector state");
     }
     return FALSE;
   }
@@ -2099,6 +2148,111 @@ static void test_apply_patch_validate_completed_rejection_rolls_back(void **stat
   borders_fixture_free(fixture);
 }
 
+static void test_apply_patch_validate_completed_observes_all_writes(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  static dt_remote_vector_descriptor_t descriptors[2];
+  descriptors[0] = make_color_descriptor();
+  descriptors[0].name = "vector.color";
+  descriptors[1] = make_color_descriptor();
+  descriptors[1].name = "vector.frame";
+  descriptors[1].native = s_frame_color_path;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = descriptors, .vector_count = 2,
+    .validate_completed = validate_completed_observes_both_vectors,
+  };
+  install_vector_adapter(&adapter);
+
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+
+  const double color_values[] = {
+    s_expected_completed_color[0], s_expected_completed_color[1],
+    s_expected_completed_color[2],
+  };
+  const double frame_values[] = {
+    s_expected_completed_frame[0], s_expected_completed_frame[1],
+    s_expected_completed_frame[2],
+  };
+  g_ptr_array_add(patch.semantic_values,
+                  make_vector_patch("vector.frame", frame_values, 3));
+  g_ptr_array_add(patch.semantic_values,
+                  make_vector_patch("vector.color", color_values, 3));
+  s_validate_completed_calls = 0;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  assert_int_equal(s_validate_completed_calls, 1);
+
+  void *live_before = g_malloc(fixture->module->params_size);
+  memcpy(live_before, fixture->module->params, fixture->module->params_size);
+  g_free(projected);
+  projected = g_malloc(fixture->module->params_size);
+  s_validate_completed_force_reject = TRUE;
+  s_validate_completed_calls = 0;
+  error = NULL;
+
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_int_equal(s_validate_completed_calls, 1);
+  for(guint i = 0; i < 3; i++)
+  {
+    assert_float_equal(read_color_component(fixture, projected, "color", i),
+                       s_expected_completed_color[i], 0.0);
+    assert_float_equal(read_color_component(fixture, projected, "frame_color", i),
+                       s_expected_completed_frame[i], 0.0);
+  }
+  assert_memory_equal(fixture->module->params, live_before, fixture->module->params_size);
+
+  s_validate_completed_force_reject = FALSE;
+  dt_remote_error_free(error);
+  g_free(live_before);
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_apply_patch_uses_registry_order_for_aliases(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  static dt_remote_vector_descriptor_t aliases[2];
+  aliases[0] = make_color_descriptor();
+  aliases[0].name = "vector.first";
+  aliases[1] = make_color_descriptor();
+  aliases[1].name = "vector.second";
+  static dt_remote_vector_module_adapter_t alias_adapter;
+  alias_adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = aliases, .vector_count = 2,
+  };
+  install_vector_adapter(&alias_adapter);
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+
+  const double first_values[] = { 0.1, 0.2, 0.3 };
+  const double second_values[] = { 0.7, 0.8, 0.9 };
+  g_ptr_array_add(patch.semantic_values,
+                  make_vector_patch("vector.second", second_values, 3));
+  g_ptr_array_add(patch.semantic_values,
+                  make_vector_patch("vector.first", first_values, 3));
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  for(guint i = 0; i < 3; i++)
+    assert_float_equal(read_color_component(fixture, projected, "color", i),
+                       (float)second_values[i], 0.0);
+  assert_null(error);
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
 static void test_apply_patch_skips_non_vector_semantic_entries(void **state)
 {
   (void)state;
@@ -2243,6 +2397,12 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_validate_completed_rejection_rolls_back,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_validate_completed_observes_all_writes,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_uses_registry_order_for_aliases,
+      lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_skips_non_vector_semantic_entries,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_no_vector_content_returns_true_without_touching_registry,
