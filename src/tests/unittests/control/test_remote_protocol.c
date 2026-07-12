@@ -954,6 +954,81 @@ static gboolean stub_set_module_params_curve_unknown_id(const dt_remote_module_r
   return FALSE;
 }
 
+/* --- set_module_params semantic vector stubs (milestone 4 Task 2) ------- */
+
+// Success stub for the vector parse-accept test: asserts the handler decoded
+// semantic_values into exactly one DT_REMOTE_PARAMETER_VECTOR entry with the
+// four components from the request, in order, preserved as doubles. The
+// result is deliberately minimal (no semantic readback) -- serializing a
+// vector value/schema back onto the wire is milestone 4 Task 4's job, not
+// the parser's.
+static gboolean stub_set_module_params_vector_capture(const dt_remote_module_ref_t *ref,
+                                                       const dt_remote_patch_t *patch,
+                                                       const uint64_t *expected_revision,
+                                                       dt_remote_mutation_result_t **out,
+                                                       dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_VECTOR);
+  assert_string_equal(semantic->value.vector.name, "vector.example");
+  assert_non_null(semantic->value.vector.values);
+
+  static const double expected[] = { 1.0, 1.1, 1.0, 0.95 };
+  assert_int_equal(semantic->value.vector.values->len, (int)G_N_ELEMENTS(expected));
+  for(guint i = 0; i < G_N_ELEMENTS(expected); i++)
+    assert_float_equal(g_array_index(semantic->value.vector.values, double, i), expected[i], 1e-12);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
+// double-domain proof stub (curve design rationale, mirrored for vectors):
+// a component that would narrow cleanly to float (2.00000001 -> 2.0f) must
+// survive the parser as its un-narrowed double -- validating in float
+// domain would let a slightly out-of-range number round back into range
+// and pass.
+static gboolean stub_set_module_params_vector_precision(const dt_remote_module_ref_t *ref,
+                                                         const dt_remote_patch_t *patch,
+                                                         const uint64_t *expected_revision,
+                                                         dt_remote_mutation_result_t **out,
+                                                         dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_VECTOR);
+  assert_non_null(semantic->value.vector.values);
+  assert_int_equal(semantic->value.vector.values->len, 1);
+  assert_true(g_array_index(semantic->value.vector.values, double, 0) > 2.0);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
 /* ---------------------------------------------------------------------- */
 /* hello                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -1831,6 +1906,199 @@ static void test_set_module_params_semantic_bad_shapes(void **state)
   g_string_append(oversized, "]}}}}");
   _assert_inline_error(oversized->str, "invalid_value");
   g_string_free(oversized, TRUE);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- set_module_params semantic_values vector class (milestone 4 Task 2) */
+
+// accept: {"class":"vector","values":[1.0,1.1,1.0,0.95]} decodes into a
+// DT_REMOTE_PARAMETER_VECTOR patch with all four components preserved, in
+// order, as doubles, and the semantic name kept.
+static void test_semantic_vector_entry_parses(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_vector_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":100,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\","
+    "\"values\":[1.0,1.1,1.0,0.95]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: 'values' member missing, and 'values' present but not an array.
+static void test_semantic_vector_requires_values_array(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // values missing entirely
+  _assert_inline_error(
+    "{\"id\":101,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\"}}}}",
+    "invalid_value");
+  // values present but not an array
+  _assert_inline_error(
+    "{\"id\":102,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":true}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: every non-numeric/non-finite component spelling -- a non-numeric
+// string, a boolean, overflow-to-Infinity in both directions (1e400/-1e400
+// have no finite double representation; a bare Infinity/NaN token is not
+// valid JSON, so overflow is the wire-representable spelling -- curve
+// point parsing uses the same trick), and a null element.
+static void test_semantic_vector_rejects_non_finite_components(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":103,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[1.0,\"x\"]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":104,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[1.0,true]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":105,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[1e400]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":106,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[-1e400]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":107,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[1.0,null]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: 9 components exceeds DT_REMOTE_VECTOR_WIRE_COMPONENT_CAP (8) -- the
+// protocol layer's flat pre-engine limit, mirroring the curve point cap.
+static void test_semantic_vector_rejects_oversized_component_list(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  GString *oversized = g_string_new(
+    "{\"id\":108,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\",\"values\":[");
+  for(int i = 0; i < 9; i++)
+    g_string_append_printf(oversized, "%s%.6f", i ? "," : "", i / 8.0);
+  g_string_append(oversized, "]}}}}");
+  _assert_inline_error(oversized->str, "invalid_value");
+  g_string_free(oversized, TRUE);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: a member beyond exactly {class, values} -- here "points", a
+// curve-flavored member, leaking onto a vector entry.
+static void test_semantic_vector_rejects_unknown_members(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":109,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\","
+    "\"values\":[1.0,1.1],\"points\":[{\"x\":0.0,\"y\":0.0}]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: two entries with the same semantic ID, one curve-shaped and one
+// vector-shaped. JSON object member names are unique -- the underlying
+// JSON parser deduplicates literal duplicate keys during parse, keeping
+// only the last occurrence -- so the curve entry never survives to be seen
+// by _parse_semantic_values at all; "duplicate-ID detection" is therefore
+// structural (see the comment above _parse_semantic_values), not code this
+// branch adds. The surviving (vector) entry is deliberately malformed so
+// the test can observe whole-patch atomicity: nothing from the discarded
+// curve entry, and nothing from the malformed survivor, is produced.
+static void test_semantic_duplicate_ids_rejected_across_classes(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":110,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"shared.name\":{\"class\":\"curve\","
+    "\"points\":[{\"x\":0.0,\"y\":0.0},{\"x\":1.0,\"y\":1.0}]},"
+    "\"shared.name\":{\"class\":\"vector\",\"values\":[\"oops\"]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// double-domain proof: a component that would narrow cleanly to float
+// (2.00000001 -> 2.0f, since the difference is well under float's ULP near
+// 2.0) must survive parsing as its un-narrowed double.
+static void test_semantic_vector_preserves_double_precision(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_vector_precision,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":111,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\","
+    "\"values\":[2.00000001]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
 
   dt_remote_protocol_set_calls(NULL);
 }
@@ -3713,6 +3981,13 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_curve_error_invalid_spacing),
     cmocka_unit_test(test_set_module_params_curve_error_unknown_id),
     cmocka_unit_test(test_set_module_params_semantic_bad_shapes),
+    cmocka_unit_test(test_semantic_vector_entry_parses),
+    cmocka_unit_test(test_semantic_vector_requires_values_array),
+    cmocka_unit_test(test_semantic_vector_rejects_non_finite_components),
+    cmocka_unit_test(test_semantic_vector_rejects_oversized_component_list),
+    cmocka_unit_test(test_semantic_vector_rejects_unknown_members),
+    cmocka_unit_test(test_semantic_duplicate_ids_rejected_across_classes),
+    cmocka_unit_test(test_semantic_vector_preserves_double_precision),
     cmocka_unit_test(test_hello_curve_params_implies_semantic_values_accepted),
 
     cmocka_unit_test(test_set_module_enabled_success),

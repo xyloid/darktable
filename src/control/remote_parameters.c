@@ -63,10 +63,14 @@ void dt_remote_semantic_patch_free(gpointer patch_ptr)
       if(patch->value.curve.points) g_array_unref(patch->value.curve.points);
       break;
 
-    // DT_REMOTE_PARAMETER_SAMPLED_RESPONSE and DT_REMOTE_PARAMETER_LEVELS
-    // have no union member yet (see remote_parameters.h); nothing to free.
+    case DT_REMOTE_PARAMETER_VECTOR:
+      g_free(patch->value.vector.name);
+      if(patch->value.vector.values) g_array_unref(patch->value.vector.values);
+      break;
+
+    // DT_REMOTE_PARAMETER_SAMPLED_RESPONSE has no union member yet (see
+    // remote_parameters.h); nothing to free.
     case DT_REMOTE_PARAMETER_SAMPLED_RESPONSE:
-    case DT_REMOTE_PARAMETER_LEVELS:
     default:
       break;
   }

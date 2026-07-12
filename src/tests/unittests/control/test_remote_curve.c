@@ -222,15 +222,17 @@ static void test_semantic_patch_free_curve_partially_populated(void **state)
 
 static void test_semantic_patch_free_non_curve_class_is_safe(void **state)
 {
-  // DT_REMOTE_PARAMETER_SAMPLED_RESPONSE/LEVELS have no union member yet;
-  // freeing a zeroed instance of either must not crash.
+  // DT_REMOTE_PARAMETER_SAMPLED_RESPONSE has no union member yet; freeing a
+  // zeroed instance must not crash. A zeroed DT_REMOTE_PARAMETER_VECTOR
+  // instance (NULL name, NULL values) must also free safely even though
+  // the class does have a union member.
   dt_remote_semantic_patch_t *sampled = g_new0(dt_remote_semantic_patch_t, 1);
   sampled->class_id = DT_REMOTE_PARAMETER_SAMPLED_RESPONSE;
   dt_remote_semantic_patch_free(sampled);
 
-  dt_remote_semantic_patch_t *levels = g_new0(dt_remote_semantic_patch_t, 1);
-  levels->class_id = DT_REMOTE_PARAMETER_LEVELS;
-  dt_remote_semantic_patch_free(levels);
+  dt_remote_semantic_patch_t *vector = g_new0(dt_remote_semantic_patch_t, 1);
+  vector->class_id = DT_REMOTE_PARAMETER_VECTOR;
+  dt_remote_semantic_patch_free(vector);
 }
 
 static void test_semantic_patch_free_null_is_safe(void **state)
