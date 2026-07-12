@@ -1439,6 +1439,70 @@ static void test_read_values_unknown_rgbcurve_autoscale_fails_closed(void **stat
   g_free(blob);
 }
 
+/* ---------------------------------------------------------------------- */
+/* tonecurve adapter (curve-classes design doc SS Initial registry         */
+/* mapping / tonecurve)                                                    */
+/* ---------------------------------------------------------------------- */
+
+static void test_registry_lookup_finds_tonecurve_only_at_version_5(void **state)
+{
+  (void)state;
+  const dt_remote_curve_module_adapter_t *adapter = dt_remote_curve_registry_lookup("tonecurve", 5);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "tonecurve");
+  assert_int_equal(adapter->curve_count, 3);
+  assert_null(dt_remote_curve_registry_lookup("tonecurve", 4));
+  assert_null(dt_remote_curve_registry_lookup("tonecurve", 6));
+}
+
+static void test_registry_resolves_tonecurve_manual_enum_name(void **state)
+{
+  (void)state;
+  // Same confirm-the-generated-token pattern as
+  // test_registry_resolves_manual_rgb_enum_name: the predicate's enum_name
+  // must be a real introspection name on the real loaded module.
+  dt_iop_module_so_t *so = dt_iop_get_module_so("tonecurve");
+  assert_non_null(so);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+  dt_introspection_field_t *field = NULL;
+  guint8 dummy = 0;
+  (void)dt_introspection_get_child(intro->field, &dummy, "tonecurve_autoscale_ab", &field);
+  assert_non_null(field);
+  int value = -1;
+  assert_true(dt_introspection_get_enum_value(field, "DT_S_SCALE_MANUAL", &value));
+  assert_int_equal(value, 0);
+}
+
+static void test_tonecurve_schema_lists_lightness_then_a_then_b(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("tonecurve");
+  assert_non_null(so);
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_int_equal(schemas->len, 3);
+
+  const dt_remote_curve_schema_t *lightness = g_ptr_array_index(schemas, 0);
+  const dt_remote_curve_schema_t *a = g_ptr_array_index(schemas, 1);
+  const dt_remote_curve_schema_t *b = g_ptr_array_index(schemas, 2);
+  assert_string_equal(lightness->name, "curve.lightness");
+  assert_string_equal(a->name, "curve.a");
+  assert_string_equal(b->name, "curve.b");
+  assert_int_equal(lightness->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(lightness->active_when);
+  assert_int_equal(a->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+  assert_int_equal(b->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+  assert_non_null(a->writable_when);
+  assert_string_equal(a->writable_when->field, "tonecurve_autoscale_ab");
+  assert_string_equal(a->writable_when->enum_name, "DT_S_SCALE_MANUAL");
+  assert_int_equal(lightness->default_interpolation, DT_REMOTE_CURVE_MONOTONE_HERMITE);
+  assert_false(lightness->periodic_x);
+  g_ptr_array_unref(schemas);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1485,6 +1549,9 @@ int main(void)
     cmocka_unit_test(test_read_values_unused_capacity_not_serialized),
     cmocka_unit_test(test_read_values_out_of_range_curve_type_fails_closed),
     cmocka_unit_test(test_read_values_unknown_rgbcurve_autoscale_fails_closed),
+    cmocka_unit_test(test_registry_lookup_finds_tonecurve_only_at_version_5),
+    cmocka_unit_test(test_registry_resolves_tonecurve_manual_enum_name),
+    cmocka_unit_test(test_tonecurve_schema_lists_lightness_then_a_then_b),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);

@@ -638,10 +638,116 @@ static const dt_remote_curve_module_adapter_t s_rgbcurve_adapter = {
   .validate_completed = adapter_validate_active_curves,
 };
 
-// The full adapter table. Only rgbcurve for now; a future op (e.g.
-// tonecurve) adds another entry here, not a parallel lookup mechanism.
+/* ---------------------------------------------------------------------- */
+/* tonecurve descriptor table (curve-classes design doc SS Initial         */
+/* registry mapping / tonecurve). Params v5: tonecurve[3][20] node         */
+/* structs, tonecurve_nodes[3], tonecurve_type[3];                         */
+/* tonecurve_autoscale_ab gates a/b exactly like rgbcurve's manual mode.   */
+/* ---------------------------------------------------------------------- */
+
+// Compact channel-path declaration for the milestone-3 adapters. The
+// rgbcurve tables above predate it and stay longhand as committed.
+#define ADAPTER_CHANNEL_PATH(var, field_name, channel)                       \
+  static const dt_remote_path_segment_t var##_segments[] = {                 \
+    { .type = DT_REMOTE_PATH_FIELD, .value.field = field_name },             \
+    { .type = DT_REMOTE_PATH_INDEX, .value.index = channel },                \
+  };                                                                         \
+  static const dt_remote_introspection_path_t var = {                        \
+    .segments = var##_segments, .length = G_N_ELEMENTS(var##_segments)       \
+  };
+
+ADAPTER_CHANNEL_PATH(s_tc_nodes_ch0, "tonecurve", 0)
+ADAPTER_CHANNEL_PATH(s_tc_nodes_ch1, "tonecurve", 1)
+ADAPTER_CHANNEL_PATH(s_tc_nodes_ch2, "tonecurve", 2)
+ADAPTER_CHANNEL_PATH(s_tc_count_ch0, "tonecurve_nodes", 0)
+ADAPTER_CHANNEL_PATH(s_tc_count_ch1, "tonecurve_nodes", 1)
+ADAPTER_CHANNEL_PATH(s_tc_count_ch2, "tonecurve_nodes", 2)
+ADAPTER_CHANNEL_PATH(s_tc_type_ch0, "tonecurve_type", 0)
+ADAPTER_CHANNEL_PATH(s_tc_type_ch1, "tonecurve_type", 1)
+ADAPTER_CHANNEL_PATH(s_tc_type_ch2, "tonecurve_type", 2)
+
+// Confirmed against the loaded module by
+// test_registry_resolves_tonecurve_manual_enum_name.
+static const dt_remote_parameter_predicate_t s_tonecurve_manual_predicate = {
+  .field = "tonecurve_autoscale_ab", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "DT_S_SCALE_MANUAL"
+};
+
+// Shared field values for one tonecurve descriptor. Camera presets ship
+// adjacent gaps down to ~0.00096, so any nonzero spacing floor would make
+// adapter_validate_active_curves() reject patches merely because a factory
+// preset is loaded: spacing rule NONE, strict ascending only.
+#define TONECURVE_DESCRIPTOR_COMMON                                          \
+    .x = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },           \
+    .y = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },           \
+    .minimum_points = 2,                                                     \
+    .maximum_points = 20,                                                    \
+    .minimum_x_spacing = 0.0,                                                \
+    .adjacent_spacing_rule = DT_REMOTE_SPACING_NONE,                         \
+    .minimum_wrap_spacing = 0.0,                                             \
+    .wrap_spacing_rule = DT_REMOTE_SPACING_NONE,                             \
+    .strict_x_order = TRUE,                                                  \
+    .boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL,       \
+    .interpolation_mask = RGBCURVE_INTERPOLATION_MASK,                       \
+    .default_interpolation = DT_REMOTE_CURVE_MONOTONE_HERMITE,               \
+    .periodic_when = NULL
+
+static const dt_remote_curve_descriptor_t s_tonecurve_curves[] = {
+  {
+    .name = "curve.lightness",
+    .display_name_msgid = N_("L"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_tc_nodes_ch0, .count = s_tc_count_ch0, .type = s_tc_type_ch0,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_no_internal_version_path, .internal_version_value = 0 },
+    TONECURVE_DESCRIPTOR_COMMON,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "curve.a",
+    .display_name_msgid = N_("a"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_tc_nodes_ch1, .count = s_tc_count_ch1, .type = s_tc_type_ch1,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_no_internal_version_path, .internal_version_value = 0 },
+    TONECURVE_DESCRIPTOR_COMMON,
+    .active_when = &s_tonecurve_manual_predicate,
+    .writable_when = &s_tonecurve_manual_predicate,
+  },
+  {
+    .name = "curve.b",
+    .display_name_msgid = N_("b"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_tc_nodes_ch2, .count = s_tc_count_ch2, .type = s_tc_type_ch2,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_no_internal_version_path, .internal_version_value = 0 },
+    TONECURVE_DESCRIPTOR_COMMON,
+    .active_when = &s_tonecurve_manual_predicate,
+    .writable_when = &s_tonecurve_manual_predicate,
+  },
+};
+
+// A scalar-only flip to manual mode activates a/b holding whatever prior
+// state the params carry; validate_completed re-checks them then.
+static const char *const s_tonecurve_prepare_fields[] = { "tonecurve_autoscale_ab" };
+
+static const dt_remote_curve_module_adapter_t s_tonecurve_adapter = {
+  .operation = "tonecurve",
+  .minimum_params_version = 5,
+  .maximum_params_version = 5,
+  .curves = s_tonecurve_curves,
+  .curve_count = G_N_ELEMENTS(s_tonecurve_curves),
+  .prepare_fields = s_tonecurve_prepare_fields,
+  .prepare_field_count = G_N_ELEMENTS(s_tonecurve_prepare_fields),
+  .prepare = NULL,
+  .validate_completed = adapter_validate_active_curves,
+};
+
+// The full adapter table. rgbcurve and tonecurve for now; a future op adds
+// another entry here, not a parallel lookup mechanism.
 static const dt_remote_curve_module_adapter_t *const s_adapters[] = {
   &s_rgbcurve_adapter,
+  &s_tonecurve_adapter,
 };
 
 static dt_remote_curve_registry_lookup_override_t s_lookup_override = NULL;
