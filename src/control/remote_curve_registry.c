@@ -969,12 +969,65 @@ static const dt_remote_curve_module_adapter_t s_colorzones_adapter = {
   .validate_completed = colorzones_validate_completed,
 };
 
-// The full adapter table. rgbcurve, tonecurve, and colorzones for now; a
-// future op adds another entry here, not a parallel lookup mechanism.
+/* ---------------------------------------------------------------------- */
+/* basecurve descriptor table (curve-classes design doc SS Initial         */
+/* registry mapping / basecurve). Params v6: basecurve[3][20] node         */
+/* structs, basecurve_nodes[3], basecurve_type[3]; only channel 0 is       */
+/* meaningful -- 1/2 are reserved and stay invisible (no descriptor).      */
+/* ---------------------------------------------------------------------- */
+
+ADAPTER_CHANNEL_PATH(s_bc_nodes_ch0, "basecurve", 0)
+ADAPTER_CHANNEL_PATH(s_bc_count_ch0, "basecurve_nodes", 0)
+ADAPTER_CHANNEL_PATH(s_bc_type_ch0, "basecurve_type", 0)
+
+static const dt_remote_curve_descriptor_t s_basecurve_curves[] = {
+  {
+    .name = "curve.master",
+    .display_name_msgid = N_("base curve"),
+    .description_msgid = NULL,
+    .native = { .nodes = s_bc_nodes_ch0, .count = s_bc_count_ch0, .type = s_bc_type_ch0,
+                .x_field = "x", .y_field = "y",
+                .internal_version = s_no_internal_version_path, .internal_version_value = 0 },
+    .x = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },
+    .y = { .minimum = 0.0, .maximum = 1.0, .unit = "normalized" },
+    .minimum_points = 2,
+    .maximum_points = 20,
+    // camera presets ship adjacent gaps ~0.001 (see the task brief); any
+    // nonzero floor would reject patches while a factory preset is loaded
+    .minimum_x_spacing = 0.0,
+    .adjacent_spacing_rule = DT_REMOTE_SPACING_NONE,
+    .minimum_wrap_spacing = 0.0,
+    .wrap_spacing_rule = DT_REMOTE_SPACING_NONE,
+    .strict_x_order = TRUE,
+    .boundary_point_policy = DT_REMOTE_CURVE_BOUNDARY_POINTS_OPTIONAL,
+    .interpolation_mask = RGBCURVE_INTERPOLATION_MASK,
+    .default_interpolation = DT_REMOTE_CURVE_MONOTONE_HERMITE,
+    .active_when = NULL,
+    .writable_when = NULL,
+    .periodic_when = NULL,
+  },
+};
+
+static const dt_remote_curve_module_adapter_t s_basecurve_adapter = {
+  .operation = "basecurve",
+  .minimum_params_version = 6,
+  .maximum_params_version = 6,
+  .curves = s_basecurve_curves,
+  .curve_count = G_N_ELEMENTS(s_basecurve_curves),
+  .prepare_fields = NULL,
+  .prepare_field_count = 0,
+  .prepare = NULL,
+  .validate_completed = adapter_validate_active_curves,
+};
+
+// The full adapter table. rgbcurve, tonecurve, colorzones, and basecurve
+// for now; a future op adds another entry here, not a parallel lookup
+// mechanism.
 static const dt_remote_curve_module_adapter_t *const s_adapters[] = {
   &s_rgbcurve_adapter,
   &s_tonecurve_adapter,
   &s_colorzones_adapter,
+  &s_basecurve_adapter,
 };
 
 static dt_remote_curve_registry_lookup_override_t s_lookup_override = NULL;

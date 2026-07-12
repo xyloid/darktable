@@ -1542,6 +1542,32 @@ static void test_colorzones_schema_all_writable_and_conditionally_periodic(void 
   g_ptr_array_unref(schemas);
 }
 
+/* ---------------------------------------------------------------------- */
+/* basecurve adapter (curve-classes design doc SS Initial registry         */
+/* mapping / basecurve)                                                    */
+/* ---------------------------------------------------------------------- */
+
+static void test_basecurve_schema_exposes_single_master_curve(void **state)
+{
+  (void)state;
+  assert_non_null(dt_remote_curve_registry_lookup("basecurve", 6));
+  assert_null(dt_remote_curve_registry_lookup("basecurve", 5));
+
+  dt_iop_module_so_t *so = dt_iop_get_module_so("basecurve");
+  assert_non_null(so);
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_curve_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_int_equal(schemas->len, 1);
+  const dt_remote_curve_schema_t *master = g_ptr_array_index(schemas, 0);
+  assert_string_equal(master->name, "curve.master");
+  assert_int_equal(master->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(master->active_when);
+  assert_false(master->periodic_x);
+  g_ptr_array_unref(schemas);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1593,6 +1619,7 @@ int main(void)
     cmocka_unit_test(test_tonecurve_schema_lists_lightness_then_a_then_b),
     cmocka_unit_test(test_registry_lookup_finds_colorzones_only_at_version_5),
     cmocka_unit_test(test_colorzones_schema_all_writable_and_conditionally_periodic),
+    cmocka_unit_test(test_basecurve_schema_exposes_single_master_curve),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);

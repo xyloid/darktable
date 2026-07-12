@@ -1886,6 +1886,49 @@ static void test_colorzones_adapter_select_by_change_resets_curves(void **state)
   rgbcurve_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* basecurve adapter (curve-classes design doc SS Initial registry         */
+/* mapping / basecurve)                                                    */
+/* ---------------------------------------------------------------------- */
+
+static void test_basecurve_adapter_master_write_leaves_reserved_channels_untouched(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = adapter_fixture_new("basecurve");
+
+  const dt_remote_curve_point_t s_curve[] = {
+    { 0.0, 0.0 }, { 0.25, 0.15 }, { 0.75, 0.85 }, { 1.0, 1.0 }
+  };
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_curve_patch("curve.master", s_curve, 4, TRUE,
+                                            DT_REMOTE_CURVE_MONOTONE_HERMITE));
+
+  void *projected = g_malloc0(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  GHashTable *values = NULL;
+  dt_remote_curve_value_t *master = rgbcurve_read_value(fixture, projected, "curve.master", &values);
+  assert_curve_points(master, s_curve, 4, 1e-6);
+  assert_int_equal(master->interpolation, DT_REMOTE_CURVE_MONOTONE_HERMITE);
+  g_hash_table_unref(values);
+
+  // reserved native channels 1/2 stay exactly as the pre-patch params had
+  // them (compare the raw counts through introspection)
+  dt_introspection_field_t *field = NULL;
+  int *counts_before = rgbcurve_field_ptr(fixture, fixture->module->params, "basecurve_nodes", &field);
+  int *counts_after = rgbcurve_field_ptr(fixture, projected, "basecurve_nodes", &field);
+  assert_int_equal(counts_after[1], counts_before[1]);
+  assert_int_equal(counts_after[2], counts_before[2]);
+
+  g_free(projected);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
 /* rgbcurve path segment helpers: curve_nodes is
  * dt_iop_rgbcurve_node_t[DT_IOP_RGBCURVE_MAX_CHANNELS][DT_IOP_RGBCURVE_MAXNODES],
  * a native two-dimensional C array. Per tools/introspection/ast.pm
@@ -2212,6 +2255,7 @@ int main(void)
     cmocka_unit_test(test_colorzones_adapter_rejects_zero_wrap_gap_in_hue_mode),
     cmocka_unit_test(test_colorzones_adapter_write_stamps_splines_version_v2),
     cmocka_unit_test(test_colorzones_adapter_select_by_change_resets_curves),
+    cmocka_unit_test(test_basecurve_adapter_master_write_leaves_reserved_channels_untouched),
     cmocka_unit_test(test_path_resolve_curve_node_x),
     cmocka_unit_test(test_path_resolve_curve_num_nodes),
     cmocka_unit_test(test_path_resolve_rejects_wrong_type_segment),
