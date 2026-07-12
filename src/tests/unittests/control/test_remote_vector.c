@@ -1439,6 +1439,79 @@ static void test_read_values_stamps_active_and_writable_now_from_predicate(void 
   borders_fixture_free(fixture);
 }
 
+static void test_read_values_evaluates_active_and_writable_predicates_independently(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  static const dt_remote_parameter_predicate_t active_portrait = {
+    .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_EQ,
+    .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_PORTRAIT",
+  };
+  static const dt_remote_parameter_predicate_t writable_not_landscape = {
+    .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_NE,
+    .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_LANDSCAPE",
+  };
+  static const dt_remote_parameter_predicate_t active_not_auto = {
+    .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_NE,
+    .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_AUTO",
+  };
+  static const dt_remote_parameter_predicate_t writable_auto = {
+    .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_EQ,
+    .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_AUTO",
+  };
+  static dt_remote_vector_descriptor_t descriptors[2];
+  descriptors[0] = make_color_descriptor();
+  descriptors[0].name = "vector.first";
+  descriptors[0].active_when = &active_portrait;
+  descriptors[0].writable_when = &writable_not_landscape;
+  descriptors[1] = make_color_descriptor();
+  descriptors[1].name = "vector.second";
+  descriptors[1].native = s_frame_color_path;
+  descriptors[1].active_when = &active_not_auto;
+  descriptors[1].writable_when = &writable_auto;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = descriptors, .vector_count = 2,
+  };
+  install_vector_adapter(&adapter);
+
+  dt_introspection_field_t *orient_field = NULL;
+  int *orient = dt_introspection_get_child(
+    fixture->module->so->get_introspection()->field,
+    fixture->module->params, "aspect_orient", &orient_field);
+  int auto_value = 0, portrait_value = 0, landscape_value = 0;
+  assert_true(dt_introspection_get_enum_value(orient_field,
+    "DT_IOP_BORDERS_ASPECT_ORIENTATION_AUTO", &auto_value));
+  assert_true(dt_introspection_get_enum_value(orient_field,
+    "DT_IOP_BORDERS_ASPECT_ORIENTATION_PORTRAIT", &portrait_value));
+  assert_true(dt_introspection_get_enum_value(orient_field,
+    "DT_IOP_BORDERS_ASPECT_ORIENTATION_LANDSCAPE", &landscape_value));
+
+  const int states[] = { auto_value, portrait_value, landscape_value };
+  const gboolean first_active[] = { FALSE, TRUE, FALSE };
+  const gboolean first_writable[] = { TRUE, TRUE, FALSE };
+  const gboolean second_active[] = { FALSE, TRUE, TRUE };
+  const gboolean second_writable[] = { TRUE, FALSE, FALSE };
+  for(guint i = 0; i < G_N_ELEMENTS(states); i++)
+  {
+    *orient = states[i];
+    GHashTable *values = NULL;
+    dt_remote_error_t *error = NULL;
+    assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params,
+                                             &values, &error));
+    assert_null(error);
+    dt_remote_vector_value_t *first = g_hash_table_lookup(values, "vector.first");
+    dt_remote_vector_value_t *second = g_hash_table_lookup(values, "vector.second");
+    assert_int_equal(first->active, first_active[i]);
+    assert_int_equal(first->writable_now, first_writable[i]);
+    assert_int_equal(second->active, second_active[i]);
+    assert_int_equal(second->writable_now, second_writable[i]);
+    g_hash_table_unref(values);
+  }
+  borders_fixture_free(fixture);
+}
+
 static void test_read_values_no_adapter_returns_empty_table(void **state)
 {
   (void)state;
@@ -1768,7 +1841,7 @@ static void test_apply_patch_writable_when_evaluated_after_scalar_prepare_writes
   };
   static dt_remote_vector_descriptor_t descriptor;
   descriptor = make_color_descriptor();
-  descriptor.active_when = &predicate;
+  descriptor.active_when = NULL;
   descriptor.writable_when = &predicate;
   static const char *const prepare_fields[] = { "aspect_orient" };
   static dt_remote_vector_module_adapter_t adapter;
@@ -1809,6 +1882,47 @@ static void test_apply_patch_writable_when_evaluated_after_scalar_prepare_writes
   assert_null(error);
 
   g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_apply_patch_active_when_is_evaluated_independently(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  static const dt_remote_parameter_predicate_t predicate = {
+    .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_EQ,
+    .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_PORTRAIT",
+  };
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.active_when = &predicate;
+  descriptor.writable_when = NULL;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+  const double raw[] = { 0.1, 0.2, 0.3 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.color", raw, 3));
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
   vector_patch_cleanup(&patch);
   borders_fixture_free(fixture);
 }
@@ -2001,6 +2115,9 @@ int main(void)
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_read_values_stamps_active_and_writable_now_from_predicate,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_read_values_evaluates_active_and_writable_predicates_independently,
+      lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_read_values_no_adapter_returns_empty_table,
                                     lookup_override_test_setup, lookup_override_test_teardown),
 
@@ -2021,6 +2138,9 @@ int main(void)
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_writable_when_evaluated_after_scalar_prepare_writes,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_active_when_is_evaluated_independently,
+      lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_apply_patch_scalar_only_prepare_field_still_triggers_validate_completed,
       lookup_override_test_setup, lookup_override_test_teardown),
