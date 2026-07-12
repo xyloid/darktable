@@ -303,13 +303,13 @@ static const dt_remote_curve_descriptor_t s_rgbcurve_curves[] = {
   },
 };
 
-static gboolean rgbcurve_fail_internal(dt_remote_error_t **error, const char *message)
+static gboolean adapter_fail_internal(dt_remote_error_t **error, const char *message)
 {
   deliver_error(dt_remote_curve_registry_error_new(DT_REMOTE_ERR_INTERNAL, "%s", message), error);
   return FALSE;
 }
 
-static gboolean rgbcurve_resolve_top(const dt_remote_curve_context_t *ctx,
+static gboolean adapter_resolve_top(const dt_remote_curve_context_t *ctx,
                                      void *params,
                                      const char *name,
                                      const dt_introspection_field_t **field,
@@ -331,9 +331,9 @@ static gboolean rgbcurve_read_bool(const dt_remote_curve_context_t *ctx,
 {
   const dt_introspection_field_t *field = NULL;
   void *ptr = NULL;
-  if(!rgbcurve_resolve_top(ctx, (void *)params, name, &field, &ptr, error)) return FALSE;
+  if(!adapter_resolve_top(ctx, (void *)params, name, &field, &ptr, error)) return FALSE;
   if(field->header.type != DT_INTROSPECTION_TYPE_BOOL)
-    return rgbcurve_fail_internal(error, _("rgbcurve boolean field drifted from introspection"));
+    return adapter_fail_internal(error, _("rgbcurve boolean field drifted from introspection"));
   *out = *(const gboolean *)ptr;
   return TRUE;
 }
@@ -346,16 +346,16 @@ static gboolean rgbcurve_read_mode(const dt_remote_curve_context_t *ctx,
 {
   const dt_introspection_field_t *field = NULL;
   void *ptr = NULL;
-  if(!rgbcurve_resolve_top(ctx, (void *)params, "curve_autoscale", &field, &ptr, error)) return FALSE;
+  if(!adapter_resolve_top(ctx, (void *)params, "curve_autoscale", &field, &ptr, error)) return FALSE;
   if(field->header.type != DT_INTROSPECTION_TYPE_ENUM
      || !dt_introspection_get_enum_value((dt_introspection_field_t *)field,
                                          "DT_S_SCALE_MANUAL_RGB", manual_value))
-    return rgbcurve_fail_internal(error, _("rgbcurve autoscale enum drifted from introspection"));
+    return adapter_fail_internal(error, _("rgbcurve autoscale enum drifted from introspection"));
   *out = *(const int *)ptr;
   return TRUE;
 }
 
-static gboolean rgbcurve_resolve_native(const dt_remote_curve_context_t *ctx,
+static gboolean adapter_resolve_native(const dt_remote_curve_context_t *ctx,
                                         const dt_remote_curve_descriptor_t *desc,
                                         void *params,
                                         const dt_introspection_field_t **nodes_field,
@@ -374,7 +374,7 @@ static gboolean rgbcurve_resolve_native(const dt_remote_curve_context_t *ctx,
                                    type_field, type_ptr, error);
 }
 
-static gboolean rgbcurve_resolve_node(const dt_remote_curve_descriptor_t *desc,
+static gboolean adapter_resolve_node(const dt_remote_curve_descriptor_t *desc,
                                       const dt_introspection_field_t *nodes_field,
                                       void *nodes_ptr,
                                       guint index,
@@ -410,21 +410,21 @@ static gboolean rgbcurve_is_identity(const dt_remote_curve_context_t *ctx,
   void *nodes_ptr = NULL;
   void *count_ptr = NULL;
   void *type_ptr = NULL;
-  if(!rgbcurve_resolve_native(ctx, desc, params, &nodes_field, &nodes_ptr,
+  if(!adapter_resolve_native(ctx, desc, params, &nodes_field, &nodes_ptr,
                               &count_field, &count_ptr, &type_field, &type_ptr, error))
     return FALSE;
   if(count_field->header.type != DT_INTROSPECTION_TYPE_INT)
-    return rgbcurve_fail_internal(error, _("rgbcurve count field drifted from introspection"));
+    return adapter_fail_internal(error, _("rgbcurve count field drifted from introspection"));
   const int count = *(const int *)count_ptr;
   if(count < 0 || (guint)count > nodes_field->Array.count)
-    return rgbcurve_fail_internal(error, _("rgbcurve count exceeds native capacity"));
+    return adapter_fail_internal(error, _("rgbcurve count exceeds native capacity"));
   *identity = TRUE;
   for(int i = 0; i < count; i++)
   {
     float *x = NULL;
     float *y = NULL;
-    if(!rgbcurve_resolve_node(desc, nodes_field, nodes_ptr, (guint)i, &x, &y))
-      return rgbcurve_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
+    if(!adapter_resolve_node(desc, nodes_field, nodes_ptr, (guint)i, &x, &y))
+      return adapter_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
     if(*x != *y)
     {
       *identity = FALSE;
@@ -452,10 +452,10 @@ static gboolean rgbcurve_copy_channel(const dt_remote_curve_context_t *ctx,
   void *destination_nodes_ptr = NULL;
   void *destination_count_ptr = NULL;
   void *destination_type_ptr = NULL;
-  if(!rgbcurve_resolve_native(ctx, source, params, &source_nodes_field, &source_nodes_ptr,
+  if(!adapter_resolve_native(ctx, source, params, &source_nodes_field, &source_nodes_ptr,
                               &source_count_field, &source_count_ptr,
                               &source_type_field, &source_type_ptr, error)
-     || !rgbcurve_resolve_native(ctx, destination, params,
+     || !adapter_resolve_native(ctx, destination, params,
                                  &destination_nodes_field, &destination_nodes_ptr,
                                  &destination_count_field, &destination_count_ptr,
                                  &destination_type_field, &destination_type_ptr, error))
@@ -465,7 +465,7 @@ static gboolean rgbcurve_copy_channel(const dt_remote_curve_context_t *ctx,
      || destination_count_field->header.type != DT_INTROSPECTION_TYPE_INT
      || source_type_field->header.type != DT_INTROSPECTION_TYPE_INT
      || destination_type_field->header.type != DT_INTROSPECTION_TYPE_INT)
-    return rgbcurve_fail_internal(error, _("rgbcurve channel layout drifted from introspection"));
+    return adapter_fail_internal(error, _("rgbcurve channel layout drifted from introspection"));
 
   for(guint i = 0; i < source_nodes_field->Array.count; i++)
   {
@@ -473,12 +473,12 @@ static gboolean rgbcurve_copy_channel(const dt_remote_curve_context_t *ctx,
     float *source_y = NULL;
     float *destination_x = NULL;
     float *destination_y = NULL;
-    if(!rgbcurve_resolve_node(source, source_nodes_field, source_nodes_ptr, i,
+    if(!adapter_resolve_node(source, source_nodes_field, source_nodes_ptr, i,
                               &source_x, &source_y)
-       || !rgbcurve_resolve_node(destination, destination_nodes_field,
+       || !adapter_resolve_node(destination, destination_nodes_field,
                                  destination_nodes_ptr, i,
                                  &destination_x, &destination_y))
-      return rgbcurve_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
+      return adapter_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
     *destination_x = *source_x;
     *destination_y = *source_y;
   }
@@ -500,20 +500,20 @@ static gboolean rgbcurve_transform_channel(const dt_remote_curve_context_t *ctx,
   void *nodes_ptr = NULL;
   void *count_ptr = NULL;
   void *type_ptr = NULL;
-  if(!rgbcurve_resolve_native(ctx, desc, params, &nodes_field, &nodes_ptr,
+  if(!adapter_resolve_native(ctx, desc, params, &nodes_field, &nodes_ptr,
                               &count_field, &count_ptr, &type_field, &type_ptr, error))
     return FALSE;
   if(count_field->header.type != DT_INTROSPECTION_TYPE_INT)
-    return rgbcurve_fail_internal(error, _("rgbcurve count field drifted from introspection"));
+    return adapter_fail_internal(error, _("rgbcurve count field drifted from introspection"));
   const int count = *(const int *)count_ptr;
   if(count < 0 || (guint)count > nodes_field->Array.count)
-    return rgbcurve_fail_internal(error, _("rgbcurve count exceeds native capacity"));
+    return adapter_fail_internal(error, _("rgbcurve count exceeds native capacity"));
   for(int i = 0; i < count; i++)
   {
     float *x = NULL;
     float *y = NULL;
-    if(!rgbcurve_resolve_node(desc, nodes_field, nodes_ptr, (guint)i, &x, &y))
-      return rgbcurve_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
+    if(!adapter_resolve_node(desc, nodes_field, nodes_ptr, (guint)i, &x, &y))
+      return adapter_fail_internal(error, _("rgbcurve node layout drifted from introspection"));
     *x = compensate ? dt_ioppr_compensate_middle_grey(*x, profile)
                     : dt_ioppr_uncompensate_middle_grey(*x, profile);
     *y = compensate ? dt_ioppr_compensate_middle_grey(*y, profile)
@@ -542,7 +542,7 @@ static gboolean rgbcurve_prepare(const struct dt_remote_curve_context_t *ctx,
      || !rgbcurve_read_bool(ctx, new_params, "compensate_middle_grey", &new_compensate, error))
   {
     if((!error || !*error) && old_manual_value != new_manual_value)
-      return rgbcurve_fail_internal(error, _("rgbcurve manual-mode enum changed within one layout"));
+      return adapter_fail_internal(error, _("rgbcurve manual-mode enum changed within one layout"));
     return FALSE;
   }
 
@@ -597,7 +597,7 @@ static gboolean rgbcurve_prepare(const struct dt_remote_curve_context_t *ctx,
   return TRUE;
 }
 
-static gboolean rgbcurve_validate_completed(const struct dt_remote_curve_context_t *ctx,
+static gboolean adapter_validate_active_curves(const struct dt_remote_curve_context_t *ctx,
                                             const void *new_params,
                                             dt_remote_error_t **error)
 {
@@ -610,7 +610,7 @@ static gboolean rgbcurve_validate_completed(const struct dt_remote_curve_context
     if(!value)
     {
       g_hash_table_unref(values);
-      return rgbcurve_fail_internal(error, _("rgbcurve completed value disappeared from registry"));
+      return adapter_fail_internal(error, _("completed curve value disappeared from registry"));
     }
     if(value->active
        && !dt_remote_curve_validate(desc, value->points, TRUE,
@@ -635,7 +635,7 @@ static const dt_remote_curve_module_adapter_t s_rgbcurve_adapter = {
   .prepare_fields = s_rgbcurve_prepare_fields,
   .prepare_field_count = G_N_ELEMENTS(s_rgbcurve_prepare_fields),
   .prepare = rgbcurve_prepare,
-  .validate_completed = rgbcurve_validate_completed,
+  .validate_completed = adapter_validate_active_curves,
 };
 
 // The full adapter table. Only rgbcurve for now; a future op (e.g.
