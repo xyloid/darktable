@@ -21,6 +21,7 @@
 #include "common/darktable.h" // _()
 #include "develop/imageop.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <string.h>
@@ -161,6 +162,23 @@ gboolean dt_remote_vector_validate(const dt_remote_vector_descriptor_t *desc,
           parameter, (int)i, "domain",
           _("vector '%s' component %u has value=%.17g outside domain [%.17g, %.17g]"),
           parameter, i, value, component->minimum, component->maximum);
+      return FALSE;
+    }
+    // VEC3-013: defensive preflight, independent of `component`'s own
+    // bounds -- dt_remote_vector_validate() is documented as pure and
+    // directly callable, so a caller-supplied descriptor is not guaranteed
+    // to have gone through dt_remote_vector_registry_validate()'s own
+    // bound cap (see that function's matching check). Reject a candidate
+    // that would narrow to +-inf in the write path's `(float)value`
+    // conversion before it ever reaches that conversion.
+    if(value < -(double)FLT_MAX || value > (double)FLT_MAX)
+    {
+      if(error)
+        *error = dt_remote_vector_validate_error_new(
+          parameter, (int)i, "native_range",
+          _("vector '%s' component %u has value=%.17g outside the representable native float "
+            "range [%.17g, %.17g]"),
+          parameter, i, value, -(double)FLT_MAX, (double)FLT_MAX);
       return FALSE;
     }
   }
@@ -306,11 +324,19 @@ static gboolean write_vector_patch(const dt_remote_vector_descriptor_t *desc,
     return FALSE;
   }
 
-  // Only the leading [0, component_count) elements are ever touched: the
-  // preserved tail [component_count, native_capacity) and every other
-  // params byte must come out of this call bit-identical to how they went
-  // in -- unlike rgbcurve's padding-insignificant convention, a vector's
-  // reserved tail may carry meaning this engine does not model.
+  // Preflight: resolve every destination element and pre-narrow every
+  // candidate to the float32 representation the commit loop below will
+  // actually store, before writing any of them. dt_remote_vector_validate()
+  // above proves LEVELS ordering/minimum_gap only in double precision
+  // (VEC3-014) -- two double-domain-distinct, strictly increasing values
+  // can still collapse to the same float32, or narrow to a gap below
+  // desc->minimum_gap, once actually stored. Re-checking on the narrowed
+  // representations here (widened back to double for the comparison) keeps
+  // that invariant true for the bytes actually written, not just the
+  // double-domain values already validated, while keeping the whole
+  // preflight-then-commit byte-atomic on any rejection.
+  void **element_ptrs = g_new(void *, desc->component_count);
+  float *narrowed = g_new(float, desc->component_count);
   for(guint i = 0; i < desc->component_count; i++)
   {
     dt_introspection_field_t *element_field = NULL;
@@ -322,11 +348,47 @@ static gboolean write_vector_patch(const dt_remote_vector_descriptor_t *desc,
                              DT_REMOTE_ERR_INTERNAL,
                              _("internal error: vector '%s' component %u drifted"), desc->name, i),
                            error);
+      g_free(element_ptrs);
+      g_free(narrowed);
       return FALSE;
     }
-    const double value = g_array_index(vector_patch->values, double, i);
-    *(float *)element_ptr = (float)value;
+    element_ptrs[i] = element_ptr;
+    narrowed[i] = (float)g_array_index(vector_patch->values, double, i);
   }
+
+  if(desc->subtype == DT_REMOTE_VECTOR_LEVELS)
+  {
+    for(guint i = 1; i < desc->component_count; i++)
+    {
+      const double previous = (double)narrowed[i - 1];
+      const double current = (double)narrowed[i];
+      const double delta = current - previous;
+      const gboolean unordered = delta <= 0.0;
+      if(unordered || delta < desc->minimum_gap)
+      {
+        deliver_vector_error(dt_remote_vector_validate_error_new(
+                               desc->name, (int)i, unordered ? "unordered" : "gap",
+                               _("vector '%s' components %u and %u narrow to native float values that "
+                                 "are not strictly increasing or too close together"),
+                               desc->name, i - 1, i),
+                             error);
+        g_free(element_ptrs);
+        g_free(narrowed);
+        return FALSE;
+      }
+    }
+  }
+
+  // Only the leading [0, component_count) elements are ever touched: the
+  // preserved tail [component_count, native_capacity) and every other
+  // params byte must come out of this call bit-identical to how they went
+  // in -- unlike rgbcurve's padding-insignificant convention, a vector's
+  // reserved tail may carry meaning this engine does not model.
+  for(guint i = 0; i < desc->component_count; i++)
+    *(float *)element_ptrs[i] = narrowed[i];
+
+  g_free(element_ptrs);
+  g_free(narrowed);
   return TRUE;
 }
 

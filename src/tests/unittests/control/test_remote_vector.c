@@ -355,6 +355,92 @@ static void test_vector_validate_never_mutates_values_on_rejection(void **state)
   g_array_free(snapshot, TRUE);
 }
 
+// VEC3-013: a component whose declared bounds are wider than the native
+// float range (never possible through the registry after that fix -- see
+// test_registry_validate_rejects_invalid_descriptor_metadata's huge-bound
+// cases below -- but dt_remote_vector_validate() is documented as pure and
+// directly callable) must still reject a candidate that would narrow to
+// +-inf, even though it falls inside those (unrealistically wide)
+// double-domain bounds.
+static const dt_remote_vector_component_t s_wide_bound_components[] = {
+  { .name = "red", .minimum = -1e39, .maximum = 1e39 },
+  { .name = "green", .minimum = 0.0, .maximum = 1.0 },
+  { .name = "blue", .minimum = -1.0, .maximum = 1.0 },
+};
+
+static dt_remote_vector_descriptor_t make_wide_bound_descriptor(void)
+{
+  dt_remote_vector_descriptor_t desc = { 0 };
+  desc.name = "vector.wide";
+  desc.component_count = G_N_ELEMENTS(s_wide_bound_components);
+  desc.components = s_wide_bound_components;
+  desc.native_capacity = G_N_ELEMENTS(s_wide_bound_components);
+  desc.subtype = DT_REMOTE_VECTOR_PLAIN;
+  return desc;
+}
+
+static void test_vector_validate_rejects_candidate_exceeding_native_float_range(void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_wide_bound_descriptor();
+  static const double values[] = { 1e39, 0.5, 0.0 };
+  GArray *array = make_values(values, G_N_ELEMENTS(values));
+  GArray *snapshot = make_values(values, G_N_ELEMENTS(values));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_vector_validate(&desc, array, &err));
+  assert_vector_error_details(err, "vector.wide", 0, "native_range");
+  assert_memory_equal(array->data, snapshot->data, array->len * sizeof(double));
+
+  dt_remote_error_free(err);
+  g_array_free(array, TRUE);
+  g_array_free(snapshot, TRUE);
+}
+
+static void test_vector_validate_rejects_negative_candidate_exceeding_native_float_range(void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_wide_bound_descriptor();
+  static const double values[] = { -1e39, 0.5, 0.0 };
+  GArray *array = make_values(values, G_N_ELEMENTS(values));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_vector_validate(&desc, array, &err));
+  assert_vector_error_details(err, "vector.wide", 0, "native_range");
+
+  dt_remote_error_free(err);
+  g_array_free(array, TRUE);
+}
+
+static void test_vector_validate_accepts_candidate_exactly_at_native_float_range_boundary(void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_wide_bound_descriptor();
+  static const double values[] = { (double)FLT_MAX, 0.5, -1.0 };
+  GArray *array = make_values(values, G_N_ELEMENTS(values));
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_vector_validate(&desc, array, &err));
+  assert_null(err);
+
+  g_array_free(array, TRUE);
+}
+
+static void test_vector_validate_accepts_candidate_exactly_at_negative_native_float_range_boundary(
+  void **state)
+{
+  (void)state;
+  dt_remote_vector_descriptor_t desc = make_wide_bound_descriptor();
+  static const double values[] = { -(double)FLT_MAX, 0.5, -1.0 };
+  GArray *array = make_values(values, G_N_ELEMENTS(values));
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_vector_validate(&desc, array, &err));
+  assert_null(err);
+
+  g_array_free(array, TRUE);
+}
+
 static const dt_remote_vector_component_t s_levels_components[] = {
   { .name = "black", .minimum = 0.0, .maximum = 1.0 },
   { .name = "mid", .minimum = 0.0, .maximum = 1.0 },
@@ -911,6 +997,47 @@ static void test_registry_validate_rejects_invalid_descriptor_metadata(void **st
   dt_remote_vector_module_adapter_t *bad_infinite_bounds = new_test_adapter(&descriptor);
   descriptor->components = infinite_bounds;
   assert_vector_registry_rejects(bad_infinite_bounds, so);
+
+  // VEC3-013: a finite double bound outside the native float range must be
+  // rejected -- accepting it would let a candidate at the same bound pass
+  // dt_remote_vector_validate()'s domain check and then narrow to +-inf in
+  // the write path's `(float)value` conversion.
+  static const dt_remote_vector_component_t huge_maximum[] = {
+    { "red", 0.0, 1e39 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_huge_maximum = new_test_adapter(&descriptor);
+  descriptor->components = huge_maximum;
+  assert_vector_registry_rejects(bad_huge_maximum, so);
+
+  static const dt_remote_vector_component_t huge_minimum[] = {
+    { "red", -1e39, 1.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  dt_remote_vector_module_adapter_t *bad_huge_minimum = new_test_adapter(&descriptor);
+  descriptor->components = huge_minimum;
+  assert_vector_registry_rejects(bad_huge_minimum, so);
+}
+
+static void test_registry_validate_accepts_component_bounds_at_native_float_range_boundary(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+
+  static const dt_remote_vector_component_t boundary_bounds[] = {
+    { "red", -(double)FLT_MAX, (double)FLT_MAX }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.components = boundary_bounds;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_vector_registry_validate(&adapter, so, &err));
+  assert_null(err);
 }
 
 static void test_registry_validate_rejects_invalid_subtype_metadata(void **state)
@@ -2038,6 +2165,105 @@ static void test_apply_patch_count_mismatch_fails_with_invalid_value(void **stat
   borders_fixture_free(fixture);
 }
 
+// VEC3-013: reproduces the finding's exact scenario end to end -- a
+// component bound of 1e39 (finite in double precision, but far beyond the
+// native float range) paired with a candidate that exactly matches it.
+// Pre-fix, both the registry's component-bound check and
+// dt_remote_vector_validate()'s domain check accept this (the candidate sits
+// right at the declared maximum), and the write path's `(float)value`
+// conversion then silently narrows 1e39 to +inf. Post-fix, the registry
+// itself rejects the 1e39 bound before any write is attempted.
+static void test_apply_patch_rejects_bound_and_candidate_beyond_native_float_range(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+
+  static const dt_remote_vector_component_t huge_bound_components[] = {
+    { "red", 0.0, 1e39 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.components = huge_bound_components;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  const double values[] = { 1e39, 0.5, 0.5 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.color", values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  // Fails at the registry layer (the adapter's own 1e39 bound is invalid),
+  // before dt_remote_vector_validate() or the write path ever see the
+  // candidate.
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Companion boundary-acceptance coverage: with the widest bounds a
+// registry-valid descriptor may now declare (+-FLT_MAX exactly), a
+// candidate exactly at FLT_MAX/-FLT_MAX is accepted and written as that
+// exact float, never rejected and never narrowed to infinity.
+static void test_apply_patch_accepts_candidate_exactly_at_native_float_range_boundary(void **state)
+{
+  (void)state;
+  static const dt_remote_vector_component_t boundary_components[] = {
+    { "red", -(double)FLT_MAX, (double)FLT_MAX }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+  };
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.components = boundary_components;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+
+  const double boundary_values[][3] = {
+    { (double)FLT_MAX, 0.5, 0.5 },
+    { -(double)FLT_MAX, 0.5, 0.5 },
+  };
+  const float expected_first_component[] = { FLT_MAX, -FLT_MAX };
+
+  for(guint i = 0; i < G_N_ELEMENTS(boundary_values); i++)
+  {
+    borders_fixture_t *fixture = borders_fixture_new();
+    install_vector_adapter(&adapter);
+
+    dt_remote_patch_t patch;
+    vector_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.color", boundary_values[i], 3));
+
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+    assert_null(error);
+    assert_float_equal(read_color_component(fixture, projected, "color", 0),
+                       expected_first_component[i], 0.0);
+
+    g_free(projected);
+    vector_patch_cleanup(&patch);
+    borders_fixture_free(fixture);
+  }
+}
+
 static void test_apply_patch_domain_violation_rejects_and_leaves_live_params_untouched(void **state)
 {
   (void)state;
@@ -2100,6 +2326,96 @@ static void test_apply_patch_nan_rejection_preserves_params_and_input(void **sta
   g_array_unref(input_before);
   g_free(projected);
   g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// VEC3-014: dt_remote_vector_validate() proves LEVELS ordering/minimum_gap
+// only in double precision (called at the top of write_vector_patch,
+// remote_vector.c); two double-domain-distinct, strictly increasing values
+// can still collapse to the same float32 once narrowed for the actual
+// native write. minimum_gap == 0 (itself a valid LEVELS descriptor per
+// vector_subtype_metadata_is_valid()) makes this reachable with an
+// otherwise unremarkable adjacent pair.
+static dt_remote_vector_descriptor_t make_levels_apply_descriptor(double minimum_gap)
+{
+  dt_remote_vector_descriptor_t desc = make_color_descriptor();
+  desc.name = "vector.levels";
+  desc.subtype = DT_REMOTE_VECTOR_LEVELS;
+  desc.strictly_increasing = TRUE;
+  desc.minimum_gap = minimum_gap;
+  return desc;
+}
+
+static void test_apply_patch_levels_rejects_values_that_collapse_after_narrowing(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_levels_apply_descriptor(0.0);
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  // Strictly increasing in double precision (delta ~1e-10 > 0, satisfying
+  // both ordering and the minimum_gap == 0 threshold), but the first two
+  // values narrow to the identical float32 -- collapsing the ordering the
+  // double-domain validator just proved.
+  const double values[] = { 0.5, 0.5 + 1e-10, 0.9 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.levels", values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_apply_patch_levels_accepts_values_that_remain_ordered_after_narrowing(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_levels_apply_descriptor(0.0);
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  const double values[] = { 0.1, 0.5, 0.9 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.levels", values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  assert_float_equal(read_color_component(fixture, projected, "color", 0), 0.1f, 1e-6);
+  assert_float_equal(read_color_component(fixture, projected, "color", 1), 0.5f, 1e-6);
+  assert_float_equal(read_color_component(fixture, projected, "color", 2), 0.9f, 1e-6);
+
+  g_free(projected);
   vector_patch_cleanup(&patch);
   borders_fixture_free(fixture);
 }
@@ -2626,6 +2942,11 @@ int main(void)
     cmocka_unit_test(test_vector_validate_levels_rejects_nan_in_every_position),
     cmocka_unit_test(test_vector_validate_accepts_exact_finite_minima),
     cmocka_unit_test(test_vector_validate_never_mutates_values_on_rejection),
+    cmocka_unit_test(test_vector_validate_rejects_candidate_exceeding_native_float_range),
+    cmocka_unit_test(test_vector_validate_rejects_negative_candidate_exceeding_native_float_range),
+    cmocka_unit_test(test_vector_validate_accepts_candidate_exactly_at_native_float_range_boundary),
+    cmocka_unit_test(
+      test_vector_validate_accepts_candidate_exactly_at_negative_native_float_range_boundary),
     cmocka_unit_test(test_vector_validate_levels_accepts_strictly_increasing),
     cmocka_unit_test(test_vector_validate_levels_rejects_unordered),
     cmocka_unit_test(test_vector_validate_levels_rejects_equal_adjacent_values),
@@ -2634,6 +2955,7 @@ int main(void)
 
     cmocka_unit_test(test_registry_validate_rejects_invalid_adapter_envelope),
     cmocka_unit_test(test_registry_validate_rejects_invalid_descriptor_metadata),
+    cmocka_unit_test(test_registry_validate_accepts_component_bounds_at_native_float_range_boundary),
     cmocka_unit_test(test_registry_validate_rejects_invalid_subtype_metadata),
     cmocka_unit_test(test_registry_validate_rejects_color_with_nonzero_minimum_gap),
     cmocka_unit_test(test_registry_validate_accepts_valid_color_and_levels_metadata),
@@ -2692,10 +3014,22 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_apply_patch_count_mismatch_fails_with_invalid_value,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
+      test_apply_patch_rejects_bound_and_candidate_beyond_native_float_range,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_accepts_candidate_exactly_at_native_float_range_boundary,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
       test_apply_patch_domain_violation_rejects_and_leaves_live_params_untouched,
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_apply_patch_nan_rejection_preserves_params_and_input,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_levels_rejects_values_that_collapse_after_narrowing,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_levels_accepts_values_that_remain_ordered_after_narrowing,
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_apply_patch_invalid_native_layout_preserves_params,

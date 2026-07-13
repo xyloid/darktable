@@ -42,6 +42,7 @@
 #include "common/darktable.h" // _()
 #include "develop/imageop.h" // dt_iop_module_so_t, dt_iop_module_t
 
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -237,7 +238,13 @@ static gboolean vector_component_metadata_is_valid(
     if(!nonempty_string(component->name)
        || !isfinite(component->minimum)
        || !isfinite(component->maximum)
-       || component->minimum > component->maximum)
+       || component->minimum > component->maximum
+       // VEC3-013: a finite double bound outside the native float range
+       // would let a candidate at that same bound pass
+       // dt_remote_vector_validate()'s domain check and then narrow to
+       // +-inf in the write path's `(float)value` conversion.
+       || component->minimum < -(double)FLT_MAX || component->minimum > (double)FLT_MAX
+       || component->maximum < -(double)FLT_MAX || component->maximum > (double)FLT_MAX)
       return FALSE;
   }
   return TRUE;

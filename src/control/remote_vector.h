@@ -151,16 +151,19 @@ void dt_remote_vector_registry_set_lookup_override(dt_remote_vector_registry_loo
  * backing pointers and every prepare-field ID is nonempty; and, for every
  * descriptor, that its ID and all component IDs are nonempty, its positive
  * component count has a non-NULL component array, and every component has
- * finite, ordered minimum/maximum bounds. Each descriptor subtype is checked
- * exhaustively: PLAIN permits no color space or ordering metadata; COLOR
- * requires a nonempty color space and permits no ordering metadata; LEVELS
- * requires strictly-increasing ordering, a finite nonnegative minimum gap,
- * and no color space; unknown subtype values are rejected. It then validates
- * that each native path resolves against `so`'s real introspection tree to an
- * array leaf whose declared and non-NULL element descriptor are both
- * `sizeof(float)` floats, of length >= component_count, with native_capacity
- * equal to that resolved array length exactly; that no two descriptors on
- * `adapter` share a name;
+ * finite, ordered minimum/maximum bounds that both lie within
+ * `[-FLT_MAX, FLT_MAX]` (the native float range the write path narrows into).
+ * Each descriptor subtype is checked exhaustively: PLAIN permits no color
+ * space or ordering metadata; COLOR requires a nonempty color space and
+ * permits no ordering metadata; LEVELS requires strictly-increasing
+ * ordering, a finite nonnegative minimum gap, and no color space; unknown
+ * subtype values are rejected. It then validates that each native path
+ * resolves against `so`'s real introspection tree to an array leaf whose
+ * declared and non-NULL element descriptor are both `sizeof(float)` floats,
+ * of length >= component_count, with native_capacity equal to that resolved
+ * array length exactly, and whose own aggregate byte size equals
+ * `Array.count * sizeof(float)` exactly (overflow-checked); that no two
+ * descriptors on `adapter` share a name;
  * that no descriptor's name collides with a curve semantic ID registered for
  * the same (operation, params_version) pair (queried through
  * dt_remote_curve_registry_lookup()). Invalid metadata fails closed before
@@ -230,7 +233,15 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
  * is skipped -- this engine only ever touches its own class, the same
  * request may carry curve entries the curve engine handles separately.
  * Predicate evaluation, vector validation/native writes, and
- * validate_completed all operate only on `new_params`. */
+ * validate_completed all operate only on `new_params`. Before any native
+ * write, every destination element is resolved and every candidate is
+ * pre-narrowed to the float32 representation actually stored; for a LEVELS
+ * vector, the narrowed representations (widened back to double) are
+ * re-checked for strict ordering and `minimum_gap` -- dt_remote_vector_validate()
+ * proves those invariants only in double precision, and two double-domain-
+ * distinct values can still collapse once narrowed. Rejection at this stage
+ * is DT_REMOTE_ERR_INVALID_VALUE and, like every other rejection here,
+ * leaves `new_params` untouched. */
 gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
                                       const void *old_params,
                                       void *new_params,
@@ -250,10 +261,18 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
  *     domain, inclusive ("domain") -- compared entirely in double precision,
  *     so a value like 2.00000001 against a maximum of 2.0 is correctly
  *     rejected even though both would round to the same float;
+ *   - each finite, in-domain component must also lie within
+ *     `[-FLT_MAX, FLT_MAX]` ("native_range") -- a defensive check
+ *     independent of `desc->components[i]`'s own bounds, since this
+ *     function is pure and directly callable without going through
+ *     dt_remote_vector_registry_validate()'s matching bound cap;
  *   - when `desc->subtype` is DT_REMOTE_VECTOR_LEVELS, each adjacent pair
  *     must be strictly increasing ("unordered" when the delta is <= 0) and
  *     the gap must be at least `desc->minimum_gap` ("gap" when the delta is
  *     strictly less -- a delta exactly equal to minimum_gap is accepted).
+ *     This checks the double-domain values only; dt_remote_vector_apply_patch()
+ *     additionally re-checks the same invariants on the narrowed float32
+ *     representations actually written.
  *
  * Every rejection returns FALSE with `*error` set to a newly allocated
  * DT_REMOTE_ERR_INVALID_VALUE (caller frees with dt_remote_error_free());
