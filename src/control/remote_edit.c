@@ -821,16 +821,25 @@ gboolean dt_remote_get_module_primitive_schema(const char *op,
 // several descriptors (rgbcurve's shared channel arrays, colorbalance/
 // rgblevels aliasing) and, for curves, several paths of one descriptor --
 // dedupe so a name is never added twice to the same field.
+// `class_name` is used to select class-specific error wording ("curve" or
+// "vector") to preserve original error message text per-class.
 static gboolean _stamp_root(dt_remote_module_schema_t *schema,
                             const dt_remote_introspection_path_t *path,
                             const char *semantic_name,
+                            const char *class_name,
                             dt_remote_error_t **error)
 {
   if(path->length == 0 || path->segments[0].type != DT_REMOTE_PATH_FIELD)
   {
     if(error)
-      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
-                                   _("semantic descriptor '%s' has a rootless native path"), semantic_name);
+    {
+      if(!g_strcmp0(class_name, "curve"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("curve descriptor '%s' has a rootless native path"), semantic_name);
+      else
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("vector descriptor '%s' has a rootless native path"), semantic_name);
+    }
     return FALSE;
   }
   const char *root = path->segments[0].value.field;
@@ -844,9 +853,16 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
   if(!field)
   {
     if(error)
-      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
-                                   _("semantic descriptor '%s' routes through unknown field '%s'"),
-                                   semantic_name, root);
+    {
+      if(!g_strcmp0(class_name, "curve"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("curve descriptor '%s' routes through unknown field '%s'"),
+                                     semantic_name, root);
+      else
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("vector descriptor '%s' routes through unknown field '%s'"),
+                                     semantic_name, root);
+    }
     return FALSE;
   }
 
@@ -902,7 +918,7 @@ static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
       const dt_remote_introspection_path_t *paths[] = { &desc->native.nodes, &desc->native.count,
                                                         &desc->native.type };
       for(guint p = 0; p < G_N_ELEMENTS(paths); p++)
-        if(!_stamp_root(schema, paths[p], desc->name, error)) return FALSE;
+        if(!_stamp_root(schema, paths[p], desc->name, "curve", error)) return FALSE;
     }
   }
 
@@ -922,7 +938,7 @@ static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
     for(guint v = 0; v < adapter->vector_count; v++)
     {
       const dt_remote_vector_descriptor_t *desc = &adapter->vectors[v];
-      if(!_stamp_root(schema, &desc->native, desc->name, error)) return FALSE;
+      if(!_stamp_root(schema, &desc->native, desc->name, "vector", error)) return FALSE;
     }
   }
 
