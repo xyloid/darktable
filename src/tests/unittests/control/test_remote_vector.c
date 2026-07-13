@@ -1680,6 +1680,7 @@ static void test_read_values_no_adapter_returns_empty_table(void **state)
   dt_remote_vector_registry_set_lookup_override(always_null_vector_lookup);
   assert_true(dt_remote_vector_read_values(&module, blob, &values, &error));
   assert_null(error);
+  assert_non_null(values);
   assert_ptr_not_equal(values, sentinel);
   assert_int_equal(g_hash_table_size(values), 0);
 
