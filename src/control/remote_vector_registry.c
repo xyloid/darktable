@@ -44,6 +44,7 @@
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------- */
@@ -287,6 +288,16 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
     return FALSE;
   if(array_field->Array.count < (size_t)desc->component_count) return FALSE;
   if(array_field->Array.count != (size_t)desc->native_capacity) return FALSE;
+  // VEC3-012: the checks above establish the per-element type/size, but not
+  // that the aggregate leaf's own declared byte size actually holds
+  // Array.count of them -- dt_introspection_access_array() (introspection.h)
+  // addresses elements as `start + element * Array.field->header.size`,
+  // bounded only by Array.count, so an aggregate leaf smaller than
+  // `Array.count * sizeof(float)` would validate here and then permit
+  // out-of-bounds addressing. Guard the multiply against overflow before
+  // computing it.
+  if(array_field->Array.count > SIZE_MAX / sizeof(float)) return FALSE;
+  if(array_field->header.size != array_field->Array.count * sizeof(float)) return FALSE;
 
   return vector_predicate_is_valid(desc->active_when, root, dummy_blob)
          && vector_predicate_is_valid(desc->writable_when, root, dummy_blob);

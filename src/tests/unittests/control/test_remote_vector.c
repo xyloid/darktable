@@ -1119,6 +1119,64 @@ static void test_registry_validate_rejects_oversized_native_count(void **state)
                                               sizeof(float), oversized_count);
 }
 
+// VEC3-012: element count/type/size can all individually look correct
+// while the aggregate array leaf's own declared byte size is too small to
+// actually hold that many elements -- dt_introspection_access_array()
+// addresses elements as `start + element * Array.field->header.size`
+// bounded only by Array.count, so an undersized aggregate leaf validates
+// today and then permits out-of-bounds addressing. Mirrors
+// assert_registry_rejects_private_color_array() above, but corrupts the
+// ARRAY field's own header.size rather than its element descriptor.
+static void assert_registry_rejects_private_color_array_with_aggregate_size(size_t aggregate_size_override)
+{
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+  dt_introspection_t broken_intro = *so->get_introspection();
+  dt_introspection_field_t broken_root = *broken_intro.field;
+  dt_introspection_field_t broken_color = { 0 };
+  gboolean found_color = FALSE;
+  dt_introspection_field_t **fields =
+    g_new(dt_introspection_field_t *, broken_root.Struct.entries + 1);
+  for(guint i = 0; i <= broken_root.Struct.entries; i++)
+  {
+    fields[i] = broken_root.Struct.fields[i];
+    if(fields[i] && !g_strcmp0(fields[i]->header.field_name, "color"))
+    {
+      broken_color = *fields[i];
+      assert_non_null(broken_color.Array.field);
+      // Element descriptor/type/size and Array.count are left exactly as
+      // the real "color" field declares them (3 sizeof(float) elements);
+      // only the aggregate leaf's own byte size is corrupted, below what
+      // 3 floats require.
+      broken_color.header.size = aggregate_size_override;
+      fields[i] = &broken_color;
+      found_color = TRUE;
+    }
+  }
+  assert_true(found_color);
+  broken_root.Struct.fields = fields;
+  broken_intro.field = &broken_root;
+  dt_iop_module_so_t private_so;
+  init_private_vector_so(&private_so, "borders", &broken_intro);
+  dt_remote_vector_descriptor_t *descriptor = NULL;
+  dt_remote_vector_module_adapter_t *adapter = new_test_adapter(&descriptor);
+  dt_remote_error_t *error = NULL;
+  const gboolean valid = dt_remote_vector_registry_validate(adapter, &private_so, &error);
+  s_private_vector_intro = NULL;
+  g_free(fields);
+
+  assert_false(valid);
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  dt_remote_error_free(error);
+}
+
+static void test_registry_validate_rejects_undersized_aggregate_array_byte_size(void **state)
+{
+  (void)state;
+  assert_registry_rejects_private_color_array_with_aggregate_size(sizeof(float) * 2);
+}
+
 static void test_registry_validate_passes_for_well_formed_descriptor(void **state)
 {
   (void)state;
@@ -2584,6 +2642,7 @@ int main(void)
     cmocka_unit_test(test_registry_validate_rejects_nonfloat_element_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_wrong_float_element_size),
     cmocka_unit_test(test_registry_validate_rejects_oversized_native_count),
+    cmocka_unit_test(test_registry_validate_rejects_undersized_aggregate_array_byte_size),
     cmocka_unit_test(test_registry_validate_passes_for_well_formed_descriptor),
     cmocka_unit_test(test_registry_validate_rejects_native_capacity_mismatch),
     cmocka_unit_test(test_registry_validate_rejects_duplicate_names_within_adapter),
