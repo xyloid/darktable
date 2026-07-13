@@ -1,0 +1,76 @@
+{
+  "id": 40,
+  "ok": true,
+  "result": {
+    "module": "borders",
+    "display_name": "framing",
+    "params_version": 4,
+    "deprecated": false,
+    "supports_multiple_instances": false,
+    "fields": [
+      {
+        "name": "color",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["color"]
+      },
+      {
+        "name": "size",
+        "description": "border size",
+        "type": "float",
+        "minimum": 0.0,
+        "maximum": 0.5,
+        "default": 0.1,
+        "writable": true
+      }
+    ],
+    "semantic_fields": [
+      {
+        "name": "lift",
+        "class": "vector",
+        "display_name": "Lift",
+        "subtype": "vector",
+        "readable": true,
+        "writable": true,
+        "components": [
+          { "name": "factor", "minimum": 0.0, "maximum": 1.0 },
+          { "name": "red", "minimum": 0.0, "maximum": 1.0 }
+        ]
+      },
+      {
+        "name": "color",
+        "class": "vector",
+        "display_name": "Border color",
+        "subtype": "color",
+        "color_space": "display_rgb",
+        "readable": true,
+        "writable": true,
+        "components": [
+          { "name": "red", "minimum": 0.0, "maximum": 1.0 },
+          { "name": "green", "minimum": 0.0, "maximum": 1.0 },
+          { "name": "blue", "minimum": 0.0, "maximum": 1.0 }
+        ]
+      },
+      {
+        "name": "levels.linked",
+        "class": "vector",
+        "display_name": "Levels",
+        "subtype": "levels",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "autoscale", "equals": "LINKED_CHANNELS" },
+        "components": [
+          { "name": "black", "minimum": 0.0, "maximum": 1.0 },
+          { "name": "midpoint", "minimum": 0.0, "maximum": 1.0 },
+          { "name": "white", "minimum": 0.0, "maximum": 1.0 }
+        ],
+        "ordering": {
+          "rule": "strictly_increasing",
+          "minimum_gap": 1.1920929e-07,
+          "minimum_gap_comparison": "at_least"
+        }
+      }
+    ]
+  }
+}

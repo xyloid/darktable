@@ -1,0 +1,23 @@
+{
+  "id": 41,
+  "ok": true,
+  "result": {
+    "module": "borders",
+    "instance": 0,
+    "instance_name": "",
+    "enabled": true,
+    "revision": 31,
+    "values": {
+      "size": 0.1
+    },
+    "semantic_values": {
+      "color": {
+        "class": "vector",
+        "active": true,
+        "effective": true,
+        "writable_now": true,
+        "values": [1.0, 1.0, 1.0]
+      }
+    }
+  }
+}

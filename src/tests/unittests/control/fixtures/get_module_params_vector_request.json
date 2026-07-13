@@ -1,0 +1,5 @@
+{
+  "id": 41,
+  "method": "get_module_params",
+  "params": { "module": "borders", "instance": 0 }
+}

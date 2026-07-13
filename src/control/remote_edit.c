@@ -23,6 +23,7 @@
 #include "control/control.h"
 #include "control/remote_curve.h"
 #include "control/remote_revision.h"
+#include "control/remote_vector.h"
 #include "common/colorspaces.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -810,80 +811,130 @@ gboolean dt_remote_get_module_primitive_schema(const char *op,
   return TRUE;
 }
 
-// Stamps represented_by -- the wire schema's back-reference from a native
-// storage field to the semantic parameters that own it (curve design
-// SS Schema response) -- onto the primitive fields: every top-level
-// introspection field a descriptor's nodes/count/type path routes through
-// is represented by that descriptor's semantic ID, in registry order.
-// Runs only after dt_remote_curve_list_schema() advertised at least one
-// curve, so the adapter has already passed registry validation; a path
-// that does not start at a field, or a root name no schema row carries,
-// is registry/introspection drift and fails closed like every other
-// registry inconsistency.
+// Stamps `semantic_name` onto the primitive field at `path`'s root segment
+// -- the wire schema's back-reference from a native storage field to the
+// semantic parameter(s) that own it (curve design SS Schema response).
+// `path` must start at a field (curve node/count/type paths and vector
+// native paths all do, by construction); a path that does not, or a root
+// name no schema row carries, is registry/introspection drift and fails
+// closed like every other registry inconsistency. One root often backs
+// several descriptors (rgbcurve's shared channel arrays, colorbalance/
+// rgblevels aliasing) and, for curves, several paths of one descriptor --
+// dedupe so a name is never added twice to the same field.
+static gboolean _stamp_root(dt_remote_module_schema_t *schema,
+                            const dt_remote_introspection_path_t *path,
+                            const char *semantic_name,
+                            dt_remote_error_t **error)
+{
+  if(path->length == 0 || path->segments[0].type != DT_REMOTE_PATH_FIELD)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("semantic descriptor '%s' has a rootless native path"), semantic_name);
+    return FALSE;
+  }
+  const char *root = path->segments[0].value.field;
+
+  dt_remote_field_t *field = NULL;
+  for(guint i = 0; schema->fields && i < schema->fields->len; i++)
+  {
+    dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, root)) { field = f; break; }
+  }
+  if(!field)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("semantic descriptor '%s' routes through unknown field '%s'"),
+                                   semantic_name, root);
+    return FALSE;
+  }
+
+  if(!field->represented_by) field->represented_by = g_ptr_array_new_with_free_func(g_free);
+  gboolean present = FALSE;
+  for(guint i = 0; !present && i < field->represented_by->len; i++)
+    present = !g_strcmp0(g_ptr_array_index(field->represented_by, i), semantic_name);
+  if(!present) g_ptr_array_add(field->represented_by, g_strdup(semantic_name));
+  return TRUE;
+}
+
+// Stamps represented_by onto the primitive fields for every semantic
+// descriptor advertised in `schema->semantic_fields`: curve descriptors
+// stamp their three native paths (nodes/count/type), vector descriptors
+// stamp their single native path, in registry order within each class.
+// Runs only after the schema listing seam advertised at least one semantic
+// field of a class, so that class's adapter has already passed registry
+// validation -- a class with advertised fields whose adapter lookup here
+// comes back empty is registry/introspection drift and fails closed, same
+// as every other registry inconsistency (see _stamp_root above).
 static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
                                          const dt_iop_module_so_t *so,
                                          dt_remote_error_t **error)
 {
   dt_introspection_t *intro = so->get_introspection ? so->get_introspection() : NULL;
-  const dt_remote_curve_module_adapter_t *adapter =
-    intro ? dt_remote_curve_registry_lookup(schema->op, (guint)intro->params_version) : NULL;
-  if(!adapter)
+  const guint params_version = intro ? (guint)intro->params_version : 0;
+
+  gboolean has_curve = FALSE;
+  gboolean has_vector = FALSE;
+  for(guint i = 0; schema->semantic_fields && i < schema->semantic_fields->len; i++)
   {
-    if(error)
-      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
-                                   _("semantic curves advertised without a registry adapter for '%s'"),
-                                   schema->op);
-    return FALSE;
+    const dt_remote_semantic_schema_t *wrapped = g_ptr_array_index(schema->semantic_fields, i);
+    if(wrapped->class_id == DT_REMOTE_PARAMETER_CURVE) has_curve = TRUE;
+    else if(wrapped->class_id == DT_REMOTE_PARAMETER_VECTOR) has_vector = TRUE;
   }
 
-  for(guint c = 0; c < adapter->curve_count; c++)
+  if(has_curve)
   {
-    const dt_remote_curve_descriptor_t *desc = &adapter->curves[c];
-    const dt_remote_introspection_path_t *paths[] = { &desc->native.nodes, &desc->native.count,
-                                                      &desc->native.type };
-    for(guint p = 0; p < G_N_ELEMENTS(paths); p++)
+    const dt_remote_curve_module_adapter_t *adapter =
+      intro ? dt_remote_curve_registry_lookup(schema->op, params_version) : NULL;
+    if(!adapter)
     {
-      if(paths[p]->length == 0 || paths[p]->segments[0].type != DT_REMOTE_PATH_FIELD)
-      {
-        if(error)
-          *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
-                                       _("curve descriptor '%s' has a rootless native path"), desc->name);
-        return FALSE;
-      }
-      const char *root = paths[p]->segments[0].value.field;
+      if(error)
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("semantic curves advertised without a registry adapter for '%s'"),
+                                     schema->op);
+      return FALSE;
+    }
 
-      dt_remote_field_t *field = NULL;
-      for(guint i = 0; schema->fields && i < schema->fields->len; i++)
-      {
-        dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
-        if(!g_strcmp0(f->name, root)) { field = f; break; }
-      }
-      if(!field)
-      {
-        if(error)
-          *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
-                                       _("curve descriptor '%s' routes through unknown field '%s'"),
-                                       desc->name, root);
-        return FALSE;
-      }
-
-      // one root often backs several descriptors (rgbcurve's shared
-      // channel arrays) and several paths of one descriptor -- dedupe
-      if(!field->represented_by) field->represented_by = g_ptr_array_new_with_free_func(g_free);
-      gboolean present = FALSE;
-      for(guint i = 0; !present && i < field->represented_by->len; i++)
-        present = !g_strcmp0(g_ptr_array_index(field->represented_by, i), desc->name);
-      if(!present) g_ptr_array_add(field->represented_by, g_strdup(desc->name));
+    for(guint c = 0; c < adapter->curve_count; c++)
+    {
+      const dt_remote_curve_descriptor_t *desc = &adapter->curves[c];
+      const dt_remote_introspection_path_t *paths[] = { &desc->native.nodes, &desc->native.count,
+                                                        &desc->native.type };
+      for(guint p = 0; p < G_N_ELEMENTS(paths); p++)
+        if(!_stamp_root(schema, paths[p], desc->name, error)) return FALSE;
     }
   }
+
+  if(has_vector)
+  {
+    const dt_remote_vector_module_adapter_t *adapter =
+      intro ? dt_remote_vector_registry_lookup(schema->op, params_version) : NULL;
+    if(!adapter)
+    {
+      if(error)
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("semantic vectors advertised without a registry adapter for '%s'"),
+                                     schema->op);
+      return FALSE;
+    }
+
+    for(guint v = 0; v < adapter->vector_count; v++)
+    {
+      const dt_remote_vector_descriptor_t *desc = &adapter->vectors[v];
+      if(!_stamp_root(schema, &desc->native, desc->name, error)) return FALSE;
+    }
+  }
+
   return TRUE;
 }
 
-// The curve engine (remote_curve.h) keeps producing plain curve
-// schemas/values; the two helpers below convert its output containers
-// into the class-tagged wrapper shape the semantic_fields/semantic_values
-// members carry (remote_parameters.h). Both consume their input
-// container: element ownership moves into the wrappers.
+// The curve and vector engines (remote_curve.h, remote_vector.h) keep
+// producing plain per-class schema/value containers; the helpers below
+// convert their output into the class-tagged wrapper shape the
+// semantic_fields/semantic_values members carry (remote_parameters.h).
+// All four consume their input container: element ownership moves into
+// the wrappers (or, for the merge helpers, into `dst`).
 
 static GPtrArray *_wrap_curve_schemas(GPtrArray *curves)
 {
@@ -893,6 +944,27 @@ static GPtrArray *_wrap_curve_schemas(GPtrArray *curves)
   g_ptr_array_set_free_func(curves, NULL);  // elements now owned by the wrappers
   g_ptr_array_unref(curves);
   return wrapped;
+}
+
+static GPtrArray *_wrap_vector_schemas(GPtrArray *vectors)
+{
+  GPtrArray *wrapped = g_ptr_array_new_full(vectors->len, dt_remote_semantic_schema_free);
+  for(guint i = 0; i < vectors->len; i++)
+    g_ptr_array_add(wrapped, dt_remote_semantic_schema_wrap_vector(g_ptr_array_index(vectors, i)));
+  g_ptr_array_set_free_func(vectors, NULL);  // elements now owned by the wrappers
+  g_ptr_array_unref(vectors);
+  return wrapped;
+}
+
+// Moves every element of `src` onto the end of `dst` (ownership transfers)
+// and releases `src`'s now-empty array structure without touching the
+// (already-relocated) elements.
+static void _ptr_array_move_all(GPtrArray *dst, GPtrArray *src)
+{
+  for(guint i = 0; i < src->len; i++)
+    g_ptr_array_add(dst, g_ptr_array_index(src, i));
+  g_ptr_array_set_free_func(src, NULL);
+  g_ptr_array_unref(src);
 }
 
 static GHashTable *_wrap_curve_values(GHashTable *curves)
@@ -912,6 +984,24 @@ static GHashTable *_wrap_curve_values(GHashTable *curves)
   return wrapped;
 }
 
+// Wraps every entry of `vectors` and merges it into `dst`, which may
+// already hold wrapped entries of any class -- registry validation
+// guarantees semantic IDs are unique across classes (curve vs vector) for
+// one module, so no key can collide.
+static void _merge_wrapped_vector_values(GHashTable *dst, GHashTable *vectors)
+{
+  GHashTableIter it;
+  gpointer key = NULL;
+  gpointer value = NULL;
+  g_hash_table_iter_init(&it, vectors);
+  while(g_hash_table_iter_next(&it, &key, &value))
+  {
+    g_hash_table_iter_steal(&it);  // key and value ownership move below
+    g_hash_table_insert(dst, key, dt_remote_semantic_value_wrap_vector(value));
+  }
+  g_hash_table_unref(vectors);
+}
+
 gboolean dt_remote_get_module_schema(const char *op,
                                      dt_remote_module_schema_t **out,
                                      dt_remote_error_t **error)
@@ -920,9 +1010,9 @@ gboolean dt_remote_get_module_schema(const char *op,
   if(!dt_remote_get_module_primitive_schema(op, &schema, error)) return FALSE;
   dt_iop_module_so_t *so = dt_iop_get_module_so(op);
 
-  GPtrArray *semantic_fields = NULL;
+  GPtrArray *curve_fields = NULL;
   dt_remote_error_t *curve_error = NULL;
-  if(!dt_remote_curve_list_schema(so, &semantic_fields, &curve_error))
+  if(!dt_remote_curve_list_schema(so, &curve_fields, &curve_error))
   {
     dt_remote_module_schema_free(schema);
     if(error)
@@ -932,9 +1022,33 @@ gboolean dt_remote_get_module_schema(const char *op,
     return FALSE;
   }
 
-  if(semantic_fields->len > 0)
+  GPtrArray *vector_fields = NULL;
+  dt_remote_error_t *vector_error = NULL;
+  if(!dt_remote_vector_list_schema(so, &vector_fields, &vector_error))
   {
-    schema->semantic_fields = _wrap_curve_schemas(semantic_fields);
+    g_ptr_array_unref(curve_fields);
+    dt_remote_module_schema_free(schema);
+    if(error)
+      *error = vector_error;
+    else
+      dt_remote_error_free(vector_error);
+    return FALSE;
+  }
+
+  const guint curve_count = curve_fields->len;
+  const guint vector_count = vector_fields ? vector_fields->len : 0;
+
+  if(curve_count > 0 || vector_count > 0)
+  {
+    // Deterministic aggregation order: curves first, then vectors.
+    schema->semantic_fields =
+      g_ptr_array_new_full(curve_count + vector_count, dt_remote_semantic_schema_free);
+    _ptr_array_move_all(schema->semantic_fields, _wrap_curve_schemas(curve_fields));
+    if(vector_count > 0)
+      _ptr_array_move_all(schema->semantic_fields, _wrap_vector_schemas(vector_fields));
+    else if(vector_fields)
+      g_ptr_array_unref(vector_fields);
+
     if(!_annotate_represented_by(schema, so, error))
     {
       dt_remote_module_schema_free(schema);
@@ -942,7 +1056,10 @@ gboolean dt_remote_get_module_schema(const char *op,
     }
   }
   else
-    g_ptr_array_unref(semantic_fields);
+  {
+    g_ptr_array_unref(curve_fields);
+    if(vector_fields) g_ptr_array_unref(vector_fields);
+  }
 
   *out = schema;
   return TRUE;
@@ -1001,10 +1118,20 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
   // Keep scalar-only callers independent of the semantic registry. When a
   // semantic snapshot is requested, read it before allocating scalar output
   // so any registry/introspection failure leaves both outputs untouched.
-  GHashTable *semantic_values = NULL;
+  // Curves first, then vectors -- same deterministic aggregation order the
+  // schema-listing seam uses.
+  GHashTable *curve_values = NULL;
   if(semantic_out
-     && !dt_remote_curve_read_values(module, module->params, &semantic_values, error))
+     && !dt_remote_curve_read_values(module, module->params, &curve_values, error))
     return FALSE;
+
+  GHashTable *vector_values = NULL;
+  if(semantic_out
+     && !dt_remote_vector_read_values(module, module->params, &vector_values, error))
+  {
+    if(curve_values) g_hash_table_unref(curve_values);
+    return FALSE;
+  }
 
   GPtrArray *values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
 
@@ -1026,7 +1153,12 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
   }
 
   *out = values;
-  if(semantic_out) *semantic_out = _wrap_curve_values(semantic_values);
+  if(semantic_out)
+  {
+    GHashTable *wrapped = _wrap_curve_values(curve_values);
+    _merge_wrapped_vector_values(wrapped, vector_values);
+    *semantic_out = wrapped;
+  }
   return TRUE;
 }
 
@@ -1099,8 +1231,15 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   // projected state first; adapter preparation, semantic validation/native
   // writes, and completed-state validation then operate on the same scratch
   // block. Any failure discards both scalar and semantic changes before live
-  // params, enable state, GUI, history, or revision are touched.
+  // params, enable state, GUI, history, or revision are touched. Curve
+  // entries in the patch route to the curve engine, vector entries to the
+  // vector engine -- each skips whatever entries are not its own class.
   if(!dt_remote_curve_apply_patch(module, module->params, temp_params, patch, error))
+  {
+    g_free(temp_params);
+    return FALSE;
+  }
+  if(!dt_remote_vector_apply_patch(module, module->params, temp_params, patch, error))
   {
     g_free(temp_params);
     return FALSE;
@@ -1111,27 +1250,45 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   // below), and reading here means a read failure (registry drift racing
   // the transaction) still aborts with live state untouched. Restricted to
   // exactly the semantic IDs the patch wrote -- the same rule the scalar
-  // read-back loop below applies to field names.
+  // read-back loop below applies to field names. One pass over the merged
+  // (curve + vector) semantic_values map: entries are wrapped immediately
+  // after each class's read so the filter below can key off `class_id`
+  // directly, then trimmed to exactly what this patch wrote.
   GHashTable *semantic_readback = NULL;
   if(patch->semantic_values && patch->semantic_values->len > 0)
   {
-    if(!dt_remote_curve_read_values(module, temp_params, &semantic_readback, error))
+    GHashTable *curve_readback = NULL;
+    if(!dt_remote_curve_read_values(module, temp_params, &curve_readback, error))
     {
       g_free(temp_params);
       return FALSE;
     }
+    GHashTable *vector_readback = NULL;
+    if(!dt_remote_vector_read_values(module, temp_params, &vector_readback, error))
+    {
+      if(curve_readback) g_hash_table_unref(curve_readback);
+      g_free(temp_params);
+      return FALSE;
+    }
+
+    semantic_readback = _wrap_curve_values(curve_readback);
+    _merge_wrapped_vector_values(semantic_readback, vector_readback);
 
     GHashTableIter it;
     gpointer key = NULL;
+    gpointer val = NULL;
     g_hash_table_iter_init(&it, semantic_readback);
-    while(g_hash_table_iter_next(&it, &key, NULL))
+    while(g_hash_table_iter_next(&it, &key, &val))
     {
+      const dt_remote_semantic_value_t *wrapped = val;
       gboolean written = FALSE;
       for(guint i = 0; !written && i < patch->semantic_values->len; i++)
       {
         const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
-        written = semantic && semantic->class_id == DT_REMOTE_PARAMETER_CURVE
-                  && !g_strcmp0(semantic->value.curve.name, key);
+        if(!semantic || semantic->class_id != wrapped->class_id) continue;
+        const char *patch_name = semantic->class_id == DT_REMOTE_PARAMETER_CURVE
+                                    ? semantic->value.curve.name : semantic->value.vector.name;
+        written = !g_strcmp0(patch_name, key);
       }
       if(!written) g_hash_table_iter_remove(&it);
     }
@@ -1217,7 +1374,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
     entry->value = value;
     g_ptr_array_add(result->values, entry);
   }
-  result->semantic_values = semantic_readback ? _wrap_curve_values(semantic_readback) : NULL;
+  result->semantic_values = semantic_readback;  // already class-tagged (wrapped above)
   result->revision = new_revision;
 
   *out = result;

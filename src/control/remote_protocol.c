@@ -526,10 +526,116 @@ static JsonNode *_curve_value_to_json(const dt_remote_curve_value_t *v)
   return node;
 }
 
+/* ---------------------------------------------------------------------- */
+/* semantic vector schema/value -> JSON (milestone 4; wire shapes are the  */
+/* vector-class design doc's SS Wire and MCP contract "Schema row"/"Value")*/
+/* ---------------------------------------------------------------------- */
+
+// Stable wire vocabulary for dt_remote_vector_subtype_t -- like curve
+// interpolation names, these strings are part of the wire contract.
+static const char *_vector_subtype_name(dt_remote_vector_subtype_t subtype)
+{
+  switch(subtype)
+  {
+    case DT_REMOTE_VECTOR_COLOR: return "color";
+    case DT_REMOTE_VECTOR_LEVELS: return "levels";
+    case DT_REMOTE_VECTOR_PLAIN:
+    default: return "vector";
+  }
+}
+
+static JsonNode *_vector_schema_to_json(const dt_remote_vector_schema_t *s)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, s->name ? s->name : "");
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "vector");
+  json_builder_set_member_name(b, "display_name");
+  json_builder_add_string_value(b, s->display_name ? s->display_name : "");
+  json_builder_set_member_name(b, "subtype");
+  json_builder_add_string_value(b, _vector_subtype_name(s->subtype));
+  if(s->subtype == DT_REMOTE_VECTOR_COLOR)
+  {
+    json_builder_set_member_name(b, "color_space");
+    json_builder_add_string_value(b, s->color_space ? s->color_space : "");
+  }
+
+  json_builder_set_member_name(b, "readable");
+  json_builder_add_boolean_value(b, TRUE);
+  // Same convention as the curve schema serializer: "writable: true" means
+  // the server implements writes for the class in some valid state;
+  // writable_when below carries the static condition.
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, s->writability != DT_REMOTE_WRITABLE_NEVER);
+  _condition_to_json(b, "writable_when", s->writable_when);
+
+  json_builder_set_member_name(b, "components");
+  json_builder_begin_array(b);
+  for(guint i = 0; s->components && i < s->components->len; i++)
+  {
+    const dt_remote_vector_component_schema_t *c =
+      &g_array_index(s->components, dt_remote_vector_component_schema_t, i);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "name");
+    json_builder_add_string_value(b, c->name ? c->name : "");
+    json_builder_set_member_name(b, "minimum");
+    json_builder_add_double_value(b, c->minimum);
+    json_builder_set_member_name(b, "maximum");
+    json_builder_add_double_value(b, c->maximum);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+
+  if(s->subtype == DT_REMOTE_VECTOR_LEVELS)
+  {
+    json_builder_set_member_name(b, "ordering");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "rule");
+    json_builder_add_string_value(b, "strictly_increasing");
+    json_builder_set_member_name(b, "minimum_gap");
+    json_builder_add_double_value(b, s->minimum_gap);
+    json_builder_set_member_name(b, "minimum_gap_comparison");
+    json_builder_add_string_value(b, "at_least");
+    json_builder_end_object(b);
+  }
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
+static JsonNode *_vector_value_to_json(const dt_remote_vector_value_t *v)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "vector");
+  json_builder_set_member_name(b, "active");
+  json_builder_add_boolean_value(b, v->active);
+  json_builder_set_member_name(b, "effective");
+  json_builder_add_boolean_value(b, v->effective);
+  json_builder_set_member_name(b, "writable_now");
+  json_builder_add_boolean_value(b, v->writable_now);
+
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  for(guint i = 0; v->values && i < v->values->len; i++)
+    json_builder_add_double_value(b, g_array_index(v->values, double, i));
+  json_builder_end_array(b);
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
 // The semantic_fields/semantic_values containers carry class-tagged
 // wrappers (remote_parameters.h); serialization switches on the tag.
-// Only the curve arm exists today -- the milestone 4 vector class
-// replaces the g_assert_not_reached() arms when it lands.
 
 static JsonNode *_semantic_schema_to_json(const dt_remote_semantic_schema_t *w)
 {
@@ -537,6 +643,8 @@ static JsonNode *_semantic_schema_to_json(const dt_remote_semantic_schema_t *w)
   {
     case DT_REMOTE_PARAMETER_CURVE:
       return _curve_schema_to_json(w->u.curve);
+    case DT_REMOTE_PARAMETER_VECTOR:
+      return _vector_schema_to_json(w->u.vector);
     default:
       g_assert_not_reached();
       return NULL;
@@ -549,6 +657,8 @@ static JsonNode *_semantic_value_to_json(const dt_remote_semantic_value_t *w)
   {
     case DT_REMOTE_PARAMETER_CURVE:
       return _curve_value_to_json(w->u.curve);
+    case DT_REMOTE_PARAMETER_VECTOR:
+      return _vector_value_to_json(w->u.vector);
     default:
       g_assert_not_reached();
       return NULL;
@@ -607,9 +717,12 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // (plan step 10). "semantic_params"/"curve_params" (milestone 2) gate
   // the additive semantic_fields/semantic_values wire members -- no
   // protocol_version bump, per the milestone spec's resolved decision.
+  // "vector_params" (milestone 4) gates vector-class semantic_fields/
+  // semantic_values entries the same way, on top of "semantic_params".
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "semantic_params");
   json_builder_add_string_value(b, "curve_params");
+  json_builder_add_string_value(b, "vector_params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");

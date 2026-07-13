@@ -9,6 +9,7 @@
       "params",
       "semantic_params",
       "curve_params",
+      "vector_params",
       "instances",
       "history",
       "preview",

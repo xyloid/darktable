@@ -34,6 +34,7 @@
  *
  * Please see README.md for more detailed documentation.
  */
+#include <float.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -584,6 +585,150 @@ static gboolean stub_list_modules_one_rgbcurve(GPtrArray **out, dt_remote_error_
   return TRUE;
 }
 
+/* --- semantic vector schema/value stubs (milestone 4, task 4) ----------- */
+
+// One hand-built vector schema per subtype -- covers the three wire shapes
+// _vector_schema_to_json emits: PLAIN (no color_space/ordering), COLOR
+// (color_space, no ordering), LEVELS (ordering, no color_space). Mirrors
+// what a real registry adapter would produce (remote_vector_registry.c).
+static dt_remote_vector_schema_t *_make_vector_schema(const char *name, const char *display_name,
+                                                       dt_remote_vector_subtype_t subtype,
+                                                       const char *color_space,
+                                                       double minimum_gap,
+                                                       const char *const *component_names,
+                                                       guint component_count,
+                                                       dt_remote_parameter_condition_t *writable_when)
+{
+  dt_remote_vector_schema_t *schema = g_new0(dt_remote_vector_schema_t, 1);
+  schema->name = g_strdup(name);
+  schema->display_name = g_strdup(display_name);
+  schema->subtype = subtype;
+  schema->color_space = color_space ? g_strdup(color_space) : NULL;
+  schema->strictly_increasing = (subtype == DT_REMOTE_VECTOR_LEVELS);
+  schema->minimum_gap = minimum_gap;
+  schema->writability = writable_when ? DT_REMOTE_WRITABLE_CONDITIONAL : DT_REMOTE_WRITABLE_NOW;
+  schema->writable_when = writable_when;
+  schema->components =
+    g_array_sized_new(FALSE, FALSE, sizeof(dt_remote_vector_component_schema_t), component_count);
+  for(guint i = 0; i < component_count; i++)
+  {
+    dt_remote_vector_component_schema_t c = { .name = g_strdup(component_names[i]),
+                                              .minimum = 0.0, .maximum = 1.0 };
+    g_array_append_val(schema->components, c);
+  }
+  return schema;
+}
+
+static gboolean stub_get_module_schema_vector(const char *op, dt_remote_module_schema_t **out,
+                                              dt_remote_error_t **error)
+{
+  (void)op;
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup("borders");
+  schema->display_name = g_strdup("framing");
+  schema->params_version = 4;
+  schema->deprecated = FALSE;
+  schema->supports_multiple_instances = FALSE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+
+  dt_remote_field_t *color_field = _make_field("color", "", "array", FALSE);
+  color_field->represented_by = g_ptr_array_new_with_free_func(g_free);
+  g_ptr_array_add(color_field->represented_by, g_strdup("color"));
+  g_ptr_array_add(schema->fields, color_field);
+
+  dt_remote_field_t *size = _make_field("size", "border size", "float", TRUE);
+  size->has_range = TRUE;
+  size->minimum = 0.0;
+  size->maximum = 0.5;
+  size->has_default = TRUE;
+  size->default_value.type = DT_REMOTE_VALUE_FLOAT;
+  size->default_value.v.f = 0.1;
+  g_ptr_array_add(schema->fields, size);
+
+  schema->semantic_fields = g_ptr_array_new_with_free_func(dt_remote_semantic_schema_free);
+
+  static const char *const lift_components[] = { "factor", "red" };
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_vector(
+                    _make_vector_schema("lift", "Lift", DT_REMOTE_VECTOR_PLAIN, NULL, 0.0,
+                                        lift_components, G_N_ELEMENTS(lift_components), NULL)));
+
+  static const char *const color_components[] = { "red", "green", "blue" };
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_vector(
+                    _make_vector_schema("color", "Border color", DT_REMOTE_VECTOR_COLOR, "display_rgb",
+                                        0.0, color_components, G_N_ELEMENTS(color_components), NULL)));
+
+  static const char *const levels_components[] = { "black", "midpoint", "white" };
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_vector(
+                    _make_vector_schema("levels.linked", "Levels", DT_REMOTE_VECTOR_LEVELS, NULL,
+                                        (double)FLT_EPSILON, levels_components,
+                                        G_N_ELEMENTS(levels_components),
+                                        _make_condition("autoscale", DT_REMOTE_PREDICATE_EQ,
+                                                       "LINKED_CHANNELS"))));
+
+  *out = schema;
+  return TRUE;
+}
+
+static dt_remote_vector_value_t *_make_vector_value(const char *name, const double *values, guint count,
+                                                     gboolean active)
+{
+  dt_remote_vector_value_t *value = g_new0(dt_remote_vector_value_t, 1);
+  value->name = g_strdup(name);
+  value->values = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+  g_array_append_vals(value->values, values, count);
+  value->active = active;
+  value->effective = active;
+  value->writable_now = active;
+  return value;
+}
+
+static gboolean stub_get_module_params_vector(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                              GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  dt_remote_patch_entry_t *size = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  size->name = g_strdup("size");
+  size->value.type = DT_REMOTE_VALUE_FLOAT;
+  size->value.v.f = 0.1;
+  g_ptr_array_add(arr, size);
+
+  GHashTable *semantic =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  static const double color_values[] = { 1.0, 1.0, 1.0 };
+  g_hash_table_insert(semantic, g_strdup("color"),
+                      dt_remote_semantic_value_wrap_vector(
+                        _make_vector_value("color", color_values, G_N_ELEMENTS(color_values), TRUE)));
+
+  *out = arr;
+  if(semantic_out) *semantic_out = semantic;
+  else g_hash_table_unref(semantic);
+  return TRUE;
+}
+
+static gboolean stub_list_modules_one_borders(GPtrArray **out, dt_remote_error_t **error)
+{
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_module_free);
+  dt_remote_module_t *m = g_malloc0(sizeof(dt_remote_module_t));
+  m->op = g_strdup("borders");
+  m->instance = 0;
+  m->instance_name = g_strdup("");
+  m->display_name = g_strdup("framing");
+  m->enabled = TRUE;
+  m->deprecated = FALSE;
+  m->supports_multiple_instances = FALSE;
+  g_ptr_array_add(arr, m);
+  *out = arr;
+  return TRUE;
+}
+
 /* --- set_module_params stubs (plan step 7) ------------------------------ */
 
 // Like stub_get_module_schema_exposure but with the "black" field the wire
@@ -1056,18 +1201,20 @@ static void test_hello_success(void **state)
   assert_string_equal(json_object_get_string_member(result, "darktable_version"), darktable_package_version);
   assert_int_equal(json_object_get_int_member(result, "pid"), (gint64)getpid());
   // "params" (step 7) + "semantic_params"/"curve_params" (milestone 2:
-  // capability-gated semantic curve read/write) + "instances"/"history"
-  // (step 8) + "preview" (step 9) + "scopes" (step 10) -- the full
-  // capability set.
+  // capability-gated semantic curve read/write) + "vector_params"
+  // (milestone 4: capability-gated semantic vector read/write) +
+  // "instances"/"history" (step 8) + "preview" (step 9) + "scopes"
+  // (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 7);
+  assert_int_equal(json_array_get_length(caps), 8);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
-  assert_string_equal(json_array_get_string_element(caps, 3), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 4), "history");
-  assert_string_equal(json_array_get_string_element(caps, 5), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 6), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 3), "vector_params");
+  assert_string_equal(json_array_get_string_element(caps, 4), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 5), "history");
+  assert_string_equal(json_array_get_string_element(caps, 6), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 7), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1419,6 +1566,39 @@ static void test_get_module_params_rgbcurve_semantic_values(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_rgbcurve_request.json",
                            "get_module_params_rgbcurve_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- semantic vector schema/value path (milestone 4, task 4) ------------ */
+
+// borders' hand-built vector schema (subtypes PLAIN/COLOR/LEVELS) rides on
+// get_module_schema as `semantic_fields` entries tagged `"class":"vector"`:
+// "subtype" always present, "components" with per-component name/minimum/
+// maximum always present, "color_space" only for the COLOR entry,
+// "ordering" only for the LEVELS entry.
+static void test_get_module_schema_vector_semantic_fields(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_schema = stub_get_module_schema_vector };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_schema_vector_request.json",
+                           "get_module_schema_vector_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// borders' "color" vector value rides on get_module_params as an optional
+// `semantic_values` member: class/active/effective/writable_now/values.
+static void test_get_module_params_vector_semantic_values(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_vector,
+    .list_modules = stub_list_modules_one_borders,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_params_vector_request.json",
+                           "get_module_params_vector_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -3960,6 +4140,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_success),
     cmocka_unit_test(test_get_module_schema_rgbcurve_semantic_fields),
     cmocka_unit_test(test_get_module_params_rgbcurve_semantic_values),
+    cmocka_unit_test(test_get_module_schema_vector_semantic_fields),
+    cmocka_unit_test(test_get_module_params_vector_semantic_values),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),
