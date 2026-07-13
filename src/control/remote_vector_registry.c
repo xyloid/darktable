@@ -515,19 +515,15 @@ gboolean dt_remote_vector_list_schema(const struct dt_iop_module_so_t *so,
   return TRUE;
 }
 
-static gboolean is_floating_type(dt_introspection_type_t type)
-{
-  return type == DT_INTROSPECTION_TYPE_FLOAT || type == DT_INTROSPECTION_TYPE_DOUBLE;
-}
-
+// Reviewer Minor: registry validation (vector_descriptor_is_valid() above)
+// and the write path (write_vector_patch(), remote_vector.c) both require
+// the native leaf to be strict FLOAT -- a DOUBLE-typed array field never
+// passes registry validation, so a DOUBLE branch here would be dead for any
+// validated adapter. Read path, validate, and write now all agree on
+// strict FLOAT.
 static double read_float_leaf(const dt_introspection_field_t *field, const void *ptr)
 {
-  switch(field->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT: return (double)*(const float *)ptr;
-    case DT_INTROSPECTION_TYPE_DOUBLE: return *(const double *)ptr;
-    default: return 0.0;
-  }
+  return field->header.type == DT_INTROSPECTION_TYPE_FLOAT ? (double)*(const float *)ptr : 0.0;
 }
 
 // Evaluates `pred` against `params_blob`, resolving `pred->field` as a one
@@ -661,7 +657,7 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
                                &read_error))
       goto fail;
     if(array_field->header.type != DT_INTROSPECTION_TYPE_ARRAY
-       || !is_floating_type(array_field->Array.type))
+       || array_field->Array.type != DT_INTROSPECTION_TYPE_FLOAT)
     {
       read_error = dt_remote_vector_registry_error_new(
         DT_REMOTE_ERR_INTERNAL, _("internal error: vector '%s' native path did not resolve"), desc->name);
@@ -675,7 +671,7 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
       void *element_ptr =
         dt_introspection_access_array((dt_introspection_field_t *)array_field, array_ptr, j,
                                       &element_field);
-      if(!element_ptr || !element_field || !is_floating_type(element_field->header.type))
+      if(!element_ptr || !element_field || element_field->header.type != DT_INTROSPECTION_TYPE_FLOAT)
       {
         read_error = dt_remote_vector_registry_error_new(
           DT_REMOTE_ERR_INTERNAL, _("internal error: vector '%s' component %u did not resolve"),

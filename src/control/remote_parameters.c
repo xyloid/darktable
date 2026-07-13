@@ -19,8 +19,9 @@
 #include "control/remote_parameters.h"
 
 /** frees a single condition (its two owned strings and the struct
- * itself). NULL-safe. Internal: dt_remote_curve_schema_t is the only
- * owner of dt_remote_parameter_condition_t instances in v1. */
+ * itself). NULL-safe. Internal: dt_remote_curve_schema_t and
+ * dt_remote_vector_schema_t are the only owners of
+ * dt_remote_parameter_condition_t instances in v1. */
 static void dt_remote_parameter_condition_free(dt_remote_parameter_condition_t *condition)
 {
   if(!condition) return;
