@@ -756,6 +756,14 @@ static gboolean validate_completed_observes_both_vectors(
 
 static const dt_remote_vector_module_adapter_t *s_lookup_override_adapter = NULL;
 
+static const dt_remote_vector_module_adapter_t *always_null_vector_lookup(
+  const char *operation, guint params_version)
+{
+  (void)operation;
+  (void)params_version;
+  return NULL;
+}
+
 static const dt_remote_vector_module_adapter_t *private_lookup_override(const char *operation,
                                                                          guint params_version)
 {
@@ -1327,14 +1335,15 @@ static void test_list_schema_no_adapter_yields_null_and_succeeds(void **state)
   (void)state;
   dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
   assert_non_null(so);
-  // No override installed by lookup_override_test_setup(): the empty
-  // production table applies.
 
-  GPtrArray *fields = NULL;
-  dt_remote_error_t *err = NULL;
-  assert_true(dt_remote_vector_list_schema(so, &fields, &err));
-  assert_null(err);
+  GPtrArray *sentinel = g_ptr_array_new();
+  GPtrArray *fields = sentinel;
+  dt_remote_error_t *error = NULL;
+  dt_remote_vector_registry_set_lookup_override(always_null_vector_lookup);
+  assert_true(dt_remote_vector_list_schema(so, &fields, &error));
+  assert_null(error);
   assert_null(fields);
+  g_ptr_array_unref(sentinel);
 }
 
 static const dt_remote_parameter_predicate_t active_predicate = {
@@ -1665,14 +1674,17 @@ static void test_read_values_no_adapter_returns_empty_table(void **state)
 
   void *blob = g_malloc0(so->get_introspection()->size);
 
-  GHashTable *values = NULL;
-  dt_remote_error_t *err = NULL;
-  assert_true(dt_remote_vector_read_values(&module, blob, &values, &err));
-  assert_null(err);
-  assert_non_null(values);
+  GHashTable *sentinel = g_hash_table_new(g_str_hash, g_str_equal);
+  GHashTable *values = sentinel;
+  dt_remote_error_t *error = NULL;
+  dt_remote_vector_registry_set_lookup_override(always_null_vector_lookup);
+  assert_true(dt_remote_vector_read_values(&module, blob, &values, &error));
+  assert_null(error);
+  assert_ptr_not_equal(values, sentinel);
   assert_int_equal(g_hash_table_size(values), 0);
 
   g_hash_table_unref(values);
+  g_hash_table_unref(sentinel);
   g_free(blob);
 }
 
@@ -1792,8 +1804,7 @@ static void test_apply_patch_no_adapter_for_op_fails_with_unknown_field(void **s
 {
   (void)state;
   borders_fixture_t *fixture = borders_fixture_new();
-  // No override installed: the empty production table applies, so "borders"
-  // has no vector adapter at all.
+  dt_remote_vector_registry_set_lookup_override(always_null_vector_lookup);
 
   static const double values[] = { 0.1, 0.2, 0.3 };
   dt_remote_patch_t patch;
@@ -1869,7 +1880,7 @@ static void test_apply_patch_domain_violation_rejects_and_leaves_live_params_unt
   void *before = g_malloc(fixture->module->params_size);
   memcpy(before, fixture->module->params, fixture->module->params_size);
 
-  static const double values[] = { 0.1, 1.5, 0.2 }; // green out of [0,1]
+  const double values[] = { 0.1, 1.00000001, 0.2 };
   dt_remote_patch_t patch;
   vector_patch_init(&patch);
   g_ptr_array_add(patch.semantic_values, make_vector_patch("vector.color", values, 3));
@@ -1881,6 +1892,7 @@ static void test_apply_patch_domain_violation_rejects_and_leaves_live_params_unt
   assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
   assert_non_null(strstr(error->details_json, "domain"));
   assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
 
   dt_remote_error_free(error);
   g_free(projected);
@@ -2282,10 +2294,7 @@ static void test_apply_patch_no_vector_content_returns_true_without_touching_reg
 {
   (void)state;
   borders_fixture_t *fixture = borders_fixture_new();
-  // No override installed and no prepare-field scalar entries: this patch
-  // must succeed trivially without consulting the (empty) vector registry
-  // at all -- mirrors the curve engine's own "scalar-only patch unrelated
-  // to adapter preparation" contract.
+  dt_remote_vector_registry_set_lookup_override(always_null_vector_lookup);
 
   dt_remote_patch_t patch;
   vector_patch_init(&patch);
