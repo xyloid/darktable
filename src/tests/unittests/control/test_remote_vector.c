@@ -2304,6 +2304,60 @@ static void test_apply_patch_scalar_only_prepare_field_still_triggers_validate_c
   borders_fixture_free(fixture);
 }
 
+// VEC3-011: a malformed adapter (prepare_field_count > 0 but prepare_fields
+// == NULL -- exactly the shape dt_remote_vector_registry_validate()'s own
+// envelope check rejects) must not crash patch_mentions_prepare_field()'s
+// traversal when a scalar-only patch (no vector semantic entries, so
+// has_vector_semantics is FALSE and the short-circuit that would otherwise
+// skip straight to full registry validation does not apply) is applied.
+// The scalar entry below re-asserts aspect_orient's own current value (its
+// enum name read back from the live params before building the patch), so
+// applying it alone is a byte-for-byte no-op -- isolating the assertion to
+// whether the vector engine itself ever wrote anything, same convention as
+// the other atomicity tests in this file.
+static void test_apply_patch_malformed_prepare_fields_envelope_fails_closed(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+    .prepare_field_count = 1, .prepare_fields = NULL, // malformed: count > 0, array NULL
+  };
+  install_vector_adapter(&adapter);
+
+  dt_introspection_field_t *orient_field = NULL;
+  int *orient_ptr = dt_introspection_get_child(fixture->module->so->get_introspection()->field,
+                                               fixture->module->params, "aspect_orient", &orient_field);
+  assert_non_null(orient_ptr);
+  const char *current_orient_name = dt_introspection_get_enum_name(orient_field, *orient_ptr);
+  assert_non_null(current_orient_name);
+
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_orient_entry(fixture, current_orient_name));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
 static void test_apply_patch_validate_completed_rejection_rolls_back(void **state)
 {
   (void)state;
@@ -2598,6 +2652,9 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_apply_patch_scalar_only_prepare_field_still_triggers_validate_completed,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_malformed_prepare_fields_envelope_fails_closed,
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_validate_completed_rejection_rolls_back,
                                     lookup_override_test_setup, lookup_override_test_teardown),

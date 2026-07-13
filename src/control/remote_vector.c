@@ -256,9 +256,25 @@ static const dt_remote_vector_descriptor_t *find_vector_descriptor(
   return NULL;
 }
 
+// `adapter->prepare_field_count > 0` with `adapter->prepare_fields == NULL`
+// is a malformed adapter envelope -- the same shape
+// vector_adapter_envelope_is_valid() (remote_vector_registry.c) rejects,
+// but this helper runs before that registry validation to compute the
+// prepare_needed fast-path gate (VEC3-011). Detect it here and report
+// through `*out_malformed` before ever indexing `adapter->prepare_fields`,
+// rather than risking a NULL-array dereference for a scalar-only patch that
+// would otherwise never trigger full registry validation.
 static gboolean patch_mentions_prepare_field(const dt_remote_vector_module_adapter_t *adapter,
-                                             const dt_remote_patch_t *patch)
+                                             const dt_remote_patch_t *patch,
+                                             gboolean *out_malformed)
 {
+  if(out_malformed) *out_malformed = FALSE;
+  if(adapter->prepare_field_count > 0 && !adapter->prepare_fields)
+  {
+    if(out_malformed) *out_malformed = TRUE;
+    return FALSE;
+  }
+
   for(guint i = 0; patch->scalar_values && i < patch->scalar_values->len; i++)
   {
     const dt_remote_patch_entry_t *entry = g_ptr_array_index(patch->scalar_values, i);
@@ -365,7 +381,25 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
     return FALSE;
   }
 
-  const gboolean prepare_needed = has_vector_semantics || patch_mentions_prepare_field(adapter, patch);
+  // Preserved short-circuit: when `has_vector_semantics` is already TRUE,
+  // full registry validation runs unconditionally below and will itself
+  // reject a malformed prepare-fields envelope, so the traversal (and its
+  // malformed-envelope probe) is skipped entirely -- same fast path as
+  // before VEC3-011.
+  gboolean prepare_fields_malformed = FALSE;
+  const gboolean mentions_prepare_field = has_vector_semantics
+    ? FALSE
+    : patch_mentions_prepare_field(adapter, patch, &prepare_fields_malformed);
+  if(prepare_fields_malformed)
+  {
+    deliver_vector_error(dt_remote_vector_error_new(
+                           DT_REMOTE_ERR_INTERNAL,
+                           _("internal error: vector adapter '%s' has a malformed prepare-fields envelope"),
+                           adapter->operation),
+                         error);
+    return FALSE;
+  }
+  const gboolean prepare_needed = has_vector_semantics || mentions_prepare_field;
   // A scalar-only patch unrelated to adapter preparation must remain
   // independent of semantic registry health -- same convention as the
   // curve engine.
