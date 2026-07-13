@@ -637,6 +637,10 @@ static const dt_remote_vector_component_t s_rgba_components[] = {
   { "blue", 0.0, 1.0 }, { "alpha", 0.0, 1.0 },
 };
 
+static const dt_remote_vector_component_t s_levels_schema_components[] = {
+  { "black", 0.0, 0.8 }, { "midpoint", 0.1, 0.9 }, { "white", 0.2, 1.0 },
+};
+
 // Base fixture descriptor: three components, full native capacity, no
 // predicates, PLAIN subtype. Individual tests copy and adjust as needed.
 static dt_remote_vector_descriptor_t make_color_descriptor(void)
@@ -1346,14 +1350,73 @@ static void test_list_schema_no_adapter_yields_null_and_succeeds(void **state)
   g_ptr_array_unref(sentinel);
 }
 
+static void test_list_schema_invalid_native_layout_clears_output(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.component_count = G_N_ELEMENTS(s_rgba_components);
+  descriptor.components = s_rgba_components;
+  descriptor.native_capacity = 3;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  GPtrArray *sentinel = g_ptr_array_new();
+  GPtrArray *fields = sentinel;
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_vector_list_schema(so, &fields, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  assert_null(fields);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(sentinel);
+}
+
 static const dt_remote_parameter_predicate_t active_predicate = {
   .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_EQ,
   .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_PORTRAIT",
 };
 static const dt_remote_parameter_predicate_t writable_predicate = {
-  .field = "aspect_orient", .op = DT_REMOTE_PREDICATE_NE,
-  .enum_name = "DT_IOP_BORDERS_ASPECT_ORIENTATION_LANDSCAPE",
+  .field = "basis", .op = DT_REMOTE_PREDICATE_NE,
+  .enum_name = "DT_IOP_BORDERS_BASIS_WIDTH",
 };
+
+static void assert_schema_condition_matches(
+  const dt_remote_parameter_condition_t *condition,
+  const dt_remote_parameter_predicate_t *predicate)
+{
+  assert_non_null(condition);
+  assert_ptr_not_equal(condition->field, predicate->field);
+  assert_string_equal(condition->field, predicate->field);
+  assert_int_equal(condition->op, predicate->op);
+  assert_ptr_not_equal(condition->enum_name, predicate->enum_name);
+  assert_string_equal(condition->enum_name, predicate->enum_name);
+}
+
+static void assert_schema_components_match(
+  const dt_remote_vector_schema_t *schema,
+  const dt_remote_vector_descriptor_t *descriptor)
+{
+  assert_non_null(schema->components);
+  assert_int_equal(schema->components->len, descriptor->component_count);
+  for(guint i = 0; i < descriptor->component_count; i++)
+  {
+    const dt_remote_vector_component_schema_t component =
+      g_array_index(schema->components, dt_remote_vector_component_schema_t, i);
+    assert_ptr_not_equal(component.name, descriptor->components[i].name);
+    assert_string_equal(component.name, descriptor->components[i].name);
+    assert_float_equal(component.minimum, descriptor->components[i].minimum, 0.0);
+    assert_float_equal(component.maximum, descriptor->components[i].maximum, 0.0);
+  }
+}
 
 static void test_list_schema_converts_descriptors_in_registry_order(void **state)
 {
@@ -1365,11 +1428,16 @@ static void test_list_schema_converts_descriptors_in_registry_order(void **state
   descriptors[0] = make_color_descriptor();
   descriptors[0].name = "vector.first";
   descriptors[0].description = "first description";
+  descriptors[0].subtype = DT_REMOTE_VECTOR_COLOR;
+  descriptors[0].color_space = "display_rgb";
   descriptors[0].active_when = &active_predicate;
   descriptors[0].writable_when = &writable_predicate;
   descriptors[1] = make_color_descriptor();
   descriptors[1].name = "vector.second";
+  descriptors[1].display_name = "Levels";
+  descriptors[1].description = "second description";
   descriptors[1].native = s_frame_color_path;
+  descriptors[1].components = s_levels_schema_components;
   descriptors[1].subtype = DT_REMOTE_VECTOR_LEVELS;
   descriptors[1].strictly_increasing = TRUE;
   descriptors[1].minimum_gap = FLT_EPSILON;
@@ -1390,33 +1458,41 @@ static void test_list_schema_converts_descriptors_in_registry_order(void **state
 
   dt_remote_vector_schema_t *first = g_ptr_array_index(fields, 0);
   dt_remote_vector_schema_t *second = g_ptr_array_index(fields, 1);
+  assert_ptr_not_equal(first->name, descriptors[0].name);
   assert_string_equal(first->name, "vector.first");
-  assert_string_equal(second->name, "vector.second");
-  assert_int_equal(first->subtype, DT_REMOTE_VECTOR_PLAIN);
-  assert_null(first->color_space);
+  assert_ptr_not_equal(first->display_name, descriptors[0].display_name);
   assert_string_equal(first->display_name, "Color");
+  assert_ptr_not_equal(first->description, descriptors[0].description);
   assert_string_equal(first->description, "first description");
+  assert_int_equal(first->subtype, DT_REMOTE_VECTOR_COLOR);
+  assert_ptr_not_equal(first->color_space, descriptors[0].color_space);
+  assert_string_equal(first->color_space, "display_rgb");
+  assert_schema_components_match(first, &descriptors[0]);
+  assert_false(first->strictly_increasing);
+  assert_float_equal(first->minimum_gap, 0.0, 0.0);
   assert_int_equal(first->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
-  assert_non_null(first->active_when);
-  assert_non_null(first->writable_when);
   assert_ptr_not_equal(first->active_when, descriptors[0].active_when);
   assert_ptr_not_equal(first->writable_when, descriptors[0].writable_when);
-  assert_string_equal(first->active_when->field, active_predicate.field);
-  assert_string_equal(first->writable_when->enum_name, writable_predicate.enum_name);
-  assert_int_equal(first->components->len, 3);
-  for(guint i = 0; i < descriptors[0].component_count; i++)
-  {
-    const dt_remote_vector_component_schema_t component =
-      g_array_index(first->components, dt_remote_vector_component_schema_t, i);
-    assert_string_equal(component.name, descriptors[0].components[i].name);
-    assert_float_equal(component.minimum, descriptors[0].components[i].minimum, 0.0);
-    assert_float_equal(component.maximum, descriptors[0].components[i].maximum, 0.0);
-  }
+  assert_schema_condition_matches(first->active_when, &active_predicate);
+  assert_schema_condition_matches(first->writable_when, &writable_predicate);
+
+  assert_ptr_not_equal(second->name, descriptors[1].name);
+  assert_string_equal(second->name, "vector.second");
+  assert_ptr_not_equal(second->display_name, descriptors[1].display_name);
+  assert_string_equal(second->display_name, "Levels");
+  assert_ptr_not_equal(second->description, descriptors[1].description);
+  assert_string_equal(second->description, "second description");
   assert_int_equal(second->subtype, DT_REMOTE_VECTOR_LEVELS);
+  assert_null(second->color_space);
+  assert_schema_components_match(second, &descriptors[1]);
   assert_true(second->strictly_increasing);
   assert_float_equal(second->minimum_gap, (double)FLT_EPSILON, 0.0);
-  assert_null(second->color_space);
+  assert_int_equal(second->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(second->active_when);
+  assert_null(second->writable_when);
 
+  // The public array contract installs dt_remote_vector_schema_free() as
+  // its element destructor, exercising every populated optional member.
   g_ptr_array_unref(fields);
 }
 
@@ -1689,6 +1765,37 @@ static void test_read_values_no_adapter_returns_empty_table(void **state)
   g_free(blob);
 }
 
+static void test_read_values_invalid_native_layout_clears_output(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.component_count = G_N_ELEMENTS(s_rgba_components);
+  descriptor.components = s_rgba_components;
+  descriptor.native_capacity = 3;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+
+  GHashTable *sentinel = g_hash_table_new(g_str_hash, g_str_equal);
+  GHashTable *values = sentinel;
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_vector_read_values(fixture->module, fixture->module->params,
+                                            &values, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
+  assert_null(values);
+
+  dt_remote_error_free(error);
+  g_hash_table_unref(sentinel);
+  borders_fixture_free(fixture);
+}
+
 /* ---------------------------------------------------------------------- */
 /* dt_remote_vector_apply_patch                                            */
 /* ---------------------------------------------------------------------- */
@@ -1892,6 +1999,83 @@ static void test_apply_patch_domain_violation_rejects_and_leaves_live_params_unt
   assert_non_null(error);
   assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
   assert_non_null(strstr(error->details_json, "domain"));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_apply_patch_nan_rejection_preserves_params_and_input(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+  install_simple_vector_adapter();
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  const double raw_values[] = { 0.1, NAN, 0.2 };
+  dt_remote_semantic_patch_t *semantic =
+    make_vector_patch("vector.color", raw_values, G_N_ELEMENTS(raw_values));
+  const gpointer input_data = semantic->value.vector.values->data;
+  const guint input_length = semantic->value.vector.values->len;
+  GArray *input_before = make_values(raw_values, G_N_ELEMENTS(raw_values));
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, semantic);
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_vector_error_details(error, "vector.color", 1, "non_finite");
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_int_equal(semantic->value.vector.values->len, input_length);
+  assert_ptr_equal(semantic->value.vector.values->data, input_data);
+  assert_memory_equal(semantic->value.vector.values->data, input_before->data,
+                      input_before->len * sizeof(double));
+
+  dt_remote_error_free(error);
+  g_array_unref(input_before);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_apply_patch_invalid_native_layout_preserves_params(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = borders_fixture_new();
+
+  static dt_remote_vector_descriptor_t descriptor;
+  descriptor = make_color_descriptor();
+  descriptor.component_count = G_N_ELEMENTS(s_rgba_components);
+  descriptor.components = s_rgba_components;
+  descriptor.native_capacity = 3;
+  static dt_remote_vector_module_adapter_t adapter;
+  adapter = (dt_remote_vector_module_adapter_t){
+    .operation = "borders", .minimum_params_version = 4, .maximum_params_version = 4,
+    .vectors = &descriptor, .vector_count = 1,
+  };
+  install_vector_adapter(&adapter);
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  const double values[] = { 0.1, 0.2, 0.3, 0.4 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values,
+                  make_vector_patch("vector.color", values, G_N_ELEMENTS(values)));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INTERNAL);
   assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
   assert_memory_equal(projected, before, fixture->module->params_size);
 
@@ -2366,6 +2550,8 @@ int main(void)
 
     cmocka_unit_test_setup_teardown(test_list_schema_no_adapter_yields_null_and_succeeds,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_list_schema_invalid_native_layout_clears_output,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_list_schema_converts_descriptors_in_registry_order,
                                     lookup_override_test_setup, lookup_override_test_teardown),
 
@@ -2381,6 +2567,8 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_read_values_no_adapter_returns_empty_table,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_read_values_invalid_native_layout_clears_output,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
 
     cmocka_unit_test_setup_teardown(test_apply_patch_unknown_id_fails_with_unknown_field,
                                     lookup_override_test_setup, lookup_override_test_teardown),
@@ -2392,6 +2580,12 @@ int main(void)
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_apply_patch_domain_violation_rejects_and_leaves_live_params_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_nan_rejection_preserves_params_and_input,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_apply_patch_invalid_native_layout_preserves_params,
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_succeeds_and_writes_native_floats,
                                     lookup_override_test_setup, lookup_override_test_teardown),
