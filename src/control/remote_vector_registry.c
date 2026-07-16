@@ -271,14 +271,256 @@ static const dt_remote_vector_module_adapter_t s_colorbalance_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* channelmixerrgb adapter (milestone4 vector-class design doc SS Module   */
+/* adapter specifics, channelmixerrgb). Params v3: six independent        */
+/* float[4] mixing rows -- red/green/blue (channelmixerrgb.c:94-96) and    */
+/* saturation/lightness/grey (channelmixerrgb.c:97-99) -- each row's       */
+/* three exposed components are its own contribution from the input       */
+/* red/green/blue channels, all $MIN: -2.0 $MAX: 2.0. Six independent      */
+/* normalize_* flags gate each row (channelmixerrgb.c:100).                */
+/* ---------------------------------------------------------------------- */
+
+// Every row shares this one component layout: the row's own contribution
+// from red/green/blue, all -2.0..2.0 (channelmixerrgb.c:94-99).
+static const dt_remote_vector_component_t s_cmrgb_components[3] = {
+  { "red", -2.0, 2.0 }, { "green", -2.0, 2.0 }, { "blue", -2.0, 2.0 },
+};
+
+static const dt_remote_path_segment_t s_cmrgb_red_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "red" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_red_path = {
+  .segments = s_cmrgb_red_segments, .length = G_N_ELEMENTS(s_cmrgb_red_segments)
+};
+
+static const dt_remote_path_segment_t s_cmrgb_green_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "green" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_green_path = {
+  .segments = s_cmrgb_green_segments, .length = G_N_ELEMENTS(s_cmrgb_green_segments)
+};
+
+static const dt_remote_path_segment_t s_cmrgb_blue_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "blue" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_blue_path = {
+  .segments = s_cmrgb_blue_segments, .length = G_N_ELEMENTS(s_cmrgb_blue_segments)
+};
+
+static const dt_remote_path_segment_t s_cmrgb_saturation_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "saturation" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_saturation_path = {
+  .segments = s_cmrgb_saturation_segments, .length = G_N_ELEMENTS(s_cmrgb_saturation_segments)
+};
+
+static const dt_remote_path_segment_t s_cmrgb_lightness_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "lightness" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_lightness_path = {
+  .segments = s_cmrgb_lightness_segments, .length = G_N_ELEMENTS(s_cmrgb_lightness_segments)
+};
+
+static const dt_remote_path_segment_t s_cmrgb_grey_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "grey" },
+};
+static const dt_remote_introspection_path_t s_cmrgb_grey_path = {
+  .segments = s_cmrgb_grey_segments, .length = G_N_ELEMENTS(s_cmrgb_grey_segments)
+};
+
+// No predicates: unlike colorbalance's mode-gated aliases, every
+// channelmixerrgb row is its own independent native array, always active
+// and always writable.
+static const dt_remote_vector_descriptor_t s_cmrgb_vectors[6] = {
+  {
+    .name = "red",
+    .display_name = "Red",
+    .description =
+      "Red output channel mixing row: its own contribution from the input red/green/blue "
+      "channels (channelmixerrgb.c:94). Divided by the sum of its three components in "
+      "commit_params() when 'normalize_R' is enabled.",
+    .native = s_cmrgb_red_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "green",
+    .display_name = "Green",
+    .description =
+      "Green output channel mixing row: its own contribution from the input red/green/blue "
+      "channels (channelmixerrgb.c:95). Divided by the sum of its three components in "
+      "commit_params() when 'normalize_G' is enabled.",
+    .native = s_cmrgb_green_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "blue",
+    .display_name = "Blue",
+    .description =
+      "Blue output channel mixing row: its own contribution from the input red/green/blue "
+      "channels (channelmixerrgb.c:96). Divided by the sum of its three components in "
+      "commit_params() when 'normalize_B' is enabled.",
+    .native = s_cmrgb_blue_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "saturation",
+    .display_name = "Saturation",
+    .description =
+      "Saturation row: its own contribution from the input red/green/blue channels "
+      "(channelmixerrgb.c:97). Averaged when 'normalize_sat' is enabled; no zero-sum guard -- "
+      "unlike the red/green/blue rows, this row's own normalize divides by 3, not by its sum, so "
+      "it is never a divide-by-zero risk.",
+    .native = s_cmrgb_saturation_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "lightness",
+    .display_name = "Lightness",
+    .description =
+      "Lightness row: its own contribution from the input red/green/blue channels "
+      "(channelmixerrgb.c:98). Averaged when 'normalize_light' is enabled; same no-guard "
+      "rationale as 'saturation'.",
+    .native = s_cmrgb_lightness_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "grey",
+    .display_name = "Grey",
+    .description =
+      "Grey (monochrome) row: its own contribution from the input red/green/blue channels "
+      "(channelmixerrgb.c:99). The module's own commit_params() already guards its "
+      "'normalize_grey' zero-sum case (channelmixerrgb.c:3080, `norm_grey == 0.f`), so no "
+      "additional guard is registered here.",
+    .native = s_cmrgb_grey_path,
+    .component_count = 3,
+    .components = s_cmrgb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+// Listing the three flags here means a scalar-only patch that flips one of
+// them still triggers validate_completed() below (VEC3-011's
+// prepare_needed gate), so the guard catches a flag flip against rows
+// already sitting at a zero sum from an earlier write, not only a patch
+// that also rewrites the row in the same request.
+static const char *const s_cmrgb_prepare[] = { "normalize_R", "normalize_G", "normalize_B" };
+
+// Guards one mixing row against the divide-by-zero commit_params() has no
+// guard of its own for (channelmixerrgb.c:3058-3068: `p->red[i] / norm_R`
+// with no `norm_R == 0.f` fallback, unlike grey's own guard at :3080): a
+// normalize-enabled row whose three components narrow to a sum of exactly
+// 0.0f would divide by zero. Resolves both the row array and its flag
+// through dt_remote_path_resolve() against `params` -- never a struct
+// cast -- so the guard works against the fully projected candidate params
+// (post scalar-and-vector writes), never the live module state.
+static gboolean _cmrgb_guard_row(const dt_remote_vector_context_t *ctx, void *params,
+                                 const char *row_field, const char *flag_field,
+                                 dt_remote_error_t **error)
+{
+  const dt_remote_path_segment_t row_seg[] = {
+    { .type = DT_REMOTE_PATH_FIELD, .value.field = row_field },
+  };
+  const dt_remote_path_segment_t flag_seg[] = {
+    { .type = DT_REMOTE_PATH_FIELD, .value.field = flag_field },
+  };
+  const dt_remote_introspection_path_t row_path = { .segments = row_seg, .length = 1 };
+  const dt_remote_introspection_path_t flag_path = { .segments = flag_seg, .length = 1 };
+
+  void *row_ptr = NULL, *flag_ptr = NULL;
+  if(!dt_remote_path_resolve(&row_path, ctx->introspection->field, params, NULL, &row_ptr, error)
+     || !dt_remote_path_resolve(&flag_path, ctx->introspection->field, params, NULL, &flag_ptr, error))
+    return FALSE; // registry/introspection drift, internal error
+
+  const float *row = row_ptr;
+  const gboolean *flag = flag_ptr;
+  const float sum = row[0] + row[1] + row[2];
+  if(*flag && sum == 0.0f)
+  {
+    if(error)
+      *error = dt_remote_vector_registry_error_new(
+        DT_REMOTE_ERR_INVALID_VALUE,
+        _("channelmixerrgb '%s' sums to zero while '%s' is enabled; "
+          "this would produce a non-finite render"), row_field, flag_field);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+// Runs after the registry-ordered write loop against the fully projected
+// params (dt_remote_vector_apply_patch()'s own contract). Only red/green/
+// blue get a guard: their own normalize divides by the row's raw sum with
+// no fallback (channelmixerrgb.c:3058-3068); saturation/lightness divide
+// by a constant 3, and grey already has its own zero-sum guard in
+// commit_params() (channelmixerrgb.c:3080).
+static gboolean _cmrgb_validate_completed(const dt_remote_vector_context_t *ctx,
+                                          const void *new_params, dt_remote_error_t **error)
+{
+  void *params = (void *)new_params;
+  return _cmrgb_guard_row(ctx, params, "red", "normalize_R", error)
+         && _cmrgb_guard_row(ctx, params, "green", "normalize_G", error)
+         && _cmrgb_guard_row(ctx, params, "blue", "normalize_B", error);
+}
+
+static const dt_remote_vector_module_adapter_t s_cmrgb_adapter = {
+  "channelmixerrgb", 3, 3, s_cmrgb_vectors, 6, s_cmrgb_prepare, 3, _cmrgb_validate_completed
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// The full adapter table. colorbalance for now; a future op adds another
-// entry here, not a parallel lookup mechanism -- same convention as
-// remote_curve_registry.c's own s_adapters[].
+// The full adapter table. colorbalance and channelmixerrgb for now; a
+// future op adds another entry here, not a parallel lookup mechanism --
+// same convention as remote_curve_registry.c's own s_adapters[].
 static const dt_remote_vector_module_adapter_t *const s_adapters[] = {
   &s_colorbalance_adapter,
+  &s_cmrgb_adapter,
 };
 
 static dt_remote_vector_registry_lookup_override_t s_lookup_override = NULL;

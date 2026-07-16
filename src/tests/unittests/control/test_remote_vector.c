@@ -3185,6 +3185,247 @@ static void test_colorbalance_alias_write_conflict_is_rejected_atomically(void *
   borders_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* channelmixerrgb adapter (production registry; milestone4 vector-class   */
+/* design doc SS Module adapter specifics, channelmixerrgb). Params v3:    */
+/* six independent float[4] mixing rows -- red/green/blue                 */
+/* (channelmixerrgb.c:94-96) and saturation/lightness/grey                 */
+/* (channelmixerrgb.c:97-99) -- each row's three exposed components are    */
+/* its own contribution from the input red/green/blue channels, all       */
+/* -2.0..2.0. Six independent normalize_* flags gate each row              */
+/* (channelmixerrgb.c:100); commit_params() (channelmixerrgb.c:3047-3092)  */
+/* divides row i by norm_R/norm_G/norm_B when the matching flag is set,    */
+/* with no zero-sum guard of its own for R/G/B (unlike grey's own          */
+/* `norm_grey == 0.f` guard at :3080) -- a normalize-enabled row summing   */
+/* to exactly zero would divide by zero. These tests exercise the         */
+/* production s_adapters[] table directly, same "real adapter, no         */
+/* override" pattern as the colorbalance section above.                   */
+/* ---------------------------------------------------------------------- */
+
+static dt_remote_patch_entry_t *make_bool_entry(const char *field_name, gboolean value)
+{
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup(field_name);
+  entry->value.type = DT_REMOTE_VALUE_BOOL;
+  entry->value.v.b = value;
+  return entry;
+}
+
+static void test_cmrgb_schema_lists_six_rows_with_three_components_each(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("channelmixerrgb");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 6);
+
+  static const char *const expected_names[] = {
+    "red", "green", "blue", "saturation", "lightness", "grey",
+  };
+  static const char *const expected_component_names[] = { "red", "green", "blue" };
+
+  for(guint i = 0; i < 6; i++)
+  {
+    const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_PLAIN);
+    assert_null(schema->color_space);
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+
+    assert_int_equal(schema->components->len, 3);
+    for(guint c = 0; c < 3; c++)
+    {
+      const dt_remote_vector_component_schema_t *component =
+        &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+      assert_string_equal(component->name, expected_component_names[c]);
+      assert_float_equal(component->minimum, -2.0, 0.0);
+      assert_float_equal(component->maximum, 2.0, 0.0);
+    }
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// Reserved-component preservation: native_capacity (4) > component_count
+// (3) for every channelmixerrgb row, so component index 3 must survive a
+// write untouched -- proven with a full-params_size memcmp against a
+// hand-built expected buffer, same convention as
+// test_apply_patch_narrowing_write_preserves_tail_and_every_other_byte
+// above.
+static void test_cmrgb_apply_patch_preserves_reserved_fourth_component(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("channelmixerrgb");
+
+  write_color_component(fixture, fixture->module->params, "red", 3, 0.777f);
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "red", 0, 1.0f);
+  write_color_component(fixture, expected, "red", 1, 0.0f);
+  write_color_component(fixture, expected, "red", 2, 0.0f);
+  // index 3 left at the seeded 0.777f sentinel: never touched.
+
+  static const double red_values[] = { 1.0, 0.0, 0.0 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("red", red_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+  assert_float_equal(read_color_component(fixture, projected, "red", 3), 0.777f, 0.0);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Guard rejects a normalize-enabled row that narrows to a zero sum,
+// composed in one patch: a scalar normalize_R=TRUE write plus a vector
+// red=[1,-1,0] write (sum exactly 0.0f). Atomic like every other rejection
+// in this engine: only the live params blob is guaranteed untouched on
+// failure -- the caller-owned `projected` scratch buffer may retain the
+// vector write validate_completed subsequently rejected (same contract
+// test_apply_patch_validate_completed_rejection_rolls_back proves above).
+static void test_cmrgb_apply_patch_guard_rejects_composed_flag_and_zero_sum_row(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("channelmixerrgb");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  // Introspection default for normalize_R is off (channelmixerrgb.c:100 has
+  // no $DEFAULT tag, and init() never sets it -- only red/green/blue's
+  // identity diagonal, channelmixerrgb.c:3859).
+  dt_introspection_field_t *flag_field = NULL;
+  gboolean *flag_ptr = dt_introspection_get_child(fixture->module->so->get_introspection()->field,
+                                                  fixture->module->params, "normalize_R", &flag_field);
+  assert_non_null(flag_ptr);
+  assert_false(*flag_ptr);
+
+  static const double red_values[] = { 1.0, -1.0, 0.0 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_bool_entry("normalize_R", TRUE));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("red", red_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Guard permits a near-zero (but not exactly zero) sum: the parity bound
+// is the spec's exact `sum == 0.0f` comparison, not an epsilon.
+static void test_cmrgb_apply_patch_guard_permits_near_zero_sum(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("channelmixerrgb");
+
+  static const double red_values[] = { 1.0, -1.0, 0.5 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_bool_entry("normalize_R", TRUE));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("red", red_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  for(guint i = 0; i < 3; i++)
+    assert_float_equal(read_color_component(fixture, projected, "red", i), (float)red_values[i], 1e-6);
+
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Guard also catches a scalar-only patch that flips just the flag against
+// rows already sitting at a zero sum from an earlier write: no vector
+// semantic entry in this patch at all, so validate_completed only runs
+// because normalize_R is listed in prepare_fields (VEC3-011's
+// prepare_needed gate) -- proving the guard is not accidentally
+// conditioned on a vector write being present in the same request.
+static void test_cmrgb_apply_patch_guard_rejects_flag_only_write_against_stale_zero_sum_row(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("channelmixerrgb");
+  write_color_component(fixture, fixture->module->params, "red", 0, 1.0f);
+  write_color_component(fixture, fixture->module->params, "red", 1, -1.0f);
+  write_color_component(fixture, fixture->module->params, "red", 2, 0.0f);
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_bool_entry("normalize_R", TRUE));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// The component-order proof, against an independently-poked blob -- same
+// rationale as
+// test_colorbalance_read_values_proves_component_order_against_independent_blob
+// above: poking the native offset directly and reading it back through
+// dt_remote_vector_read_values() is what proves component 1 of the
+// "saturation" descriptor is green, not red or blue.
+static void test_cmrgb_read_values_proves_component_order_against_independent_blob(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("channelmixerrgb");
+
+  write_color_component(fixture, fixture->module->params, "saturation", 1, 0.35f);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *saturation = g_hash_table_lookup(values, "saturation");
+  assert_non_null(saturation);
+  assert_int_equal(saturation->values->len, 3);
+  // component 0 ("red") and 2 ("blue") are untouched defaults (0.0, no
+  // init() override for saturation); only component 1 ("green") was poked.
+  assert_float_equal(g_array_index(saturation->values, double, 0), 0.0, 1e-6);
+  assert_float_equal(g_array_index(saturation->values, double, 1), 0.35, 1e-6);
+  assert_float_equal(g_array_index(saturation->values, double, 2), 0.0, 1e-6);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -3339,6 +3580,22 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_colorbalance_alias_write_conflict_is_rejected_atomically,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_cmrgb_schema_lists_six_rows_with_three_components_each,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_cmrgb_apply_patch_preserves_reserved_fourth_component,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_cmrgb_apply_patch_guard_rejects_composed_flag_and_zero_sum_row,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_cmrgb_apply_patch_guard_permits_near_zero_sum,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_cmrgb_apply_patch_guard_rejects_flag_only_write_against_stale_zero_sum_row,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_cmrgb_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
