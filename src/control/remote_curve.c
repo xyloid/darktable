@@ -765,7 +765,19 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
     return FALSE;
   }
 
-  const gboolean has_semantics = patch->semantic_values && patch->semantic_values->len > 0;
+  gboolean has_curve_semantics = FALSE;
+  const char *first_curve_name = NULL;
+  for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    if(semantic && semantic->class_id == DT_REMOTE_PARAMETER_CURVE)
+    {
+      has_curve_semantics = TRUE;
+      first_curve_name = semantic->value.curve.name;
+      break;
+    }
+  }
+
   dt_introspection_t *intro = module->so->get_introspection
     ? module->so->get_introspection() : NULL;
   if(!intro || !intro->field)
@@ -781,24 +793,16 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
     dt_remote_curve_registry_lookup(module->op, (guint)intro->params_version);
   if(!adapter)
   {
-    if(!has_semantics) return TRUE;
-    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
-    if(semantic && semantic->class_id != DT_REMOTE_PARAMETER_CURVE)
-      deliver_curve_error(dt_remote_curve_error_new(
-                            DT_REMOTE_ERR_UNSUPPORTED_FIELD,
-                            _("semantic parameter class is not writable for module '%s'"), module->op),
-                          error);
-    else
-      deliver_curve_error(dt_remote_curve_error_new(
-                            DT_REMOTE_ERR_UNKNOWN_FIELD,
-                            _("unknown semantic curve '%s'"),
-                            semantic && semantic->value.curve.name
-                              ? semantic->value.curve.name : ""),
-                          error);
+    if(!has_curve_semantics) return TRUE;
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_UNKNOWN_FIELD,
+                          _("unknown semantic curve '%s'"),
+                          first_curve_name ? first_curve_name : ""),
+                        error);
     return FALSE;
   }
 
-  const gboolean prepare_needed = has_semantics || patch_mentions_prepare_field(adapter, patch);
+  const gboolean prepare_needed = has_curve_semantics || patch_mentions_prepare_field(adapter, patch);
   // A scalar-only patch unrelated to adapter preparation must remain
   // independent of semantic registry health. Registry drift disables curve
   // support for this operation, not its primitive field support.
@@ -812,9 +816,10 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
      && !adapter->prepare(&context, old_params, new_params, patch, error))
     return FALSE;
 
-  // Resolve every request ID before the registry-ordered write loop. This
-  // catches unknown IDs, wrong classes, and duplicates without silently
-  // dropping any request entry.
+  // Resolve every curve-class request ID before the registry-ordered write
+  // loop, skipping every non-curve entry entirely -- the same request may
+  // carry vector entries the vector engine handles separately
+  // (remote_vector.c).
   for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
   {
     const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
@@ -825,14 +830,7 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
                             _("internal error: null semantic patch entry")), error);
       return FALSE;
     }
-    if(semantic->class_id != DT_REMOTE_PARAMETER_CURVE)
-    {
-      deliver_curve_error(dt_remote_curve_error_new(
-                            DT_REMOTE_ERR_UNSUPPORTED_FIELD,
-                            _("semantic parameter class is not supported by curve mutation")),
-                          error);
-      return FALSE;
-    }
+    if(semantic->class_id != DT_REMOTE_PARAMETER_CURVE) continue;
     const char *name = semantic->value.curve.name;
     if(!find_curve_descriptor(adapter, name))
     {

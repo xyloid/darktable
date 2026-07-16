@@ -3186,6 +3186,127 @@ static void test_colorbalance_alias_write_conflict_is_rejected_atomically(void *
 }
 
 /* ---------------------------------------------------------------------- */
+/* dt_remote_curve_apply_patch class-scoping regression (Task 10). Before  */
+/* this fix, dt_remote_curve_apply_patch() used a class-generic            */
+/* has_semantics flag: any patch with semantic entries, on a module with   */
+/* no curve adapter, was rejected with UNSUPPORTED_FIELD even when every   */
+/* entry was vector-class -- rejecting the patch before                    */
+/* dt_remote_vector_apply_patch() ever ran. colorbalance (production       */
+/* vector-only adapter, no curve adapter -- see the section above) is the  */
+/* real module used to prove the fix, mirroring                            */
+/* test_apply_patch_skips_non_vector_semantic_entries's non-vector-entry   */
+/* skip test for the vector engine's own twin scoping.                    */
+/* ---------------------------------------------------------------------- */
+
+static gboolean curve_apply_to_copy(const borders_fixture_t *fixture, const dt_remote_patch_t *patch,
+                                    void *projected, dt_remote_error_t **error)
+{
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  if(!dt_remote_patch_apply(linear, dt_remote_denylist_for_op(fixture->module->op), patch, projected, error))
+    return FALSE;
+  return dt_remote_curve_apply_patch(fixture->module, fixture->module->params, projected, patch, error);
+}
+
+// RED test A: a vector-only semantic patch must be a pure pass-through
+// through the curve engine on a module with no curve adapter -- full-blob
+// byte identity, not just "no error".
+static void test_curve_apply_patch_vector_only_semantics_pass_through_untouched(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double offset_values[] = { 0.4, 0.5, 0.6, 0.7 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("offset", offset_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(curve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// RED test B: simulate remote_edit.c's dispatch order (curve engine, then
+// vector engine, both against the same scratch block -- remote_edit.c:
+// 1253-1262) and confirm the vector write actually lands. Before the fix
+// this failed at the curve stage before the vector engine ever ran.
+static void test_curve_then_vector_apply_patch_pipeline_writes_vector_value(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+
+  static const double offset_values[] = { 0.4, 0.5, 0.6, 0.7 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("offset", offset_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_patch_apply(linear, dt_remote_denylist_for_op(fixture->module->op), &patch,
+                                    projected, &error));
+  assert_null(error);
+
+  assert_true(dt_remote_curve_apply_patch(fixture->module, fixture->module->params, projected, &patch,
+                                          &error));
+  assert_null(error);
+  assert_true(dt_remote_vector_apply_patch(fixture->module, fixture->module->params, projected, &patch,
+                                           &error));
+  assert_null(error);
+
+  // "offset" is a semantic alias over the native "lift" storage
+  // (remote_vector_registry.c: s_colorbalance_lift_path) -- read back
+  // through the native field name, same as the colorbalance tests above.
+  for(guint i = 0; i < 4; i++)
+    assert_float_equal(read_color_component(fixture, projected, "lift", i),
+                       (float)offset_values[i], 1e-6);
+
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Guard test C: a curve-class-only patch on a module with no curve adapter
+// must still fail with UNKNOWN_FIELD -- the scoping fix must not turn the
+// no-adapter branch into a blanket pass-through.
+static void test_curve_apply_patch_curve_only_semantics_fails_unknown_field_no_adapter(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_curve_class_patch("curve.unrelated"));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(curve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNKNOWN_FIELD);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
 /* channelmixerrgb adapter (production registry; milestone4 vector-class   */
 /* design doc SS Module adapter specifics, channelmixerrgb). Params v3:    */
 /* six independent float[4] mixing rows -- red/green/blue                 */
@@ -4397,6 +4518,16 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_colorbalance_alias_write_conflict_is_rejected_atomically,
                                     lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(
+      test_curve_apply_patch_vector_only_semantics_pass_through_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_curve_then_vector_apply_patch_pipeline_writes_vector_value,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_curve_apply_patch_curve_only_semantics_fails_unknown_field_no_adapter,
+      lookup_override_test_setup, lookup_override_test_teardown),
 
     cmocka_unit_test_setup_teardown(test_cmrgb_schema_lists_six_rows_with_three_components_each,
                                     lookup_override_test_setup, lookup_override_test_teardown),
