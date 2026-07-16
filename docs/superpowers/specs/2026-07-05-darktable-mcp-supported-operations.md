@@ -1,7 +1,8 @@
 # darktable MCP — Supported Operations Reference
 
 Date: 2026-07-05
-Status: reference (companion to `2026-07-05-darktable-mcp-design.md`)
+Status: superseded by `2026-07-16-darktable-mcp-supported-operations.md`
+(companion to `2026-07-05-darktable-mcp-design.md`)
 Source inventory: `src/iop/` at commit `81129368e0` (this fork)
 
 ## Purpose
