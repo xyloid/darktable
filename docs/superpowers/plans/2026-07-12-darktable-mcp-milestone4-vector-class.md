@@ -142,30 +142,30 @@ void dt_remote_semantic_schema_free(gpointer schema_ptr);  // GDestroyNotify-abl
 void dt_remote_semantic_value_free(gpointer value_ptr);
 ```
 
-- [ ] **Step 1: Add the wrapper types and free functions.** Free functions
+- [x] **Step 1: Add the wrapper types and free functions.** Free functions
   switch on `class_id` and delegate to `dt_remote_curve_schema_free` /
   `dt_remote_curve_value_free`; `default:` frees only the wrapper. Wrap
   helpers `g_malloc0` the wrapper, set the tag, take ownership.
-- [ ] **Step 2: Retype the containers.** `dt_remote_module_schema_t.semantic_fields`
+- [x] **Step 2: Retype the containers.** `dt_remote_module_schema_t.semantic_fields`
   now holds `dt_remote_semantic_schema_t *`;
   `dt_remote_mutation_result_t.semantic_values` maps name →
   `dt_remote_semantic_value_t *`. Update both comments and the container
   free functions to use the new destructors.
-- [ ] **Step 3: Wrap at the producers.** In `remote_edit.c`, everywhere
+- [x] **Step 3: Wrap at the producers.** In `remote_edit.c`, everywhere
   `dt_remote_curve_list_schema` / `dt_remote_curve_read_values` output is
   inserted into these containers, wrap with the helpers. (Simplest: keep
   those two curve functions returning curve types and wrap at the three
   insertion sites in `remote_edit.c` — `grep -n "semantic_fields\|semantic_values"
   src/control/remote_edit.c` lists them.)
-- [ ] **Step 4: Unwrap at the serializers.** At `remote_protocol.c:766` and
+- [x] **Step 4: Unwrap at the serializers.** At `remote_protocol.c:766` and
   `:882`, switch on the wrapper tag; the `DT_REMOTE_PARAMETER_CURVE` arm
   calls the existing `_curve_schema_to_json(w->u.curve)` /
   `_curve_value_to_json(w->u.curve)`; any other tag is
   `g_assert_not_reached()` for now (Task 4 replaces it).
-- [ ] **Step 5: Build and verify byte-identical wire.**
+- [x] **Step 5: Build and verify byte-identical wire.**
   Run: `cmake --build build -j$(nproc) && ctest --test-dir build && cd tools/mcp && .venv/bin/pytest -q`
   Expected: all pass, zero test edits.
-- [ ] **Step 6: Commit** — `remote_parameters: class-tagged semantic schema/value wrappers (curve-only)`
+- [x] **Step 6: Commit** — `remote_parameters: class-tagged semantic schema/value wrappers (curve-only)`
 
 ### Task 2: Vector class core — enum cleanup, patch arm, parser branch
 
@@ -199,7 +199,7 @@ typedef struct dt_remote_vector_patch_t
 #define DT_REMOTE_VECTOR_WIRE_COMPONENT_CAP 8
 ```
 
-- [ ] **Step 1: Write the failing parser tests** in
+- [x] **Step 1: Write the failing parser tests** in
   `test_remote_protocol.c`, following the file's existing curve-parser test
   style (same fixtures, same request-building helpers — read the
   `semantic value` tests there first). Cases, each asserting
@@ -226,10 +226,10 @@ static void test_semantic_duplicate_ids_rejected_across_classes(void **state);
 static void test_semantic_vector_preserves_double_precision(void **state);
 ```
 
-- [ ] **Step 2: Run to verify failure.**
+- [x] **Step 2: Run to verify failure.**
   Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R remote_protocol`
   Expected: FAIL (new tests; `"unsupported class 'vector'"` path today).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Enum: remove `DT_REMOTE_PARAMETER_LEVELS`, add
     `DT_REMOTE_PARAMETER_VECTOR`; update the case list in
     `dt_remote_semantic_patch_free` (remote_parameters.c:59): the vector
@@ -277,10 +277,10 @@ static void test_semantic_vector_preserves_double_precision(void **state);
     }
 ```
 
-- [ ] **Step 4: Run tests to verify pass.**
+- [x] **Step 4: Run tests to verify pass.**
   Run: `ctest --test-dir build -R remote_protocol` — PASS; then full
   `ctest --test-dir build` — PASS (curve suites untouched).
-- [ ] **Step 5: Commit** — `remote_protocol: parse vector-class semantic values (doubles, capped, strict members)`
+- [x] **Step 5: Commit** — `remote_protocol: parse vector-class semantic values (doubles, capped, strict members)`
 
 ### Task 3: Vector engine and registry core
 
@@ -431,7 +431,7 @@ The Task 1 wrappers gain the `vector` union arms and
    doubles), LEVELS unordered, LEVELS gap `< FLT_EPSILON`, accept gap
    `== FLT_EPSILON`.
 
-- [ ] **Step 1: Write failing unit tests** in `test_remote_vector.c` for
+- [x] **Step 1: Write failing unit tests** in `test_remote_vector.c` for
   requirements 1–5, using a **test-local static adapter** against a real
   loaded module `.so` exactly as `test_remote_curve.c` does (read its
   fixture setup first; reuse its module-loading fixture). Use `borders` as
@@ -440,17 +440,17 @@ The Task 1 wrappers gain the `vector` union arms and
   adapter exists. Register the binary in
   `src/tests/unittests/control/CMakeLists.txt` by copying the
   `test_remote_curve` block.
-- [ ] **Step 2: Run to verify failure.**
+- [x] **Step 2: Run to verify failure.**
   Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R remote_vector`
   Expected: FAIL (nothing implemented).
-- [ ] **Step 3: Implement** `remote_vector.h/.c`,
+- [x] **Step 3: Implement** `remote_vector.h/.c`,
   `remote_vector_registry.c` (empty `s_adapters[]` + lookup + validate),
   the schema/value types + frees in `remote_parameters.h/.c`, and the
   wrapper vector arms. Copy structure from the curve twins; do not invent
   new patterns. Add both `.c` files to the CMake source list.
-- [ ] **Step 4: Run tests to verify pass.**
+- [x] **Step 4: Run tests to verify pass.**
   Run: `ctest --test-dir build` — all suites PASS.
-- [ ] **Step 5: Commit** — `remote_vector: vector-class engine and registry core`
+- [x] **Step 5: Commit** — `remote_vector: vector-class engine and registry core`
 
 ### Task 4: Generalize the four remote_edit seams; wire serializers; capability
 
@@ -467,7 +467,7 @@ this task, any registered vector adapter is fully live end-to-end.
 
 **Interfaces (Consumes):** everything Task 3 produced.
 
-- [ ] **Step 1: Write failing tests.**
+- [x] **Step 1: Write failing tests.**
   - `test_remote_edit.c`: with the vector registry's **test lookup
     override** (add `dt_remote_vector_registry_set_lookup_override`,
     mirroring remote_curve.h:239) injecting a borders test adapter:
@@ -481,8 +481,8 @@ this task, any registered vector adapter is fully live end-to-end.
     `name/minimum/maximum`, `"ordering"` only for LEVELS, `"color_space"`
     only for COLOR; value JSON carries `class/active/effective/
     writable_now/values`; hello capabilities contain `"vector_params"`.
-- [ ] **Step 2: Run to verify failure** (`ctest --test-dir build -R "remote_edit|remote_protocol"`).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run to verify failure** (`ctest --test-dir build -R "remote_edit|remote_protocol"`).
+- [x] **Step 3: Implement.**
   - **Schema seam (:892):** after `dt_remote_curve_list_schema`, call
     `dt_remote_vector_list_schema`; wrap both outputs (curves first, then
     vectors — deterministic aggregation order per spec) into the tagged
@@ -507,9 +507,9 @@ this task, any registered vector adapter is fully live end-to-end.
     calls. Reuse `_condition_to_json` for `writable_when`/`active_when`.
   - **Hello:** add `"vector_params"` immediately after the
     `"curve_params"` line (remote_protocol.c:583).
-- [ ] **Step 4: Run all suites** — `ctest --test-dir build` PASS; curve
+- [x] **Step 4: Run all suites** — `ctest --test-dir build` PASS; curve
   suites prove byte-identical curve behavior.
-- [ ] **Step 5: Commit** — `remote_edit: dispatch semantic seams across curve and vector registries`
+- [x] **Step 5: Commit** — `remote_edit: dispatch semantic seams across curve and vector registries`
 
 ### Task 5: colorbalance adapter — six mode-gated aliases
 
@@ -545,7 +545,7 @@ Descriptions are required to state (spec, verbatim requirement): stored 1.0
 is the identity — the GUI displays it as 0.0 (red/green/blue) or 0%
 (factor) — and the color space (ProPhoto RGB; LEGACY mode is sRGB).
 
-- [ ] **Step 1: Write failing tests** (real `colorbalance` .so, version 3):
+- [x] **Step 1: Write failing tests** (real `colorbalance` .so, version 3):
   - schema lists exactly `lift,gamma,gain,offset,power,slope` in that
     order, each with the four components and `writable_when` on `mode`;
   - component-order proof **against an independently constructed blob**:
@@ -562,11 +562,11 @@ is the identity — the GUI displays it as 0.0 (red/green/blue) or 0%
   - alias write-conflict is structurally impossible: patch with both
     `lift` and `offset` → exactly one is non-writable under any mode →
     rejected atomically; assert blob unchanged.
-- [ ] **Step 2: Run to verify failure** (`ctest --test-dir build -R remote_vector`).
-- [ ] **Step 3: Implement** the descriptor table + adapter row
+- [x] **Step 2: Run to verify failure** (`ctest --test-dir build -R remote_vector`).
+- [x] **Step 3: Implement** the descriptor table + adapter row
   `{ "colorbalance", 3, 3, s_colorbalance_vectors, 6, s_colorbalance_prepare, 1, NULL }`.
-- [ ] **Step 4: Run tests** — PASS; full `ctest` PASS.
-- [ ] **Step 5: Commit** — `remote_vector_registry: colorbalance mode-gated lift/gamma/gain + offset/power/slope`
+- [x] **Step 4: Run tests** — PASS; full `ctest` PASS.
+- [x] **Step 5: Commit** — `remote_vector_registry: colorbalance mode-gated lift/gamma/gain + offset/power/slope`
 
 ### Task 6: channelmixerrgb adapter — six rows + normalize zero-sum guard
 
@@ -622,7 +622,7 @@ static gboolean _cmrgb_validate_completed(const dt_remote_vector_context_t *ctx,
 { /* three _cmrgb_guard_row calls: red/normalize_R, green/normalize_G, blue/normalize_B */ }
 ```
 
-- [ ] **Step 1: Write failing tests** (real .so, version 3):
+- [x] **Step 1: Write failing tests** (real .so, version 3):
   - schema: six rows, three components each, ranges ±2.0;
   - reserved-component preservation: seed `red[3] = 0.777f` directly in the
     blob, patch `red = [1,0,0]`, assert `red[3]` still `0.777f` and
@@ -636,11 +636,11 @@ static gboolean _cmrgb_validate_completed(const dt_remote_vector_context_t *ctx,
     patch flips only `normalize_R` → rejected;
   - independent-read proof for one row (same poke-the-blob pattern as
     Task 5).
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** descriptors + guard + adapter row
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** descriptors + guard + adapter row
   `{ "channelmixerrgb", 3, 3, s_cmrgb_vectors, 6, s_cmrgb_prepare, 3, _cmrgb_validate_completed }`.
-- [ ] **Step 4: Run tests** — PASS; full `ctest` PASS.
-- [ ] **Step 5: Commit** — `remote_vector_registry: channelmixerrgb mixing rows with normalize zero-sum guard`
+- [x] **Step 4: Run tests** — PASS; full `ctest` PASS.
+- [x] **Step 5: Commit** — `remote_vector_registry: channelmixerrgb mixing rows with normalize zero-sum guard`
 
 ### Task 7: rgblevels adapter — four gated names, no reset, epsilon gaps
 
@@ -672,7 +672,7 @@ preserves stored rows across autoscale switches (rgblevels.c:747
 `gui_changed` only flips the displayed tab; the row-0 fan-out is
 pipeline-only, :857).
 
-- [ ] **Step 1: Write failing tests** (real .so, version 1):
+- [x] **Step 1: Write failing tests** (real .so, version 1):
   - schema: four names, LEVELS ordering advertised
     (`minimum_gap == FLT_EPSILON`, at-least);
   - default (linked): `levels.linked` writable_now TRUE, the three
@@ -690,11 +690,11 @@ pipeline-only, :857).
   - aliasing: linked write then switch to independent and read
     `levels.red` — returns the values written via `levels.linked`
     (same storage row).
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** the four descriptors + adapter row
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** the four descriptors + adapter row
   `{ "rgblevels", 1, 1, s_rgblevels_vectors, 4, s_rgblevels_prepare, 1, NULL }`.
-- [ ] **Step 4: Run tests** — PASS; full `ctest` PASS.
-- [ ] **Step 5: Commit** — `remote_vector_registry: rgblevels gated levels triples, epsilon minimum gap, no reset`
+- [x] **Step 4: Run tests** — PASS; full `ctest` PASS.
+- [x] **Step 5: Commit** — `remote_vector_registry: rgblevels gated levels triples, epsilon minimum gap, no reset`
 
 ### Task 8: borders and watermark adapters — color subtype
 
@@ -717,17 +717,17 @@ descriptors `color` (path `FIELD "color"`) and `frame_color`
 NULL }`. watermark: one descriptor `color`; row `{ "watermark", 7, 7, ...,
 1, NULL, 0, NULL }`.
 
-- [ ] **Step 1: Write failing tests** (real .so's, versions 4 and 7):
+- [x] **Step 1: Write failing tests** (real .so's, versions 4 and 7):
   schema advertises subtype `color` + `color_space "display_rgb"`;
   independent-read pokes; round-trip writes; out-of-range `1.00000001`
   rejected in double domain; borders `frame_color` write leaves `color`
   and every scalar byte untouched.
-- [ ] **Step 2: Run to verify failure.**
-- [ ] **Step 3: Implement** the three descriptors + two adapter rows.
-- [ ] **Step 4: Run tests** — PASS; full `ctest` PASS. All five adapters
+- [x] **Step 2: Run to verify failure.**
+- [x] **Step 3: Implement** the three descriptors + two adapter rows.
+- [x] **Step 4: Run tests** — PASS; full `ctest` PASS. All five adapters
   now registered: 19 semantic names total (6+6+4+2+1 — assert this count
   in a registry test).
-- [ ] **Step 5: Commit** — `remote_vector_registry: borders and watermark color triples`
+- [x] **Step 5: Commit** — `remote_vector_registry: borders and watermark color triples`
 
 ### Task 9: Python sidecar — `vectors` argument
 
@@ -742,7 +742,7 @@ and :176/:210 (tool arg + `curve_params` gate).
   there — follow where `_wire_semantic_values` tests live:
   `grep -rn "_wire_semantic_values" tools/mcp/tests/`)
 
-- [ ] **Step 1: Write failing tests** (fake-server pattern the file already
+- [x] **Step 1: Write failing tests** (fake-server pattern the file already
   uses):
   - `vectors={"lift": [1.0, 1.1, 1.0, 0.95]}` sends
     `semantic_values={"lift": {"class": "vector", "values": [1.0, 1.1, 1.0, 0.95]}}`;
@@ -755,9 +755,9 @@ and :176/:210 (tool arg + `curve_params` gate).
   - rejects: empty list, non-list, bool element, NaN/inf element,
     non-numeric element — each `ToolError` with the offending name, no
     connection attempted.
-- [ ] **Step 2: Run to verify failure:** `cd tools/mcp && .venv/bin/pytest -q`
+- [x] **Step 2: Run to verify failure:** `cd tools/mcp && .venv/bin/pytest -q`
   Expected: FAIL (no `vectors` parameter).
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
 
 ```python
 def _wire_vector_values(vectors: dict[str, Any]) -> dict[str, Any]:
@@ -785,8 +785,8 @@ def _wire_vector_values(vectors: dict[str, Any]) -> dict[str, Any]:
   "vector"`; each patch replaces the whole named vector; components are
   stored-space values (colorbalance stores identity as 1.0); requires
   `vector_params`.
-- [ ] **Step 4: Run tests** — `cd tools/mcp && .venv/bin/pytest -q` PASS.
-- [ ] **Step 5: Commit** — `mcp sidecar: vectors argument on set_module_params, vector_params gated`
+- [x] **Step 4: Run tests** — `cd tools/mcp && .venv/bin/pytest -q` PASS.
+- [x] **Step 5: Commit** — `mcp sidecar: vectors argument on set_module_params, vector_params gated`
 
 ### Task 10: Live integration gates
 
@@ -851,11 +851,11 @@ live run (enable watermark via MCP, copy the written `.xmp`, replace the
 Verify `struct.calcsize` == the C `sizeof` (assert 880 == 4*4+4+4+3*4+256+512+12+64
 in a unit-style check inside the test module).
 
-- [ ] **Step 1: Write all gates.**
-- [ ] **Step 2: Run.**
+- [x] **Step 1: Write all gates.**
+- [x] **Step 2: Run.**
   `cd tools/mcp && DARKTABLE_BIN=$PWD/../../build/bin/darktable .venv/bin/pytest -m integration -q`
   Expected: new gates PASS, every existing curve gate PASS.
-- [ ] **Step 3: Commit** — `mcp tests: milestone 4 live vector gates for the five adapters`
+- [x] **Step 3: Commit** — `mcp tests: milestone 4 live vector gates for the five adapters`
 
 ### Task 11: Documentation
 
@@ -867,7 +867,7 @@ Spec §Documentation — same milestone, not after.
 - Modify: `tools/mcp/README.md`, `tools/mcp/docs/remote-control.md`
 - Modify: `docs/superpowers/specs/2026-07-12-darktable-mcp-milestone4-vector-class-design.md` (status line → implemented)
 
-- [ ] **Step 1: supported-operations.** Move `colorbalance`,
+- [x] **Step 1: supported-operations.** Move `colorbalance`,
   `channelmixerrgb`, `borders` rows (:114–116) from Tier 2 to Tier 1;
   move `rgblevels` (:151) from Tier 3 to Tier 1 and drop it from the
   Tier-3 rationale sentence (:138); update `watermark` (:130) to note the
@@ -877,17 +877,17 @@ Spec §Documentation — same milestone, not after.
   `| borders | aspect_text, pos_h_text, pos_v_text | marked UNUSED in source |`.
   Note in each moved row that arrays are exposed as semantic vectors with
   `represented_by`, matching the curve rows' phrasing.
-- [ ] **Step 2: protocol-reference.** In the capability section (:76):
+- [x] **Step 2: protocol-reference.** In the capability section (:76):
   `vector_params` advertises writable vector-class semantic parameters,
   never advertised without accepting vector entries. Add the normative
   schema/value/patch JSON shapes and the stable vocabulary (subtypes,
   `display_rgb`, `at_least`) — copy them from spec §Wire and MCP contract
   verbatim.
-- [ ] **Step 3: MCP user docs.** README + remote-control.md: `vectors`
+- [x] **Step 3: MCP user docs.** README + remote-control.md: `vectors`
   argument with a colorbalance SOP example and the stored-identity warning
   (1.0 = identity, GUI shows 0.0/0%); rgblevels linked/independent
   example.
-- [ ] **Step 4: Verify all suites one final time** (full ctest + pytest +
+- [x] **Step 4: Verify all suites one final time** (full ctest + pytest +
   integration) and commit —
   `darktable-mcp: milestone 4 docs — tiers, vector protocol, sidecar usage`
 
