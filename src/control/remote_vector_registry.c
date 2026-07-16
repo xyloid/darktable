@@ -512,15 +512,185 @@ static const dt_remote_vector_module_adapter_t s_cmrgb_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* rgblevels adapter (milestone4 vector-class design doc SS Module         */
+/* adapter specifics, rgblevels). Params v1: a single levels[3][3] array,   */
+/* one row per channel -- row 0 red, row 1 green, row 2 blue                */
+/* (rgblevels.c:38-43) -- each row a black/grey/white triple in             */
+/* [0.0, 1.0] (rgblevels.c:56). `autoscale`                                 */
+/* (dt_iop_rgblevels_autoscale_t, rgblevels.c:46-50) gates which alias set  */
+/* is live: LINKED_CHANNELS (the module default, rgblevels.c:54) exposes    */
+/* only row 0 as "levels.linked"; INDEPENDENT_CHANNELS exposes all three    */
+/* rows as "levels.red"/"levels.green"/"levels.blue". "levels.linked" and   */
+/* "levels.red" alias the SAME storage (row 0) under opposite predicates,   */
+/* structurally impossible for both to be writable at once -- same gating   */
+/* discipline as colorbalance's mode-gated aliases above.                   */
+/* ---------------------------------------------------------------------- */
+
+// Every alias shares this one component layout: black/grey/white, all
+// 0.0-1.0 (rgblevels.c:56).
+static const dt_remote_vector_component_t s_rgblevels_components[3] = {
+  { "black", 0.0, 1.0 }, { "grey", 0.0, 1.0 }, { "white", 0.0, 1.0 },
+};
+
+static const dt_remote_path_segment_t s_rgblevels_row0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "levels" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_introspection_path_t s_rgblevels_row0_path = {
+  .segments = s_rgblevels_row0_segments, .length = G_N_ELEMENTS(s_rgblevels_row0_segments)
+};
+
+static const dt_remote_path_segment_t s_rgblevels_row1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "levels" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_introspection_path_t s_rgblevels_row1_path = {
+  .segments = s_rgblevels_row1_segments, .length = G_N_ELEMENTS(s_rgblevels_row1_segments)
+};
+
+static const dt_remote_path_segment_t s_rgblevels_row2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "levels" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_introspection_path_t s_rgblevels_row2_path = {
+  .segments = s_rgblevels_row2_segments, .length = G_N_ELEMENTS(s_rgblevels_row2_segments)
+};
+
+// `autoscale` selects which alias set is live: LINKED_CHANNELS (the module
+// default) makes "levels.linked" (row 0) writable; INDEPENDENT_CHANNELS
+// makes the three per-channel aliases writable instead. Declared exactly as
+// colorbalance's own mode predicates -- one shared predicate object per
+// alias set, reused for both active_when and writable_when so a dormant
+// alias reads back both inactive and non-writable.
+static const dt_remote_parameter_predicate_t s_rgblevels_linked_predicate = {
+  .field = "autoscale", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "DT_IOP_RGBLEVELS_LINKED_CHANNELS"
+};
+static const dt_remote_parameter_predicate_t s_rgblevels_independent_predicate = {
+  .field = "autoscale", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS"
+};
+
+// Four mode-gated aliases over three levels[3][3] rows: "levels.linked" and
+// "levels.red" both target row 0 under opposite predicates (structurally at
+// most one is ever writable); "levels.green"/"levels.blue" are rows 1/2,
+// each its own storage, no alias. All LEVELS subtype (strictly increasing,
+// FLT_EPSILON minimum gap): the module clamps/orders these itself in the
+// GUI (rgblevels.c:1245-1247) but does not enforce ordering in
+// commit_params(), so the engine's own LEVELS validation is this adapter's
+// only ordering guard. The module never resets a row on an autoscale
+// switch: gui_changed() (rgblevels.c:747) only flips the displayed GUI tab,
+// and the row-0 fan-out that mirrors row 0 into rows 1/2 under
+// LINKED_CHANNELS is pipeline-only (commit_params(), rgblevels.c:857-866)
+// -- it never touches self->params, only piece->data. This adapter must
+// never reset a row either, ever.
+static const dt_remote_vector_descriptor_t s_rgblevels_vectors[4] = {
+  {
+    .name = "levels.linked",
+    .display_name = "Levels (linked)",
+    .description =
+      "Black/grey/white levels triple shared by all three channels in linked mode "
+      "(autoscale == LINKED_CHANNELS, the module default): stored in row 0 of "
+      "levels[3][3] (rgblevels.c:56). Writable only when autoscale is LINKED_CHANNELS. "
+      "Aliases the same storage as 'levels.red'; rows persist unchanged across autoscale "
+      "switches -- gui_changed() (rgblevels.c:747) only flips the displayed GUI tab, and "
+      "the row-0 fan-out into rows 1/2 is pipeline-only (commit_params(), "
+      "rgblevels.c:857-866), never applied to stored params.",
+    .native = s_rgblevels_row0_path,
+    .component_count = 3,
+    .components = s_rgblevels_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_LEVELS,
+    .color_space = NULL,
+    .strictly_increasing = TRUE,
+    .minimum_gap = FLT_EPSILON,
+    .active_when = &s_rgblevels_linked_predicate,
+    .writable_when = &s_rgblevels_linked_predicate,
+  },
+  {
+    .name = "levels.red",
+    .display_name = "Levels (red)",
+    .description =
+      "Black/grey/white levels triple for the red channel in independent mode "
+      "(autoscale == INDEPENDENT_CHANNELS): stored in row 0 of levels[3][3] "
+      "(rgblevels.c:38-43, 56). Writable only when autoscale is INDEPENDENT_CHANNELS. "
+      "Aliases the same storage as 'levels.linked'; rows persist unchanged across "
+      "autoscale switches -- see 'levels.linked' for the no-reset rationale.",
+    .native = s_rgblevels_row0_path,
+    .component_count = 3,
+    .components = s_rgblevels_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_LEVELS,
+    .color_space = NULL,
+    .strictly_increasing = TRUE,
+    .minimum_gap = FLT_EPSILON,
+    .active_when = &s_rgblevels_independent_predicate,
+    .writable_when = &s_rgblevels_independent_predicate,
+  },
+  {
+    .name = "levels.green",
+    .display_name = "Levels (green)",
+    .description =
+      "Black/grey/white levels triple for the green channel in independent mode "
+      "(autoscale == INDEPENDENT_CHANNELS): stored in row 1 of levels[3][3] "
+      "(rgblevels.c:38-43, 56). Writable only when autoscale is INDEPENDENT_CHANNELS. "
+      "Own storage row, no alias; rows persist unchanged across autoscale switches -- "
+      "see 'levels.linked' for the no-reset rationale.",
+    .native = s_rgblevels_row1_path,
+    .component_count = 3,
+    .components = s_rgblevels_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_LEVELS,
+    .color_space = NULL,
+    .strictly_increasing = TRUE,
+    .minimum_gap = FLT_EPSILON,
+    .active_when = &s_rgblevels_independent_predicate,
+    .writable_when = &s_rgblevels_independent_predicate,
+  },
+  {
+    .name = "levels.blue",
+    .display_name = "Levels (blue)",
+    .description =
+      "Black/grey/white levels triple for the blue channel in independent mode "
+      "(autoscale == INDEPENDENT_CHANNELS): stored in row 2 of levels[3][3] "
+      "(rgblevels.c:38-43, 56). Writable only when autoscale is INDEPENDENT_CHANNELS. "
+      "Own storage row, no alias; rows persist unchanged across autoscale switches -- "
+      "see 'levels.linked' for the no-reset rationale.",
+    .native = s_rgblevels_row2_path,
+    .component_count = 3,
+    .components = s_rgblevels_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_LEVELS,
+    .color_space = NULL,
+    .strictly_increasing = TRUE,
+    .minimum_gap = FLT_EPSILON,
+    .active_when = &s_rgblevels_independent_predicate,
+    .writable_when = &s_rgblevels_independent_predicate,
+  },
+};
+
+// `autoscale` drives every alias's active_when/writable_when above; listing
+// it in prepare_fields means a scalar-only patch that switches autoscale
+// still triggers the registry-ordered validation path (VEC3-011's
+// prepare_needed gate), same convention as colorbalance's own "mode" entry.
+// No validate_completed hook: this adapter must never reset a row, and no
+// shipped rgblevels behavior needs a composed post-write check beyond the
+// per-descriptor gating already enforced by the engine.
+static const char *const s_rgblevels_prepare[] = { "autoscale" };
+
+static const dt_remote_vector_module_adapter_t s_rgblevels_adapter = {
+  "rgblevels", 1, 1, s_rgblevels_vectors, 4, s_rgblevels_prepare, 1, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// The full adapter table. colorbalance and channelmixerrgb for now; a
-// future op adds another entry here, not a parallel lookup mechanism --
-// same convention as remote_curve_registry.c's own s_adapters[].
+// The full adapter table. colorbalance, channelmixerrgb, and rgblevels for
+// now; a future op adds another entry here, not a parallel lookup
+// mechanism -- same convention as remote_curve_registry.c's own s_adapters[].
 static const dt_remote_vector_module_adapter_t *const s_adapters[] = {
   &s_colorbalance_adapter,
   &s_cmrgb_adapter,
+  &s_rgblevels_adapter,
 };
 
 static dt_remote_vector_registry_lookup_override_t s_lookup_override = NULL;

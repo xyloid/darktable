@@ -3426,6 +3426,421 @@ static void test_cmrgb_read_values_proves_component_order_against_independent_bl
   borders_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* rgblevels adapter (production registry; milestone4 vector-class design  */
+/* doc SS Module adapter specifics, rgblevels). Params v1: a single        */
+/* levels[3][3] array, one row per channel -- row 0 red, row 1 green, row  */
+/* 2 blue (rgblevels.c:38-43) -- each row a black/grey/white triple in     */
+/* [0.0, 1.0] (rgblevels.c:56). `autoscale`                                */
+/* (dt_iop_rgblevels_autoscale_t, rgblevels.c:46-50) gates which of two    */
+/* alias sets is live: LINKED_CHANNELS (the module default) exposes only   */
+/* row 0 as "levels.linked"; INDEPENDENT_CHANNELS exposes all three rows   */
+/* as "levels.red"/"levels.green"/"levels.blue". "levels.linked" and       */
+/* "levels.red" alias the SAME storage (row 0) under opposite predicates.  */
+/* The module never resets a row on an autoscale switch: gui_changed()     */
+/* (rgblevels.c:747) only flips the displayed GUI tab, and the row-0       */
+/* fan-out that mirrors row 0 into rows 1/2 under LINKED_CHANNELS is       */
+/* pipeline-only (commit_params(), rgblevels.c:857-866) -- it never        */
+/* touches self->params, only piece->data. These tests exercise the        */
+/* production s_adapters[] table directly, same "real adapter, no          */
+/* override" pattern as the colorbalance/channelmixerrgb sections above.   */
+/* ---------------------------------------------------------------------- */
+
+static dt_remote_patch_entry_t *make_autoscale_entry(const borders_fixture_t *fixture, const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  (void)dt_introspection_get_child(fixture->module->so->get_introspection()->field,
+                                   fixture->module->params, "autoscale", &field);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup("autoscale");
+  entry->value.type = DT_REMOTE_VALUE_ENUM;
+  entry->value.v.e.value = value;
+  entry->value.v.e.name = g_strdup(enum_name);
+  return entry;
+}
+
+// Pokes "autoscale" directly through introspection, bypassing the patch
+// engine entirely -- used to build hand-constructed "expected" buffers
+// (never to exercise the code path under test).
+static void write_autoscale(const borders_fixture_t *fixture, void *params, const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  int *ptr = dt_introspection_get_child(fixture->module->so->get_introspection()->field, params,
+                                        "autoscale", &field);
+  assert_non_null(ptr);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+  *ptr = value;
+}
+
+// levels[3][3] is a nested array (row, then black/grey/white); these three
+// helpers resolve both INDEX levels the way dt_remote_path_resolve() itself
+// does for the "levels" + row-index native paths, but independently of the
+// registry descriptors under test -- same rationale as write_color_component/
+// read_color_component's own "independent poke" contract above.
+static void *levels_row_ptr_ex(const borders_fixture_t *fixture, void *params, guint row,
+                               dt_introspection_field_t **out_row_field)
+{
+  dt_introspection_field_t *levels_field = NULL;
+  void *levels_ptr = dt_introspection_get_child(fixture->module->so->get_introspection()->field, params,
+                                                "levels", &levels_field);
+  assert_non_null(levels_ptr);
+  void *row_ptr = dt_introspection_access_array(levels_field, levels_ptr, row, out_row_field);
+  assert_non_null(row_ptr);
+  return row_ptr;
+}
+
+static void *levels_row_ptr(const borders_fixture_t *fixture, void *params, guint row)
+{
+  dt_introspection_field_t *row_field = NULL;
+  return levels_row_ptr_ex(fixture, params, row, &row_field);
+}
+
+static float read_levels_component(const borders_fixture_t *fixture, void *params, guint row, guint col)
+{
+  dt_introspection_field_t *row_field = NULL;
+  void *row_ptr = levels_row_ptr_ex(fixture, params, row, &row_field);
+  dt_introspection_field_t *col_field = NULL;
+  float *element_ptr = dt_introspection_access_array(row_field, row_ptr, col, &col_field);
+  assert_non_null(element_ptr);
+  assert_int_equal(col_field->header.type, DT_INTROSPECTION_TYPE_FLOAT);
+  return *element_ptr;
+}
+
+static void test_rgblevels_schema_lists_four_gated_names_with_levels_ordering(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rgblevels");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 4);
+
+  static const char *const expected_names[] = {
+    "levels.linked", "levels.red", "levels.green", "levels.blue",
+  };
+  static const char *const expected_enum_names[] = {
+    "DT_IOP_RGBLEVELS_LINKED_CHANNELS", "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS",
+    "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS", "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS",
+  };
+  static const char *const expected_component_names[] = { "black", "grey", "white" };
+
+  for(guint i = 0; i < 4; i++)
+  {
+    const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_LEVELS);
+    assert_null(schema->color_space);
+    assert_true(schema->strictly_increasing);
+    assert_float_equal(schema->minimum_gap, (double)FLT_EPSILON, 0.0);
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+    assert_non_null(schema->writable_when);
+    assert_string_equal(schema->writable_when->field, "autoscale");
+    assert_string_equal(schema->writable_when->enum_name, expected_enum_names[i]);
+    assert_int_equal(schema->writable_when->op, DT_REMOTE_PREDICATE_EQ);
+    assert_non_null(schema->active_when);
+    assert_string_equal(schema->active_when->field, "autoscale");
+    assert_string_equal(schema->active_when->enum_name, expected_enum_names[i]);
+    assert_int_equal(schema->active_when->op, DT_REMOTE_PREDICATE_EQ);
+
+    assert_int_equal(schema->components->len, 3);
+    for(guint c = 0; c < 3; c++)
+    {
+      const dt_remote_vector_component_schema_t *component =
+        &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+      assert_string_equal(component->name, expected_component_names[c]);
+      assert_float_equal(component->minimum, 0.0, 0.0);
+      assert_float_equal(component->maximum, 1.0, 0.0);
+    }
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+static void test_rgblevels_default_linked_writable_gates_and_row0_write_preserves_other_rows(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("rgblevels");
+  // Module default is LINKED_CHANNELS (rgblevels.c:54); no scalar write
+  // needed to reach the state under test.
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+
+  dt_remote_vector_value_t *linked = g_hash_table_lookup(values, "levels.linked");
+  assert_non_null(linked);
+  assert_true(linked->active);
+  assert_true(linked->writable_now);
+
+  static const char *const channel_names[] = { "levels.red", "levels.green", "levels.blue" };
+  for(guint i = 0; i < G_N_ELEMENTS(channel_names); i++)
+  {
+    dt_remote_vector_value_t *value = g_hash_table_lookup(values, channel_names[i]);
+    assert_non_null(value);
+    assert_false(value->active);
+    assert_false(value->writable_now);
+  }
+  g_hash_table_unref(values);
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double linked_values[] = { 0.1, 0.5, 0.9 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", linked_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  for(guint i = 0; i < 3; i++)
+    assert_float_equal(read_levels_component(fixture, projected, 0, i), (float)linked_values[i], 1e-6);
+
+  // Rows 1 and 2 are separate storage from row 0's; writing "levels.linked"
+  // must never touch them -- byte-identical, not just value-equal.
+  assert_memory_equal(levels_row_ptr(fixture, projected, 1), levels_row_ptr(fixture, before, 1),
+                      3 * sizeof(float));
+  assert_memory_equal(levels_row_ptr(fixture, projected, 2), levels_row_ptr(fixture, before, 2),
+                      3 * sizeof(float));
+
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_rgblevels_composed_switch_to_independent_writes_green_leaves_row0_and_row2_untouched(
+  void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("rgblevels");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double green_values[] = { 0.2, 0.4, 0.8 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values,
+                  make_autoscale_entry(fixture, "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS"));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.green", green_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  for(guint i = 0; i < 3; i++)
+    assert_float_equal(read_levels_component(fixture, projected, 1, i), (float)green_values[i], 1e-6);
+
+  // Row 0 ("levels.linked"/"levels.red" storage) and row 2 ("levels.blue")
+  // are separate native arrays from row 1's; writing "levels.green" -- even
+  // composed with the autoscale switch that makes it writable in the same
+  // request -- must never touch either. No-reset proof: the module's own
+  // row-0 fan-out under LINKED_CHANNELS is pipeline-only (commit_params(),
+  // rgblevels.c:857-866); the adapter never mirrors it into stored params.
+  assert_memory_equal(levels_row_ptr(fixture, projected, 0), levels_row_ptr(fixture, before, 0),
+                      3 * sizeof(float));
+  assert_memory_equal(levels_row_ptr(fixture, projected, 2), levels_row_ptr(fixture, before, 2),
+                      3 * sizeof(float));
+
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// The no-reset guarantee for a mode-only (scalar-only) write: switching
+// back to LINKED_CHANNELS from an INDEPENDENT_CHANNELS state where the
+// three rows already hold distinguishable values must leave every row
+// byte-identical -- proven with a full-params_size memcmp against a
+// hand-built "expected" buffer that pokes only the autoscale field,
+// same convention as test_cmrgb_apply_patch_preserves_reserved_fourth_component
+// above.
+static void test_rgblevels_switch_back_to_linked_scalar_only_causes_no_row_changes(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("rgblevels");
+
+  // Move to independent mode with distinguishable per-row values first, so
+  // a switch back to linked mode has rows worth preserving.
+  dt_remote_patch_t setup_patch;
+  vector_patch_init(&setup_patch);
+  g_ptr_array_add(setup_patch.scalar_values,
+                  make_autoscale_entry(fixture, "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS"));
+  static const double red_values[] = { 0.05, 0.35, 0.75 };
+  static const double green_values[] = { 0.15, 0.45, 0.85 };
+  static const double blue_values[] = { 0.25, 0.65, 0.95 };
+  g_ptr_array_add(setup_patch.semantic_values, make_vector_patch("levels.red", red_values, 3));
+  g_ptr_array_add(setup_patch.semantic_values, make_vector_patch("levels.green", green_values, 3));
+  g_ptr_array_add(setup_patch.semantic_values, make_vector_patch("levels.blue", blue_values, 3));
+
+  void *after_setup = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *setup_error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &setup_patch, after_setup, &setup_error));
+  assert_null(setup_error);
+  memcpy(fixture->module->params, after_setup, fixture->module->params_size);
+  g_free(after_setup);
+  vector_patch_cleanup(&setup_patch);
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_autoscale(fixture, expected, "DT_IOP_RGBLEVELS_LINKED_CHANNELS");
+
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_autoscale_entry(fixture, "DT_IOP_RGBLEVELS_LINKED_CHANNELS"));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Ordering/gap accept-reject set against the real module: equal-adjacent
+// and unordered candidates are rejected atomically; a gap of exactly
+// FLT_EPSILON (widened to double per the brief's own literal, "0.5f +
+// FLT_EPSILON" computed in float then implicitly widened) is accepted; a
+// gap strictly below FLT_EPSILON is rejected. Same "at-least" LEVELS
+// contract test_vector_validate_levels_accepts_gap_exactly_at_flt_epsilon/
+// test_vector_validate_levels_rejects_gap_below_flt_epsilon prove against
+// the synthetic descriptor above, now proven against the production
+// rgblevels adapter and a real module blob.
+static void test_rgblevels_apply_patch_ordering_and_gap_accept_reject(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("rgblevels");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  // Equal adjacent values: rejected (not strictly increasing).
+  {
+    static const double equal_values[] = { 0.5, 0.5, 0.9 };
+    dt_remote_patch_t patch;
+    vector_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", equal_values, 3));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+    assert_non_null(error);
+    assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+    assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+    dt_remote_error_free(error);
+    g_free(projected);
+    vector_patch_cleanup(&patch);
+  }
+
+  // Unordered (decreasing): rejected.
+  {
+    static const double unordered_values[] = { 0.5, 0.4, 0.9 };
+    dt_remote_patch_t patch;
+    vector_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", unordered_values, 3));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+    assert_non_null(error);
+    assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+    assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+    dt_remote_error_free(error);
+    g_free(projected);
+    vector_patch_cleanup(&patch);
+  }
+
+  // Gap exactly FLT_EPSILON: accepted.
+  {
+    static const double gap_values[] = { 0.5, 0.5f + FLT_EPSILON, 0.9 };
+    dt_remote_patch_t patch;
+    vector_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", gap_values, 3));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+    assert_null(error);
+    assert_float_equal(read_levels_component(fixture, projected, 0, 0), 0.5f, 1e-9);
+    assert_float_equal(read_levels_component(fixture, projected, 0, 1), 0.5f + FLT_EPSILON, 1e-9);
+    assert_float_equal(read_levels_component(fixture, projected, 0, 2), 0.9f, 1e-9);
+    g_free(projected);
+    vector_patch_cleanup(&patch);
+  }
+
+  // Gap below FLT_EPSILON: rejected.
+  {
+    static const double small_gap_values[] = { 0.5, 0.5 + (double)FLT_EPSILON * 0.5, 0.9 };
+    dt_remote_patch_t patch;
+    vector_patch_init(&patch);
+    g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", small_gap_values, 3));
+    void *projected = g_malloc(fixture->module->params_size);
+    dt_remote_error_t *error = NULL;
+    assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+    assert_non_null(error);
+    assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+    assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+    dt_remote_error_free(error);
+    g_free(projected);
+    vector_patch_cleanup(&patch);
+  }
+
+  g_free(before);
+  borders_fixture_free(fixture);
+}
+
+// Aliasing: a write through "levels.linked" (row 0) is read back through
+// "levels.red" (also row 0) once autoscale switches to
+// INDEPENDENT_CHANNELS -- the same storage, proven by the values round-
+// tripping through the opposite-predicate alias, not a copy.
+static void test_rgblevels_linked_write_then_switch_to_independent_reads_back_via_red_alias(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("rgblevels");
+
+  static const double linked_values[] = { 0.15, 0.55, 0.95 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("levels.linked", linked_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  memcpy(fixture->module->params, projected, fixture->module->params_size);
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+
+  write_autoscale(fixture, fixture->module->params, "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS");
+
+  GHashTable *values = NULL;
+  error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *red = g_hash_table_lookup(values, "levels.red");
+  assert_non_null(red);
+  assert_true(red->active);
+  assert_true(red->writable_now);
+  assert_int_equal(red->values->len, 3);
+  for(guint i = 0; i < 3; i++)
+    assert_float_equal(g_array_index(red->values, double, i), linked_values[i], 1e-6);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -3595,6 +4010,24 @@ int main(void)
       lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_cmrgb_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_rgblevels_schema_lists_four_gated_names_with_levels_ordering,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_rgblevels_default_linked_writable_gates_and_row0_write_preserves_other_rows,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_rgblevels_composed_switch_to_independent_writes_green_leaves_row0_and_row2_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_rgblevels_switch_back_to_linked_scalar_only_causes_no_row_changes,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_rgblevels_apply_patch_ordering_and_gap_accept_reject,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_rgblevels_linked_write_then_switch_to_independent_reads_back_via_red_alias,
       lookup_override_test_setup, lookup_override_test_teardown),
   };
 
