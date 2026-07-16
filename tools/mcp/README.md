@@ -48,7 +48,7 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
-| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves`); one history item + new revision |
+| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves` and semantic vectors via `vectors`); one history item + new revision |
 | `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
 | `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
@@ -88,6 +88,72 @@ is the authoritative source of each module's curve IDs. This requires a
 darktable that advertises the `curve_params` hello capability; against an
 older darktable the tool refuses client-side with an upgrade message
 instead of silently dropping the curve half of a patch.
+
+`set_module_params` also edits semantic vector parameters (milestone 4)
+through its optional `vectors` argument: semantic IDs mapped to a flat
+list of finite numbers, e.g. `{"lift": [1.0, 1.1, 1.0, 0.95]}`. Each patch
+replaces the whole named vector; unlisted vectors are untouched. Five
+modules currently expose vector semantics — `colorbalance` (`lift`/
+`gamma`/`gain`, with mode-gated aliases `offset`/`power`/`slope` writable
+instead under the module's default `SLOPE_OFFSET_POWER` mode),
+`channelmixerrgb` (`red`/`green`/`blue`/`saturation`/`lightness`/`grey`
+mixing rows), `rgblevels` (`levels.linked` when `autoscale` is linked,
+`levels.red`/`levels.green`/`levels.blue` when it is independent),
+`borders` (`color`/`frame_color`), and `watermark` (`color`) — and
+`get_module_schema`'s `semantic_fields` (`"class": "vector"`) is the
+authoritative source of each module's vector IDs, component count, and
+per-component ranges. This requires a darktable that advertises the
+`vector_params` hello capability; against an older darktable the tool
+refuses client-side with an upgrade message instead of silently dropping
+the vector half of a patch. `curves` and `vectors` may be given together
+in the same call; a semantic ID given in both raises a client-side error
+before either is sent.
+
+**Stored-value warning.** Vector components are the module's *stored*
+values, not what the GUI displays. `colorbalance` is the sharp case: its
+identity lift/gamma/gain is stored as `1.0` for every component, which the
+GUI renders as `0.0` (the R/G/B components) or `0%` (the factor
+component) — sending `0.0` to "reset" a component actually drives it hard
+away from identity, not toward it. A SOP-mode (the module's default)
+colorbalance write:
+
+```json
+{
+  "module": "colorbalance",
+  "values": {},
+  "vectors": {
+    "offset": [1.1, 1.05, 0.95, 1.0],
+    "power":  [0.9, 1.0, 1.0, 1.1],
+    "slope":  [1.05, 0.9, 1.1, 1.0]
+  }
+}
+```
+
+writes `offset`/`power`/`slope` — `SLOPE_OFFSET_POWER` mode's names for
+the same `lift`/`gamma`/`gain` storage. A single call that also sets
+`"values": {"mode": "LIFT_GAMMA_GAIN"}` and patches `lift`/`gamma`/`gain`
+instead lands atomically: `writable_when` is checked against the
+*projected* params, so the mode switch and the newly-active names apply
+together in one history step.
+
+`rgblevels` shows the linked/independent alias gating: with the module's
+default `autoscale` (`DT_IOP_RGBLEVELS_LINKED_CHANNELS`) only
+`levels.linked` is writable; switching `autoscale` to
+`DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS` in the same request makes
+`levels.red`/`levels.green`/`levels.blue` writable instead, and writing
+one row never resets the others — the unwritten rows read back at their
+prior stored values, not defaults:
+
+```json
+{
+  "module": "rgblevels",
+  "values": { "autoscale": "DT_IOP_RGBLEVELS_INDEPENDENT_CHANNELS" },
+  "vectors": { "levels.red": [0.05, 0.4, 0.95] }
+}
+```
+
+Each `levels.*` vector is a `[black, grey, white]` triple; the schema's
+`ordering` constraint enforces `black < grey < white` with a minimum gap.
 
 ## Setup
 

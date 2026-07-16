@@ -65,7 +65,7 @@ Result:
   "darktable_version": "5.x",
   "pid": 12345,
   "capabilities": ["params", "instances", "history", "preview", "scopes",
-                   "semantic_params", "curve_params"]
+                   "semantic_params", "curve_params", "vector_params"]
 }
 ```
 
@@ -78,9 +78,14 @@ previews omits `"preview"` and the sidecar hides `look_at_image`.
 `curve_params` additionally advertises writable curve-class semantic
 parameters (the `semantic_values` request member on `set_module_params`).
 The server never advertises `curve_params` without accepting that request
-member. A client must send curve patches only when `curve_params` is
-present; capability-gated optional request members do not bump
-`protocol_version` (see Maintenance).
+member. `vector_params` (milestone 4) additionally advertises writable
+vector-class semantic parameters — plain vectors, color triples, and
+levels triples (the `semantic_values` request member's vector entries on
+`set_module_params`); the server never advertises `vector_params` without
+accepting vector entries in `semantic_values`. A client must send curve
+patches only when `curve_params` is present and vector patches only when
+`vector_params` is present; capability-gated optional request members do
+not bump `protocol_version` (see Maintenance).
 
 ### get_state
 
@@ -186,12 +191,42 @@ semantic descriptors (`name` like `"curve.master"`, `class: "curve"`,
 `x`/`y` axis ranges, a `points` limits object, the allowed
 `interpolation_values`, and optional `active_when`/`writable_when`/
 `periodic_when` conditions on scalar fields).
+
+When the server also advertises `vector_params` (milestone 4), semantic
+descriptors with `class: "vector"` may also appear. A `subtype` tag
+(`"vector"` | `"color"` | `"levels"`) marks the descriptor's flavor;
+`color_space` is present only when `subtype = "color"` (the only value in
+use today is `"display_rgb"`); `ordering` is present only when `subtype =
+"levels"`. Subtype and color-space strings are stable wire vocabulary, like
+curve interpolation names. Normative shape:
+
+```json
+{
+  "name": "lift", "class": "vector", "display_name": "lift",
+  "subtype": "vector",              // "vector" | "color" | "levels"
+  "color_space": "display_rgb",     // present only when subtype = "color"
+  "readable": true, "writable": true,
+  "writable_when": { "field": "mode", "op": "ne", "value": "SLOPE_OFFSET_POWER" },
+  "components": [
+    { "name": "factor", "minimum": 0.0, "maximum": 2.0 },
+    { "name": "red",    "minimum": 0.0, "maximum": 2.0 },
+    ...
+  ],
+  "ordering": {                     // present only when subtype = "levels"
+    "rule": "strictly_increasing",
+    "minimum_gap": 1.19e-7, "minimum_gap_comparison": "at_least"
+  }
+}
+```
+
 Native storage fields backing a semantic parameter stay listed in `fields`
 with `writable: false` and a `represented_by` array naming the semantic IDs
 that represent them. This applies uniformly across the curve-bearing ops
-(`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`) — see the
-`get_module_schema_rgbcurve_*` fixtures for the full shape; the other three
-ops follow the identical wire shape with their own field/semantic names.
+(`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`) and the vector-bearing
+ops (`colorbalance`, `channelmixerrgb`, `rgblevels`, `borders`,
+`watermark`) — see the `get_module_schema_rgbcurve_*` fixtures for the full
+curve shape and the vector registry tests for the vector shape; each op
+follows the identical wire shape with its own field/semantic names.
 
 Errors: `unknown_module`.
 
@@ -217,8 +252,11 @@ When the server advertises `semantic_params` and the op has semantic
 parameters, the result additionally carries `semantic_values`: every
 semantic ID mapped to its current value -- for curves `{"class": "curve",
 "active", "effective", "writable_now", "points": [{"x", "y"}, ...],
-"interpolation"}`. Inactive parameters (e.g. `curve.red` in linked mode)
-are always present with `active: false`, never omitted.
+"interpolation"}`; for vectors (milestone 4) `{"class": "vector",
+"active": ..., "effective": ..., "writable_now": ..., "values": [...]}` —
+the same status flags curve values carry. Inactive parameters (e.g.
+`curve.red` in linked mode, `levels.red` in linked-autoscale mode) are
+always present with `active: false`, never omitted.
 
 Errors: `unknown_module`, `unknown_instance`.
 
@@ -270,6 +308,36 @@ semantic ID is `unknown_field`; writing a curve whose `writable_when`
 condition fails (checked against the *projected* params, so a mode switch
 in the same request counts) is `unsupported_field`. Curve validation errors
 carry `details: {"parameter", "point_index", "constraint"}`.
+
+When the server advertises `vector_params` (milestone 4), the same
+`semantic_values?` object may also carry vector entries alongside curve
+entries, in the same atomic history item:
+
+```json
+{
+  "semantic_values": {
+    "lift": { "values": [1.0, 1.0, 1.0, 1.0] }
+  }
+}
+```
+
+Each entry supplies `values`: a JSON number array whose length must match
+the descriptor's component count exactly — a patch is a **complete
+replacement** of the named vector, never a partial write (a client wanting
+to change one component does a read-modify-write). Components are carried
+as doubles and validated against the schema's per-component
+`minimum`/`maximum` in double domain before narrowing to the native storage
+type on write; nothing is clamped. Unknown or extra members anywhere in the
+shape are `invalid_value`; an unknown semantic ID is `unknown_field`;
+writing a vector whose `writable_when` condition fails (checked against the
+*projected* params, so a mode switch in the same request counts) is
+`unsupported_field`; a `levels`-subtype vector whose components fail the
+schema's `ordering` constraint is also `invalid_value`. Vector validation
+errors carry `details: {"parameter", "component_index", "constraint"}`
+(`component_index` present only when the failure is attributable to one
+component). Semantic IDs are unique across the curve and vector registries
+within a module, so a `semantic_values` object may freely mix curve and
+vector entries by name with no collision.
 
 Result (values read back from live state):
 
@@ -462,4 +530,8 @@ field's meaning, requiredness, or type bumps `protocol_version`. Every
 change here must land with matching updates to the C dispatcher validation
 and the Python fixtures in the same commit. New curve-bearing ops are
 registry entries in `src/control/remote_curve_registry.c` and require no
-protocol change — the wire shape documented above already generalizes.
+protocol change — the wire shape documented above already generalizes. New
+vector-bearing ops are likewise registry entries in
+`src/control/remote_vector_registry.c` (milestone 4); the two registries
+share the `semantic_values` wire envelope and enforce unique semantic IDs
+across classes within a module.

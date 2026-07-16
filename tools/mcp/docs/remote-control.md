@@ -214,6 +214,23 @@ off. Removing/stopping the sidecar from your MCP host removes the client end.
   upgrade message instead. Milestone 3 extended the same `curve_params`
   capability to `tonecurve`, `colorzones`, and `basecurve` (joining
   `rgbcurve` from milestone 2) with no version bump.
+* **Semantic vector editing (milestone 4) is likewise capability-gated.** A
+  darktable with vector support advertises `vector_params` in the hello
+  `capabilities` list (protocol version stays `1`); the `semantic_values`
+  request member's vector entries only flow when the capability is
+  present, exactly like curves — an older server never receives a partial
+  patch, the sidecar refuses client-side with an upgrade message instead.
+  Five modules expose vector semantics: `colorbalance` (`lift`/`gamma`/
+  `gain`, with mode-gated `offset`/`power`/`slope` aliases writable
+  instead under the default `SLOPE_OFFSET_POWER` mode — **stored identity
+  is `1.0`, which the GUI displays as `0.0`/`0%`**, so do not send a
+  GUI-style `0.0` expecting to reset a component), `channelmixerrgb`
+  (mixing rows), `rgblevels` (`levels.linked` when `autoscale` is linked,
+  `levels.red`/`levels.green`/`levels.blue` when it is independent —
+  writing one row never resets the others), `borders` (`color`/
+  `frame_color`), and `watermark` (`color`). See the sidecar
+  [`README`](../README.md#tools-exposed) for the full `vectors` argument
+  shape and worked colorbalance/rgblevels examples.
 * **darktable:** this feature targets the darktable release it ships in
   (5.x and later) on Linux, macOS, and Windows. The server reports its
   `darktable_version` in the handshake; schema responses are cacheable per

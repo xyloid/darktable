@@ -27,7 +27,12 @@ that rule: an op with a registered curve adapter exposes writable
 curve-class semantic parameters (gated by the `curve_params` hello
 capability) even though its native node arrays stay `writable: false` —
 `rgbcurve` (milestone 2) then `tonecurve`, `colorzones`, and `basecurve`
-(milestone 3). A module's tier follows from what fraction of its
+(milestone 3). Milestone 4 adds a second semantic class, the named
+fixed-length vector (plain vectors, color triples, and levels triples),
+exposing writable `vector`-class semantic parameters (gated by the
+`vector_params` capability) for `colorbalance`, `channelmixerrgb`,
+`rgblevels`, `borders`, and `watermark`, while their native arrays stay
+`writable: false`. A module's tier follows from what fraction of its
 user-facing controls survive these rules:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
@@ -56,7 +61,7 @@ with `instance_not_supported` (column "multi" below).
 Blending and mask parameters (`blendop`) are out of scope for every module,
 per the design spec's non-goals.
 
-## Tier 1 — full support (46 modules)
+## Tier 1 — full support (50 modules)
 
 | op | display name | multi | notes |
 |---|---|---|---|
@@ -67,9 +72,12 @@ per the design spec's non-goals.
 | `bilateral` | surface blur | yes | radius + per-channel sigmas |
 | `bloom` | bloom | yes | size/threshold/strength |
 | `blurs` | blurs | yes | lens/motion/gaussian blur, fully parametric |
+| `borders` | framing | yes | **milestone 4, semantic vectors**: `color`/`frame_color` writable via `semantic_values` (`vector_params` capability); `aspect`, `size`, `pos_h`, `pos_v`, frame scalars, `basis` enum writable; native arrays stay read-only with `represented_by`; unused `*_text` strings (appendix) |
 | `cacorrect` | raw chromatic aberrations | no | raw only; bool + iterations enum |
 | `cacorrectrgb` | chromatic aberrations | yes | guide channel enum + radius/strength |
 | `censorize` | censorize | yes | blur/pixelate radii |
+| `channelmixerrgb` | color calibration | yes | **milestone 4, semantic vectors**: `red`/`green`/`blue`/`saturation`/`lightness`/`grey` mixing rows writable via `semantic_values` (`vector_params` capability); illuminant/adaptation enums, `temperature`, `gamut`, `clip` scalars writable — usable for conversational white balance; native arrays stay read-only with `represented_by`; illuminant `x`,`y` set by picker |
+| `colorbalance` | color balance | yes | **milestone 4, semantic vectors**: `lift`/`gamma`/`gain` (mode-gated aliases `offset`/`power`/`slope` under `SLOPE_OFFSET_POWER`) writable via `semantic_values` (`vector_params` capability); `saturation`, `contrast`, `grey`, `saturation_out`, mode enum scalars writable; native arrays stay read-only with `represented_by` |
 | `colorbalancergb` | color balance rgb | yes | flagship grading module; 4-way Y/C/H + saturation/brilliance, all scalars |
 | `colorcontrast` | color contrast | yes | a/b steepness; offsets internal |
 | `colorequal` | color equalizer | yes | per-hue-band saturation/hue/brightness as named scalars — ideal for "make the greens less yellow" |
@@ -96,6 +104,7 @@ per the design spec's non-goals.
 | `primaries` | rgb primaries | yes | per-primary hue/purity scalars |
 | `profile_gamma` | unbreak input profile | no | log/gamma scalars + mode enum |
 | `rgbcurve` | rgb curve | yes | **milestone 2, semantic curves**: `curve.master`/`curve.red`/`curve.green`/`curve.blue` writable via `semantic_values` (`curve_params` capability); mode/compensation scalars writable; native node arrays stay read-only with `represented_by` |
+| `rgblevels` | rgb levels | yes | **milestone 4, semantic vectors**: `levels.linked` (autoscale linked) and `levels.red`/`levels.green`/`levels.blue` (autoscale independent) writable via `semantic_values` (`vector_params` capability); `autoscale`/`preserve_colors` enums writable; native `levels[3][3]` array stays read-only with `represented_by` |
 | `scalepixels` | scale pixels | no | single pixel-aspect scalar (niche, camera-specific) |
 | `shadhi` | shadows and highlights | yes | shadows/highlights/radius scalars; `flags`, `reserved2`, `low_approximation` internal |
 | `sharpen` | sharpen | yes | radius/amount/threshold |
@@ -107,13 +116,10 @@ per the design spec's non-goals.
 | `velvia` | velvia | yes | strength + mid-tones bias |
 | `vignette` | vignetting | yes | scale/falloff/brightness/saturation/shape + `center.x`/`center.y` (dotted, rangeless — finiteness-only validation); `unbound` internal |
 
-## Tier 2 — partial support (17 modules)
+## Tier 2 — partial support (14 modules)
 
 | op | display name | multi | supported | unsupported / caveats |
 |---|---|---|---|---|
-| `borders` | framing | yes | `aspect`, `size`, `pos_h`, `pos_v`, frame scalars, `basis` enum | `color[3]`/`frame_color[3]` arrays; unused `*_text` strings |
-| `channelmixerrgb` | color calibration | yes | illuminant/adaptation enums, `temperature`, `gamut`, `clip` — usable for conversational white balance | per-channel mixing arrays (`red[4]`…`grey[4]`); illuminant `x`,`y` set by picker |
-| `colorbalance` | color balance | yes | `saturation`, `contrast`, `grey`, `saturation_out`, mode enum | `lift`/`gamma`/`gain` arrays (the module's core) |
 | `colorcorrection` | color correction | yes | `saturation` | `hia`/`hib`/`loa`/`lob` are unranged Lab-ish grid coordinates; stored semantics unclear |
 | `colorharmonizer` | color harmonizer | yes | rule enum, anchor hue, pull strength/width, smoothing | `custom_hue[4]`, `node_saturation[4]` arrays |
 | `colorin` | input color profile | no | profile `type`/`intent`/`normalize` enums (caution: pipeline-level change) | ICC `filename` strings |
@@ -127,17 +133,15 @@ per the design spec's non-goals.
 | `rawdenoise` | raw denoise | yes | `threshold` | wavelet band arrays `x`/`y` |
 | `rawprepare` | raw black/white point | no | crop scalars, `raw_white_point`, flat-field enum — **caution: sensor-level values; wrong edits break the image** | `raw_black_level_separate[4]` array |
 | `temperature` | white balance | no | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
-| `watermark` | watermark | yes | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums | `filename`/`text`/`font` strings, `color[3]` array |
+| `watermark` | watermark | yes | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums; **milestone 4, semantic vectors**: `color` writable via `semantic_values` (`vector_params` capability); native array stays read-only with `represented_by` | `filename`/`text`/`font` strings still unsupported (near-Tier 1) |
 
-## Tier 3 — parameter editing excluded (8 modules)
+## Tier 3 — parameter editing excluded (7 modules)
 
 Enable/disable, reset, history, and undo remain available; `set_module_params`
-is not useful because the module's essence is unsupported data. The two
-remaining curve-shaped entries here are explicitly out of the curve-adapter
+is not useful because the module's essence is unsupported data. One
+remaining curve-shaped entry here is explicitly out of the curve-adapter
 pattern's reach: `atrous`'s per-band controls are fixed parallel arrays, not
-a control-point curve, and would need a new native layout kind; `rgblevels`'
-per-channel data is levels triples (black/grey/white), not curve nodes, and
-would need a levels parameter class instead.
+a control-point curve, and would need a new native layout kind.
 
 | op | display name | why excluded |
 |---|---|---|
@@ -148,7 +152,6 @@ would need a levels parameter class instead.
 | `lut3d` | LUT 3D | LUT file path + embedded compressed LUT blob; enums meaningless without a loaded LUT |
 | `rasterfile` | external raster masks | file-path strings |
 | `retouch` | retouch | drawn-form data (`rt_forms`); algorithm scalars only act on shapes drawn in the GUI |
-| `rgblevels` | rgb levels | per-channel `levels` 2-D array is the whole control |
 
 ## Deprecated (16 modules)
 
@@ -206,6 +209,7 @@ heuristic verified per module):
 |---|---|---|
 | `ashift` | `cl`, `cr`, `ct`, `cb`, `last_drawn_lines_count` (the `last_drawn_lines`/`last_quad_lines` arrays are already excluded by type; there is no separate `last_drawn_lines_version` field) | auto-crop results and line-fit state |
 | `basecurve` | — | (curve arrays already excluded by type) |
+| `borders` | `aspect_text`, `pos_h_text`, `pos_v_text` | marked UNUSED in source |
 | `channelmixerrgb` | `x`, `y`, `version` | picker-set illuminant coords; algorithm version |
 | `colorcontrast` | `a_offset`, `b_offset`, `unbound` | no GUI, legacy |
 | `colorize` | `version` | internal versioning |

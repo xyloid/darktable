@@ -1,7 +1,7 @@
 # darktable MCP milestone 4 — semantic vector class (vectors, colors, levels)
 
 **Date:** 2026-07-12
-**Status:** approved design, pre-plan — revised 2026-07-12 after two design
+**Status:** implemented — revised 2026-07-12 after two design
 reviews (all findings verified against the code; each delta below traces to
 one).
 **Builds on:** milestone 2 (`rgbcurve` semantic curves) and milestone 3
