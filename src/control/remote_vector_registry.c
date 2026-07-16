@@ -19,9 +19,9 @@
 // The per-op vector module adapter registry, mirroring
 // remote_curve_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the vector engine
-// API (list_schema/read_values). The adapter table starts empty in this
-// task -- later tasks (color/levels/plain vector adapters) populate it, the
-// same way rgbcurve/tonecurve/colorzones/basecurve were added to the curve
+// API (list_schema/read_values). colorbalance (Task 5) is the first entry;
+// later tasks (color/levels vector adapters) populate the rest, the same
+// way rgbcurve/tonecurve/colorzones/basecurve were added to the curve
 // registry one at a time.
 //
 // Like remote_vector.c, this file never includes JSON, socket, or MCP
@@ -80,16 +80,206 @@ static void deliver_error(dt_remote_error_t *owned_error, dt_remote_error_t **ou
 }
 
 /* ---------------------------------------------------------------------- */
-/* adapter table (empty; Tasks 5-8 populate it)                           */
+/* colorbalance adapter (milestone4 vector-class design doc SS Initial     */
+/* registry mapping / colorbalance). Params v3: lift[4]/gamma[4]/gain[4]   */
+/* float arrays, channel order factor/red/green/blue                      */
+/* (src/iop/colorbalance.c: _colorbalance_channel_t), all components       */
+/* $MIN: 0.0 $MAX: 2.0 $DEFAULT: 1.0.                                       */
 /* ---------------------------------------------------------------------- */
 
-// No adapters registered yet. dt_remote_vector_registry_lookup() therefore
-// returns NULL for every real operation until a later task adds an entry
-// here -- the "no adapter" paths in list_schema/read_values/apply_patch
-// (silent degrade) are the ones exercised in production right now. The
-// lone NULL keeps this a valid, non-empty C array initializer; the lookup
-// loop below skips it.
-static const dt_remote_vector_module_adapter_t *const s_adapters[] = { NULL };
+// Every alias shares this one component layout: factor/red/green/blue,
+// all 0.0-2.0 (colorbalance.c:100).
+static const dt_remote_vector_component_t s_colorbalance_components[4] = {
+  { "factor", 0.0, 2.0 }, { "red", 0.0, 2.0 }, { "green", 0.0, 2.0 }, { "blue", 0.0, 2.0 },
+};
+
+static const dt_remote_path_segment_t s_colorbalance_lift_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "lift" },
+};
+static const dt_remote_introspection_path_t s_colorbalance_lift_path = {
+  .segments = s_colorbalance_lift_segments, .length = G_N_ELEMENTS(s_colorbalance_lift_segments)
+};
+
+static const dt_remote_path_segment_t s_colorbalance_gamma_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "gamma" },
+};
+static const dt_remote_introspection_path_t s_colorbalance_gamma_path = {
+  .segments = s_colorbalance_gamma_segments, .length = G_N_ELEMENTS(s_colorbalance_gamma_segments)
+};
+
+static const dt_remote_path_segment_t s_colorbalance_gain_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "gain" },
+};
+static const dt_remote_introspection_path_t s_colorbalance_gain_path = {
+  .segments = s_colorbalance_gain_segments, .length = G_N_ELEMENTS(s_colorbalance_gain_segments)
+};
+
+// `mode` (dt_iop_colorbalance_mode_t, colorbalance.c:59) gates which of the
+// two alias sets over the same three arrays is live: LIFT_GAMMA_GAIN and
+// LEGACY both read/write lift/gamma/gain; SLOPE_OFFSET_POWER (the module
+// default) relabels the identical storage as offset/power/slope. Declared
+// exactly as colorzones' channel predicate is declared in this file's curve
+// twin (same dt_remote_parameter_predicate_t type) -- one shared predicate
+// object per alias set, reused for both active_when and writable_when so a
+// dormant alias reads back both inactive and non-writable.
+static const dt_remote_parameter_predicate_t s_colorbalance_lgg_predicate = {
+  .field = "mode", .op = DT_REMOTE_PREDICATE_NE, .enum_name = "SLOPE_OFFSET_POWER"
+};
+static const dt_remote_parameter_predicate_t s_colorbalance_sop_predicate = {
+  .field = "mode", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "SLOPE_OFFSET_POWER"
+};
+
+// Six mode-gated aliases over three arrays: (lift, offset) -> lift,
+// (gamma, power) -> gamma, (gain, slope) -> gain, per the GUI section
+// headers (lift/gamma/gain in LIFT_GAMMA_GAIN or LEGACY mode; the same
+// storage relabelled offset/power/slope in SLOPE_OFFSET_POWER mode).
+// Gating makes alias conflicts structurally impossible: at most one name
+// per array is writable under any mode. Every descriptor's stored 1.0 is
+// the identity, which the GUI displays as 0.0 for red/green/blue
+// (`set_offset(-1.0)`) or 100% for factor; the color space is ProPhoto RGB
+// in LIFT_GAMMA_GAIN and SLOPE_OFFSET_POWER modes, sRGB in LEGACY mode
+// (colorbalance.c:61-63).
+static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
+  {
+    .name = "lift",
+    .display_name = "Lift",
+    .description =
+      "Lift (shadows) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
+      "storage as 'offset'; writable only when mode is not SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_lift_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_lgg_predicate,
+    .writable_when = &s_colorbalance_lgg_predicate,
+  },
+  {
+    .name = "gamma",
+    .display_name = "Gamma",
+    .description =
+      "Gamma (midtones) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
+      "storage as 'power'; writable only when mode is not SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_gamma_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_lgg_predicate,
+    .writable_when = &s_colorbalance_lgg_predicate,
+  },
+  {
+    .name = "gain",
+    .display_name = "Gain",
+    .description =
+      "Gain (highlights) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
+      "storage as 'slope'; writable only when mode is not SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_gain_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_lgg_predicate,
+    .writable_when = &s_colorbalance_lgg_predicate,
+  },
+  {
+    .name = "offset",
+    .display_name = "Offset",
+    .description =
+      "Offset (shadows) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "factor. Color space is ProPhoto RGB. Aliases the same storage as 'lift'; writable only "
+      "when mode is SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_lift_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_sop_predicate,
+    .writable_when = &s_colorbalance_sop_predicate,
+  },
+  {
+    .name = "power",
+    .display_name = "Power",
+    .description =
+      "Power (midtones) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "factor. Color space is ProPhoto RGB. Aliases the same storage as 'gamma'; writable only "
+      "when mode is SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_gamma_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_sop_predicate,
+    .writable_when = &s_colorbalance_sop_predicate,
+  },
+  {
+    .name = "slope",
+    .display_name = "Slope",
+    .description =
+      "Slope (highlights) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "factor. Color space is ProPhoto RGB. Aliases the same storage as 'gain'; writable only "
+      "when mode is SLOPE_OFFSET_POWER.",
+    .native = s_colorbalance_gain_path,
+    .component_count = 4,
+    .components = s_colorbalance_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = &s_colorbalance_sop_predicate,
+    .writable_when = &s_colorbalance_sop_predicate,
+  },
+};
+
+// `mode` drives every alias's active_when/writable_when above; listing it
+// in prepare_fields means a scalar-only patch that switches mode still
+// triggers the registry-order write loop (VEC3-011's prepare_needed gate),
+// so a composed patch can flip mode and write the newly active alias in
+// the same request (the colorzones select-by precedent). No
+// validate_completed hook: no shipped colorbalance behavior needs a
+// composed post-write check beyond the per-descriptor gating already
+// enforced by the engine.
+static const char *const s_colorbalance_prepare[] = { "mode" };
+
+static const dt_remote_vector_module_adapter_t s_colorbalance_adapter = {
+  "colorbalance", 3, 3, s_colorbalance_vectors, 6, s_colorbalance_prepare, 1, NULL
+};
+
+/* ---------------------------------------------------------------------- */
+/* adapter table                                                           */
+/* ---------------------------------------------------------------------- */
+
+// The full adapter table. colorbalance for now; a future op adds another
+// entry here, not a parallel lookup mechanism -- same convention as
+// remote_curve_registry.c's own s_adapters[].
+static const dt_remote_vector_module_adapter_t *const s_adapters[] = {
+  &s_colorbalance_adapter,
+};
 
 static dt_remote_vector_registry_lookup_override_t s_lookup_override = NULL;
 

@@ -649,18 +649,30 @@ typedef struct borders_fixture_t
   dt_iop_module_t *module;
 } borders_fixture_t;
 
-static borders_fixture_t *borders_fixture_new(void)
+// Generic real-module loader: despite the type name (kept for the many
+// existing borders-specific callers below), nothing here is borders-
+// specific -- same "adapter_fixture_new(op)" generalization
+// test_remote_curve.c uses for its own rgbcurve_fixture_t across
+// rgbcurve/tonecurve/colorzones/basecurve. The colorbalance adapter
+// section further below reuses this loader directly rather than adding a
+// parallel fixture type.
+static borders_fixture_t *real_vector_module_fixture_new(const char *op)
 {
   borders_fixture_t *fixture = g_new0(borders_fixture_t, 1);
   dt_dev_init(&fixture->dev, TRUE);
   fixture->dev.gui_attached = FALSE;
   fixture->module = g_malloc0(sizeof(dt_iop_module_t));
-  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
   assert_non_null(so);
   assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
   memcpy(fixture->module->params, fixture->module->default_params, fixture->module->params_size);
   fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
   return fixture;
+}
+
+static borders_fixture_t *borders_fixture_new(void)
+{
+  return real_vector_module_fixture_new("borders");
 }
 
 static void borders_fixture_free(borders_fixture_t *fixture)
@@ -2923,6 +2935,256 @@ static void test_apply_patch_no_vector_content_returns_true_without_touching_reg
   borders_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* colorbalance adapter (production registry; milestone4 vector-class      */
+/* design doc SS Initial registry mapping / colorbalance). Unlike every     */
+/* test above, these exercise the *production* s_adapters[] table (Task 5) */
+/* through the public engine API directly -- no dt_remote_vector_registry_ */
+/* set_lookup_override() install -- the same "real adapter, no override"   */
+/* pattern test_remote_curve_registry.c uses for rgbcurve/tonecurve/       */
+/* colorzones/basecurve once those ship in the curve registry. lift/gamma/ */
+/* gain and offset/power/slope are six mode-gated aliases over the same    */
+/* three lift[4]/gamma[4]/gain[4] float arrays (colorbalance.c:100);       */
+/* `mode` (colorbalance.c:59) selects which alias set is live, defaulting  */
+/* to SLOPE_OFFSET_POWER (offset/power/slope).                             */
+/* ---------------------------------------------------------------------- */
+
+static dt_remote_patch_entry_t *make_colorbalance_mode_entry(const borders_fixture_t *fixture,
+                                                              const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  (void)dt_introspection_get_child(fixture->module->so->get_introspection()->field,
+                                   fixture->module->params, "mode", &field);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup("mode");
+  entry->value.type = DT_REMOTE_VALUE_ENUM;
+  entry->value.v.e.value = value;
+  entry->value.v.e.name = g_strdup(enum_name);
+  return entry;
+}
+
+static void test_colorbalance_schema_lists_six_mode_gated_aliases_in_order(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("colorbalance");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 6);
+
+  static const char *const expected_names[] = { "lift", "gamma", "gain", "offset", "power", "slope" };
+  // lift/gamma/gain are writable when mode != SLOPE_OFFSET_POWER (NE);
+  // offset/power/slope alias the same three arrays, writable when
+  // mode == SLOPE_OFFSET_POWER (EQ) -- the module's default mode.
+  static const dt_remote_predicate_operator_t expected_ops[] = {
+    DT_REMOTE_PREDICATE_NE, DT_REMOTE_PREDICATE_NE, DT_REMOTE_PREDICATE_NE,
+    DT_REMOTE_PREDICATE_EQ, DT_REMOTE_PREDICATE_EQ, DT_REMOTE_PREDICATE_EQ,
+  };
+  static const char *const expected_component_names[] = { "factor", "red", "green", "blue" };
+
+  for(guint i = 0; i < 6; i++)
+  {
+    const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_PLAIN);
+    assert_null(schema->color_space);
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+    assert_non_null(schema->writable_when);
+    assert_string_equal(schema->writable_when->field, "mode");
+    assert_string_equal(schema->writable_when->enum_name, "SLOPE_OFFSET_POWER");
+    assert_int_equal(schema->writable_when->op, expected_ops[i]);
+    assert_non_null(schema->active_when);
+    assert_string_equal(schema->active_when->field, "mode");
+    assert_string_equal(schema->active_when->enum_name, "SLOPE_OFFSET_POWER");
+    assert_int_equal(schema->active_when->op, expected_ops[i]);
+
+    assert_int_equal(schema->components->len, 4);
+    for(guint c = 0; c < 4; c++)
+    {
+      const dt_remote_vector_component_schema_t *component =
+        &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+      assert_string_equal(component->name, expected_component_names[c]);
+      assert_float_equal(component->minimum, 0.0, 0.0);
+      assert_float_equal(component->maximum, 2.0, 0.0);
+    }
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// The component-order proof, against an *independently constructed* blob:
+// the params blob comes from the module's own introspection defaults, and
+// the poke below writes directly through dt_introspection_access_array()
+// (the same primitive write_color_component() wraps) -- never through
+// dt_remote_vector_apply_patch() or any other part of the engine under
+// test. A component-order bug that swapped the write and read paths
+// identically would still pass a write-then-readback round trip; poking
+// the native offset independently and reading it back through
+// dt_remote_vector_read_values() is what actually proves component 1 of
+// the "lift" descriptor is red, not e.g. green or factor.
+static void test_colorbalance_read_values_proves_component_order_against_independent_blob(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+
+  write_color_component(fixture, fixture->module->params, "lift", 1, 1.25f);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *lift = g_hash_table_lookup(values, "lift");
+  assert_non_null(lift);
+  assert_int_equal(lift->values->len, 4);
+  // component 0 ("factor"), 2 ("green"), 3 ("blue") are untouched
+  // defaults; only component 1 ("red") was poked.
+  assert_float_equal(g_array_index(lift->values, double, 0), 1.0, 1e-6);
+  assert_float_equal(g_array_index(lift->values, double, 1), 1.25, 1e-6);
+  assert_float_equal(g_array_index(lift->values, double, 2), 1.0, 1e-6);
+  assert_float_equal(g_array_index(lift->values, double, 3), 1.0, 1e-6);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+static void test_colorbalance_default_mode_gates_offset_writable_lift_not(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+  // Module default is SLOPE_OFFSET_POWER (colorbalance.c:62); no scalar
+  // write needed to reach the state under test.
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+
+  static const char *const lgg_names[] = { "lift", "gamma", "gain" };
+  static const char *const sop_names[] = { "offset", "power", "slope" };
+  for(guint i = 0; i < G_N_ELEMENTS(lgg_names); i++)
+  {
+    dt_remote_vector_value_t *value = g_hash_table_lookup(values, lgg_names[i]);
+    assert_non_null(value);
+    assert_false(value->active);
+    assert_false(value->writable_now);
+  }
+  for(guint i = 0; i < G_N_ELEMENTS(sop_names); i++)
+  {
+    dt_remote_vector_value_t *value = g_hash_table_lookup(values, sop_names[i]);
+    assert_non_null(value);
+    assert_true(value->active);
+    assert_true(value->writable_now);
+  }
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+static void test_colorbalance_apply_patch_rejects_lift_write_under_default_sop_mode(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double lift_values[] = { 1.1, 1.2, 1.3, 1.4 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("lift", lift_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  // Same not-writable error shape the curve engine returns for a gated-off
+  // write (see e.g. test_apply_patch_active_when_is_evaluated_independently
+  // above and the colorzones tests in test_remote_curve.c): unsupported
+  // field, not invalid value.
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_colorbalance_composed_mode_switch_writes_lift_leaves_gamma_gain_untouched(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+
+  static const double lift_values[] = { 0.4, 0.5, 0.6, 0.7 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_colorbalance_mode_entry(fixture, "LIFT_GAMMA_GAIN"));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("lift", lift_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  for(guint i = 0; i < 4; i++)
+    assert_float_equal(read_color_component(fixture, projected, "lift", i), (float)lift_values[i], 1e-6);
+  // gamma/gain are separate native arrays from lift's; writing "lift" must
+  // never touch them, mode switch or not.
+  for(guint i = 0; i < 4; i++)
+  {
+    assert_float_equal(read_color_component(fixture, projected, "gamma", i),
+                       read_color_component(fixture, fixture->module->params, "gamma", i), 0.0);
+    assert_float_equal(read_color_component(fixture, projected, "gain", i),
+                       read_color_component(fixture, fixture->module->params, "gain", i), 0.0);
+  }
+
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+static void test_colorbalance_alias_write_conflict_is_rejected_atomically(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorbalance");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  // Default mode is SLOPE_OFFSET_POWER: "offset" is writable, "lift" is
+  // not -- gating makes it structurally impossible for both aliases of
+  // one array to be writable at once, under any mode. "lift" sorts first
+  // in registry order, so it is the descriptor evaluated (and rejected)
+  // before "offset" is ever reached.
+  static const double lift_values[] = { 1.1, 1.2, 1.3, 1.4 };
+  static const double offset_values[] = { 0.4, 0.5, 0.6, 0.7 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("offset", offset_values, 4));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("lift", lift_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -3060,6 +3322,22 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_apply_patch_skips_non_vector_semantic_entries,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_no_vector_content_returns_true_without_touching_registry,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_colorbalance_schema_lists_six_mode_gated_aliases_in_order,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorbalance_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_colorbalance_default_mode_gates_offset_writable_lift_not,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorbalance_apply_patch_rejects_lift_write_under_default_sop_mode,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorbalance_composed_mode_switch_writes_lift_leaves_gamma_gain_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_colorbalance_alias_write_conflict_is_rejected_atomically,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 
