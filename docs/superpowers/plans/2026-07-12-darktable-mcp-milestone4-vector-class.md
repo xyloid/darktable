@@ -542,7 +542,7 @@ Six descriptors over three paths — alias pairs (lift,offset)→`lift`,
 (gamma,power)→`gamma`, (gain,slope)→`gain`; all `component_count 4`,
 `native_capacity 4`, subtype PLAIN. `prepare_fields = { "mode" }`.
 Descriptions are required to state (spec, verbatim requirement): stored 1.0
-is the identity — the GUI displays it as 0.0 (red/green/blue) or 100%
+is the identity — the GUI displays it as 0.0 (red/green/blue) or 0%
 (factor) — and the color space (ProPhoto RGB; LEGACY mode is sRGB).
 
 - [ ] **Step 1: Write failing tests** (real `colorbalance` .so, version 3):
@@ -885,7 +885,7 @@ Spec §Documentation — same milestone, not after.
   verbatim.
 - [ ] **Step 3: MCP user docs.** README + remote-control.md: `vectors`
   argument with a colorbalance SOP example and the stored-identity warning
-  (1.0 = identity, GUI shows 0.0/100%); rgblevels linked/independent
+  (1.0 = identity, GUI shows 0.0/0%); rgblevels linked/independent
   example.
 - [ ] **Step 4: Verify all suites one final time** (full ctest + pytest +
   integration) and commit —

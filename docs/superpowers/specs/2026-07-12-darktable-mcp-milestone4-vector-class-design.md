@@ -207,7 +207,7 @@ Grounded in the current param structs:
   most one name per array is writable under any composed mode. Component
   descriptions must state the stored-value convention — stored 1.0 is the
   identity, which the GUI displays as 0.0 (R/G/B, `set_offset(-1.0)`) or
-  100% (factor) — and the per-mode color space, or clients will send
+  0% (factor) — and the per-mode color space, or clients will send
   GUI-style values.
 - **channelmixerrgb** — six `float[4]` rows: `red`/`green`/`blue`
   (COLOR_MIN −2.0 … COLOR_MAX 2.0) and `saturation`/`lightness`/`grey`

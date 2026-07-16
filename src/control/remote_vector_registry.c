@@ -136,7 +136,7 @@ static const dt_remote_parameter_predicate_t s_colorbalance_sop_predicate = {
 // Gating makes alias conflicts structurally impossible: at most one name
 // per array is writable under any mode. Every descriptor's stored 1.0 is
 // the identity, which the GUI displays as 0.0 for red/green/blue
-// (`set_offset(-1.0)`) or 100% for factor; the color space is ProPhoto RGB
+// (`set_offset(-1.0)`) or 0% for factor; the color space is ProPhoto RGB
 // in LIFT_GAMMA_GAIN and SLOPE_OFFSET_POWER modes, sRGB in LEGACY mode
 // (colorbalance.c:61-63).
 static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
@@ -145,7 +145,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Lift",
     .description =
       "Lift (shadows) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
-      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 0% for factor. Color "
       "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
       "storage as 'offset'; writable only when mode is not SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_lift_path,
@@ -164,7 +164,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Gamma",
     .description =
       "Gamma (midtones) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
-      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 0% for factor. Color "
       "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
       "storage as 'power'; writable only when mode is not SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_gamma_path,
@@ -183,7 +183,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Gain",
     .description =
       "Gain (highlights) in lift/gamma/gain mode (LIFT_GAMMA_GAIN or LEGACY): stored 1.0 is the "
-      "identity, which the GUI displays as 0.0 for red/green/blue or 100% for factor. Color "
+      "identity, which the GUI displays as 0.0 for red/green/blue or 0% for factor. Color "
       "space is ProPhoto RGB in LIFT_GAMMA_GAIN mode, sRGB in LEGACY mode. Aliases the same "
       "storage as 'slope'; writable only when mode is not SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_gain_path,
@@ -202,7 +202,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Offset",
     .description =
       "Offset (shadows) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
-      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 0% for "
       "factor. Color space is ProPhoto RGB. Aliases the same storage as 'lift'; writable only "
       "when mode is SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_lift_path,
@@ -221,7 +221,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Power",
     .description =
       "Power (midtones) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
-      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 0% for "
       "factor. Color space is ProPhoto RGB. Aliases the same storage as 'gamma'; writable only "
       "when mode is SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_gamma_path,
@@ -240,7 +240,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
     .display_name = "Slope",
     .description =
       "Slope (highlights) in slope/offset/power mode (SLOPE_OFFSET_POWER, the module default): "
-      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 100% for "
+      "stored 1.0 is the identity, which the GUI displays as 0.0 for red/green/blue or 0% for "
       "factor. Color space is ProPhoto RGB. Aliases the same storage as 'gain'; writable only "
       "when mode is SLOPE_OFFSET_POWER.",
     .native = s_colorbalance_gain_path,
