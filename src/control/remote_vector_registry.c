@@ -19,10 +19,10 @@
 // The per-op vector module adapter registry, mirroring
 // remote_curve_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the vector engine
-// API (list_schema/read_values). colorbalance (Task 5) is the first entry;
-// later tasks (color/levels vector adapters) populate the rest, the same
-// way rgbcurve/tonecurve/colorzones/basecurve were added to the curve
-// registry one at a time.
+// API (list_schema/read_values). colorbalance, channelmixerrgb, rgblevels,
+// borders, and watermark are all registered here (19 semantic names
+// total), the same way rgbcurve/tonecurve/colorzones/basecurve were added
+// to the curve registry one at a time.
 //
 // Like remote_vector.c, this file never includes JSON, socket, or MCP
 // protocol headers -- introspection/GLib (plus develop/imageop.h, for the
@@ -681,16 +681,130 @@ static const dt_remote_vector_module_adapter_t s_rgblevels_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* borders adapter (milestone4 vector-class design doc SS Module adapter   */
+/* specifics, borders). Params v4: `color[3]` (border fill color,          */
+/* $DEFAULT 1.0, borders.c:82) and `frame_color[3]` (frame line color,     */
+/* $DEFAULT 0.0, borders.c:103) -- two independent float[3] leaves, no     */
+/* $MIN/$MAX in the source; COLOR subtype with the 0.0-1.0 range           */
+/* normative per the design doc's resolved decision. No predicates: both   */
+/* colors are always active and always writable.                          */
+/* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+/* watermark adapter (milestone4 vector-class design doc SS Module         */
+/* adapter specifics, watermark). Params v7: `color[3]` (SVG watermark     */
+/* tint/fill color, $DEFAULT 0.0, watermark.c:109) -- a single float[3]    */
+/* leaf, no $MIN/$MAX in the source; COLOR subtype with the 0.0-1.0 range  */
+/* normative per the design doc's resolved decision. No predicates:        */
+/* always active and always writable.                                     */
+/* ---------------------------------------------------------------------- */
+
+// Shared by both adapters below: a plain red/green/blue triple, all
+// 0.0-1.0 -- the design doc's normative COLOR component layout for both
+// borders' two color fields and watermark's one.
+static const dt_remote_vector_component_t s_rgb_color_components[3] = {
+  { "red", 0.0, 1.0 }, { "green", 0.0, 1.0 }, { "blue", 0.0, 1.0 },
+};
+
+static const dt_remote_path_segment_t s_borders_color_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "color" },
+};
+static const dt_remote_introspection_path_t s_borders_color_path = {
+  .segments = s_borders_color_segments, .length = G_N_ELEMENTS(s_borders_color_segments)
+};
+
+static const dt_remote_path_segment_t s_borders_frame_color_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "frame_color" },
+};
+static const dt_remote_introspection_path_t s_borders_frame_color_path = {
+  .segments = s_borders_frame_color_segments, .length = G_N_ELEMENTS(s_borders_frame_color_segments)
+};
+
+static const dt_remote_vector_descriptor_t s_borders_vectors[2] = {
+  {
+    .name = "color",
+    .display_name = "Color",
+    .description = "Border fill color (borders.c:82): the color of the border added around the image.",
+    .native = s_borders_color_path,
+    .component_count = 3,
+    .components = s_rgb_color_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_COLOR,
+    .color_space = "display_rgb",
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "frame_color",
+    .display_name = "Frame color",
+    .description =
+      "Frame line color (borders.c:103): the color of the thin line drawn between the image and "
+      "the border when the frame line size is nonzero.",
+    .native = s_borders_frame_color_path,
+    .component_count = 3,
+    .components = s_rgb_color_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_COLOR,
+    .color_space = "display_rgb",
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const dt_remote_vector_module_adapter_t s_borders_adapter = {
+  "borders", 4, 4, s_borders_vectors, 2, NULL, 0, NULL
+};
+
+static const dt_remote_path_segment_t s_watermark_color_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "color" },
+};
+static const dt_remote_introspection_path_t s_watermark_color_path = {
+  .segments = s_watermark_color_segments, .length = G_N_ELEMENTS(s_watermark_color_segments)
+};
+
+static const dt_remote_vector_descriptor_t s_watermark_vectors[1] = {
+  {
+    .name = "color",
+    .display_name = "Color",
+    .description =
+      "Tint/fill color applied to the SVG watermark (watermark.c:109), used where the marker's "
+      "own SVG references $(WATERMARK_COLOR).",
+    .native = s_watermark_color_path,
+    .component_count = 3,
+    .components = s_rgb_color_components,
+    .native_capacity = 3,
+    .subtype = DT_REMOTE_VECTOR_COLOR,
+    .color_space = "display_rgb",
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const dt_remote_vector_module_adapter_t s_watermark_adapter = {
+  "watermark", 7, 7, s_watermark_vectors, 1, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// The full adapter table. colorbalance, channelmixerrgb, and rgblevels for
-// now; a future op adds another entry here, not a parallel lookup
-// mechanism -- same convention as remote_curve_registry.c's own s_adapters[].
+// The full adapter table: colorbalance, channelmixerrgb, rgblevels,
+// borders, and watermark -- 19 semantic names total (6 + 6 + 4 + 2 + 1),
+// the full milestone4 vector-class set. A future op adds another entry
+// here, not a parallel lookup mechanism -- same convention as
+// remote_curve_registry.c's own s_adapters[].
 static const dt_remote_vector_module_adapter_t *const s_adapters[] = {
   &s_colorbalance_adapter,
   &s_cmrgb_adapter,
   &s_rgblevels_adapter,
+  &s_borders_adapter,
+  &s_watermark_adapter,
 };
 
 static dt_remote_vector_registry_lookup_override_t s_lookup_override = NULL;

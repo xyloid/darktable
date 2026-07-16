@@ -3841,6 +3841,408 @@ static void test_rgblevels_linked_write_then_switch_to_independent_reads_back_vi
   borders_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* borders adapter (production registry; milestone4 vector-class design    */
+/* doc SS Module adapter specifics, borders). Params v4: `color[3]`        */
+/* (border fill color, $DEFAULT 1.0, borders.c:82) and `frame_color[3]`    */
+/* (frame line color, $DEFAULT 0.0, borders.c:103) -- two independent      */
+/* float[3] leaves, no $MIN/$MAX in the source, COLOR subtype with the     */
+/* 0.0-1.0 range normative per the design doc's resolved decision. No      */
+/* predicates: both colors are always active and always writable. These    */
+/* tests exercise the production s_adapters[] table directly, same "real   */
+/* adapter, no override" pattern as the colorbalance/channelmixerrgb/      */
+/* rgblevels sections above.                                               */
+/* ---------------------------------------------------------------------- */
+
+static void test_borders_schema_lists_color_and_frame_color_as_display_rgb(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 2);
+
+  static const char *const expected_names[] = { "color", "frame_color" };
+  static const char *const expected_component_names[] = { "red", "green", "blue" };
+
+  for(guint i = 0; i < 2; i++)
+  {
+    const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_COLOR);
+    assert_non_null(schema->color_space);
+    assert_string_equal(schema->color_space, "display_rgb");
+    assert_false(schema->strictly_increasing);
+    assert_float_equal(schema->minimum_gap, 0.0, 0.0);
+    // No predicates: both colors are unconditionally writable.
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+
+    assert_int_equal(schema->components->len, 3);
+    for(guint c = 0; c < 3; c++)
+    {
+      const dt_remote_vector_component_schema_t *component =
+        &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+      assert_string_equal(component->name, expected_component_names[c]);
+      assert_float_equal(component->minimum, 0.0, 0.0);
+      assert_float_equal(component->maximum, 1.0, 0.0);
+    }
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// The component-order proof, against an independently-poked blob -- same
+// rationale as
+// test_colorbalance_read_values_proves_component_order_against_independent_blob
+// above: poking the native offset directly (never through the engine's own
+// write path) and reading it back through dt_remote_vector_read_values() is
+// what proves component 1 of "color" is green, not red or blue.
+static void test_borders_color_read_values_proves_component_order_against_independent_blob(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("borders");
+
+  write_color_component(fixture, fixture->module->params, "color", 1, 0.42f);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *color = g_hash_table_lookup(values, "color");
+  assert_non_null(color);
+  assert_int_equal(color->values->len, 3);
+  // component 0 ("red") and 2 ("blue") are untouched defaults (1.0,
+  // borders.c:82); only component 1 ("green") was poked.
+  assert_float_equal(g_array_index(color->values, double, 0), 1.0, 1e-6);
+  assert_float_equal(g_array_index(color->values, double, 1), 0.42, 1e-6);
+  assert_float_equal(g_array_index(color->values, double, 2), 1.0, 1e-6);
+  assert_true(color->active);
+  assert_true(color->writable_now);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+// Same component-order proof for "frame_color", against its own
+// independently-poked blob -- proves the second descriptor resolves to its
+// own native leaf, not "color"'s.
+static void test_borders_frame_color_read_values_proves_component_order_against_independent_blob(
+  void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("borders");
+
+  write_color_component(fixture, fixture->module->params, "frame_color", 2, 0.64f);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *frame_color = g_hash_table_lookup(values, "frame_color");
+  assert_non_null(frame_color);
+  assert_int_equal(frame_color->values->len, 3);
+  // component 0 ("red") and 1 ("green") are untouched defaults (0.0,
+  // borders.c:103); only component 2 ("blue") was poked.
+  assert_float_equal(g_array_index(frame_color->values, double, 0), 0.0, 1e-6);
+  assert_float_equal(g_array_index(frame_color->values, double, 1), 0.0, 1e-6);
+  assert_float_equal(g_array_index(frame_color->values, double, 2), 0.64, 1e-6);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+// Writing "color" must never touch "frame_color"'s separate native array,
+// nor any other scalar byte in the params block -- byte-identical, not just
+// value-equal, proven with a full-params_size memcmp against a hand-built
+// "expected" buffer (same convention as
+// test_cmrgb_apply_patch_preserves_reserved_fourth_component above).
+static void test_borders_apply_patch_writes_color_leaves_frame_color_and_every_other_byte_untouched(
+  void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("borders");
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "color", 0, 0.1f);
+  write_color_component(fixture, expected, "color", 1, 0.2f);
+  write_color_component(fixture, expected, "color", 2, 0.3f);
+
+  static const double color_values[] = { 0.1, 0.2, 0.3 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("color", color_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// The brief's explicit requirement: a "frame_color" write leaves "color"
+// and every other scalar byte untouched -- the mirror image of the
+// "color" write test above, proven the same way (full-params_size memcmp
+// against a hand-built expected buffer).
+static void test_borders_apply_patch_writes_frame_color_leaves_color_and_every_other_byte_untouched(
+  void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("borders");
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "frame_color", 0, 0.7f);
+  write_color_component(fixture, expected, "frame_color", 1, 0.8f);
+  write_color_component(fixture, expected, "frame_color", 2, 0.9f);
+
+  static const double frame_color_values[] = { 0.7, 0.8, 0.9 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("frame_color", frame_color_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Out-of-range rejection happens in the double domain before float
+// narrowing: 1.00000001 against a 0.0-1.0 component is rejected even
+// though it would narrow to the same float32 as 1.0. Rejection is
+// byte-atomic: the live params blob is left byte-identical (full-
+// params_size memcmp), same contract
+// test_apply_patch_domain_violation_rejects_and_leaves_live_params_untouched
+// proves against the synthetic descriptor, now proven against the
+// production borders adapter and a real module blob.
+static void test_borders_apply_patch_rejects_out_of_range_value_in_double_domain(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("borders");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double color_values[] = { 0.1, 1.00000001, 0.2 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("color", color_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "domain"));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* watermark adapter (production registry; milestone4 vector-class design  */
+/* doc SS Module adapter specifics, watermark). Params v7: `color[3]`      */
+/* (SVG watermark tint/fill color, $DEFAULT 0.0, watermark.c:109) -- a     */
+/* single float[3] leaf, no $MIN/$MAX in the source, COLOR subtype with    */
+/* the 0.0-1.0 range normative per the design doc's resolved decision. No  */
+/* predicates: always active and always writable. These tests exercise     */
+/* the production s_adapters[] table directly, same "real adapter, no      */
+/* override" pattern as the sections above.                                */
+/* ---------------------------------------------------------------------- */
+
+static void test_watermark_schema_lists_color_as_display_rgb(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("watermark");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 1);
+
+  const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, 0);
+  assert_string_equal(schema->name, "color");
+  assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_COLOR);
+  assert_non_null(schema->color_space);
+  assert_string_equal(schema->color_space, "display_rgb");
+  assert_false(schema->strictly_increasing);
+  assert_float_equal(schema->minimum_gap, 0.0, 0.0);
+  assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(schema->active_when);
+  assert_null(schema->writable_when);
+
+  static const char *const expected_component_names[] = { "red", "green", "blue" };
+  assert_int_equal(schema->components->len, 3);
+  for(guint c = 0; c < 3; c++)
+  {
+    const dt_remote_vector_component_schema_t *component =
+      &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+    assert_string_equal(component->name, expected_component_names[c]);
+    assert_float_equal(component->minimum, 0.0, 0.0);
+    assert_float_equal(component->maximum, 1.0, 0.0);
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// The component-order proof, against an independently-poked blob -- same
+// rationale as the borders section's own component-order tests above.
+static void test_watermark_read_values_proves_component_order_against_independent_blob(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("watermark");
+
+  write_color_component(fixture, fixture->module->params, "color", 0, 0.15f);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *color = g_hash_table_lookup(values, "color");
+  assert_non_null(color);
+  assert_int_equal(color->values->len, 3);
+  // component 1 ("green") and 2 ("blue") are untouched defaults (0.0,
+  // watermark.c:109); only component 0 ("red") was poked.
+  assert_float_equal(g_array_index(color->values, double, 0), 0.15, 1e-6);
+  assert_float_equal(g_array_index(color->values, double, 1), 0.0, 1e-6);
+  assert_float_equal(g_array_index(color->values, double, 2), 0.0, 1e-6);
+  assert_true(color->active);
+  assert_true(color->writable_now);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+// Writing "color" must leave every other scalar byte in the params block
+// untouched -- byte-identical, not just value-equal, same
+// full-params_size-memcmp convention as the borders section's own write
+// test above.
+static void test_watermark_apply_patch_writes_color_leaves_every_other_byte_untouched(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("watermark");
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "color", 0, 0.55f);
+  write_color_component(fixture, expected, "color", 1, 0.66f);
+  write_color_component(fixture, expected, "color", 2, 0.77f);
+
+  static const double color_values[] = { 0.55, 0.66, 0.77 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("color", color_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Out-of-range rejection in the double domain, byte-atomic on rejection --
+// same contract as the borders section's own out-of-range test above, now
+// proven against the production watermark adapter (params v7).
+static void test_watermark_apply_patch_rejects_out_of_range_value_in_double_domain(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("watermark");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double color_values[] = { 0.3, 0.4, 1.00000001 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("color", color_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "domain"));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* registry total (production registry; milestone4 vector-class design doc */
+/* SS Initial registry mapping): with all five adapters registered         */
+/* (colorbalance, channelmixerrgb, rgblevels, borders, watermark), the      */
+/* production registry advertises 19 semantic names total                  */
+/* (6 + 6 + 4 + 2 + 1). Queries dt_remote_vector_list_schema() -- the same  */
+/* public entry point each adapter section above uses -- across all five   */
+/* real module .so's and sums the returned schema counts, rather than      */
+/* reaching into the static s_adapters[] table directly.                   */
+/* ---------------------------------------------------------------------- */
+
+static void test_registry_lists_nineteen_semantic_names_across_five_adapters(void **state)
+{
+  (void)state;
+  static const char *const ops[] = {
+    "colorbalance", "channelmixerrgb", "rgblevels", "borders", "watermark",
+  };
+  static const guint expected_counts[] = { 6, 6, 4, 2, 1 };
+
+  guint total = 0;
+  for(guint i = 0; i < G_N_ELEMENTS(ops); i++)
+  {
+    dt_iop_module_so_t *so = dt_iop_get_module_so(ops[i]);
+    assert_non_null(so);
+
+    GPtrArray *schemas = NULL;
+    dt_remote_error_t *error = NULL;
+    assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+    assert_null(error);
+    assert_non_null(schemas);
+    assert_int_equal(schemas->len, expected_counts[i]);
+    total += schemas->len;
+
+    g_ptr_array_unref(schemas);
+  }
+
+  assert_int_equal(total, 19);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -4029,6 +4431,39 @@ int main(void)
     cmocka_unit_test_setup_teardown(
       test_rgblevels_linked_write_then_switch_to_independent_reads_back_via_red_alias,
       lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_borders_schema_lists_color_and_frame_color_as_display_rgb,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_borders_color_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_borders_frame_color_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_borders_apply_patch_writes_color_leaves_frame_color_and_every_other_byte_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_borders_apply_patch_writes_frame_color_leaves_color_and_every_other_byte_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_borders_apply_patch_rejects_out_of_range_value_in_double_domain,
+      lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_watermark_schema_lists_color_as_display_rgb,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_watermark_read_values_proves_component_order_against_independent_blob,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_watermark_apply_patch_writes_color_leaves_every_other_byte_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_watermark_apply_patch_rejects_out_of_range_value_in_double_domain,
+      lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_registry_lists_nineteen_semantic_names_across_five_adapters,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
   };
 
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
