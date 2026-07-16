@@ -542,7 +542,7 @@ async def test_set_module_params_vectors_translates_to_semantic_values(
     await app.call_tool(
         "set_module_params",
         {
-            "module": "colorbalancergb",
+            "module": "colorbalance",
             "values": {},
             "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
         },
@@ -581,7 +581,7 @@ async def test_set_module_params_curves_and_vectors_merge_into_semantic_values(
     await app.call_tool(
         "set_module_params",
         {
-            "module": "colorbalancergb",
+            "module": "colorbalance",
             "values": {},
             "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
             "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
@@ -613,7 +613,7 @@ async def test_set_module_params_curves_and_vectors_overlap_fails_before_wire(
         await app.call_tool(
             "set_module_params",
             {
-                "module": "colorbalancergb",
+                "module": "colorbalance",
                 "values": {},
                 "curves": {"lift": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
                 "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
@@ -642,7 +642,7 @@ async def test_set_module_params_vectors_gated_on_vector_params_capability(
         await app.call_tool(
             "set_module_params",
             {
-                "module": "colorbalancergb",
+                "module": "colorbalance",
                 "values": {},
                 "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
             },
@@ -739,7 +739,7 @@ async def test_set_module_params_vectors_rejects_invalid_entries(
     with pytest.raises(ToolError) as excinfo:
         await app.call_tool(
             "set_module_params",
-            {"module": "colorbalancergb", "values": {}, "vectors": bad_vectors},
+            {"module": "colorbalance", "values": {}, "vectors": bad_vectors},
         )
 
     message = str(excinfo.value)

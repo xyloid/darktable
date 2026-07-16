@@ -222,11 +222,11 @@ def build_server(
 
         `vectors` edits semantic vector parameters (see
         `get_module_schema`'s `semantic_fields` with `"class": "vector"`,
-        e.g. colorbalancergb's `lift`) and needs a darktable that
+        e.g. colorbalance's `lift`) and needs a darktable that
         advertises the `vector_params` capability. It maps semantic IDs to
         a flat list of finite numbers; each patch replaces that whole
         named vector (unlisted vectors are untouched). Components are the
-        module's stored-space values -- e.g. colorbalancergb stores its
+        module's stored-space values -- e.g. colorbalance stores its
         identity lift/gamma/gain as 1.0, not 0.0. `curves` and `vectors`
         may be given together; a semantic ID given in both raises an
         error before either is sent."""
