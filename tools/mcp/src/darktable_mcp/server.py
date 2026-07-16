@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp.exceptions import ToolError
 
 from . import discovery
 from .errors import TransportError
@@ -94,6 +96,22 @@ def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
                 )
             entry["interpolation"] = interp
         out[name] = entry
+    return out
+
+
+def _wire_vector_values(vectors: dict[str, Any]) -> dict[str, Any]:
+    """Translate the `vectors` tool argument to wire semantic_values
+    entries. Mirrors _wire_semantic_values: validate fully before any
+    wire traffic."""
+    out: dict[str, Any] = {}
+    for name, values in vectors.items():
+        ok = (isinstance(values, (list, tuple)) and len(values) > 0
+              and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                      and math.isfinite(v) for v in values))
+        if not ok:
+            raise ToolError(
+                f"vector '{name}' must be a non-empty list of finite numbers")
+        out[name] = {"class": "vector", "values": [float(v) for v in values]}
     return out
 
 
@@ -174,6 +192,7 @@ def build_server(
         enable: bool | None = None,
         expected_revision: int | None = None,
         curves: dict[str, Any] | None = None,
+        vectors: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Set parameter values on one module instance, recorded as one
         history step. `module` is the internal op name, `instance` its
@@ -199,22 +218,51 @@ def build_server(
         whole curve (unlisted curves are untouched); omitted
         interpolation keeps the curve's current one. The response's
         `semantic_values` reads back every written curve with points as
-        `{x, y}` objects."""
+        `{x, y}` objects.
+
+        `vectors` edits semantic vector parameters (see
+        `get_module_schema`'s `semantic_fields` with `"class": "vector"`,
+        e.g. colorbalancergb's `lift`) and needs a darktable that
+        advertises the `vector_params` capability. It maps semantic IDs to
+        a flat list of finite numbers; each patch replaces that whole
+        named vector (unlisted vectors are untouched). Components are the
+        module's stored-space values -- e.g. colorbalancergb stores its
+        identity lift/gamma/gain as 1.0, not 0.0. `curves` and `vectors`
+        may be given together; a semantic ID given in both raises an
+        error before either is sent."""
         params: dict[str, Any] = {"module": module, "instance": instance, "values": values}
         if enable is not None:
             params["enable"] = enable
         if expected_revision is not None:
             params["expected_revision"] = expected_revision
-        # Translate before connecting: a malformed `curves` argument
-        # (e.g. a bad interpolation name) fails without any wire traffic.
-        semantic_values = _wire_semantic_values(curves) if curves is not None else None
+        # Translate before connecting: a malformed `curves`/`vectors`
+        # argument (e.g. a bad interpolation name, a non-finite vector
+        # component) fails without any wire traffic.
+        curve_semantic_values = _wire_semantic_values(curves) if curves is not None else None
+        vector_semantic_values = _wire_vector_values(vectors) if vectors is not None else None
+        semantic_values: dict[str, Any] | None = None
+        if curve_semantic_values is not None or vector_semantic_values is not None:
+            curve_semantic_values = curve_semantic_values or {}
+            vector_semantic_values = vector_semantic_values or {}
+            overlap = set(curve_semantic_values) & set(vector_semantic_values)
+            if overlap:
+                raise ToolError(
+                    "semantic id(s) given in both `curves` and `vectors`: "
+                    + ", ".join(sorted(overlap))
+                )
+            semantic_values = {**curve_semantic_values, **vector_semantic_values}
         client = await _client()
         if semantic_values is not None:
             await client.ensure_connected()
-            if "curve_params" not in client.capabilities:
+            if curves is not None and "curve_params" not in client.capabilities:
                 raise TransportError(
                     "this darktable does not advertise curve_params; "
                     "upgrade darktable to edit curves"
+                )
+            if vectors is not None and "vector_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise vector_params; "
+                    "upgrade darktable to edit vectors"
                 )
             params["semantic_values"] = semantic_values
         return await client.call("set_module_params", params)

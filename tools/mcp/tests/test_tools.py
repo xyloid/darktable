@@ -515,6 +515,241 @@ async def test_set_module_params_curves_invalid_interpolation_fails_before_wire(
     assert server.connections_seen == 0
 
 
+async def test_set_module_params_vectors_translates_to_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """`vectors` is tool-side sugar mirroring `curves`: each entry becomes
+    `{"class": "vector", "values": [float...]}` under `semantic_values`."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 3,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "colorbalancergb",
+            "values": {},
+            "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
+        },
+    )
+
+    assert "vectors" not in seen
+    assert seen["semantic_values"] == {
+        "lift": {"class": "vector", "values": [1.0, 1.1, 1.0, 0.95]},
+    }
+
+
+async def test_set_module_params_curves_and_vectors_merge_into_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """`curves` and `vectors` given in the same call merge into one
+    `semantic_values` dict on the wire."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 4,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "colorbalancergb",
+            "values": {},
+            "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
+        },
+    )
+
+    assert seen["semantic_values"] == {
+        "curve.master": {
+            "class": "curve",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+        },
+        "lift": {"class": "vector", "values": [1.0, 1.1, 1.0, 0.95]},
+    }
+
+
+async def test_set_module_params_curves_and_vectors_overlap_fails_before_wire(
+    tmp_path, fake_server_factory
+):
+    """A semantic id given in both `curves` and `vectors` is rejected
+    client-side, before any wire traffic."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "colorbalancergb",
+                "values": {},
+                "curves": {"lift": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+                "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "lift" in message
+    assert calls == []
+    assert server.connections_seen == 0
+
+
+async def test_set_module_params_vectors_gated_on_vector_params_capability(
+    tmp_path, fake_server_factory
+):
+    """A darktable whose hello does not advertise `vector_params` (the
+    fake's default hello has `capabilities: []`) must be refused
+    client-side: clear upgrade message, and no `set_module_params` wire
+    call that the peer would reject less legibly."""
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "colorbalancergb",
+                "values": {},
+                "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "vector_params" in message
+    assert "upgrade darktable" in message
+    assert calls == []
+
+
+async def test_set_module_params_curves_alone_not_gated_on_vector_params(
+    tmp_path, fake_server_factory
+):
+    """A darktable advertising `curve_params` but not `vector_params` must
+    still accept a curves-only call: the two gates are independent."""
+    server = await fake_server_factory()
+
+    def hello_override(params, req_id):
+        return {
+            "id": req_id,
+            "ok": True,
+            "result": {
+                "protocol_version": 1,
+                "darktable_version": "5.x",
+                "pid": 12345,
+                "capabilities": ["curve_params"],
+            },
+        }
+
+    server.hello_override = hello_override
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 5,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "rgbcurve",
+            "values": {},
+            "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+        },
+    )
+
+    assert seen["semantic_values"] == {
+        "curve.master": {
+            "class": "curve",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_vectors,expected_name",
+    [
+        ({"lift": []}, "lift"),
+        ({"lift": "not-a-list"}, "lift"),
+        ({"lift": [1.0, True, 1.0, 0.95]}, "lift"),
+        ({"lift": [1.0, float("nan"), 1.0, 0.95]}, "lift"),
+        ({"lift": [1.0, float("inf"), 1.0, 0.95]}, "lift"),
+        ({"lift": [1.0, "not-a-number", 1.0, 0.95]}, "lift"),
+    ],
+    ids=[
+        "empty-list",
+        "non-list",
+        "bool-element",
+        "nan-element",
+        "inf-element",
+        "non-numeric-element",
+    ],
+)
+async def test_set_module_params_vectors_rejects_invalid_entries(
+    tmp_path, fake_server_factory, bad_vectors, expected_name
+):
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {"module": "colorbalancergb", "values": {}, "vectors": bad_vectors},
+        )
+
+    message = str(excinfo.value)
+    assert expected_name in message
+    assert calls == []
+    # Validation is pure client-side and runs before connect: the fake
+    # server never even saw a connection.
+    assert server.connections_seen == 0
+
+
 async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("reset_module_response.json")
