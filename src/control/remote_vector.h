@@ -240,8 +240,12 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
  * re-checked for strict ordering and `minimum_gap` -- dt_remote_vector_validate()
  * proves those invariants only in double precision, and two double-domain-
  * distinct values can still collapse once narrowed. Rejection at this stage
- * is DT_REMOTE_ERR_INVALID_VALUE and, like every other rejection here,
- * leaves `new_params` untouched. */
+ * is DT_REMOTE_ERR_INVALID_VALUE; for a multi-vector patch, earlier entries'
+ * writes may already be present in `new_params` when a later entry is
+ * rejected. `new_params` is always the caller's projected/candidate block,
+ * never the live one -- dt_remote_set_module_params() (remote_edit.c) discards
+ * it on any failure, which is what makes rejections byte-atomic on the live
+ * params. */
 gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
                                       const void *old_params,
                                       void *new_params,

@@ -258,7 +258,7 @@ static const dt_remote_vector_descriptor_t s_colorbalance_vectors[6] = {
 
 // `mode` drives every alias's active_when/writable_when above; listing it
 // in prepare_fields means a scalar-only patch that switches mode still
-// triggers the registry-order write loop (VEC3-011's prepare_needed gate),
+// triggers the registry-order write loop (the prepare_needed gate),
 // so a composed patch can flip mode and write the newly active alias in
 // the same request (the colorzones select-by precedent). No
 // validate_completed hook: no shipped colorbalance behavior needs a
@@ -445,8 +445,8 @@ static const dt_remote_vector_descriptor_t s_cmrgb_vectors[6] = {
 };
 
 // Listing the three flags here means a scalar-only patch that flips one of
-// them still triggers validate_completed() below (VEC3-011's
-// prepare_needed gate), so the guard catches a flag flip against rows
+// them still triggers validate_completed() below (the prepare_needed
+// gate), so the guard catches a flag flip against rows
 // already sitting at a zero sum from an earlier write, not only a patch
 // that also rewrites the row in the same request.
 static const char *const s_cmrgb_prepare[] = { "normalize_R", "normalize_G", "normalize_B" };
@@ -579,7 +579,7 @@ static const dt_remote_parameter_predicate_t s_rgblevels_independent_predicate =
 // only ordering guard. The module never resets a row on an autoscale
 // switch: gui_changed() (rgblevels.c:747) only flips the displayed GUI tab,
 // and the row-0 fan-out that mirrors row 0 into rows 1/2 under
-// LINKED_CHANNELS is pipeline-only (commit_params(), rgblevels.c:857-866)
+// LINKED_CHANNELS is pipeline-only (commit_params(), rgblevels.c:859-868)
 // -- it never touches self->params, only piece->data. This adapter must
 // never reset a row either, ever.
 static const dt_remote_vector_descriptor_t s_rgblevels_vectors[4] = {
@@ -593,7 +593,7 @@ static const dt_remote_vector_descriptor_t s_rgblevels_vectors[4] = {
       "Aliases the same storage as 'levels.red'; rows persist unchanged across autoscale "
       "switches -- gui_changed() (rgblevels.c:747) only flips the displayed GUI tab, and "
       "the row-0 fan-out into rows 1/2 is pipeline-only (commit_params(), "
-      "rgblevels.c:857-866), never applied to stored params.",
+      "rgblevels.c:859-868), never applied to stored params.",
     .native = s_rgblevels_row0_path,
     .component_count = 3,
     .components = s_rgblevels_components,
@@ -669,8 +669,8 @@ static const dt_remote_vector_descriptor_t s_rgblevels_vectors[4] = {
 
 // `autoscale` drives every alias's active_when/writable_when above; listing
 // it in prepare_fields means a scalar-only patch that switches autoscale
-// still triggers the registry-ordered validation path (VEC3-011's
-// prepare_needed gate), same convention as colorbalance's own "mode" entry.
+// still triggers the registry-ordered validation path (the prepare_needed
+// gate), same convention as colorbalance's own "mode" entry.
 // No validate_completed hook: this adapter must never reset a row, and no
 // shipped rgblevels behavior needs a composed post-write check beyond the
 // per-descriptor gating already enforced by the engine.
@@ -955,7 +955,7 @@ static gboolean vector_component_metadata_is_valid(
        || !isfinite(component->minimum)
        || !isfinite(component->maximum)
        || component->minimum > component->maximum
-       // VEC3-013: a finite double bound outside the native float range
+       // A finite double bound outside the native float range
        // would let a candidate at that same bound pass
        // dt_remote_vector_validate()'s domain check and then narrow to
        // +-inf in the write path's `(float)value` conversion.
@@ -1011,7 +1011,7 @@ static gboolean vector_descriptor_is_valid(const dt_remote_vector_descriptor_t *
     return FALSE;
   if(array_field->Array.count < (size_t)desc->component_count) return FALSE;
   if(array_field->Array.count != (size_t)desc->native_capacity) return FALSE;
-  // VEC3-012: the checks above establish the per-element type/size, but not
+  // The checks above establish the per-element type/size, but not
   // that the aggregate leaf's own declared byte size actually holds
   // Array.count of them -- dt_introspection_access_array() (introspection.h)
   // addresses elements as `start + element * Array.field->header.size`,
@@ -1112,6 +1112,16 @@ gboolean dt_remote_vector_registry_validate(const dt_remote_vector_module_adapte
     }
     cache_validation_result(adapter, intro->params_version, intrinsic_valid);
     cache = lookup_cache_entry(adapter, intro->params_version);
+
+    if(!intrinsic_valid)
+    {
+      deliver_error(dt_remote_vector_registry_error_new(
+                      DT_REMOTE_ERR_INTERNAL,
+                      _("vector adapter '%s' descriptor '%s' does not match introspection version %d"),
+                      adapter->operation, first_failure ? first_failure : "", intro->params_version),
+                    error);
+      return FALSE;
+    }
   }
 
   if(!cache->adapter_valid)
@@ -1231,15 +1241,15 @@ gboolean dt_remote_vector_list_schema(const struct dt_iop_module_so_t *so,
   return TRUE;
 }
 
-// Reviewer Minor: registry validation (vector_descriptor_is_valid() above)
-// and the write path (write_vector_patch(), remote_vector.c) both require
-// the native leaf to be strict FLOAT -- a DOUBLE-typed array field never
-// passes registry validation, so a DOUBLE branch here would be dead for any
-// validated adapter. Read path, validate, and write now all agree on
-// strict FLOAT.
+// Registry validation (vector_descriptor_is_valid() above) and the write
+// path (write_vector_patch(), remote_vector.c) both require the native
+// leaf to be strict FLOAT -- a DOUBLE-typed array field never passes
+// registry validation, so this is only ever called with a FLOAT leaf.
+// Read path, validate, and write all agree on strict FLOAT.
 static double read_float_leaf(const dt_introspection_field_t *field, const void *ptr)
 {
-  return field->header.type == DT_INTROSPECTION_TYPE_FLOAT ? (double)*(const float *)ptr : 0.0;
+  (void)field;
+  return (double)*(const float *)ptr;
 }
 
 // Evaluates `pred` against `params_blob`, resolving `pred->field` as a one

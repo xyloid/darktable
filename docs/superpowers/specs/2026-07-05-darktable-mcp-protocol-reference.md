@@ -316,12 +316,12 @@ entries, in the same atomic history item:
 ```json
 {
   "semantic_values": {
-    "lift": { "values": [1.0, 1.0, 1.0, 1.0] }
+    "lift": { "class": "vector", "values": [1.0, 1.0, 1.0, 1.0] }
   }
 }
 ```
 
-Each entry supplies `values`: a JSON number array whose length must match
+Each entry requires `class: "vector"`, and supplies `values`: a JSON number array whose length must match
 the descriptor's component count exactly — a patch is a **complete
 replacement** of the named vector, never a partial write (a client wanting
 to change one component does a read-modify-write). Components are carried

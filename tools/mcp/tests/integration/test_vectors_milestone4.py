@@ -24,22 +24,11 @@ Gate 8 (curve regression) needs no new code here: running this file under
 ``integration``) exercises every existing curve gate alongside these new
 vector gates in one session.
 
-KNOWN BLOCKER (discovered writing this file, documented in the task-10
-report): every write-path gate below (all except the two synchronous
-``test_watermark_params_v7_struct_size`` checks) currently fails, not from
-a defect in this test file, but from a real dispatch bug in
-``dt_remote_curve_apply_patch()`` (``src/control/remote_curve.c``): its
-"no curve adapter for this op" branch tests the *class-generic*
-``has_semantics`` flag (any semantic entry present) rather than a
-curve-scoped one, so it rejects with ``unsupported_field`` before
-``dt_remote_vector_apply_patch()`` (``src/control/remote_vector.c``) --
-which itself correctly scopes the same check to ``has_vector_semantics``,
-lines ~409-420/435-444 -- is ever reached. None of the five vector-only
-modules under test here register a curve adapter, so this fires on every
-``set_module_params`` call carrying a vector ``semantic_values`` entry to
-any of them, confirmed by reproducing it live against all five ops. Left
-unpatched per the task's explicit instruction not to touch engine code;
-see the report for the full repro and suggested fix shape.
+Historical note: these gates originally exposed a class-scoping dispatch
+bug in ``dt_remote_curve_apply_patch()`` (``src/control/remote_curve.c``)
+that rejected vector-only writes before the vector engine was ever
+reached; that bug was fixed on this branch (commits ``2148bec6ed`` and
+``193154ae9e``), and all 31 gates below now pass.
 """
 
 from __future__ import annotations

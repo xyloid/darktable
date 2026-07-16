@@ -164,7 +164,7 @@ gboolean dt_remote_vector_validate(const dt_remote_vector_descriptor_t *desc,
           parameter, i, value, component->minimum, component->maximum);
       return FALSE;
     }
-    // VEC3-013: defensive preflight, independent of `component`'s own
+    // Defensive preflight, independent of `component`'s own
     // bounds -- dt_remote_vector_validate() is documented as pure and
     // directly callable, so a caller-supplied descriptor is not guaranteed
     // to have gone through dt_remote_vector_registry_validate()'s own
@@ -278,7 +278,7 @@ static const dt_remote_vector_descriptor_t *find_vector_descriptor(
 // is a malformed adapter envelope -- the same shape
 // vector_adapter_envelope_is_valid() (remote_vector_registry.c) rejects,
 // but this helper runs before that registry validation to compute the
-// prepare_needed fast-path gate (VEC3-011). Detect it here and report
+// prepare_needed fast-path gate. Detect it here and report
 // through `*out_malformed` before ever indexing `adapter->prepare_fields`,
 // rather than risking a NULL-array dereference for a scalar-only patch that
 // would otherwise never trigger full registry validation.
@@ -327,8 +327,8 @@ static gboolean write_vector_patch(const dt_remote_vector_descriptor_t *desc,
   // Preflight: resolve every destination element and pre-narrow every
   // candidate to the float32 representation the commit loop below will
   // actually store, before writing any of them. dt_remote_vector_validate()
-  // above proves LEVELS ordering/minimum_gap only in double precision
-  // (VEC3-014) -- two double-domain-distinct, strictly increasing values
+  // above proves LEVELS ordering/minimum_gap only in double precision --
+  // two double-domain-distinct, strictly increasing values
   // can still collapse to the same float32, or narrow to a gap below
   // desc->minimum_gap, once actually stored. Re-checking on the narrowed
   // representations here (widened back to double for the comparison) keeps
@@ -446,8 +446,7 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
   // Preserved short-circuit: when `has_vector_semantics` is already TRUE,
   // full registry validation runs unconditionally below and will itself
   // reject a malformed prepare-fields envelope, so the traversal (and its
-  // malformed-envelope probe) is skipped entirely -- same fast path as
-  // before VEC3-011.
+  // malformed-envelope probe) is skipped entirely.
   gboolean prepare_fields_malformed = FALSE;
   const gboolean mentions_prepare_field = has_vector_semantics
     ? FALSE
