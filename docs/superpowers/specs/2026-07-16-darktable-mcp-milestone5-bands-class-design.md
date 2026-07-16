@@ -162,10 +162,13 @@ A third engine makes the pass-through chain quadratic in review effort and
 leaves multi-class modules (none exist yet, but atrous-style modules could
 plausibly gain one) without a shared final validation point.
 
-Restructure: `remote_edit.c` parses the mutation array once, partitions
-entries by their `class` member, dispatches each class's slice to its
-engine against the same projected temp blob, and runs one shared final pass
-(param-version check, blob-size invariants) before commit. Requirements:
+Restructure: `remote_edit.c` drives all seams from one class-ops dispatch
+table (fixed order: curve, vector, bands), calling each engine
+unconditionally against the same projected temp blob; each engine's
+entry-point wrapper partitions out its own class's entries and keeps its
+prepare gate, so scalar-only patches that name a prepare-field still reach
+their engine. One shared final pass (param-version check, blob-size
+invariants) runs after the table loop, before commit. Requirements:
 
 - Byte-for-byte behavioral parity for existing curve and vector traffic —
   the gate is the existing `test_remote_curve` (69) and

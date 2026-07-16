@@ -130,10 +130,15 @@ typedef struct dt_remote_class_ops_t
   gboolean (*read_values)(const struct dt_iop_module_t *module,
                           const void *params, GHashTable **out,
                           dt_remote_error_t **error);
-  gboolean (*apply_entries)(const struct dt_iop_module_t *module,
-                            const void *old_params, void *new_params,
-                            GPtrArray *entries /* dt_remote_semantic_patch_t*, this class only */,
-                            dt_remote_error_t **error);
+  gboolean (*apply_patch)(const struct dt_iop_module_t *module,
+                          const void *old_params, void *new_params,
+                          const dt_remote_patch_t *patch,
+                          dt_remote_error_t **error);
+  /* apply_patch takes the FULL patch — the engines' exported wrappers keep
+     their internal own-class partitioning and the prepare_needed gate
+     (scalar-only patches naming a prepare_field must still reach the
+     engine). The dispatcher calls every row unconditionally in table
+     order, exactly as the pre-refactor code called both engines. */
   dt_remote_semantic_schema_t *(*wrap_schema)(gpointer class_schema);
   dt_remote_semantic_value_t *(*wrap_value)(gpointer class_value);
 } dt_remote_class_ops_t;
@@ -172,12 +177,14 @@ gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
     the row's `wrap_schema`, append (existing insertion order preserved:
     curve rows first, then vector — identical to today).
   - readback: same loop shape with `read_values`/`wrap_value`.
-  - apply: partition `patch->semantic_values` once into per-class slices
-    (one pass, `GPtrArray` per table row, unknown class_id impossible —
-    the parser only produces known classes); for each row with a non-empty
-    slice, call `apply_entries` against the same `temp_params`. The
-    existing post-apply verification stays after the loop unchanged — that
-    is the shared final pass.
+  - apply: call every row's `apply_patch` (the existing exported wrapper)
+    unconditionally in table order against the same `temp_params`. Each
+    wrapper partitions its own class's entries internally and keeps the
+    `prepare_needed` gate, so a scalar-only patch naming a prepare_field
+    (e.g. colorzones `channel`) still reaches its engine. Do NOT gate the
+    call on "has entries of this class" — that would skip the gate and
+    change production behavior. The existing post-apply verification stays
+    after the loop unchanged — that is the shared final pass.
   - `represented_by` annotation: convert its curve/vector pair the same way
     (loop over table rows' registries; keep a per-row lookup function
     pointer if the current code needs one — follow what's there).
@@ -323,6 +330,13 @@ gboolean dt_remote_band_read_values(const struct dt_iop_module_t *module,
                                     const void *params,
                                     GHashTable **out,         // name → dt_remote_band_value_t*
                                     dt_remote_error_t **error);
+gboolean dt_remote_band_apply_patch(const struct dt_iop_module_t *module,
+                                    const void *old_params, void *new_params,
+                                    const dt_remote_patch_t *patch,
+                                    dt_remote_error_t **error);
+/* thin wrapper mirroring dt_remote_vector_apply_patch: null checks,
+   own-class partition into a borrowed slice, prepare_needed gate over
+   patch->scalar_values vs adapter prepare_fields, then apply_entries */
 gboolean dt_remote_band_apply_entries(const struct dt_iop_module_t *module,
                                       const void *old_params, void *new_params,
                                       GPtrArray *entries,
@@ -457,7 +471,7 @@ is fully live end-to-end.
   beside the vector serializers; new wrapper-tag switch arms; the
   `band_params` capability string; the `s_class_ops[]` bands row
   (`dt_remote_band_list_schema`, `dt_remote_band_read_values`,
-  `dt_remote_band_apply_entries`, band wrap helpers); bands registry in the
+  `dt_remote_band_apply_patch`, band wrap helpers); bands registry in the
   `represented_by` annotation (both `native_x` and `native_y` leaves point
   at the semantic name).
 - [ ] **Step 4: Run tests to verify pass.**
