@@ -894,10 +894,27 @@ typedef struct dt_remote_class_ops_t
   gboolean (*read_values)(const struct dt_iop_module_t *module,
                           const void *params, GHashTable **out,
                           dt_remote_error_t **error);
-  gboolean (*apply_entries)(const struct dt_iop_module_t *module,
-                            const void *old_params, void *new_params,
-                            GPtrArray *entries /* dt_remote_semantic_patch_t*, this class only */,
-                            dt_remote_error_t **error);
+  // Takes the FULL patch, not a pre-partitioned slice: each engine's own
+  // apply_patch() wrapper (remote_curve.h/remote_vector.h) partitions its
+  // own class's entries out of `patch->semantic_values` internally, and --
+  // critically -- computes its own prepare_needed gate from
+  // `patch->scalar_values` before ever looking at semantic entries, so a
+  // scalar-only patch that mentions a prepare_field still reaches that
+  // engine's prepare()/validate_completed() even when the patch carries
+  // zero entries of that engine's class (see e.g. rgbcurve's
+  // compensate_middle_grey / colorzones' channel). A dispatcher that only
+  // called an engine when its own semantic slice was non-empty would drop
+  // that behavior -- proven by
+  // test_transaction_middle_grey_without_work_profile_fails_without_mutation
+  // (test_remote_edit.c) and
+  // test_rgbcurve_adapter_foreign_class_entry_with_colliding_name_is_ignored
+  // (test_remote_curve.c) -- so every row is called unconditionally, in
+  // table order, exactly as the pre-refactor code called both engines
+  // unconditionally.
+  gboolean (*apply_patch)(const struct dt_iop_module_t *module,
+                          const void *old_params, void *new_params,
+                          const dt_remote_patch_t *patch,
+                          dt_remote_error_t **error);
   dt_remote_semantic_schema_t *(*wrap_schema)(gpointer class_schema);
   dt_remote_semantic_value_t *(*wrap_value)(gpointer class_value);
   // Stamps this class's represented_by back-references onto `schema`'s
@@ -983,7 +1000,7 @@ static const dt_remote_class_ops_t s_class_ops[] = {
     .class_id = DT_REMOTE_PARAMETER_CURVE,
     .list_schema = dt_remote_curve_list_schema,
     .read_values = dt_remote_curve_read_values,
-    .apply_entries = dt_remote_curve_apply_entries,
+    .apply_patch = dt_remote_curve_apply_patch,
     .wrap_schema = (dt_remote_semantic_schema_t *(*)(gpointer))dt_remote_semantic_schema_wrap_curve,
     .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_curve,
     .annotate_represented_by = _annotate_curve_represented_by,
@@ -992,7 +1009,7 @@ static const dt_remote_class_ops_t s_class_ops[] = {
     .class_id = DT_REMOTE_PARAMETER_VECTOR,
     .list_schema = dt_remote_vector_list_schema,
     .read_values = dt_remote_vector_read_values,
-    .apply_entries = dt_remote_vector_apply_entries,
+    .apply_patch = dt_remote_vector_apply_patch,
     .wrap_schema = (dt_remote_semantic_schema_t *(*)(gpointer))dt_remote_semantic_schema_wrap_vector,
     .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_vector,
     .annotate_represented_by = _annotate_vector_represented_by,
@@ -1308,51 +1325,20 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   // projected state first; adapter preparation, semantic validation/native
   // writes, and completed-state validation then operate on the same scratch
   // block. Any failure discards both scalar and semantic changes before live
-  // params, enable state, GUI, history, or revision are touched. Partition
-  // this patch's semantic entries into per-class slices once (a null entry
-  // -- never produced by the request parser, see remote_parameters.h, but
-  // defended against here as this pure core does not assume a JSON-shaped
-  // caller -- fails closed immediately), then run each table row with a
-  // non-empty slice against the same temp_params, in table order (curve,
-  // then vector) -- preserves today's error precedence and the rule that
-  // each class only ever touches its own entries.
-  GPtrArray *class_entries[G_N_ELEMENTS(s_class_ops)];
+  // params, enable state, GUI, history, or revision are touched. Every row's
+  // apply_patch() gets the whole patch (not a pre-partitioned slice) and is
+  // called unconditionally, in table order (curve, then vector) -- each
+  // engine partitions its own class's entries out internally and computes
+  // its own prepare_needed gate from the whole patch (see the
+  // dt_remote_class_ops_t.apply_patch field comment above); this preserves
+  // today's error precedence and the "scalar-only patch can still reach an
+  // engine via its prepare_fields" behavior exactly.
   for(gsize row = 0; row < G_N_ELEMENTS(s_class_ops); row++)
-    class_entries[row] = g_ptr_array_new();
-
-  gboolean partition_ok = TRUE;
-  for(guint i = 0; partition_ok && patch->semantic_values && i < patch->semantic_values->len; i++)
-  {
-    dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
-    if(!semantic)
+    if(!s_class_ops[row].apply_patch(module, module->params, temp_params, patch, error))
     {
-      if(error)
-        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL, _("internal error: null semantic patch entry"));
-      partition_ok = FALSE;
-      break;
+      g_free(temp_params);
+      return FALSE;
     }
-    for(gsize row = 0; row < G_N_ELEMENTS(s_class_ops); row++)
-      if(semantic->class_id == s_class_ops[row].class_id)
-      {
-        g_ptr_array_add(class_entries[row], semantic);
-        break;
-      }
-  }
-
-  gboolean apply_ok = partition_ok;
-  for(gsize row = 0; apply_ok && row < G_N_ELEMENTS(s_class_ops); row++)
-    if(class_entries[row]->len > 0
-       && !s_class_ops[row].apply_entries(module, module->params, temp_params, class_entries[row], error))
-      apply_ok = FALSE;
-
-  for(gsize row = 0; row < G_N_ELEMENTS(s_class_ops); row++)
-    g_ptr_array_unref(class_entries[row]);
-
-  if(!apply_ok)
-  {
-    g_free(temp_params);
-    return FALSE;
-  }
 
   // Semantic read-back happens against the projected block, before the
   // commit: projected and post-commit params are byte-identical (the memcpy
