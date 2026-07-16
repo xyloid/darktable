@@ -318,12 +318,19 @@ class DarktableInstance:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def launch(self) -> "DarktableInstance":
+    def launch(self, *, sidecar_files: dict[str, bytes] | None = None) -> "DarktableInstance":
         for sub in ("config", "cache", "output"):
             (self.workdir / sub).mkdir(parents=True, exist_ok=True)
         source_image = test_image()
         image = self.workdir / f"test{source_image.suffix}"
         shutil.copyfile(source_image, image)
+
+        # Optional launch-time fixture drop (e.g. a pre-seeded .xmp sidecar
+        # a test wants darktable to import history from): written into
+        # self.workdir next to the copied image, before the process starts.
+        # Default empty -- every other caller is unaffected.
+        for name, content in (sidecar_files or {}).items():
+            (self.workdir / name).write_bytes(content)
 
         env = scrubbed_env(
             home=str(self.workdir / "home"),
