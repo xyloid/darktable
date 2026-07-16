@@ -226,26 +226,48 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
                                       GHashTable **out,            /* name -> dt_remote_vector_value_t */
                                       dt_remote_error_t **error);
 
+/** Self-contained vector-class transaction: resolves its own adapter for
+ * `module`'s operation/params_version, validates and writes every entry in
+ * `entries` in descriptor/registry order, then runs completed-state
+ * validation -- all operating only on `new_params` (`old_params` remains
+ * the pre-transaction block, read-only). Every element of `entries` must be
+ * a DT_REMOTE_PARAMETER_VECTOR-tagged dt_remote_semantic_patch_t; callers
+ * guarantee this by construction and a violation is asserted, not skipped --
+ * unlike dt_remote_vector_apply_patch() below, this entry point never sees
+ * another class's entries to filter out. Before any native write, every
+ * destination element is resolved and every candidate is pre-narrowed to
+ * the float32 representation actually stored; for a LEVELS vector, the
+ * narrowed representations (widened back to double) are re-checked for
+ * strict ordering and `minimum_gap` -- dt_remote_vector_validate() proves
+ * those invariants only in double precision, and two double-domain-distinct
+ * values can still collapse once narrowed. Rejection at this stage is
+ * DT_REMOTE_ERR_INVALID_VALUE; for a multi-vector slice, earlier entries'
+ * writes may already be present in `new_params` when a later entry is
+ * rejected. `new_params` is always the caller's projected/candidate block,
+ * never the live one -- dt_remote_set_module_params() (remote_edit.c)
+ * discards it on any failure, which is what makes rejections byte-atomic on
+ * the live params. `entries` may be empty: an op with no registered vector
+ * adapter then trivially succeeds; an op with a registered adapter still
+ * runs completed-state validation against `new_params` even with zero
+ * entries (the same "validate on adapter presence alone" behavior the
+ * pre-split engine had). Used directly by remote_edit.c's class-ops
+ * dispatch table; dt_remote_vector_apply_patch() below partitions its own
+ * class's entries out of a full patch and calls this. */
+gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
+                                        const void *old_params,
+                                        void *new_params,
+                                        GPtrArray *entries, /* dt_remote_semantic_patch_t*, vector class only */
+                                        dt_remote_error_t **error);
+
 /** Applies the vector-class portion of `patch` to the caller-owned
  * projected params block. Scalar entries must already have been written to
  * `new_params`; `old_params` remains the pre-transaction block. Every entry
  * in `patch->semantic_values` whose class_id is not DT_REMOTE_PARAMETER_VECTOR
  * is skipped -- this engine only ever touches its own class, the same
  * request may carry curve entries the curve engine handles separately.
- * Predicate evaluation, vector validation/native writes, and
- * validate_completed all operate only on `new_params`. Before any native
- * write, every destination element is resolved and every candidate is
- * pre-narrowed to the float32 representation actually stored; for a LEVELS
- * vector, the narrowed representations (widened back to double) are
- * re-checked for strict ordering and `minimum_gap` -- dt_remote_vector_validate()
- * proves those invariants only in double precision, and two double-domain-
- * distinct values can still collapse once narrowed. Rejection at this stage
- * is DT_REMOTE_ERR_INVALID_VALUE; for a multi-vector patch, earlier entries'
- * writes may already be present in `new_params` when a later entry is
- * rejected. `new_params` is always the caller's projected/candidate block,
- * never the live one -- dt_remote_set_module_params() (remote_edit.c) discards
- * it on any failure, which is what makes rejections byte-atomic on the live
- * params. */
+ * Thin wrapper over dt_remote_vector_apply_entries() above: partitions this
+ * class's entries out of `patch` (preserving request order), then
+ * delegates. */
 gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
                                       const void *old_params,
                                       void *new_params,

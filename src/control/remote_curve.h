@@ -308,11 +308,35 @@ gboolean dt_remote_curve_read_values(const struct dt_iop_module_t *module,
                                      GHashTable **out, /* name -> dt_remote_curve_value_t */
                                      dt_remote_error_t **error);
 
+/** Self-contained curve-class transaction: resolves its own adapter for
+ * `module`'s operation/params_version, composes adapter preparation,
+ * validates and writes every entry in `entries` in descriptor/registry
+ * order, then runs completed-state validation -- all operating only on
+ * `new_params` (`old_params` remains the pre-transaction block, read-only).
+ * Every element of `entries` must be a DT_REMOTE_PARAMETER_CURVE-tagged
+ * dt_remote_semantic_patch_t; callers guarantee this by construction and a
+ * violation is asserted, not skipped -- unlike dt_remote_curve_apply_patch()
+ * below, this entry point never sees another class's entries to filter out.
+ * `entries` may be empty: an op with no registered curve adapter then
+ * trivially succeeds; an op with a registered adapter still runs adapter
+ * preparation and completed-state validation against `new_params` even with
+ * zero entries (the same "prepare on adapter presence alone" behavior the
+ * pre-split engine had). Used directly by remote_edit.c's class-ops dispatch
+ * table; dt_remote_curve_apply_patch() below partitions its own class's
+ * entries out of a full patch and calls this. */
+gboolean dt_remote_curve_apply_entries(const struct dt_iop_module_t *module,
+                                       const void *old_params,
+                                       void *new_params,
+                                       GPtrArray *entries, /* dt_remote_semantic_patch_t*, curve class only */
+                                       dt_remote_error_t **error);
+
 /** Applies the semantic portion of `patch` to the caller-owned projected
  * params block. Scalar entries must already have been written to
  * `new_params`; `old_params` remains the pre-transaction block. Adapter
  * preparation, predicate evaluation, curve validation/native writes, and
- * completed-state validation all operate only on `new_params`. */
+ * completed-state validation all operate only on `new_params`. Thin wrapper
+ * over dt_remote_curve_apply_entries() above: partitions this class's
+ * entries out of `patch` (preserving request order), then delegates. */
 gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
                                      const void *old_params,
                                      void *new_params,

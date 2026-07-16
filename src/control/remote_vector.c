@@ -392,6 +392,131 @@ static gboolean write_vector_patch(const dt_remote_vector_descriptor_t *desc,
   return TRUE;
 }
 
+// Self-contained vector-class transaction: resolves its own adapter (the
+// caller need not know or care whether one exists), validates and writes
+// every entry in `entries` in descriptor/registry order, then runs
+// completed-state validation. Every element of `entries` must be a
+// DT_REMOTE_PARAMETER_VECTOR-tagged dt_remote_semantic_patch_t -- callers
+// (the thin dt_remote_vector_apply_patch() wrapper below and remote_edit.c's
+// class-ops dispatcher) guarantee this by construction, so violations are
+// asserted, not skipped. `entries` may be empty: an adapter-less op with no
+// requested vector then trivially succeeds, while an adapter-less op with a
+// requested vector still reports the same "unknown semantic vector" the
+// pre-refactor code did.
+gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
+                                        const void *old_params,
+                                        void *new_params,
+                                        GPtrArray *entries,
+                                        dt_remote_error_t **error)
+{
+  if(!module || !module->so || !old_params || !new_params || !entries)
+  {
+    deliver_vector_error(dt_remote_vector_error_new(
+                           DT_REMOTE_ERR_INTERNAL,
+                           _("internal error: null argument to vector mutation engine")), error);
+    return FALSE;
+  }
+
+  dt_introspection_t *intro = module->so->get_introspection
+    ? module->so->get_introspection() : NULL;
+  if(!intro || !intro->field)
+  {
+    deliver_vector_error(dt_remote_vector_error_new(
+                           DT_REMOTE_ERR_INTERNAL,
+                           _("internal error: module '%s' has no vector introspection"), module->op),
+                         error);
+    return FALSE;
+  }
+
+  const dt_remote_vector_module_adapter_t *adapter =
+    dt_remote_vector_registry_lookup(module->op, (guint)intro->params_version);
+  if(!adapter)
+  {
+    if(entries->len == 0) return TRUE;
+    const dt_remote_semantic_patch_t *first = g_ptr_array_index(entries, 0);
+    deliver_vector_error(dt_remote_vector_error_new(
+                           DT_REMOTE_ERR_UNKNOWN_FIELD,
+                           _("unknown semantic vector '%s'"),
+                           first->value.vector.name ? first->value.vector.name : ""),
+                         error);
+    return FALSE;
+  }
+
+  if(!dt_remote_vector_registry_validate(adapter, module->so, error)) return FALSE;
+
+  const dt_remote_vector_context_t context = {
+    .module = module, .introspection = intro, .adapter = adapter,
+  };
+
+  // Resolve every entry's ID against the adapter before the registry-ordered
+  // write loop below.
+  for(guint i = 0; i < entries->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(entries, i);
+    g_assert(semantic && semantic->class_id == DT_REMOTE_PARAMETER_VECTOR);
+
+    const char *name = semantic->value.vector.name;
+    if(!find_vector_descriptor(adapter, name))
+    {
+      deliver_vector_error(dt_remote_vector_error_new(
+                             DT_REMOTE_ERR_UNKNOWN_FIELD,
+                             _("unknown semantic vector '%s'"), name ? name : ""), error);
+      return FALSE;
+    }
+    for(guint j = 0; j < i; j++)
+    {
+      const dt_remote_semantic_patch_t *prior = g_ptr_array_index(entries, j);
+      if(!g_strcmp0(prior->value.vector.name, name))
+      {
+        deliver_vector_error(vector_parameter_error_new(
+                               DT_REMOTE_ERR_INVALID_VALUE, name, "duplicate_parameter",
+                               _("duplicate semantic vector '%s'"), name), error);
+        return FALSE;
+      }
+    }
+  }
+
+  // Apply in descriptor/registry order, never request hash/array order.
+  for(guint descriptor_index = 0; descriptor_index < adapter->vector_count; descriptor_index++)
+  {
+    const dt_remote_vector_descriptor_t *desc = &adapter->vectors[descriptor_index];
+    const dt_remote_vector_patch_t *vector_patch = NULL;
+    for(guint patch_index = 0; patch_index < entries->len; patch_index++)
+    {
+      const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(entries, patch_index);
+      if(!g_strcmp0(semantic->value.vector.name, desc->name))
+      {
+        vector_patch = &semantic->value.vector;
+        break;
+      }
+    }
+    if(!vector_patch) continue;
+
+    gboolean active = TRUE;
+    gboolean writable = TRUE;
+    if(!vector_predicate_holds(desc->active_when, intro->field, new_params, &active, error)
+       || !vector_predicate_holds(desc->writable_when, intro->field, new_params, &writable, error))
+      return FALSE;
+    if(!active || !writable)
+    {
+      deliver_vector_error(vector_parameter_error_new(
+                             DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name,
+                             "condition_not_satisfied",
+                             _("semantic vector '%s' is inactive or not writable in projected state"),
+                             desc->name),
+                           error);
+      return FALSE;
+    }
+
+    if(!write_vector_patch(desc, intro->field, new_params, vector_patch, error)) return FALSE;
+  }
+
+  if(adapter->validate_completed
+     && !adapter->validate_completed(&context, new_params, error))
+    return FALSE;
+  return TRUE;
+}
+
 gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
                                       const void *old_params,
                                       void *new_params,
@@ -444,9 +569,10 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
   }
 
   // Preserved short-circuit: when `has_vector_semantics` is already TRUE,
-  // full registry validation runs unconditionally below and will itself
-  // reject a malformed prepare-fields envelope, so the traversal (and its
-  // malformed-envelope probe) is skipped entirely.
+  // full registry validation runs unconditionally below (inside
+  // dt_remote_vector_apply_entries()) and will itself reject a malformed
+  // prepare-fields envelope, so the traversal (and its malformed-envelope
+  // probe) is skipped entirely.
   gboolean prepare_fields_malformed = FALSE;
   const gboolean mentions_prepare_field = has_vector_semantics
     ? FALSE
@@ -465,92 +591,33 @@ gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
   // independent of semantic registry health -- same convention as the
   // curve engine.
   if(!prepare_needed) return TRUE;
-  if(!dt_remote_vector_registry_validate(adapter, module->so, error)) return FALSE;
 
-  const dt_remote_vector_context_t context = {
-    .module = module, .introspection = intro, .adapter = adapter,
-  };
-
-  // Resolve every vector-class request ID before the registry-ordered write
-  // loop, skipping every non-vector entry entirely -- the same request may
-  // carry curve entries the curve engine handles separately (remote_curve.c).
+  // Partition this class's entries out of the patch, in request order, and
+  // hand the slice to the self-contained engine above -- entries are
+  // borrowed from `patch`, never owned or freed by this array. A null entry
+  // anywhere in the patch (never produced by the request parser -- see
+  // remote_parameters.h -- but defended against here as this pure core does
+  // not assume a JSON-shaped caller) fails closed exactly as it did before
+  // the partition split.
+  GPtrArray *entries = g_ptr_array_new();
   for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
   {
-    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
     if(!semantic)
     {
       deliver_vector_error(dt_remote_vector_error_new(
                              DT_REMOTE_ERR_INTERNAL,
                              _("internal error: null semantic patch entry")), error);
+      g_ptr_array_unref(entries);
       return FALSE;
     }
-    if(semantic->class_id != DT_REMOTE_PARAMETER_VECTOR) continue;
-
-    const char *name = semantic->value.vector.name;
-    if(!find_vector_descriptor(adapter, name))
-    {
-      deliver_vector_error(dt_remote_vector_error_new(
-                             DT_REMOTE_ERR_UNKNOWN_FIELD,
-                             _("unknown semantic vector '%s'"), name ? name : ""), error);
-      return FALSE;
-    }
-    for(guint j = 0; j < i; j++)
-    {
-      const dt_remote_semantic_patch_t *prior = g_ptr_array_index(patch->semantic_values, j);
-      if(prior && prior->class_id == DT_REMOTE_PARAMETER_VECTOR
-         && !g_strcmp0(prior->value.vector.name, name))
-      {
-        deliver_vector_error(vector_parameter_error_new(
-                               DT_REMOTE_ERR_INVALID_VALUE, name, "duplicate_parameter",
-                               _("duplicate semantic vector '%s'"), name), error);
-        return FALSE;
-      }
-    }
+    if(semantic->class_id == DT_REMOTE_PARAMETER_VECTOR)
+      g_ptr_array_add(entries, semantic);
   }
 
-  // Apply in descriptor/registry order, never request hash/array order.
-  for(guint descriptor_index = 0; descriptor_index < adapter->vector_count; descriptor_index++)
-  {
-    const dt_remote_vector_descriptor_t *desc = &adapter->vectors[descriptor_index];
-    const dt_remote_vector_patch_t *vector_patch = NULL;
-    for(guint patch_index = 0;
-        patch->semantic_values && patch_index < patch->semantic_values->len;
-        patch_index++)
-    {
-      const dt_remote_semantic_patch_t *semantic =
-        g_ptr_array_index(patch->semantic_values, patch_index);
-      if(semantic->class_id == DT_REMOTE_PARAMETER_VECTOR
-         && !g_strcmp0(semantic->value.vector.name, desc->name))
-      {
-        vector_patch = &semantic->value.vector;
-        break;
-      }
-    }
-    if(!vector_patch) continue;
-
-    gboolean active = TRUE;
-    gboolean writable = TRUE;
-    if(!vector_predicate_holds(desc->active_when, intro->field, new_params, &active, error)
-       || !vector_predicate_holds(desc->writable_when, intro->field, new_params, &writable, error))
-      return FALSE;
-    if(!active || !writable)
-    {
-      deliver_vector_error(vector_parameter_error_new(
-                             DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name,
-                             "condition_not_satisfied",
-                             _("semantic vector '%s' is inactive or not writable in projected state"),
-                             desc->name),
-                           error);
-      return FALSE;
-    }
-
-    if(!write_vector_patch(desc, intro->field, new_params, vector_patch, error)) return FALSE;
-  }
-
-  if(prepare_needed && adapter->validate_completed
-     && !adapter->validate_completed(&context, new_params, error))
-    return FALSE;
-  return TRUE;
+  const gboolean ok = dt_remote_vector_apply_entries(module, old_params, new_params, entries, error);
+  g_ptr_array_unref(entries);
+  return ok;
 }
 
 // clang-format off

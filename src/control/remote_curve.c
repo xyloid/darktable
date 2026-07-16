@@ -751,6 +751,141 @@ static gboolean write_curve_patch(const dt_remote_curve_descriptor_t *desc,
   return TRUE;
 }
 
+// Self-contained curve-class transaction: resolves its own adapter (the
+// caller need not know or care whether one exists), composes adapter
+// preparation, validates and writes every entry in `entries` in
+// descriptor/registry order, then runs completed-state validation. Every
+// element of `entries` must be a DT_REMOTE_PARAMETER_CURVE-tagged
+// dt_remote_semantic_patch_t -- callers (the thin dt_remote_curve_apply_patch()
+// wrapper below and remote_edit.c's class-ops dispatcher) guarantee this by
+// construction, so violations are asserted, not skipped. `entries` may be
+// empty: an adapter-less op with no requested curve then trivially succeeds,
+// while an adapter-less op with a requested curve still reports the same
+// "unknown semantic curve" the pre-refactor code did.
+gboolean dt_remote_curve_apply_entries(const struct dt_iop_module_t *module,
+                                       const void *old_params,
+                                       void *new_params,
+                                       GPtrArray *entries,
+                                       dt_remote_error_t **error)
+{
+  if(!module || !module->so || !old_params || !new_params || !entries)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: null argument to curve mutation engine")), error);
+    return FALSE;
+  }
+
+  dt_introspection_t *intro = module->so->get_introspection
+    ? module->so->get_introspection() : NULL;
+  if(!intro || !intro->field)
+  {
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_INTERNAL,
+                          _("internal error: module '%s' has no curve introspection"), module->op),
+                        error);
+    return FALSE;
+  }
+
+  const dt_remote_curve_module_adapter_t *adapter =
+    dt_remote_curve_registry_lookup(module->op, (guint)intro->params_version);
+  if(!adapter)
+  {
+    if(entries->len == 0) return TRUE;
+    const dt_remote_semantic_patch_t *first = g_ptr_array_index(entries, 0);
+    deliver_curve_error(dt_remote_curve_error_new(
+                          DT_REMOTE_ERR_UNKNOWN_FIELD,
+                          _("unknown semantic curve '%s'"),
+                          first->value.curve.name ? first->value.curve.name : ""),
+                        error);
+    return FALSE;
+  }
+
+  if(!dt_remote_curve_registry_validate(adapter, intro, error)) return FALSE;
+
+  const dt_remote_curve_context_t context = {
+    .module = module, .introspection = intro, .adapter = adapter,
+  };
+  // adapter->prepare() only ever needs `old_params`/`new_params` in every
+  // shipped and test adapter (its `patch` argument is unused, `(void)patch`)
+  // -- this synthetic view (this class's entries, no scalar values) keeps
+  // the callback's signature satisfied without requiring the caller's
+  // whole dt_remote_patch_t.
+  const dt_remote_patch_t synthetic_patch = {
+    .scalar_values = NULL, .semantic_values = entries, .has_enable = FALSE, .enable = FALSE,
+  };
+  if(adapter->prepare
+     && !adapter->prepare(&context, old_params, new_params, &synthetic_patch, error))
+    return FALSE;
+
+  // Resolve every entry's ID against the adapter before the registry-ordered
+  // write loop below.
+  for(guint i = 0; i < entries->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(entries, i);
+    g_assert(semantic && semantic->class_id == DT_REMOTE_PARAMETER_CURVE);
+    const char *name = semantic->value.curve.name;
+    if(!find_curve_descriptor(adapter, name))
+    {
+      deliver_curve_error(dt_remote_curve_error_new(
+                            DT_REMOTE_ERR_UNKNOWN_FIELD,
+                            _("unknown semantic curve '%s'"), name ? name : ""), error);
+      return FALSE;
+    }
+    for(guint j = 0; j < i; j++)
+    {
+      const dt_remote_semantic_patch_t *prior = g_ptr_array_index(entries, j);
+      if(!g_strcmp0(prior->value.curve.name, name))
+      {
+        deliver_curve_error(curve_parameter_error_new(
+                              DT_REMOTE_ERR_INVALID_VALUE, name, "duplicate_parameter",
+                              _("duplicate semantic curve '%s'"), name), error);
+        return FALSE;
+      }
+    }
+  }
+
+  // Apply in descriptor/registry order, never request hash/array order.
+  for(guint descriptor_index = 0; descriptor_index < adapter->curve_count; descriptor_index++)
+  {
+    const dt_remote_curve_descriptor_t *desc = &adapter->curves[descriptor_index];
+    const dt_remote_curve_patch_t *curve = NULL;
+    for(guint patch_index = 0; patch_index < entries->len; patch_index++)
+    {
+      const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(entries, patch_index);
+      if(!g_strcmp0(semantic->value.curve.name, desc->name))
+      {
+        curve = &semantic->value.curve;
+        break;
+      }
+    }
+    if(!curve) continue;
+
+    gboolean active = TRUE;
+    gboolean writable = TRUE;
+    if(!curve_predicate_holds(desc->active_when, intro->field, new_params, &active, error)
+       || !curve_predicate_holds(desc->writable_when, intro->field, new_params, &writable, error))
+      return FALSE;
+    if(!active || !writable)
+    {
+      deliver_curve_error(curve_parameter_error_new(
+                            DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name,
+                            "condition_not_satisfied",
+                            _("semantic curve '%s' is inactive or not writable in projected state"),
+                            desc->name),
+                          error);
+      return FALSE;
+    }
+
+    if(!write_curve_patch(desc, intro->field, new_params, curve, error)) return FALSE;
+  }
+
+  if(adapter->validate_completed
+     && !adapter->validate_completed(&context, new_params, error))
+    return FALSE;
+  return TRUE;
+}
+
 gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
                                      const void *old_params,
                                      void *new_params,
@@ -807,95 +942,33 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
   // independent of semantic registry health. Registry drift disables curve
   // support for this operation, not its primitive field support.
   if(!prepare_needed) return TRUE;
-  if(!dt_remote_curve_registry_validate(adapter, intro, error)) return FALSE;
 
-  const dt_remote_curve_context_t context = {
-    .module = module, .introspection = intro, .adapter = adapter,
-  };
-  if(prepare_needed && adapter->prepare
-     && !adapter->prepare(&context, old_params, new_params, patch, error))
-    return FALSE;
-
-  // Resolve every curve-class request ID before the registry-ordered write
-  // loop, skipping every non-curve entry entirely -- the same request may
-  // carry vector entries the vector engine handles separately
-  // (remote_vector.c).
+  // Partition this class's entries out of the patch, in request order, and
+  // hand the slice to the self-contained engine above -- entries are
+  // borrowed from `patch`, never owned or freed by this array. A null entry
+  // anywhere in the patch (never produced by the request parser -- see
+  // remote_parameters.h -- but defended against here as this pure core does
+  // not assume a JSON-shaped caller) fails closed exactly as it did before
+  // the partition split.
+  GPtrArray *entries = g_ptr_array_new();
   for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
   {
-    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
     if(!semantic)
     {
       deliver_curve_error(dt_remote_curve_error_new(
                             DT_REMOTE_ERR_INTERNAL,
                             _("internal error: null semantic patch entry")), error);
+      g_ptr_array_unref(entries);
       return FALSE;
     }
-    if(semantic->class_id != DT_REMOTE_PARAMETER_CURVE) continue;
-    const char *name = semantic->value.curve.name;
-    if(!find_curve_descriptor(adapter, name))
-    {
-      deliver_curve_error(dt_remote_curve_error_new(
-                            DT_REMOTE_ERR_UNKNOWN_FIELD,
-                            _("unknown semantic curve '%s'"), name ? name : ""), error);
-      return FALSE;
-    }
-    for(guint j = 0; j < i; j++)
-    {
-      const dt_remote_semantic_patch_t *prior = g_ptr_array_index(patch->semantic_values, j);
-      if(prior && prior->class_id == DT_REMOTE_PARAMETER_CURVE
-         && !g_strcmp0(prior->value.curve.name, name))
-      {
-        deliver_curve_error(curve_parameter_error_new(
-                              DT_REMOTE_ERR_INVALID_VALUE, name, "duplicate_parameter",
-                              _("duplicate semantic curve '%s'"), name), error);
-        return FALSE;
-      }
-    }
+    if(semantic->class_id == DT_REMOTE_PARAMETER_CURVE)
+      g_ptr_array_add(entries, semantic);
   }
 
-  // Apply in descriptor/registry order, never request hash/array order.
-  for(guint descriptor_index = 0; descriptor_index < adapter->curve_count; descriptor_index++)
-  {
-    const dt_remote_curve_descriptor_t *desc = &adapter->curves[descriptor_index];
-    const dt_remote_curve_patch_t *curve = NULL;
-    for(guint patch_index = 0;
-        patch->semantic_values && patch_index < patch->semantic_values->len;
-        patch_index++)
-    {
-      const dt_remote_semantic_patch_t *semantic =
-        g_ptr_array_index(patch->semantic_values, patch_index);
-      if(semantic->class_id == DT_REMOTE_PARAMETER_CURVE
-         && !g_strcmp0(semantic->value.curve.name, desc->name))
-      {
-        curve = &semantic->value.curve;
-        break;
-      }
-    }
-    if(!curve) continue;
-
-    gboolean active = TRUE;
-    gboolean writable = TRUE;
-    if(!curve_predicate_holds(desc->active_when, intro->field, new_params, &active, error)
-       || !curve_predicate_holds(desc->writable_when, intro->field, new_params, &writable, error))
-      return FALSE;
-    if(!active || !writable)
-    {
-      deliver_curve_error(curve_parameter_error_new(
-                            DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name,
-                            "condition_not_satisfied",
-                            _("semantic curve '%s' is inactive or not writable in projected state"),
-                            desc->name),
-                          error);
-      return FALSE;
-    }
-
-    if(!write_curve_patch(desc, intro->field, new_params, curve, error)) return FALSE;
-  }
-
-  if(prepare_needed && adapter->validate_completed
-     && !adapter->validate_completed(&context, new_params, error))
-    return FALSE;
-  return TRUE;
+  const gboolean ok = dt_remote_curve_apply_entries(module, old_params, new_params, entries, error);
+  g_ptr_array_unref(entries);
+  return ok;
 }
 
 // clang-format off
