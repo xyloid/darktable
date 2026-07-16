@@ -864,7 +864,8 @@ gboolean dt_remote_curve_apply_patch(const struct dt_iop_module_t *module,
     {
       const dt_remote_semantic_patch_t *semantic =
         g_ptr_array_index(patch->semantic_values, patch_index);
-      if(!g_strcmp0(semantic->value.curve.name, desc->name))
+      if(semantic->class_id == DT_REMOTE_PARAMETER_CURVE
+         && !g_strcmp0(semantic->value.curve.name, desc->name))
       {
         curve = &semantic->value.curve;
         break;

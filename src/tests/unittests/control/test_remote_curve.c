@@ -1714,6 +1714,72 @@ static void test_rgbcurve_adapter_unused_native_capacity_is_zero_and_not_returne
   rgbcurve_fixture_free(fixture);
 }
 
+// Builds a semantic patch entry whose class is VECTOR, not CURVE -- used
+// only to prove the curve engine's write-order loop matches by class
+// *and* name, never name alone, so a vector-class entry can never be
+// misread through the curve union arm (semantic->value.curve.*) even when
+// its name string collides with a real curve descriptor name.
+static dt_remote_semantic_patch_t *rgbcurve_make_vector_class_patch(const char *name,
+                                                                     const double *values,
+                                                                     guint count)
+{
+  dt_remote_semantic_patch_t *semantic = g_new0(dt_remote_semantic_patch_t, 1);
+  semantic->class_id = DT_REMOTE_PARAMETER_VECTOR;
+  semantic->value.vector.name = g_strdup(name);
+  semantic->value.vector.values = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+  g_array_append_vals(semantic->value.vector.values, values, count);
+  return semantic;
+}
+
+// Regression (Task 10 follow-up): before this fix, the resolution loop's
+// `continue` on non-curve entries made it possible for a vector-class
+// entry to reach the registry-ordered write loop's name-only match
+// (old remote_curve.c:867: `!g_strcmp0(semantic->value.curve.name,
+// desc->name)`), reading the CURVE union arm of a VECTOR-typed entry --
+// on a module with a curve adapter, a vector-class entry named identically
+// to a real curve descriptor ("curve.master") would be matched and applied
+// as a curve. The class check must gate the name compare, same as
+// remote_vector.c:523-524's `semantic->class_id == DT_REMOTE_PARAMETER_VECTOR &&`.
+static void test_rgbcurve_adapter_foreign_class_entry_with_colliding_name_is_ignored(void **state)
+{
+  (void)state;
+  rgbcurve_fixture_t *fixture = rgbcurve_fixture_new();
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double foreign_values[] = { 0.1, 0.2, 0.3 };
+  dt_remote_patch_t patch;
+  rgbcurve_patch_init(&patch);
+  // "curve.master" is a real curve descriptor name for rgbcurve
+  // (remote_curve_registry.c:197), but this entry's class is VECTOR.
+  g_ptr_array_add(patch.semantic_values,
+                  rgbcurve_make_vector_class_patch("curve.master", foreign_values,
+                                                   G_N_ELEMENTS(foreign_values)));
+  // "compensate_middle_grey" is one of rgbcurve's prepare_fields
+  // (remote_curve_registry.c:627); writing it to its own default value
+  // (FALSE) is a true no-op but still makes patch_mentions_prepare_field()
+  // return TRUE, so prepare_needed is TRUE and execution reaches the
+  // registry-ordered write loop below -- without this, has_curve_semantics
+  // would be FALSE (the only semantic entry is vector-class) and the
+  // function would return TRUE before the write loop ever runs, proving
+  // nothing about the bug under test.
+  g_ptr_array_add(patch.scalar_values, rgbcurve_make_bool_entry("compensate_middle_grey", FALSE));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(rgbcurve_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+  // Pure pass-through: the curve engine must ignore the foreign-class
+  // entry entirely, not read it through the curve union arm.
+  assert_memory_equal(projected, before, fixture->module->params_size);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(before);
+  rgbcurve_patch_cleanup(&patch);
+  rgbcurve_fixture_free(fixture);
+}
+
 /* ---------------------------------------------------------------------- */
 /* tonecurve adapter                                                       */
 /* ---------------------------------------------------------------------- */
@@ -2251,6 +2317,7 @@ int main(void)
     cmocka_unit_test(test_rgbcurve_adapter_middle_grey_transforms_untouched_before_explicit_replacement),
     cmocka_unit_test(test_rgbcurve_adapter_invalid_green_blue_write_in_linked_mode_is_unsupported),
     cmocka_unit_test(test_rgbcurve_adapter_unused_native_capacity_is_zero_and_not_returned),
+    cmocka_unit_test(test_rgbcurve_adapter_foreign_class_entry_with_colliding_name_is_ignored),
     cmocka_unit_test(test_tonecurve_adapter_ab_write_in_linked_mode_is_unsupported),
     cmocka_unit_test(test_tonecurve_adapter_mode_flip_and_ab_write_in_one_patch),
     cmocka_unit_test(test_colorzones_adapter_periodic_flag_follows_select_by),
