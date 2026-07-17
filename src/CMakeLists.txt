@@ -118,6 +118,8 @@ FILE(GLOB SOURCE_FILES
   "control/remote_frame.c"
   "control/remote_parameters.c"
   "control/remote_protocol.c"
+  "control/remote_quantity.c"
+  "control/remote_quantity_registry.c"
   "control/remote_revision.c"
   "control/remote_scopes.c"
   "control/remote_server.c"

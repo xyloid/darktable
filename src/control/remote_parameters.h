@@ -295,6 +295,50 @@ typedef struct dt_remote_band_value_t
 void dt_remote_band_value_free(dt_remote_band_value_t *value);
 
 /* ---------------------------------------------------------------------- */
+/* quantity schema                                                          */
+/* ---------------------------------------------------------------------- */
+
+typedef struct dt_remote_quantity_schema_component_t
+{
+  char *name; char *unit;              // owned; unit nullable
+  double minimum, maximum;
+} dt_remote_quantity_schema_component_t;
+
+typedef struct dt_remote_quantity_schema_t
+{
+  char *name; char *display_name; char *description;  // owned
+  GPtrArray *components;   // dt_remote_quantity_schema_component_t*, owned
+  gboolean derived;
+  dt_remote_writability_t writability;
+  dt_remote_parameter_condition_t *active_when;       // owned, nullable
+  dt_remote_parameter_condition_t *writable_when;     // owned, nullable
+} dt_remote_quantity_schema_t;
+
+/** frees a quantity schema, including its owned strings, its components'
+ * owned names/units and the components array itself, its two optional
+ * conditions, and the schema struct itself. NULL-safe. */
+void dt_remote_quantity_schema_free(dt_remote_quantity_schema_t *schema);
+
+/* ---------------------------------------------------------------------- */
+/* quantity value                                                           */
+/* ---------------------------------------------------------------------- */
+
+typedef struct dt_remote_quantity_value_t
+{
+  char *name;
+  GPtrArray *values;       // dt_remote_quantity_component_value_t*, descriptor order
+  gboolean active, effective, writable_now;
+} dt_remote_quantity_value_t;
+
+// Same `active`/`effective`/`writable_now` conventions as the curve/vector/
+// band value types above.
+
+/** frees a quantity value, including its owned name, its owned component
+ * values (via dt_remote_quantity_component_value_free()), and the value
+ * struct itself. NULL-safe. */
+void dt_remote_quantity_value_free(dt_remote_quantity_value_t *value);
+
+/* ---------------------------------------------------------------------- */
 /* semantic patch                                                           */
 /* ---------------------------------------------------------------------- */
 
@@ -377,14 +421,14 @@ typedef struct dt_remote_semantic_schema_t
 {
   dt_remote_parameter_class_t class_id;
   union { dt_remote_curve_schema_t *curve; dt_remote_vector_schema_t *vector;
-          dt_remote_band_schema_t *bands; } u;   // owned
+          dt_remote_band_schema_t *bands; dt_remote_quantity_schema_t *quantity; } u;   // owned
 } dt_remote_semantic_schema_t;
 
 typedef struct dt_remote_semantic_value_t
 {
   dt_remote_parameter_class_t class_id;
   union { dt_remote_curve_value_t *curve; dt_remote_vector_value_t *vector;
-          dt_remote_band_value_t *bands; } u;    // owned
+          dt_remote_band_value_t *bands; dt_remote_quantity_value_t *quantity; } u;    // owned
 } dt_remote_semantic_value_t;
 
 /** wraps an owned curve schema in a DT_REMOTE_PARAMETER_CURVE-tagged
@@ -410,6 +454,14 @@ dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_band(dt_remote_band_
 /** wraps an owned band value in a DT_REMOTE_PARAMETER_BANDS-tagged
  * wrapper, taking ownership of `v`. */
 dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_band(dt_remote_band_value_t *v);
+
+/** wraps an owned quantity schema in a DT_REMOTE_PARAMETER_QUANTITY-tagged
+ * wrapper, taking ownership of `s`. */
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_quantity(dt_remote_quantity_schema_t *s);
+
+/** wraps an owned quantity value in a DT_REMOTE_PARAMETER_QUANTITY-tagged
+ * wrapper, taking ownership of `v`. */
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_quantity(dt_remote_quantity_value_t *v);
 
 /** frees a tagged semantic schema wrapper and its class-specific owned
  * payload. GDestroyNotify-able. NULL-safe. */

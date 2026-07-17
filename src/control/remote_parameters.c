@@ -108,6 +108,42 @@ void dt_remote_quantity_component_value_free(gpointer value_ptr)
   g_free(value);
 }
 
+void dt_remote_quantity_schema_free(dt_remote_quantity_schema_t *schema)
+{
+  if(!schema) return;
+  g_free(schema->name);
+  g_free(schema->display_name);
+  g_free(schema->description);
+  if(schema->components)
+  {
+    for(guint i = 0; i < schema->components->len; i++)
+    {
+      dt_remote_quantity_schema_component_t *component = g_ptr_array_index(schema->components, i);
+      if(component)
+      {
+        g_free(component->name);
+        g_free(component->unit);
+        g_free(component);
+      }
+    }
+    // The array itself has no attached element destructor (elements are
+    // already freed individually above), so unref only releases its own
+    // backing storage.
+    g_ptr_array_unref(schema->components);
+  }
+  dt_remote_parameter_condition_free(schema->active_when);
+  dt_remote_parameter_condition_free(schema->writable_when);
+  g_free(schema);
+}
+
+void dt_remote_quantity_value_free(dt_remote_quantity_value_t *value)
+{
+  if(!value) return;
+  g_free(value->name);
+  if(value->values) g_ptr_array_unref(value->values); // attached destroy func frees each component value
+  g_free(value);
+}
+
 void dt_remote_semantic_patch_free(gpointer patch_ptr)
 {
   dt_remote_semantic_patch_t *patch = patch_ptr;
@@ -191,6 +227,22 @@ dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_band(dt_remote_band_va
   return wrapper;
 }
 
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_quantity(dt_remote_quantity_schema_t *s)
+{
+  dt_remote_semantic_schema_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_schema_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_QUANTITY;
+  wrapper->u.quantity = s;
+  return wrapper;
+}
+
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_quantity(dt_remote_quantity_value_t *v)
+{
+  dt_remote_semantic_value_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_value_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_QUANTITY;
+  wrapper->u.quantity = v;
+  return wrapper;
+}
+
 void dt_remote_semantic_schema_free(gpointer schema_ptr)
 {
   dt_remote_semantic_schema_t *schema = schema_ptr;
@@ -208,6 +260,10 @@ void dt_remote_semantic_schema_free(gpointer schema_ptr)
 
     case DT_REMOTE_PARAMETER_BANDS:
       dt_remote_band_schema_free(schema->u.bands);
+      break;
+
+    case DT_REMOTE_PARAMETER_QUANTITY:
+      dt_remote_quantity_schema_free(schema->u.quantity);
       break;
 
     default:
@@ -234,6 +290,10 @@ void dt_remote_semantic_value_free(gpointer value_ptr)
 
     case DT_REMOTE_PARAMETER_BANDS:
       dt_remote_band_value_free(value->u.bands);
+      break;
+
+    case DT_REMOTE_PARAMETER_QUANTITY:
+      dt_remote_quantity_value_free(value->u.quantity);
       break;
 
     default:
