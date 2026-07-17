@@ -177,14 +177,18 @@ protocol reference both document this as a deliberate exception to the
   the shipped detail vocabulary in the protocol reference from day one).
 - Error precedence extends the dispatch order: parse errors first, then
   curve → vector → bands → quantity.
-- Sidecar: a `white_balance`-style convenience argument is *not* added;
-  the generic `semantic_values` path plus tool-description guidance
-  covers it. (Rationale: `curves`/`vectors`/`bands` sugar exists because
-  those shapes needed client-side translation; a quantity entry is
-  already the natural JSON a model would write. If usage shows friction,
-  sugar is a one-task follow-up.) The sidecar gains only the
-  `quantity_params` capability gate wording in `set_module_params`'s
-  docstring and README examples.
+- Sidecar: a thin `quantities` argument on `set_module_params`, mapping
+  semantic IDs to component objects —
+  `{"wb.temperature": {"temperature": 5500, "tint": 1.0}}` — translated
+  client-side to wire entries by adding `"class": "quantity"`. (Amended
+  during planning: the original draft said no sugar was needed because
+  "the generic `semantic_values` path covers it", but the MCP tool has
+  no raw `semantic_values` passthrough — the wire member is only
+  reachable through the sugar arguments, so without `quantities` the
+  class would be unreachable from the tool.) It joins the existing
+  merge/overlap machinery (the three-way overlap check becomes
+  four-way) and is gated on the `quantity_params` capability with the
+  established upgrade-message refusal.
 
 ## Ride-along adapters (milestone-4 vector engine, no new machinery)
 
