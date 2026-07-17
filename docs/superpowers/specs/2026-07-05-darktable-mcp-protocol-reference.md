@@ -65,7 +65,8 @@ Result:
   "darktable_version": "5.x",
   "pid": 12345,
   "capabilities": ["params", "instances", "history", "preview", "scopes",
-                   "semantic_params", "curve_params", "vector_params"]
+                   "semantic_params", "curve_params", "vector_params",
+                   "band_params"]
 }
 ```
 
@@ -82,10 +83,16 @@ member. `vector_params` (milestone 4) additionally advertises writable
 vector-class semantic parameters — plain vectors, color triples, and
 levels triples (the `semantic_values` request member's vector entries on
 `set_module_params`); the server never advertises `vector_params` without
-accepting vector entries in `semantic_values`. A client must send curve
-patches only when `curve_params` is present and vector patches only when
-`vector_params` is present; capability-gated optional request members do
-not bump `protocol_version` (see Maintenance).
+accepting vector entries in `semantic_values`. `band_params` (milestone 5)
+additionally advertises writable bands-class semantic parameters —
+fixed-count sampled-response band sets (the `semantic_values` request
+member's bands entries on `set_module_params`); the server never
+advertises `band_params` without accepting band entries in
+`semantic_values`. A client must send curve patches only when
+`curve_params` is present, vector patches only when `vector_params` is
+present, and band patches only when `band_params` is present;
+capability-gated optional request members do not bump `protocol_version`
+(see Maintenance).
 
 ### get_state
 
@@ -219,14 +226,40 @@ curve interpolation names. Normative shape:
 }
 ```
 
+When the server advertises `band_params` (milestone 5), semantic
+descriptors with `class: "bands"` may also appear: a fixed-count set of
+band samples (a sampled response curve stored as parallel x/y arrays).
+`count` is the exact number of samples; `y_range` bounds every y sample;
+`x_policy` is `"fixed"` (x positions are immutable) or `"interior"` (the
+interior x positions are writable; the endpoints stay pinned); `min_gap`
+is present only under `"interior"` and is the minimum adjacent x spacing,
+compared **at-least** (a gap exactly equal to `min_gap` is accepted);
+`x_shared_with` is present only on twin channels that share their x
+positions with another band of the same module (the link is symmetric).
+All policy and member names are stable wire vocabulary. Normative shape:
+
+```json
+{
+  "name": "bands.luma", "class": "bands", "display_name": "luma",
+  "readable": true, "writable": true,
+  "count": 6,
+  "y_range": { "minimum": 0.0, "maximum": 1.0 },
+  "x_policy": "interior",                   // "fixed" | "interior"
+  "min_gap": 0.001,                         // present only when x_policy = "interior"
+  "x_shared_with": "bands.luma_threshold"   // present only on twin channels
+}
+```
+
 Native storage fields backing a semantic parameter stay listed in `fields`
 with `writable: false` and a `represented_by` array naming the semantic IDs
 that represent them. This applies uniformly across the curve-bearing ops
-(`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`) and the vector-bearing
+(`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`), the vector-bearing
 ops (`colorbalance`, `channelmixerrgb`, `rgblevels`, `borders`,
-`watermark`) — see the `get_module_schema_rgbcurve_*` fixtures for the full
-curve shape and the vector registry tests for the vector shape; each op
-follows the identical wire shape with its own field/semantic names.
+`watermark`), and the band-bearing ops (`atrous`, `denoiseprofile`,
+`rawdenoise`, `lowlight`) — see the `get_module_schema_rgbcurve_*`
+fixtures for the full curve shape and the vector/band registry tests for
+the vector and band shapes; each op follows the identical wire shape with
+its own field/semantic names.
 
 Errors: `unknown_module`.
 
@@ -254,9 +287,13 @@ semantic ID mapped to its current value -- for curves `{"class": "curve",
 "active", "effective", "writable_now", "points": [{"x", "y"}, ...],
 "interpolation"}`; for vectors (milestone 4) `{"class": "vector",
 "active": ..., "effective": ..., "writable_now": ..., "values": [...]}` —
-the same status flags curve values carry. Inactive parameters (e.g.
-`curve.red` in linked mode, `levels.red` in linked-autoscale mode) are
-always present with `active: false`, never omitted.
+the same status flags curve values carry; for bands (milestone 5)
+`{"class": "bands", "active": ..., "effective": ..., "writable_now": ...,
+"y": [...], "x": [...]}` — the current samples and their stored x
+positions, both as number arrays of the schema's `count` length. Inactive
+parameters (e.g. `curve.red` in linked mode, `levels.red` in
+linked-autoscale mode) are always present with `active: false`, never
+omitted.
 
 Errors: `unknown_module`, `unknown_instance`.
 
@@ -335,9 +372,50 @@ writing a vector whose `writable_when` condition fails (checked against the
 schema's `ordering` constraint is also `invalid_value`. Vector validation
 errors carry `details: {"parameter", "component_index", "constraint"}`
 (`component_index` present only when the failure is attributable to one
-component). Semantic IDs are unique across the curve and vector registries
-within a module, so a `semantic_values` object may freely mix curve and
-vector entries by name with no collision.
+component).
+
+When the server advertises `band_params` (milestone 5), the same
+`semantic_values?` object may also carry bands entries alongside curve and
+vector entries, in the same atomic history item:
+
+```json
+{
+  "semantic_values": {
+    "bands.luma": {
+      "class": "bands",
+      "y": [0.5, 0.6, 0.7, 0.6, 0.5, 0.5],
+      "x": [0.0, 0.15, 0.4, 0.6, 0.85, 1.0]
+    }
+  }
+}
+```
+
+Each entry requires `class: "bands"` and `y`: a JSON number array of 1-8
+samples on the wire (the schema's exact `count` is enforced by the engine),
+each finite and within the schema's `y_range` — a patch is a **complete
+replacement** of the named band set, never a partial write. `x` is
+optional and, when present, must have the same length as `y`. Samples are
+carried as doubles and validated in double domain before narrowing to the
+native `float` storage on write; nothing is clamped. Sending `x` to a
+band whose `x_policy` is `"fixed"` is `unsupported_field`. Under
+`"interior"`, the first and last x must equal the stored endpoints (after
+`float` narrowing), the positions must be strictly ascending, and every
+adjacent gap must be at least `min_gap`. An x write to a band with
+`x_shared_with` mirrors the same x to the twin's native array; two entries
+in one request carrying different x for the same twin group is
+`invalid_value` (identical x on both is accepted and applied once).
+Unknown or extra members anywhere in the shape are `invalid_value`; an
+unknown semantic ID is `unknown_field`. Band validation errors carry
+`details: {"parameter", "array", "index", "constraint"}` — `array` is
+`"y"` or `"x"`, naming the offending array, and `index` is present only
+when the failure is attributable to one sample.
+
+Semantic IDs are unique across the curve, vector, and band registries
+within a module, so a `semantic_values` object may freely mix curve,
+vector, and band entries by name with no collision. Error precedence
+within one request: parse errors (shape, class, duplicate-ID) surface
+first, then engine validation in dispatch-table order — curve, then
+vector, then bands.
 
 Result (values read back from live state):
 

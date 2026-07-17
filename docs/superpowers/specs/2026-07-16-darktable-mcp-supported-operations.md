@@ -3,14 +3,14 @@
 Date: 2026-07-16
 Status: reference (supersedes `2026-07-05-darktable-mcp-supported-operations.md`;
 companion to `2026-07-05-darktable-mcp-design.md`)
-Source inventory: `src/iop/` and `src/control/remote_*` at milestone-4
-completion (`13e44f0b2e`, branch `worktree-mcp-remote-edit`)
+Source inventory: `src/iop/` and `src/control/remote_*` at milestone-5
+completion (`20e1f50e09`, branch `worktree-mcp-remote-edit`)
 
 ## Purpose
 
 A complete inventory of darktable's darkroom operations (IOP modules) and how
 the MCP remote-edit surface supports each one, as implemented through
-milestone 4. The runtime source of truth is always `get_module_schema` — this
+milestone 5. The runtime source of truth is always `get_module_schema` — this
 document is the planning and review reference: which modules the model can
 usefully edit, which are partially editable, which are excluded and why, when
 each level of support arrived, and how often photographers typically reach
@@ -28,7 +28,7 @@ listed module regardless of tier:
 | Category | Tools |
 |---|---|
 | state and introspection | `get_current_image`, `list_modules`, `get_module_schema`, `get_module_params` |
-| editing | `set_module_params` (scalars, plus semantic curves via `curves` and semantic vectors via `vectors`) |
+| editing | `set_module_params` (scalars, plus semantic curves via `curves`, semantic vectors via `vectors`, and semantic bands via `bands`) |
 | module lifecycle | `set_module_enabled`, `reset_module`, `create_module_instance` |
 | history | `get_history`, `undo` |
 | visual feedback | `render_preview`, `get_scopes` |
@@ -48,6 +48,7 @@ already covered it.
 | **m2** | semantic parameter classes and the curve engine (`src/control/remote_curve.c`): whole-curve replacement of named control-point curves, gated by the `curve_params` hello capability; per-module internal-field denylist (appendix). Design: `2026-07-11-darktable-mcp-milestone2-denylist-rgbcurve-design.md`. | `rgbcurve` → Tier 1 |
 | **m3** | curve adapters for the remaining control-point-curve modules, including periodic (hue) curves and multi-channel Lab modes. Plan: `2026-07-11-darktable-mcp-milestone3-curve-adapters.md`. | `tonecurve`, `colorzones`, `basecurve` → Tier 1 |
 | **m4** | the vector semantic class (`src/control/remote_vector.c`): named fixed-length vectors in three subtypes (plain `vector`, `color` with `display_rgb`, ordered `levels` triples), gated by the `vector_params` capability; 19 semantic names across five adapters. Design: `2026-07-12-darktable-mcp-milestone4-vector-class-design.md`. | `colorbalance`, `channelmixerrgb`, `rgblevels`, `borders` → Tier 1; `watermark` color writable (stays Tier 2 for its strings) |
+| **m5** | the sampled-response (bands) semantic class (`src/control/remote_band.c`): whole-set replacement of fixed-count band arrays, with fixed or interior x policy and twin-channel x sharing, gated by the `band_params` capability; 16 semantic names across four adapters. Ride-alongs: the class-ops dispatch table in `remote_edit.c` replacing the per-class seams, and the sidecar unifying all caller-input errors on ToolError. Design: `2026-07-16-darktable-mcp-milestone5-bands-class-design.md`. | `atrous`, `denoiseprofile`, `rawdenoise`, `lowlight` → Tier 1 |
 
 ## How support is determined
 
@@ -66,7 +67,12 @@ fixed-length vector (plain vectors, color triples, and levels triples),
 exposing writable `vector`-class semantic parameters (gated by the
 `vector_params` capability) for `colorbalance`, `channelmixerrgb`,
 `rgblevels`, `borders`, and `watermark`, while their native arrays stay
-`writable: false`. A module's tier follows from what fraction of its
+`writable: false`. Milestone 5 adds a third class, the sampled response
+(fixed-count band arrays with fixed or interior x positions and
+twin-channel x sharing), exposing writable `bands`-class semantic
+parameters (gated by the `band_params` capability) for `atrous`,
+`denoiseprofile`, `rawdenoise`, and `lowlight`, again leaving the native
+arrays `writable: false`. A module's tier follows from what fraction of its
 user-facing controls survive these rules:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
@@ -114,12 +120,13 @@ conversational steering.
   how often users deliberately *adjust* them. Note `filmicrgb` or `sigmoid`
   is also auto-applied — whichever the workflow preference selects.
 
-## Tier 1 — full support (50 modules)
+## Tier 1 — full support (54 modules)
 
 | op | display name | multi | since | usage | notes |
 |---|---|---|---|---|---|
 | `agx` | AgX | yes | m1 | common | scene-referred tone mapper; look + curve + primaries, all scalars |
 | `ashift` | rotate and perspective | no | m1 | common | rotation/lens shift/shear scalars; line-fit state internal (appendix) |
+| `atrous` | contrast equalizer | yes | m5 | common | **milestone 5, semantic bands**: `bands.luma`/`bands.chroma`/`bands.sharpness`/`bands.luma_threshold`/`bands.chroma_threshold` (six samples each, interior x; the luma and chroma pairs share x with their threshold twins) writable via `semantic_values` (`band_params` capability); `mix` scalar writable; native `x`/`y` arrays stay read-only with `represented_by`; `octaves` auto-derived (appendix) |
 | `basecurve` | base curve | yes | m3 | occasional | **milestone 3, semantic curves**: `curve.master` via `semantic_values`; fusion scalars writable; reserved native channels stay hidden |
 | `bilat` | local contrast | yes | m1 | common | mode enum + detail scalars |
 | `bilateral` | surface blur | yes | m1 | rare | radius + per-channel sigmas |
@@ -140,6 +147,7 @@ conversational steering.
 | `crop` | crop | no | m1 | core | normalized cx/cy/cw/ch; ratio ints are GUI aspect presets (caution) |
 | `defringe` | defringe | yes | m1 | rare | radius/threshold + mode enum |
 | `demosaic` | demosaic | no | m1 | occasional* | raw only; method enums + capture-sharpen scalars |
+| `denoiseprofile` | denoise (profiled) | yes | m5 | common | **milestone 5, semantic bands**: `bands.all`/`bands.red`/`bands.green`/`bands.blue`/`bands.y0`/`bands.u0v0` wavelet curves (seven samples each, fixed x) writable via `semantic_values` (`band_params` capability); `strength`, `radius`, `nbhood`, `shadows`, `bias`, `scattering`, mode enums writable; native `x`/`y` arrays stay read-only with `represented_by`; noise-fit `a[3]`/`b[3]` stay excluded (appendix) |
 | `diffuse` | diffuse or sharpen | yes | m1 | common | fully parametric anisotropic diffusion; pairs with presets |
 | `dither` | dither or posterize | yes | m1 | rare | method enum + `random.damping` (dotted nested field); `palette`, `random.radius`, `random.range` reserved (appendix) |
 | `enlargecanvas` | enlarge canvas | yes | m1 | rare | per-side percentages + color enum |
@@ -152,10 +160,12 @@ conversational steering.
 | `highlights` | highlight reconstruction | no | m1 | occasional* | raw only; method enum + scalars; `blendL`/`blendC` unused (appendix) |
 | `highpass` | highpass | yes | m1 | rare | sharpness/contrast |
 | `hotpixels` | hot pixels | no | m1 | occasional | raw only; strength/threshold + bools |
+| `lowlight` | lowlight vision | yes | m5 | rare | **milestone 5, semantic bands**: `bands.transition` (six samples, interior x) writable via `semantic_values` (`band_params` capability); `blueness` scalar writable; native `transition_x`/`transition_y` arrays stay read-only with `represented_by` |
 | `lowpass` | lowpass | yes | m1 | rare | radius/contrast/brightness/saturation; `unbound` internal |
 | `nlmeans` | astrophoto denoise | yes | m1 | rare | patch size/strength/luma/chroma |
 | `primaries` | rgb primaries | yes | m1 | occasional | per-primary hue/purity scalars |
 | `profile_gamma` | unbreak input profile | no | m1 | rare | log/gamma scalars + mode enum |
+| `rawdenoise` | raw denoise | yes | m5 | occasional | **milestone 5, semantic bands**: `bands.all`/`bands.red`/`bands.green`/`bands.blue` wavelet curves (five samples each, fixed x) writable via `semantic_values` (`band_params` capability); `threshold` scalar writable; native `x`/`y` arrays stay read-only with `represented_by` |
 | `rgbcurve` | rgb curve | yes | m2 | common | **milestone 2, semantic curves**: `curve.master`/`curve.red`/`curve.green`/`curve.blue` writable via `semantic_values` (`curve_params` capability); mode/compensation scalars writable; native node arrays stay read-only with `represented_by` |
 | `rgblevels` | rgb levels | yes | m4 | occasional | **milestone 4, semantic vectors**: `levels.linked` (autoscale linked) and `levels.red`/`levels.green`/`levels.blue` (autoscale independent) writable via `semantic_values` (`vector_params` capability); `autoscale`/`preserve_colors` enums writable; native `levels[3][3]` array stays read-only with `represented_by` |
 | `scalepixels` | scale pixels | no | m1 | rare | single pixel-aspect scalar (niche, camera-specific) |
@@ -169,7 +179,7 @@ conversational steering.
 | `velvia` | velvia | yes | m1 | occasional | strength + mid-tones bias |
 | `vignette` | vignetting | yes | m1 | common | scale/falloff/brightness/saturation/shape + `center.x`/`center.y` (dotted, rangeless — finiteness-only validation); `unbound` internal |
 
-## Tier 2 — partial support (14 modules)
+## Tier 2 — partial support (11 modules)
 
 | op | display name | multi | since | usage | supported | unsupported / caveats |
 |---|---|---|---|---|---|---|
@@ -177,29 +187,22 @@ conversational steering.
 | `colorharmonizer` | color harmonizer | yes | m1 | occasional | rule enum, anchor hue, pull strength/width, smoothing | `custom_hue[4]`, `node_saturation[4]` arrays |
 | `colorin` | input color profile | no | m1 | rare* | profile `type`/`intent`/`normalize` enums (caution: pipeline-level change) | ICC `filename` strings |
 | `colorout` | output color profile | no | m1 | rare* | profile `type`/`intent` enums (caution) | ICC `filename` string |
-| `denoiseprofile` | denoise (profiled) | yes | m1 | common | `strength`, `radius`, `nbhood`, `shadows`, `bias`, `scattering`, mode enums | wavelet band curves `x`/`y`, noise-fit `a[3]`/`b[3]` (auto-set from camera profile) |
 | `lens` | lens correction | yes | m1 | common | `method`/`modify_flags`/`target_geom` enums, `scale`, TCA overrides, fine-tune scalars | `camera[128]`/`lens[128]` strings; EXIF-derived `crop`/`focal`/`aperture`/`distance` (appendix) |
-| `lowlight` | lowlight vision | yes | m1 | rare | `blueness` | band arrays `transition_x`/`transition_y` |
 | `monochrome` | monochrome | yes | m1 | occasional | `size`, `highlights` | `a`/`b` are unranged Lab filter coordinates set by GUI drag/picker |
 | `negadoctor` | negadoctor | no | m1 | rare | film stock enum, `D_max`, `offset`, `black`, `gamma`, `soft_clip`, `exposure` | `Dmin[4]`, `wb_high[4]`, `wb_low[4]` RGB arrays (usually set by picker) |
 | `overlay` | composite | yes | m1 | rare | `opacity`, `scale`, `rotate`, offsets, scale-mode enums | overlay image reference (`imgid`, `filename`) must be chosen in the GUI first |
-| `rawdenoise` | raw denoise | yes | m1 | occasional | `threshold` | wavelet band arrays `x`/`y` |
 | `rawprepare` | raw black/white point | no | m1 | rare* | crop scalars, `raw_white_point`, flat-field enum — **caution: sensor-level values; wrong edits break the image** | `raw_black_level_separate[4]` array |
 | `temperature` | white balance | no | m1 | core* | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
 | `watermark` | watermark | yes | m4 | occasional | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums; **milestone 4, semantic vectors**: `color` writable via `semantic_values` (`vector_params` capability); native array stays read-only with `represented_by` | `filename`/`text`/`font` strings still unsupported (near-Tier 1) |
 
-## Tier 3 — parameter editing excluded (7 modules)
+## Tier 3 — parameter editing excluded (6 modules)
 
 Enable/disable, reset, history, and undo remain available (and have been
 since milestone 1); `set_module_params` is not useful because the module's
-essence is unsupported data. One remaining curve-shaped entry here is
-explicitly out of the curve-adapter pattern's reach: `atrous`'s per-band
-controls are fixed parallel arrays, not a control-point curve, and would
-need a new native layout kind.
+essence is unsupported data.
 
 | op | display name | usage | why excluded |
 |---|---|---|---|
-| `atrous` | contrast equalizer | common | per-band spline curves (`x`/`y` 2-D arrays) |
 | `colorchecker` | color look up table | rare | source/target Lab patch tables |
 | `colormapping` | color mapping | rare | acquired source/target histograms and cluster statistics; scalars meaningless without GUI acquisition |
 | `liquify` | liquify | occasional | serialized warp-node coordinate blob |
@@ -264,6 +267,7 @@ heuristic verified per module):
 | op | fields | reason |
 |---|---|---|
 | `ashift` | `cl`, `cr`, `ct`, `cb`, `last_drawn_lines_count` (the `last_drawn_lines`/`last_quad_lines` arrays are already excluded by type; there is no separate `last_drawn_lines_version` field) | auto-crop results and line-fit state |
+| `atrous` | `octaves` | auto-derived from image size in commit_params |
 | `basecurve` | — | (curve arrays already excluded by type) |
 | `borders` | `aspect_text`, `pos_h_text`, `pos_v_text` | marked UNUSED in source |
 | `channelmixerrgb` | `x`, `y`, `version` | picker-set illuminant coords; algorithm version |

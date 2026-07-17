@@ -48,7 +48,7 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
-| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves` and semantic vectors via `vectors`); one history item + new revision |
+| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves`, semantic vectors via `vectors`, and semantic bands via `bands`); one history item + new revision |
 | `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
 | `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
@@ -105,9 +105,9 @@ authoritative source of each module's vector IDs, component count, and
 per-component ranges. This requires a darktable that advertises the
 `vector_params` hello capability; against an older darktable the tool
 refuses client-side with an upgrade message instead of silently dropping
-the vector half of a patch. `curves` and `vectors` may be given together
-in the same call; a semantic ID given in both raises a client-side error
-before either is sent.
+the vector half of a patch. `curves`, `vectors`, and `bands` (below) may
+be given together in the same call; a semantic ID given in more than one
+raises a client-side error before anything is sent.
 
 **Stored-value warning.** Vector components are the module's *stored*
 values, not what the GUI displays. `colorbalance` is the sharp case: its
@@ -154,6 +154,60 @@ prior stored values, not defaults:
 
 Each `levels.*` vector is a `[black, grey, white]` triple; the schema's
 `ordering` constraint enforces `black < grey < white` with a minimum gap.
+
+`set_module_params` also edits semantic band parameters (milestone 5)
+through its optional `bands` argument: semantic IDs mapped to
+`{"y": [samples], "x"?: [positions]}`. `y` replaces the whole named band
+set (exactly the schema's `count` samples, each within its `y_range`);
+unlisted bands are untouched. Four modules currently expose band
+semantics — `atrous` (`bands.luma`/`bands.chroma`/`bands.sharpness`/
+`bands.luma_threshold`/`bands.chroma_threshold`, six samples each),
+`denoiseprofile` (`bands.all`/`bands.red`/`bands.green`/`bands.blue`/
+`bands.y0`/`bands.u0v0`, seven samples each), `rawdenoise`
+(`bands.all`/`bands.red`/`bands.green`/`bands.blue`, five samples each),
+and `lowlight` (`bands.transition`, six samples) — and
+`get_module_schema`'s `semantic_fields` (`"class": "bands"`) is the
+authoritative source of each module's band IDs, sample count, and x
+policy. This requires a darktable that advertises the `band_params` hello
+capability; the tool refuses client-side with an upgrade message
+otherwise.
+
+`x` is accepted only on bands whose schema says `x_policy: "interior"`
+(`atrous`, `lowlight`): endpoints must equal the stored endpoints, the
+positions must be strictly ascending, and adjacent gaps must be at least
+the schema's `min_gap`. On a `"fixed"`-policy module (`denoiseprofile`,
+`rawdenoise`) sending `x` is an `unsupported_field` error. An atrous
+example — a mid-frequency luma contrast boost that also shifts the
+interior band positions:
+
+```json
+{
+  "module": "atrous",
+  "values": {},
+  "bands": {
+    "bands.luma": {
+      "y": [0.5, 0.6, 0.7, 0.6, 0.5, 0.5],
+      "x": [0.0, 0.15, 0.4, 0.6, 0.85, 1.0]
+    }
+  }
+}
+```
+
+Note the twin mirroring side effect: `bands.luma` shares its x positions
+with `bands.luma_threshold` (the schema's `x_shared_with` link), so the x
+write above also moves the threshold channel's band positions — y values
+stay independent. A denoiseprofile y-only example, softening chroma
+denoising in the coarsest bands:
+
+```json
+{
+  "module": "denoiseprofile",
+  "values": {},
+  "bands": {
+    "bands.u0v0": { "y": [0.5, 0.5, 0.5, 0.5, 0.4, 0.3, 0.2] }
+  }
+}
+```
 
 ## Setup
 

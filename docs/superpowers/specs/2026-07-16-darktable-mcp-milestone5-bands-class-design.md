@@ -1,7 +1,12 @@
 # darktable MCP milestone 5 — sampled-response class (bands)
 
 Date: 2026-07-16
-Status: designed (not yet implemented)
+Status: implemented — 2026-07-17, branch `worktree-mcp-remote-edit`; two
+amendments during implementation: lowlight's x policy is interior (see the
+plan's resolved-decisions bullet), and validation-error details use
+`{parameter, array, index, constraint}` (the vector engine's convention
+extended with `array`) rather than this document's original `band_index`
+spelling — the passages below are annotated where they said otherwise
 Companions: `2026-07-05-darktable-mcp-design.md` (base protocol),
 `2026-07-05-darktable-mcp-parameter-class-investigation.md` (class taxonomy,
 step 3 of its suggested extension sequence),
@@ -161,8 +166,10 @@ documentation task, as milestone 4 did.
   (doubles).
 - **Errors**: gated-off capability → `unsupported_field`; count mismatch,
   non-finite, y out of range, x ordering/gap violation, pinned-endpoint
-  mismatch, twin x conflict → `invalid_value` with a `band_index` detail
-  member when the failure is attributable to one band; adapter envelope
+  mismatch, twin x conflict → `invalid_value` with details
+  `{parameter, array, index, constraint}` — `array` names `"y"` or `"x"`,
+  `index` present when the failure is attributable to one sample (as
+  implemented; this draft originally said `band_index`); adapter envelope
   failures (unknown module/version) → internal error. Same shape and
   atomicity rules as milestone 4: rejections are byte-atomic on the live
   blob (the projected temp blob is discarded by the caller).
@@ -242,7 +249,7 @@ Mirroring milestone 4's structure:
 
 - Protocol reference: `band_params` capability section with normative JSON
   shapes and vocabulary (`fixed`/`interior`, `min_gap`, `x_shared_with`,
-  `band_index`).
+  and the `{parameter, array, index, constraint}` error details).
 - Supported operations (2026-07-16 reference): m5 row in the milestone
   table; `atrous` → Tier 1 (since m5), `denoiseprofile`, `rawdenoise`,
   `lowlight` → Tier 1 (since m5); `atrous.octaves` appendix row.

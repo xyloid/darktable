@@ -231,6 +231,21 @@ off. Removing/stopping the sidecar from your MCP host removes the client end.
   `frame_color`), and `watermark` (`color`). See the sidecar
   [`README`](../README.md#tools-exposed) for the full `vectors` argument
   shape and worked colorbalance/rgblevels examples.
+* **Semantic band editing (milestone 5) is likewise capability-gated.** A
+  darktable with band support advertises `band_params` in the hello
+  `capabilities` list (protocol version stays `1`); the `semantic_values`
+  request member's bands entries only flow when the capability is present,
+  with the same client-side refusal against older servers. Four modules
+  expose band semantics: `atrous` (five six-sample channels with movable
+  interior x positions — `bands.luma` and `bands.chroma` share their x
+  with their `*_threshold` twins, so an x write moves both),
+  `denoiseprofile` (six seven-sample wavelet channels, fixed x),
+  `rawdenoise` (four five-sample channels, fixed x), and `lowlight`
+  (`bands.transition`, six samples, movable interior x). Each write
+  replaces the whole named band set; y values stay within the schema's
+  `y_range` and nothing is clamped. See the sidecar
+  [`README`](../README.md#tools-exposed) for the full `bands` argument
+  shape and worked atrous/denoiseprofile examples.
 * **darktable:** this feature targets the darktable release it ships in
   (5.x and later) on Linux, macOS, and Windows. The server reports its
   `darktable_version` in the handshake; schema responses are cacheable per
