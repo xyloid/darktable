@@ -250,9 +250,13 @@ gboolean dt_remote_vector_read_values(const struct dt_iop_module_t *module,
  * adapter then trivially succeeds; an op with a registered adapter still
  * runs completed-state validation against `new_params` even with zero
  * entries (the same "validate on adapter presence alone" behavior the
- * pre-split engine had). Used directly by remote_edit.c's class-ops
- * dispatch table; dt_remote_vector_apply_patch() below partitions its own
- * class's entries out of a full patch and calls this. */
+ * pre-split engine had). Called only by dt_remote_vector_apply_patch()
+ * below, which partitions its own class's entries out of a full patch and
+ * calls this -- remote_edit.c's class-ops dispatch table calls
+ * dt_remote_vector_apply_patch() (the full-patch entry point) directly,
+ * never this function, so that a scalar-only patch still reaches this
+ * engine's prepare_needed gate (see dt_remote_vector_apply_patch()'s own
+ * doc comment below). */
 gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
                                         const void *old_params,
                                         void *new_params,
@@ -267,7 +271,12 @@ gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
  * request may carry curve entries the curve engine handles separately.
  * Thin wrapper over dt_remote_vector_apply_entries() above: partitions this
  * class's entries out of `patch` (preserving request order), then
- * delegates. */
+ * delegates. This is the entry point remote_edit.c's class-ops dispatch
+ * table calls (unconditionally, with the whole patch, never a
+ * pre-partitioned slice) -- that keeps the prepare_needed gate above
+ * (computed from `patch`'s scalar values, not just its semantic entries)
+ * reachable even for a scalar-only patch that carries no vector-class
+ * entries at all. */
 gboolean dt_remote_vector_apply_patch(const struct dt_iop_module_t *module,
                                       const void *old_params,
                                       void *new_params,

@@ -756,12 +756,16 @@ static gboolean write_curve_patch(const dt_remote_curve_descriptor_t *desc,
 // preparation, validates and writes every entry in `entries` in
 // descriptor/registry order, then runs completed-state validation. Every
 // element of `entries` must be a DT_REMOTE_PARAMETER_CURVE-tagged
-// dt_remote_semantic_patch_t -- callers (the thin dt_remote_curve_apply_patch()
-// wrapper below and remote_edit.c's class-ops dispatcher) guarantee this by
-// construction, so violations are asserted, not skipped. `entries` may be
-// empty: an adapter-less op with no requested curve then trivially succeeds,
-// while an adapter-less op with a requested curve still reports the same
-// "unknown semantic curve" the pre-refactor code did.
+// dt_remote_semantic_patch_t -- guaranteed by construction by this
+// function's only caller, the thin dt_remote_curve_apply_patch() wrapper
+// below (which partitions the curve-class entries out of a full patch), so
+// violations are asserted, not skipped. remote_edit.c's class-ops dispatch
+// table calls dt_remote_curve_apply_patch() (the full-patch entry point)
+// directly, never this function -- see that wrapper's own doc comment for
+// why. `entries` may be empty: an adapter-less op with no requested curve
+// then trivially succeeds, while an adapter-less op with a requested curve
+// still reports the same "unknown semantic curve" the pre-refactor code
+// did.
 gboolean dt_remote_curve_apply_entries(const struct dt_iop_module_t *module,
                                        const void *old_params,
                                        void *new_params,

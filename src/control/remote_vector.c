@@ -396,12 +396,16 @@ static gboolean write_vector_patch(const dt_remote_vector_descriptor_t *desc,
 // caller need not know or care whether one exists), validates and writes
 // every entry in `entries` in descriptor/registry order, then runs
 // completed-state validation. Every element of `entries` must be a
-// DT_REMOTE_PARAMETER_VECTOR-tagged dt_remote_semantic_patch_t -- callers
-// (the thin dt_remote_vector_apply_patch() wrapper below and remote_edit.c's
-// class-ops dispatcher) guarantee this by construction, so violations are
-// asserted, not skipped. `entries` may be empty: an adapter-less op with no
-// requested vector then trivially succeeds, while an adapter-less op with a
-// requested vector still reports the same "unknown semantic vector" the
+// DT_REMOTE_PARAMETER_VECTOR-tagged dt_remote_semantic_patch_t -- guaranteed
+// by construction by this function's only caller, the thin
+// dt_remote_vector_apply_patch() wrapper below (which partitions the
+// vector-class entries out of a full patch), so violations are asserted,
+// not skipped. remote_edit.c's class-ops dispatch table calls
+// dt_remote_vector_apply_patch() (the full-patch entry point) directly,
+// never this function -- see that wrapper's own doc comment for why.
+// `entries` may be empty: an adapter-less op with no requested vector then
+// trivially succeeds, while an adapter-less op with a requested vector
+// still reports the same "unknown semantic vector" the
 // pre-refactor code did.
 gboolean dt_remote_vector_apply_entries(const struct dt_iop_module_t *module,
                                         const void *old_params,
