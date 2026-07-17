@@ -19,10 +19,10 @@
 // The per-op band module adapter registry, mirroring
 // remote_vector_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the band engine
-// API (list_schema/read_values). The adapter table is empty in this task --
-// Tasks 5-7 populate it (atrous, denoiseprofile, rawdenoise, lowlight), the
-// same way colorbalance/channelmixerrgb/rgblevels/borders/watermark were
-// added to the vector registry one at a time.
+// API (list_schema/read_values). The adapter table currently registers
+// lowlight and rawdenoise (Task 5); Tasks 6-7 add denoiseprofile and
+// atrous, the same way colorbalance/channelmixerrgb/rgblevels/borders/
+// watermark were added to the vector registry one at a time.
 //
 // Like remote_band.c, this file never includes JSON, socket, or MCP
 // protocol headers -- introspection/GLib (plus develop/imageop.h, for the
@@ -81,15 +81,132 @@ static void deliver_error(dt_remote_error_t *owned_error, dt_remote_error_t **ou
 }
 
 /* ---------------------------------------------------------------------- */
+/* lowlight adapter (milestone5 bands-class design doc SS Adapters,        */
+/* lowlight). Params v1: `transition_x[6]`/`transition_y[6]` -- two 1-D    */
+/* float leaves (lowlight.c:47-49), defaults x = k/5 (init(),              */
+/* lowlight.c:288), y = 0.5 ($DEFAULT). One semantic band-set over them:   */
+/* y range [0,1] (the GUI drag clamp), FIXED x policy (the GUI never       */
+/* moves transition_x), no twins, no predicates: always active, always     */
+/* writable.                                                               */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_path_segment_t s_lowlight_transition_x_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "transition_x" },
+};
+static const dt_remote_path_segment_t s_lowlight_transition_y_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "transition_y" },
+};
+
+static const dt_remote_band_descriptor_t s_lowlight_bands[1] = {
+  {
+    .name = "bands.transition",
+    .display_name = "Transition",
+    .description = "Day-to-night vision transition curve (lowlight.c:47-49): per-band blend "
+                   "between photopic and scotopic response over the six fixed brightness bands.",
+    .native_x = { .segments = s_lowlight_transition_x_segments,
+                  .length = G_N_ELEMENTS(s_lowlight_transition_x_segments) },
+    .native_y = { .segments = s_lowlight_transition_y_segments,
+                  .length = G_N_ELEMENTS(s_lowlight_transition_y_segments) },
+    .count = 6,
+    .y_minimum = 0.0,
+    .y_maximum = 1.0,
+    .x_policy = DT_REMOTE_BAND_X_FIXED,
+    .minimum_gap = 0.0,
+    .x_shared_with = NULL,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const dt_remote_band_module_adapter_t s_lowlight_adapter = {
+  "lowlight", 1, 1, s_lowlight_bands, 1, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
+/* rawdenoise adapter (milestone5 bands-class design doc SS Adapters,      */
+/* rawdenoise). Params v2: `x[4][5]`/`y[4][5]` channel rows                */
+/* (rawdenoise.c:55-56; dt_iop_rawdenoise_channel_t: all=0, red=1,         */
+/* green=2, blue=3), defaults x = k/4 (init(), rawdenoise.c:498), y = 0.5  */
+/* ($DEFAULT). Four semantic band-sets, one per channel row: y range       */
+/* [0,1] (the GUI drag clamp), FIXED x policy (the GUI never moves x), no  */
+/* twins, no predicates: always active, always writable.                   */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_path_segment_t s_rawdenoise_x0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_y0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_x1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_y1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_x2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_y2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_x3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_path_segment_t s_rawdenoise_y3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+
+// The four channel descriptors differ only in name/display/row -- shared
+// invariants (count 5, y [0,1], FIXED) spelled once per entry to stay
+// greppable static data, same convention as the vector registry's
+// s_borders_vectors[].
+#define RAWDENOISE_BAND_DESCRIPTOR(band_name, band_display, band_description, row)                          \
+  {                                                                                                          \
+    .name = (band_name), .display_name = (band_display), .description = (band_description),                  \
+    .native_x = { .segments = s_rawdenoise_x##row##_segments,                                                \
+                  .length = G_N_ELEMENTS(s_rawdenoise_x##row##_segments) },                                  \
+    .native_y = { .segments = s_rawdenoise_y##row##_segments,                                                \
+                  .length = G_N_ELEMENTS(s_rawdenoise_y##row##_segments) },                                  \
+    .count = 5, .y_minimum = 0.0, .y_maximum = 1.0, .x_policy = DT_REMOTE_BAND_X_FIXED,                      \
+    .minimum_gap = 0.0, .x_shared_with = NULL, .active_when = NULL, .writable_when = NULL,                   \
+  }
+
+static const dt_remote_band_descriptor_t s_rawdenoise_bands[4] = {
+  RAWDENOISE_BAND_DESCRIPTOR("bands.all", "All",
+                             "Wavelet noise-threshold curve applied to all channels "
+                             "(rawdenoise.c:55-56, row 0).", 0),
+  RAWDENOISE_BAND_DESCRIPTOR("bands.red", "Red",
+                             "Wavelet noise-threshold curve for the red channel (row 1).", 1),
+  RAWDENOISE_BAND_DESCRIPTOR("bands.green", "Green",
+                             "Wavelet noise-threshold curve for the green channel (row 2).", 2),
+  RAWDENOISE_BAND_DESCRIPTOR("bands.blue", "Blue",
+                             "Wavelet noise-threshold curve for the blue channel (row 3).", 3),
+};
+
+static const dt_remote_band_module_adapter_t s_rawdenoise_adapter = {
+  "rawdenoise", 2, 2, s_rawdenoise_bands, 4, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// Empty per this task -- Tasks 5-7 add atrous, denoiseprofile, rawdenoise,
-// and lowlight here, the same convention as remote_vector_registry.c's own
+// lowlight and rawdenoise (Task 5); Tasks 6-7 add denoiseprofile and
+// atrous here, the same convention as remote_vector_registry.c's own
 // s_adapters[] (and remote_curve_registry.c's before it): a future op adds
 // another entry here, not a parallel lookup mechanism.
 static const dt_remote_band_module_adapter_t *const s_adapters[] = {
-  NULL,
+  &s_lowlight_adapter,
+  &s_rawdenoise_adapter,
 };
 
 static dt_remote_band_registry_lookup_override_t s_lookup_override = NULL;

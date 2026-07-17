@@ -19,12 +19,15 @@
  * cmocka unit tests for the band-class engine and registry core
  * (src/control/remote_band.c/.h, src/control/remote_band_registry.c),
  * mirroring test_remote_vector.c's structure and fixture idioms for the
- * vector twin. The production adapter table (remote_band_registry.c's
- * s_adapters[]) is empty in this task -- every behavior below is proven
- * with a test-local, hand-rolled adapter/descriptor against real loaded
- * module .so's, installed through dt_remote_band_registry_set_lookup_override()
- * (the same test seam dt_remote_vector_registry_set_lookup_override()
- * provides for the vector registry).
+ * vector twin. The engine sections below predate any shipped adapter --
+ * every engine behavior is proven with a test-local, hand-rolled
+ * adapter/descriptor against real loaded module .so's, installed through
+ * dt_remote_band_registry_set_lookup_override() (the same test seam
+ * dt_remote_vector_registry_set_lookup_override() provides for the vector
+ * registry); the per-adapter sections at the end exercise the production
+ * s_adapters[] table directly (lowlight and rawdenoise since Task 5), and
+ * the no-adapter degrade tests use "borders", a vector-registry op that
+ * never gains a band adapter.
  *
  * Two real fixture ops, per the task brief:
  *  - "lowlight" (dt_iop_lowlight_params_t: `blueness`, `transition_x[6]`,
@@ -1229,10 +1232,13 @@ static void test_list_schema_converts_interior_twin_pair_in_registry_order(void 
   g_ptr_array_unref(out);
 }
 
+// "borders" never gains a band adapter (it is a vector-registry op), so it
+// is the permanent no-adapter fixture -- "lowlight" stopped qualifying the
+// moment Task 5 registered its production adapter.
 static void test_list_schema_no_adapter_yields_null_and_succeeds(void **state)
 {
   (void)state;
-  dt_iop_module_so_t *so = dt_iop_get_module_so("lowlight");
+  dt_iop_module_so_t *so = dt_iop_get_module_so("borders");
 
   GPtrArray *out = (GPtrArray *)0x1; // poison, must be reset to NULL
   dt_remote_error_t *error = NULL;
@@ -1294,10 +1300,12 @@ static void test_read_values_widens_floats_and_stamps_unconditional_active(void 
   band_fixture_free(fixture);
 }
 
+// Same permanent no-adapter fixture rationale as
+// test_list_schema_no_adapter_yields_null_and_succeeds above.
 static void test_read_values_no_adapter_returns_empty_table(void **state)
 {
   (void)state;
-  band_fixture_t *fixture = lowlight_fixture_new();
+  band_fixture_t *fixture = real_band_module_fixture_new("borders");
 
   GHashTable *out = NULL;
   dt_remote_error_t *error = NULL;
@@ -1405,8 +1413,10 @@ static void test_apply_entries_unknown_id_with_adapter(void **state)
 static void test_apply_patch_unknown_id_no_adapter_at_all(void **state)
 {
   (void)state;
-  band_fixture_t *fixture = lowlight_fixture_new();
-  // deliberately install nothing: production registry is empty
+  // deliberately install nothing, against an op with no production band
+  // adapter (same permanent no-adapter fixture rationale as
+  // test_list_schema_no_adapter_yields_null_and_succeeds).
+  band_fixture_t *fixture = real_band_module_fixture_new("borders");
   void *scratch = scratch_params_new(fixture->module);
 
   static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
@@ -2090,6 +2100,425 @@ static void test_apply_patch_null_arguments_fail(void **state)
 /* main                                                                     */
 /* ---------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------- */
+/* lowlight adapter (production registry; milestone5 bands-class design    */
+/* doc SS Adapters, lowlight). Params v1: `transition_x[6]`/               */
+/* `transition_y[6]` (1-D float leaves, lowlight.c:47-49), defaults        */
+/* x = k/5 (init(), lowlight.c:288), y = 0.5 ($DEFAULT). One semantic      */
+/* name, "bands.transition": count 6, y range [0,1], FIXED x policy, no    */
+/* twins/predicates/prepare/validate_completed. These tests exercise the   */
+/* production s_adapters[] table directly, same "real adapter, no          */
+/* override" pattern as test_remote_vector.c's borders/watermark sections. */
+/* ---------------------------------------------------------------------- */
+
+static void test_lowlight_registry_lookup_by_version(void **state)
+{
+  (void)state;
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("lowlight", 1);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "lowlight");
+  assert_int_equal(adapter->band_count, 1);
+
+  // Version pinned min==max==1: any other version fails closed.
+  assert_null(dt_remote_band_registry_lookup("lowlight", 0));
+  assert_null(dt_remote_band_registry_lookup("lowlight", 2));
+}
+
+static void test_lowlight_registry_validate_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("lowlight");
+  assert_non_null(so);
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("lowlight", 1);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_lowlight_schema_lists_transition(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("lowlight");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 1);
+
+  const dt_remote_band_schema_t *schema = g_ptr_array_index(schemas, 0);
+  assert_string_equal(schema->name, "bands.transition");
+  assert_int_equal(schema->count, LOWLIGHT_BAND_COUNT);
+  assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_FIXED);
+  assert_float_equal(schema->y_minimum, 0.0, 0.0);
+  assert_float_equal(schema->y_maximum, 1.0, 0.0);
+  assert_float_equal(schema->minimum_gap, 0.0, 0.0);
+  assert_null(schema->x_shared_with);
+  // No predicates: unconditionally writable.
+  assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(schema->active_when);
+  assert_null(schema->writable_when);
+
+  g_ptr_array_unref(schemas);
+}
+
+// Read-back of the real module defaults -- unlike the synthetic-adapter
+// read tests above (which poke deterministic state first), the per-adapter
+// contract pins the shipped defaults themselves: x = k/5 (init(),
+// lowlight.c:288), y = 0.5 ($DEFAULT, lowlight.c:49).
+static void test_lowlight_read_values_returns_module_defaults(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+
+  GHashTable *out = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, fixture->module->params, &out, &error));
+  assert_null(error);
+  assert_non_null(out);
+  assert_int_equal(g_hash_table_size(out), 1);
+
+  const dt_remote_band_value_t *value = g_hash_table_lookup(out, "bands.transition");
+  assert_non_null(value);
+  assert_int_equal(value->y->len, LOWLIGHT_BAND_COUNT);
+  assert_int_equal(value->x->len, LOWLIGHT_BAND_COUNT);
+  for(guint i = 0; i < LOWLIGHT_BAND_COUNT; i++)
+  {
+    assert_float_equal(g_array_index(value->x, double, i), i / 5.0, 1e-6);
+    assert_float_equal(g_array_index(value->y, double, i), 0.5, 1e-6);
+  }
+  assert_true(value->active);
+  assert_true(value->writable_now);
+
+  g_hash_table_unref(out);
+  band_fixture_free(fixture);
+}
+
+// A valid y write narrows into transition_y and nothing else -- full
+// params_size memcmp against a hand-built expected buffer proves the
+// sibling scalar (`blueness`), transition_x, and any padding are
+// byte-untouched -- then the write reads back through read_values.
+static void test_lowlight_apply_writes_y_and_reads_back(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[LOWLIGHT_BAND_COUNT] = { 0.05, 0.15, 0.25, 0.35, 0.45, 0.55 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.transition", y, LOWLIGHT_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_y[LOWLIGHT_BAND_COUNT];
+  for(guint i = 0; i < LOWLIGHT_BAND_COUNT; i++) narrowed_y[i] = (float)y[i];
+  poke_band_array(fixture->module, &s_lowlight_transition_y_path, expected, narrowed_y,
+                  LOWLIGHT_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  GHashTable *out = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_band_value_t *value = g_hash_table_lookup(out, "bands.transition");
+  assert_non_null(value);
+  for(guint i = 0; i < LOWLIGHT_BAND_COUNT; i++)
+    assert_float_equal(g_array_index(value->y, double, i), y[i], 1e-6);
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+static void test_lowlight_x_entry_rejected_unsupported_field(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[LOWLIGHT_BAND_COUNT] = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.transition", y, LOWLIGHT_BAND_COUNT, x, LOWLIGHT_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  band_fixture_free(fixture);
+}
+
+static void test_lowlight_y_out_of_range_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 1.5 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.transition", y, LOWLIGHT_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* rawdenoise adapter (production registry; milestone5 bands-class design  */
+/* doc SS Adapters, rawdenoise). Params v2: `x[4][5]`/`y[4][5]` channel    */
+/* rows (rawdenoise.c:55-56, dt_iop_rawdenoise_channel_t rows all=0,       */
+/* red=1, green=2, blue=3), defaults x = k/4 (init(), rawdenoise.c:498),   */
+/* y = 0.5 ($DEFAULT). Four semantic names over the four rows: count 5,    */
+/* y range [0,1], FIXED x policy, no twins/predicates/prepare/             */
+/* validate_completed. The 2-D FIELD+INDEX native rows are what this       */
+/* adapter proves beyond lowlight's 1-D leaves.                            */
+/* ---------------------------------------------------------------------- */
+
+#define RAWDENOISE_BAND_COUNT 5
+
+// Row-2 ("bands.green") native paths, for the expected-buffer poke in the
+// apply test below.
+static const dt_remote_path_segment_t s_rawdenoise_y2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_introspection_path_t s_rawdenoise_y2_path = {
+  .segments = s_rawdenoise_y2_segments, .length = G_N_ELEMENTS(s_rawdenoise_y2_segments)
+};
+
+static const char *const s_rawdenoise_expected_names[] = {
+  "bands.all", "bands.red", "bands.green", "bands.blue",
+};
+
+static void test_rawdenoise_registry_lookup_by_version(void **state)
+{
+  (void)state;
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("rawdenoise", 2);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "rawdenoise");
+  assert_int_equal(adapter->band_count, 4);
+
+  // Version pinned min==max==2: any other version fails closed.
+  assert_null(dt_remote_band_registry_lookup("rawdenoise", 1));
+  assert_null(dt_remote_band_registry_lookup("rawdenoise", 3));
+}
+
+static void test_rawdenoise_registry_validate_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rawdenoise");
+  assert_non_null(so);
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("rawdenoise", 2);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_rawdenoise_schema_lists_four_channels(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("rawdenoise");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, G_N_ELEMENTS(s_rawdenoise_expected_names));
+
+  for(guint i = 0; i < schemas->len; i++)
+  {
+    const dt_remote_band_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, s_rawdenoise_expected_names[i]);
+    assert_int_equal(schema->count, RAWDENOISE_BAND_COUNT);
+    assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_FIXED);
+    assert_float_equal(schema->y_minimum, 0.0, 0.0);
+    assert_float_equal(schema->y_maximum, 1.0, 0.0);
+    assert_null(schema->x_shared_with);
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+static void test_rawdenoise_read_values_returns_module_defaults(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("rawdenoise");
+
+  GHashTable *out = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, fixture->module->params, &out, &error));
+  assert_null(error);
+  assert_non_null(out);
+  assert_int_equal(g_hash_table_size(out), G_N_ELEMENTS(s_rawdenoise_expected_names));
+
+  // Defaults are per-channel identical: x = k/4 (init(), rawdenoise.c:498),
+  // y = 0.5 ($DEFAULT) -- all four channels.
+  for(guint c = 0; c < G_N_ELEMENTS(s_rawdenoise_expected_names); c++)
+  {
+    const dt_remote_band_value_t *value = g_hash_table_lookup(out, s_rawdenoise_expected_names[c]);
+    assert_non_null(value);
+    assert_int_equal(value->y->len, RAWDENOISE_BAND_COUNT);
+    assert_int_equal(value->x->len, RAWDENOISE_BAND_COUNT);
+    for(guint i = 0; i < RAWDENOISE_BAND_COUNT; i++)
+    {
+      assert_float_equal(g_array_index(value->x, double, i), i / 4.0, 1e-6);
+      assert_float_equal(g_array_index(value->y, double, i), 0.5, 1e-6);
+    }
+    assert_true(value->active);
+    assert_true(value->writable_now);
+  }
+
+  g_hash_table_unref(out);
+  band_fixture_free(fixture);
+}
+
+// Writing "bands.green" (row 2) narrows into y[2][*] and nothing else --
+// full params_size memcmp proves rows 0/1/3, the whole x array, the
+// sibling scalar (`threshold`), and any padding are byte-untouched.
+static void test_rawdenoise_apply_writes_green_row_and_leaves_other_bytes_untouched(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("rawdenoise");
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[RAWDENOISE_BAND_COUNT] = { 0.1, 0.3, 0.5, 0.7, 0.9 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.green", y, RAWDENOISE_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_y[RAWDENOISE_BAND_COUNT];
+  for(guint i = 0; i < RAWDENOISE_BAND_COUNT; i++) narrowed_y[i] = (float)y[i];
+  poke_band_array(fixture->module, &s_rawdenoise_y2_path, expected, narrowed_y,
+                  RAWDENOISE_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+static void test_rawdenoise_x_entry_rejected_unsupported_field(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("rawdenoise");
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double y[RAWDENOISE_BAND_COUNT] = { 0.1, 0.3, 0.5, 0.7, 0.9 };
+  static const double x[RAWDENOISE_BAND_COUNT] = { 0.0, 0.25, 0.5, 0.75, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.all", y, RAWDENOISE_BAND_COUNT, x, RAWDENOISE_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  band_fixture_free(fixture);
+}
+
+static void test_rawdenoise_y_out_of_range_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("rawdenoise");
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[RAWDENOISE_BAND_COUNT] = { 0.1, 0.3, 0.5, 0.7, 1.5 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.red", y, RAWDENOISE_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// A 6-sample y against the 5-band rawdenoise count is a count mismatch,
+// rejected before any write.
+static void test_rawdenoise_count_mismatch_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("rawdenoise");
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double y[6] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values, make_band_entry("bands.blue", y, 6, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  band_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -2210,6 +2639,38 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_apply_entries_null_arguments_fail,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_null_arguments_fail,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_lowlight_registry_lookup_by_version,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_registry_validate_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_schema_lists_transition,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_read_values_returns_module_defaults,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_apply_writes_y_and_reads_back,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_x_entry_rejected_unsupported_field,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_y_out_of_range_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_rawdenoise_registry_lookup_by_version,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_registry_validate_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_schema_lists_four_channels,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_read_values_returns_module_defaults,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_apply_writes_green_row_and_leaves_other_bytes_untouched,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_x_entry_rejected_unsupported_field,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_y_out_of_range_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_rawdenoise_count_mismatch_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 
