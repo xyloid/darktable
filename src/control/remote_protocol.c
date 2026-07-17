@@ -1192,20 +1192,29 @@ static gboolean _node_to_finite_double(JsonNode *node, double *out)
 // descriptor.
 #define DT_REMOTE_VECTOR_WIRE_COMPONENT_CAP 8
 
+// Flat pre-engine cap on samples per bands semantic_values entry (milestone
+// 5 design): request-size hygiene only, mirroring the vector component cap
+// above -- the engine resolves semantic IDs against the bands registry and
+// rejects sample-count mismatches against the per-name descriptor.
+#define DT_REMOTE_BAND_WIRE_SAMPLE_CAP 8
+
 // Parses the optional "semantic_values" request member into a GPtrArray of
 // dt_remote_semantic_patch_t (curve design SS Mutation request /
-// SS Serialization rules, extended by the milestone 4 vector-class design):
-// entries are objects with exactly {class, points[, interpolation]} for
-// class "curve" (points are objects with exactly {x, y}, both finite
-// numbers), or exactly {class, values} for class "vector" (values is a
-// non-empty array of at most DT_REMOTE_VECTOR_WIRE_COMPONENT_CAP finite
-// numbers). Components are carried as doubles end-to-end -- narrowing to
-// float only happens once the engine writes into the params blob, so a
-// range check never sees a value that has already rounded into range.
-// Duplicate semantic IDs cannot survive to this point -- JsonObject keys
-// are already unique. Absent member: *out stays NULL, returns TRUE. Any
-// violation: FALSE with *err set and *out NULL -- the engine is never
-// reached with a partially parsed patch.
+// SS Serialization rules, extended by the milestone 4 vector-class design
+// and the milestone 5 bands-class design): entries are objects with
+// exactly {class, points[, interpolation]} for class "curve" (points are
+// objects with exactly {x, y}, both finite numbers), exactly {class,
+// values} for class "vector" (values is a non-empty array of at most
+// DT_REMOTE_VECTOR_WIRE_COMPONENT_CAP finite numbers), or exactly {class,
+// y[, x]} for class "bands" (y is a non-empty array of at most
+// DT_REMOTE_BAND_WIRE_SAMPLE_CAP finite numbers; x, if present, is a finite
+// numeric array of the same length as y). Components/samples are carried
+// as doubles end-to-end -- narrowing to float only happens once the engine
+// writes into the params blob, so a range check never sees a value that
+// has already rounded into range. Duplicate semantic IDs cannot survive to
+// this point -- JsonObject keys are already unique. Absent member: *out
+// stays NULL, returns TRUE. Any violation: FALSE with *err set and *out
+// NULL -- the engine is never reached with a partially parsed patch.
 static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_remote_error_t **err)
 {
   *out = NULL;
@@ -1240,8 +1249,8 @@ static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_r
     JsonObject *entry = json_node_get_object(entry_node);
 
     // class is required in mutation values -- curve design SS Serialization
-    // rules ("to prevent future ambiguous shapes"); "curve" and "vector"
-    // are the v1 writable classes.
+    // rules ("to prevent future ambiguous shapes"); "curve", "vector", and
+    // "bands" are the v1 writable classes.
     JsonNode *class_node = json_object_get_member(entry, "class");
     const char *class_name =
       (class_node && JSON_NODE_HOLDS_VALUE(class_node)
@@ -1256,12 +1265,14 @@ static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_r
 
     const gboolean is_curve = !g_strcmp0(class_name, "curve");
     const gboolean is_vector = !g_strcmp0(class_name, "vector");
+    const gboolean is_bands = !g_strcmp0(class_name, "bands");
 
     // strict member set, per class: exactly class + points, optionally
-    // interpolation, for curve; exactly class + values for vector. An
-    // unrecognized class skips this check entirely -- it is rejected below
-    // regardless of which other members it carries.
-    if(is_curve || is_vector)
+    // interpolation, for curve; exactly class + values for vector; exactly
+    // class + y, optionally x, for bands. An unrecognized class skips this
+    // check entirely -- it is rejected below regardless of which other
+    // members it carries.
+    if(is_curve || is_vector || is_bands)
     {
       GList *members = json_object_get_members(entry);
       for(GList *m = members; m && !entry_err; m = m->next)
@@ -1270,7 +1281,8 @@ static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_r
         const gboolean allowed =
           !g_strcmp0(member, "class")
           || (is_curve && (!g_strcmp0(member, "points") || !g_strcmp0(member, "interpolation")))
-          || (is_vector && !g_strcmp0(member, "values"));
+          || (is_vector && !g_strcmp0(member, "values"))
+          || (is_bands && (!g_strcmp0(member, "y") || !g_strcmp0(member, "x")));
         if(!allowed)
           entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
                                  _("unknown member '%s' in semantic value '%s'"), member, name);
@@ -1390,6 +1402,92 @@ static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_r
       semantic->class_id = DT_REMOTE_PARAMETER_VECTOR;
       semantic->value.vector.name = g_strdup(name);
       semantic->value.vector.values = values;
+      g_ptr_array_add(patches, semantic);
+    }
+    else if(is_bands)
+    {
+      JsonNode *y_node = json_object_get_member(entry, "y");
+      if(!y_node || !JSON_NODE_HOLDS_ARRAY(y_node))
+      {
+        entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                               _("semantic value '%s' requires a 'y' array"), name);
+        break;
+      }
+      JsonArray *y_arr = json_node_get_array(y_node);
+      const guint n_y = json_array_get_length(y_arr);
+      if(n_y == 0 || n_y > DT_REMOTE_BAND_WIRE_SAMPLE_CAP)
+      {
+        entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                               _("semantic value '%s' has %u samples; the request limit is %d"),
+                               name, n_y, DT_REMOTE_BAND_WIRE_SAMPLE_CAP);
+        break;
+      }
+      GArray *y = g_array_sized_new(FALSE, FALSE, sizeof(double), n_y);
+      for(guint i = 0; i < n_y && !entry_err; i++)
+      {
+        double v = 0.0;
+        if(!_node_to_finite_double(json_array_get_element(y_arr, i), &v))
+          entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                 _("sample %u of semantic value '%s' must be a finite number"),
+                                 i, name);
+        else
+          g_array_append_val(y, v);
+      }
+      if(entry_err)
+      {
+        g_array_unref(y);
+        break;
+      }
+
+      // "x", if present, is the sample abscissae: same element rules as
+      // "y", and its length must match "y"'s -- the engine pairs x[i] with
+      // y[i] positionally, so a length mismatch is a wire-level shape
+      // error, not a validator concern.
+      GArray *x = NULL;
+      if(json_object_has_member(entry, "x"))
+      {
+        JsonNode *x_node = json_object_get_member(entry, "x");
+        if(!x_node || !JSON_NODE_HOLDS_ARRAY(x_node))
+        {
+          entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                 _("semantic value '%s' member 'x' must be an array"), name);
+          g_array_unref(y);
+          break;
+        }
+        JsonArray *x_arr = json_node_get_array(x_node);
+        const guint n_x = json_array_get_length(x_arr);
+        if(n_x != n_y)
+        {
+          entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                 _("semantic value '%s' has %u 'x' samples but %u 'y' samples; "
+                                   "the lengths must match"), name, n_x, n_y);
+          g_array_unref(y);
+          break;
+        }
+        x = g_array_sized_new(FALSE, FALSE, sizeof(double), n_x);
+        for(guint i = 0; i < n_x && !entry_err; i++)
+        {
+          double v = 0.0;
+          if(!_node_to_finite_double(json_array_get_element(x_arr, i), &v))
+            entry_err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                   _("x sample %u of semantic value '%s' must be a finite number"),
+                                   i, name);
+          else
+            g_array_append_val(x, v);
+        }
+        if(entry_err)
+        {
+          g_array_unref(x);
+          g_array_unref(y);
+          break;
+        }
+      }
+
+      dt_remote_semantic_patch_t *semantic = g_malloc0(sizeof(dt_remote_semantic_patch_t));
+      semantic->class_id = DT_REMOTE_PARAMETER_BANDS;
+      semantic->value.bands.name = g_strdup(name);
+      semantic->value.bands.y = y;
+      semantic->value.bands.x = x;
       g_ptr_array_add(patches, semantic);
     }
     else

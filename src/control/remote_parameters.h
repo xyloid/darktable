@@ -46,7 +46,7 @@ G_BEGIN_DECLS
 typedef enum dt_remote_parameter_class_t
 {
   DT_REMOTE_PARAMETER_CURVE = 1,
-  DT_REMOTE_PARAMETER_SAMPLED_RESPONSE,   // reserved, milestone 5
+  DT_REMOTE_PARAMETER_BANDS,               // fixed-count band samples, milestone 5
   DT_REMOTE_PARAMETER_VECTOR              // replaces DT_REMOTE_PARAMETER_LEVELS
 } dt_remote_parameter_class_t;
 
@@ -250,6 +250,13 @@ typedef struct dt_remote_vector_patch_t
   GArray *values;    // double elements, owned
 } dt_remote_vector_patch_t;
 
+typedef struct dt_remote_band_patch_t
+{
+  char *name;      // owned semantic ID
+  GArray *y;       // double elements, owned, required
+  GArray *x;       // double elements, owned, NULL when absent
+} dt_remote_band_patch_t;
+
 typedef struct dt_remote_semantic_patch_t
 {
   dt_remote_parameter_class_t class_id;
@@ -257,16 +264,18 @@ typedef struct dt_remote_semantic_patch_t
   {
     dt_remote_curve_patch_t curve;
     dt_remote_vector_patch_t vector;
+    dt_remote_band_patch_t bands;
   } value;
 } dt_remote_semantic_patch_t;
 
 // The request parser owns and frees patches. It rejects unknown members,
-// duplicate semantic IDs, oversized point/component lists, and
+// duplicate semantic IDs, oversized point/component/sample lists, and
 // non-numeric/non-finite JSON before invoking `remote_edit`.
 
 /** frees a single semantic patch entry (its class-specific owned
  * members -- name and points for DT_REMOTE_PARAMETER_CURVE, name and
- * values for DT_REMOTE_PARAMETER_VECTOR -- and the patch struct itself).
+ * values for DT_REMOTE_PARAMETER_VECTOR, name and y (and x, if present)
+ * for DT_REMOTE_PARAMETER_BANDS -- and the patch struct itself).
  * Suitable as a GDestroyNotify for the `dt_remote_patch_t.semantic_values`
  * GPtrArray. NULL-safe. */
 void dt_remote_semantic_patch_free(gpointer patch_ptr);

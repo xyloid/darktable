@@ -1174,6 +1174,119 @@ static gboolean stub_set_module_params_vector_precision(const dt_remote_module_r
   return TRUE;
 }
 
+/* --- set_module_params semantic bands stubs (milestone 5 Task 2) -------- */
+
+// Success stub for the bands parse-accept test (no "x"): asserts the
+// handler decoded semantic_values into exactly one DT_REMOTE_PARAMETER_BANDS
+// entry with the six y samples from the request, in order, preserved as
+// doubles, and "x" left NULL since the request omitted it.
+static gboolean stub_set_module_params_bands_capture(const dt_remote_module_ref_t *ref,
+                                                      const dt_remote_patch_t *patch,
+                                                      const uint64_t *expected_revision,
+                                                      dt_remote_mutation_result_t **out,
+                                                      dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_BANDS);
+  assert_string_equal(semantic->value.bands.name, "bands.example");
+  assert_non_null(semantic->value.bands.y);
+
+  static const double expected[] = { 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+  assert_int_equal(semantic->value.bands.y->len, (int)G_N_ELEMENTS(expected));
+  for(guint i = 0; i < G_N_ELEMENTS(expected); i++)
+    assert_float_equal(g_array_index(semantic->value.bands.y, double, i), expected[i], 1e-12);
+  assert_null(semantic->value.bands.x);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
+// Success stub for the bands parse-accept test with "x" present: asserts
+// both y and x decode to six doubles each, in order.
+static gboolean stub_set_module_params_bands_with_x_capture(const dt_remote_module_ref_t *ref,
+                                                             const dt_remote_patch_t *patch,
+                                                             const uint64_t *expected_revision,
+                                                             dt_remote_mutation_result_t **out,
+                                                             dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_BANDS);
+  assert_string_equal(semantic->value.bands.name, "bands.example");
+
+  static const double expected_y[] = { 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+  assert_non_null(semantic->value.bands.y);
+  assert_int_equal(semantic->value.bands.y->len, (int)G_N_ELEMENTS(expected_y));
+  for(guint i = 0; i < G_N_ELEMENTS(expected_y); i++)
+    assert_float_equal(g_array_index(semantic->value.bands.y, double, i), expected_y[i], 1e-12);
+
+  static const double expected_x[] = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 };
+  assert_non_null(semantic->value.bands.x);
+  assert_int_equal(semantic->value.bands.x->len, (int)G_N_ELEMENTS(expected_x));
+  for(guint i = 0; i < G_N_ELEMENTS(expected_x); i++)
+    assert_float_equal(g_array_index(semantic->value.bands.x, double, i), expected_x[i], 1e-12);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
+// double-domain proof stub (curve/vector design rationale, mirrored for
+// bands): a sample that would narrow cleanly to float (0.50000001 -> 0.5f)
+// must survive the parser as its un-narrowed double.
+static gboolean stub_set_module_params_bands_precision(const dt_remote_module_ref_t *ref,
+                                                        const dt_remote_patch_t *patch,
+                                                        const uint64_t *expected_revision,
+                                                        dt_remote_mutation_result_t **out,
+                                                        dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_BANDS);
+  assert_non_null(semantic->value.bands.y);
+  assert_int_equal(semantic->value.bands.y->len, 1);
+  assert_true(g_array_index(semantic->value.bands.y, double, 0) > 0.5);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
 /* ---------------------------------------------------------------------- */
 /* hello                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -2276,6 +2389,220 @@ static void test_semantic_vector_preserves_double_precision(void **state)
     "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
     "\"semantic_values\":{\"vector.example\":{\"class\":\"vector\","
     "\"values\":[2.00000001]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- set_module_params semantic_values bands class (milestone 5 Task 2) */
+
+// accept: {"class":"bands","y":[0.5,0.5,0.5,0.5,0.5,0.5]} decodes into a
+// DT_REMOTE_PARAMETER_BANDS patch with all six y samples preserved, in
+// order, as doubles, x left NULL, and the semantic name kept.
+static void test_semantic_band_entry_parses(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_bands_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":112,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
+    "\"y\":[0.5,0.5,0.5,0.5,0.5,0.5]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// accept: same y, plus "x":[0.0,0.2,0.4,0.6,0.8,1.0] -- x is kept as six
+// doubles alongside y.
+static void test_semantic_band_entry_with_x_parses(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_bands_with_x_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":113,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
+    "\"y\":[0.5,0.5,0.5,0.5,0.5,0.5],"
+    "\"x\":[0.0,0.2,0.4,0.6,0.8,1.0]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: 'y' member missing, and 'y' present but not an array.
+static void test_semantic_band_requires_y_array(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // y missing entirely
+  _assert_inline_error(
+    "{\"id\":114,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\"}}}}",
+    "invalid_value");
+  // y present but not an array
+  _assert_inline_error(
+    "{\"id\":115,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":true}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: every non-numeric/non-finite y-sample spelling -- a non-numeric
+// string, a boolean, overflow-to-Infinity in both directions (1e400/-1e400
+// have no finite double representation), and a null element -- mirroring
+// the vector-class component rejections above.
+static void test_semantic_band_rejects_non_finite_samples(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":116,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[0.5,\"x\"]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":117,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[0.5,true]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":118,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[1e400]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":119,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[-1e400]}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":120,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[0.5,null]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: 9 samples exceeds DT_REMOTE_BAND_WIRE_SAMPLE_CAP (8) -- the
+// protocol layer's flat pre-engine limit, mirroring the vector component
+// cap; and an empty y array, which is never valid regardless of the cap.
+static void test_semantic_band_rejects_oversized_sample_list(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  GString *oversized = g_string_new(
+    "{\"id\":121,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[");
+  for(int i = 0; i < 9; i++)
+    g_string_append_printf(oversized, "%s%.6f", i ? "," : "", i / 8.0);
+  g_string_append(oversized, "]}}}}");
+  _assert_inline_error(oversized->str, "invalid_value");
+  g_string_free(oversized, TRUE);
+
+  _assert_inline_error(
+    "{\"id\":122,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\",\"y\":[]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: "x" present with a length different from "y"'s.
+static void test_semantic_band_rejects_mismatched_x_length(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":123,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
+    "\"y\":[0.5,0.5,0.5],\"x\":[0.0,1.0]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: a member beyond exactly {class, y[, x]} -- here "points", a
+// curve-flavored member, leaking onto a bands entry.
+static void test_semantic_band_rejects_unknown_members(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":124,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
+    "\"y\":[0.5,0.5],\"points\":[{\"x\":0.0,\"y\":0.0}]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// double-domain proof: a y sample that would narrow cleanly to float
+// (0.50000001 -> 0.5f, since the difference is well under float's ULP near
+// 0.5) must survive parsing as its un-narrowed double.
+static void test_semantic_band_preserves_double_precision(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_bands_precision,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":125,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
+    "\"y\":[0.50000001]}}}}");
   JsonObject *resp = json_node_get_object(actual);
   assert_true(json_object_get_boolean_member(resp, "ok"));
   json_node_unref(actual);
@@ -4170,6 +4497,14 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_semantic_vector_rejects_unknown_members),
     cmocka_unit_test(test_semantic_duplicate_ids_rejected_across_classes),
     cmocka_unit_test(test_semantic_vector_preserves_double_precision),
+    cmocka_unit_test(test_semantic_band_entry_parses),
+    cmocka_unit_test(test_semantic_band_entry_with_x_parses),
+    cmocka_unit_test(test_semantic_band_requires_y_array),
+    cmocka_unit_test(test_semantic_band_rejects_non_finite_samples),
+    cmocka_unit_test(test_semantic_band_rejects_oversized_sample_list),
+    cmocka_unit_test(test_semantic_band_rejects_mismatched_x_length),
+    cmocka_unit_test(test_semantic_band_rejects_unknown_members),
+    cmocka_unit_test(test_semantic_band_preserves_double_precision),
     cmocka_unit_test(test_hello_curve_params_implies_semantic_values_accepted),
 
     cmocka_unit_test(test_set_module_enabled_success),
