@@ -750,6 +750,271 @@ async def test_set_module_params_vectors_rejects_invalid_entries(
     assert server.connections_seen == 0
 
 
+def test_wire_band_values_translates_y_only_and_y_with_x():
+    """`_wire_band_values` is pure translation: each spec becomes
+    `{"class": "bands", "y": [floats]}` with `x` carried through only
+    when given."""
+    from darktable_mcp.server import _wire_band_values
+
+    out = _wire_band_values(
+        {
+            "bands.luma": {"y": [0.5] * 6},
+            "bands.transition": {
+                "y": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                "x": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            },
+        }
+    )
+
+    assert out == {
+        "bands.luma": {"class": "bands", "y": [0.5] * 6},
+        "bands.transition": {
+            "class": "bands",
+            "y": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "x": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        },
+    }
+
+
+def test_wire_semantic_values_unknown_interpolation_raises_tool_error():
+    """Caller-input mistakes raise ToolError uniformly across the three
+    semantic translators -- `_wire_semantic_values` must not leak a bare
+    ValueError."""
+    from darktable_mcp.server import _wire_semantic_values
+
+    with pytest.raises(ToolError) as excinfo:
+        _wire_semantic_values(
+            {
+                "curve.master": {
+                    "points": [[0.0, 0.0], [1.0, 1.0]],
+                    "interpolation": "bezier",
+                }
+            }
+        )
+    assert "unknown interpolation" in str(excinfo.value)
+
+
+async def test_set_module_params_bands_translates_to_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """`bands` is tool-side sugar mirroring `vectors`: each entry becomes
+    `{"class": "bands", "y": [...], "x"?: [...]}` under `semantic_values`
+    and the wire request never carries a `bands` member."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 3,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "atrous",
+            "values": {},
+            "bands": {
+                "bands.luma": {"y": [0.5, 0.6, 0.7, 0.6, 0.5, 0.5]},
+                "bands.sharpness": {
+                    "y": [0.5] * 6,
+                    "x": [0.0, 0.15, 0.4, 0.6, 0.85, 1.0],
+                },
+            },
+        },
+    )
+
+    assert "bands" not in seen
+    assert seen["semantic_values"] == {
+        "bands.luma": {"class": "bands", "y": [0.5, 0.6, 0.7, 0.6, 0.5, 0.5]},
+        "bands.sharpness": {
+            "class": "bands",
+            "y": [0.5] * 6,
+            "x": [0.0, 0.15, 0.4, 0.6, 0.85, 1.0],
+        },
+    }
+
+
+async def test_set_module_params_curves_vectors_bands_merge_into_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """All three semantic arguments given together merge into one
+    `semantic_values` dict on the wire."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 4,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "colorbalance",
+            "values": {},
+            "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+        },
+    )
+
+    assert seen["semantic_values"] == {
+        "curve.master": {
+            "class": "curve",
+            "points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}],
+        },
+        "lift": {"class": "vector", "values": [1.0, 1.1, 1.0, 0.95]},
+        "bands.luma": {"class": "bands", "y": [0.5] * 6},
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {
+            "curves": {"bands.luma": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+        },
+        {
+            "vectors": {"bands.luma": [1.0, 1.1, 1.0]},
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+        },
+        {
+            "curves": {"bands.luma": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "vectors": {"bands.luma": [1.0, 1.1, 1.0]},
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+        },
+    ],
+    ids=["curves-and-bands", "vectors-and-bands", "all-three"],
+)
+async def test_set_module_params_three_way_overlap_fails_before_wire(
+    tmp_path, fake_server_factory, arguments
+):
+    """A semantic id given in more than one of `curves`/`vectors`/`bands`
+    is rejected client-side, before any wire traffic."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {"module": "atrous", "values": {}, **arguments},
+        )
+
+    message = str(excinfo.value)
+    assert "bands.luma" in message
+    assert calls == []
+    assert server.connections_seen == 0
+
+
+async def test_set_module_params_bands_gated_on_band_params_capability(
+    tmp_path, fake_server_factory
+):
+    """A darktable whose hello does not advertise `band_params` (the
+    fake's default hello has `capabilities: []`) must be refused
+    client-side: clear upgrade message, and no `set_module_params` wire
+    call that the peer would reject less legibly."""
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "atrous",
+                "values": {},
+                "bands": {"bands.luma": {"y": [0.5] * 6}},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "band_params" in message
+    assert "upgrade darktable" in message
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_bands,expected_name",
+    [
+        ({"bands.luma": {}}, "bands.luma"),
+        ({"bands.luma": {"y": []}}, "bands.luma"),
+        ({"bands.luma": {"y": [0.5, True, 0.5]}}, "bands.luma"),
+        ({"bands.luma": {"y": [0.5, float("nan"), 0.5]}}, "bands.luma"),
+        ({"bands.luma": {"y": [0.5, float("inf"), 0.5]}}, "bands.luma"),
+        ({"bands.luma": {"y": [0.5, "not-a-number", 0.5]}}, "bands.luma"),
+        ({"bands.luma": {"y": [0.5] * 6, "x": [0.0, 1.0]}}, "bands.luma"),
+        (
+            {"bands.luma": {"y": [0.5] * 6, "x": [0.0, 0.2, float("nan"), 0.6, 0.8, 1.0]}},
+            "bands.luma",
+        ),
+        ({"bands.luma": {"y": [0.5] * 6, "points": [[0.0, 0.0]]}}, "bands.luma"),
+        ({"bands.luma": [0.5] * 6}, "bands.luma"),
+    ],
+    ids=[
+        "missing-y",
+        "empty-y",
+        "bool-element",
+        "nan-element",
+        "inf-element",
+        "non-numeric-element",
+        "x-length-mismatch",
+        "nan-x-element",
+        "unknown-key",
+        "non-dict-spec",
+    ],
+)
+async def test_set_module_params_bands_rejects_invalid_entries(
+    tmp_path, fake_server_factory, bad_bands, expected_name
+):
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {"module": "atrous", "values": {}, "bands": bad_bands},
+        )
+
+    message = str(excinfo.value)
+    assert expected_name in message
+    assert calls == []
+    # Validation is pure client-side and runs before connect: the fake
+    # server never even saw a connection.
+    assert server.connections_seen == 0
+
+
 async def test_reset_module_returns_wire_result(tmp_path, fake_server_factory):
     server = await fake_server_factory()
     fixture = load_fixture("reset_module_response.json")

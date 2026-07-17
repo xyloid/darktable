@@ -132,6 +132,7 @@ async def test_client_capabilities_populated_from_hello(fake_server_factory):
     await client.ensure_connected()
     assert client.capabilities == hello_response["result"]["capabilities"]
     assert "curve_params" in client.capabilities
+    assert "band_params" in client.capabilities
 
     await client.close()
 

@@ -77,7 +77,7 @@ def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
     """Translates the tool-side `curves` shape (point pairs, any-case
     interpolation names) into the wire's `semantic_values` member
     (`class: "curve"`, `{x, y}` point objects, upper-case interpolation).
-    Pure and connection-free; raises `ValueError` on an interpolation
+    Pure and connection-free; raises `ToolError` on an interpolation
     name the wire would reject, so the mistake never costs a round trip.
     """
     out: dict[str, Any] = {}
@@ -90,7 +90,7 @@ def _wire_semantic_values(curves: dict[str, Any]) -> dict[str, Any]:
         if interp is not None:
             interp = str(interp).upper()
             if interp not in _INTERPOLATIONS:
-                raise ValueError(
+                raise ToolError(
                     f"unknown interpolation {interp!r}; expected one of "
                     + ", ".join(sorted(_INTERPOLATIONS))
                 )
@@ -112,6 +112,48 @@ def _wire_vector_values(vectors: dict[str, Any]) -> dict[str, Any]:
             raise ToolError(
                 f"vector '{name}' must be a non-empty list of finite numbers")
         out[name] = {"class": "vector", "values": [float(v) for v in values]}
+    return out
+
+
+def _wire_band_values(bands: dict[str, Any]) -> dict[str, Any]:
+    """Translate the `bands` tool argument to wire semantic_values
+    entries. Tool shape: {name: {"y": [...], "x": [...]?}}. Mirrors
+    _wire_vector_values: validate fully before any wire traffic, raise
+    ToolError on bad shapes."""
+
+    def _finite_samples(name: str, member: str, samples: Any) -> list[float]:
+        ok = (isinstance(samples, (list, tuple)) and len(samples) > 0
+              and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                      and math.isfinite(v) for v in samples))
+        if not ok:
+            raise ToolError(
+                f"band '{name}' member '{member}' must be a non-empty list "
+                "of finite numbers")
+        return [float(v) for v in samples]
+
+    out: dict[str, Any] = {}
+    for name, spec in bands.items():
+        if not isinstance(spec, dict):
+            raise ToolError(
+                f"band '{name}' must be a dict with a 'y' sample list "
+                "and an optional 'x' list")
+        unknown = set(spec) - {"y", "x"}
+        if unknown:
+            raise ToolError(
+                f"band '{name}' has unknown member(s): "
+                + ", ".join(sorted(unknown)))
+        entry: dict[str, Any] = {
+            "class": "bands",
+            "y": _finite_samples(name, "y", spec.get("y")),
+        }
+        x = spec.get("x")
+        if x is not None:
+            entry["x"] = _finite_samples(name, "x", x)
+            if len(entry["x"]) != len(entry["y"]):
+                raise ToolError(
+                    f"band '{name}' x length {len(entry['x'])} does not "
+                    f"match y length {len(entry['y'])}")
+        out[name] = entry
     return out
 
 
@@ -193,6 +235,7 @@ def build_server(
         expected_revision: int | None = None,
         curves: dict[str, Any] | None = None,
         vectors: dict[str, Any] | None = None,
+        bands: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Set parameter values on one module instance, recorded as one
         history step. `module` is the internal op name, `instance` its
@@ -227,30 +270,57 @@ def build_server(
         a flat list of finite numbers; each patch replaces that whole
         named vector (unlisted vectors are untouched). Components are the
         module's stored-space values -- e.g. colorbalance stores its
-        identity lift/gamma/gain as 1.0, not 0.0. `curves` and `vectors`
-        may be given together; a semantic ID given in both raises an
-        error before either is sent."""
+        identity lift/gamma/gain as 1.0, not 0.0.
+
+        `bands` edits semantic sampled-response parameters (see
+        `get_module_schema`'s `semantic_fields` with `"class": "bands"`,
+        e.g. atrous's `bands.luma`) and needs a darktable that advertises
+        the `band_params` capability. It maps semantic IDs to
+        `{"y": [samples], "x"?: [positions]}`. `y` is required and
+        replaces that whole band (exactly `count` samples, each within the
+        schema's `y_range`); `x` is accepted only on bands whose schema
+        says `x_policy: "interior"` -- endpoints must equal the stored
+        endpoints, positions strictly ascending with adjacent gaps of at
+        least `min_gap`. A band whose schema names an `x_shared_with` twin
+        mirrors any x write to that twin. Unlisted bands are untouched.
+
+        `curves`, `vectors`, and `bands` may be given together; a semantic
+        ID given in more than one raises an error before anything is
+        sent."""
         params: dict[str, Any] = {"module": module, "instance": instance, "values": values}
         if enable is not None:
             params["enable"] = enable
         if expected_revision is not None:
             params["expected_revision"] = expected_revision
-        # Translate before connecting: a malformed `curves`/`vectors`
-        # argument (e.g. a bad interpolation name, a non-finite vector
-        # component) fails without any wire traffic.
-        curve_semantic_values = _wire_semantic_values(curves) if curves is not None else None
-        vector_semantic_values = _wire_vector_values(vectors) if vectors is not None else None
+        # Translate before connecting: a malformed `curves`/`vectors`/
+        # `bands` argument (e.g. a bad interpolation name, a non-finite
+        # sample) fails without any wire traffic.
+        translated = {
+            "curves": _wire_semantic_values(curves) if curves is not None else None,
+            "vectors": _wire_vector_values(vectors) if vectors is not None else None,
+            "bands": _wire_band_values(bands) if bands is not None else None,
+        }
         semantic_values: dict[str, Any] | None = None
-        if curve_semantic_values is not None or vector_semantic_values is not None:
-            curve_semantic_values = curve_semantic_values or {}
-            vector_semantic_values = vector_semantic_values or {}
-            overlap = set(curve_semantic_values) & set(vector_semantic_values)
+        if any(entries is not None for entries in translated.values()):
+            id_sources: dict[str, list[str]] = {}
+            for argument, entries in translated.items():
+                for semantic_id in entries or {}:
+                    id_sources.setdefault(semantic_id, []).append(argument)
+            overlap = sorted(
+                semantic_id
+                for semantic_id, sources in id_sources.items()
+                if len(sources) > 1
+            )
             if overlap:
                 raise ToolError(
-                    "semantic id(s) given in both `curves` and `vectors`: "
-                    + ", ".join(sorted(overlap))
+                    "semantic id(s) given in more than one of `curves`, "
+                    "`vectors`, `bands`: " + ", ".join(overlap)
                 )
-            semantic_values = {**curve_semantic_values, **vector_semantic_values}
+            semantic_values = {
+                semantic_id: entry
+                for entries in translated.values()
+                for semantic_id, entry in (entries or {}).items()
+            }
         client = await _client()
         if semantic_values is not None:
             await client.ensure_connected()
@@ -263,6 +333,11 @@ def build_server(
                 raise TransportError(
                     "this darktable does not advertise vector_params; "
                     "upgrade darktable to edit vectors"
+                )
+            if bands is not None and "band_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise band_params; "
+                    "upgrade darktable to edit bands"
                 )
             params["semantic_values"] = semantic_values
         return await client.call("set_module_params", params)
