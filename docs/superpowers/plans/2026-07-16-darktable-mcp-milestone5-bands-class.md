@@ -61,6 +61,9 @@ tests under `src/tests/unittests/control/`, Python 3 + FastMCP sidecar in
   chroma↔chroma_threshold share x — an x write mirrors to the twin's native
   array; two entries in one request writing different x to one twin group
   are rejected.
+- lowlight interior-x rules (amended, see the resolved-decisions bullet
+  below): same pinning/ascending/0.001-at-least gap as atrous (the
+  identical GUI neighbor clamp, `lowlight.c:684-686`), no twins.
 - Band counts: atrous 6, denoiseprofile 7, rawdenoise 5, lowlight 6.
 
 ## Decisions resolved from the spec's "Open items"
@@ -82,6 +85,15 @@ tests under `src/tests/unittests/control/`, Python 3 + FastMCP sidecar in
 - **Error precedence documentation lives in the protocol reference**
   (Task 10), one paragraph: parse errors first, then engine dispatch order
   curve → vector → bands.
+- **lowlight x policy amended to interior (post-Task-6 review).** The spec
+  originally classified lowlight `fixed`; implementation review found the
+  GUI's x-drag strip below the curve (`lowlight_motion_notify`,
+  `lowlight.c:684-686`) moves interior `transition_x` nodes with pinned
+  endpoints and the same 0.001 at-least neighbor clamp as atrous, and the
+  shipped "night blooming" preset stores a non-default x
+  (`lowlight.c:424`). Spec §Adapters and Tasks 5/9 amended: the lowlight
+  descriptor is `DT_REMOTE_BAND_X_INTERIOR`, `minimum_gap` 0.001, no
+  twins.
 
 ## File Structure
 
@@ -478,9 +490,11 @@ is fully live end-to-end.
   Run: `ctest --test-dir build` — all suites PASS.
 - [ ] **Step 5: Commit** — `remote_edit/protocol: bands class live end-to-end (dispatch row, serializers, band_params)`
 
-### Task 5: lowlight and rawdenoise adapters — fixed x
+### Task 5: lowlight and rawdenoise adapters — rawdenoise fixed x, lowlight interior x
 
 Spec §Adapters. The two simple adapters prove 1-D and 2-D native paths.
+(Amended post-Task-6: lowlight is interior-x, per the resolved-decisions
+bullet above; rawdenoise stays fixed.)
 
 **Files:**
 - Modify: `src/control/remote_band_registry.c`
@@ -496,9 +510,10 @@ Spec §Adapters. The two simple adapters prove 1-D and 2-D native paths.
 | | `bands.green` | row 2 | 5 |
 | | `bands.blue` | row 3 | 5 |
 
-All: y range [0,1], `DT_REMOTE_BAND_X_FIXED`, no twins, no predicates, no
-`prepare_fields`, no `validate_completed`. Versions pinned lowlight
-min==max==1, rawdenoise min==max==2.
+All: y range [0,1], no twins, no predicates, no `prepare_fields`, no
+`validate_completed`. rawdenoise: `DT_REMOTE_BAND_X_FIXED`. lowlight:
+`DT_REMOTE_BAND_X_INTERIOR`, `minimum_gap` 0.001 (amended). Versions
+pinned lowlight min==max==1, rawdenoise min==max==2.
 
 - [ ] **Step 1: Write failing per-adapter tests** (mirror the m4
   per-adapter test style — read the borders/watermark tests in
@@ -507,7 +522,9 @@ min==max==1, rawdenoise min==max==2.
   `.so`; schema lists the expected names/counts/policies; read-back of
   default params returns the module defaults (lowlight x = 0.0,0.2,…,1.0;
   y = 0.5 six times; rawdenoise x = k/4, y = 0.5); apply a valid y write
-  and read it back; x entry rejected with `unsupported_field`; y out of
+  and read it back; rawdenoise: x entry rejected with `unsupported_field`;
+  lowlight (amended): a valid interior-x write round-trips, endpoint
+  violation and below-minimum gap rejected with `invalid_value`; y out of
   range rejected; sibling scalar (`blueness` / `threshold`) unchanged by a
   band write.
 - [ ] **Step 2: Run to verify failure.**
@@ -665,7 +682,8 @@ the harness fixtures).
    `writable:false`.
 3. `get_module_schema("denoiseprofile")` lists six `x_policy:"fixed"`
    fields, count 7.
-4. lowlight y write round-trips via `get_module_params`.
+4. lowlight y write round-trips via `get_module_params`; a lowlight
+   interior-x write (endpoints pinned) round-trips too (amended).
 5. rawdenoise `bands.green` y write round-trips; `threshold` scalar
    unchanged.
 6. denoiseprofile `bands.u0v0` y write round-trips.

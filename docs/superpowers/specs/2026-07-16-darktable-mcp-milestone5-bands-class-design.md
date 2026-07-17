@@ -42,10 +42,12 @@ curves on purpose, and the source confirms the invariants differ:
 - Band count is **fixed per module** (atrous 6, denoiseprofile 7,
   rawdenoise 5, lowlight 6). Curves accept 2–20 points; bands accept
   exactly N.
-- x positions are **fixed** for three of the four modules (evenly spaced;
-  denoiseprofile's params migrations force them back to even spacing) and
-  **partially writable** for atrous only (interior nodes, endpoints pinned,
-  twin-channel mirroring). Curves own x per point unconditionally.
+- x positions are **fixed** for denoiseprofile and rawdenoise (evenly
+  spaced; denoiseprofile's params migrations force them back to even
+  spacing) and **partially writable** for atrous (interior nodes, endpoints
+  pinned, twin-channel mirroring) and lowlight (interior nodes, endpoints
+  pinned — the x-drag strip below the curve, `lowlight.c:684-686`). Curves
+  own x per point unconditionally.
 - Interpolation is not caller-selectable; each module hard-codes its own
   spline behavior.
 
@@ -66,11 +68,13 @@ A **band-set** is a named semantic parameter with:
 x policies (schema-advertised per band-set):
 
 - `fixed` — x is reported in values but rejected in patches
-  (`unsupported_field`). denoiseprofile, rawdenoise, lowlight, and — for
-  the endpoint components — atrous.
+  (`unsupported_field`). denoiseprofile, rawdenoise, and — for the
+  endpoint components — atrous and lowlight.
 - `interior` — x[0] and x[N-1] are pinned; x[1..N-2] are writable with
-  strictly ascending order and minimum gap **0.001** (the GUI clamp in
-  `atrous.c`), validated with the milestone-4 `at_least` gap vocabulary.
+  strictly ascending order and minimum gap **0.001** (the identical GUI
+  clamps in `atrous.c:1406-1408` and `lowlight.c:684-686`), validated with
+  the milestone-4 `at_least` gap vocabulary. atrous (all five sets, with
+  twin sharing below) and lowlight (`bands.transition`, no twins).
 
 **Twin-channel x sharing (atrous).** The GUI stores five channels but
 displays three tabs; the luma tab draws `L` and `Lt` as top/bottom curves
@@ -105,7 +109,7 @@ Following the milestone-4 template exactly:
 | `atrous` | `bands.luma`, `bands.chroma`, `bands.sharpness`, `bands.luma_threshold`, `bands.chroma_threshold` | 6 | `interior`; luma↔luma_threshold and chroma↔chroma_threshold share x |
 | `denoiseprofile` | `bands.all`, `bands.red`, `bands.green`, `bands.blue`, `bands.y0`, `bands.u0v0` | 7 | `fixed` |
 | `rawdenoise` | `bands.all`, `bands.red`, `bands.green`, `bands.blue` | 5 | `fixed` |
-| `lowlight` | `bands.transition` | 6 | `fixed` |
+| `lowlight` | `bands.transition` | 6 | `interior`; no twins |
 
 Notes:
 
@@ -122,6 +126,15 @@ Notes:
 - rawdenoise and lowlight band edits leave their sibling scalars
   (`threshold`, `blueness`) untouched; scalars and bands compose in one
   request like scalars and curves do today.
+- **Amendment (post-Task-6 implementation review):** lowlight was
+  originally classified `fixed`; the GUI in fact moves interior
+  `transition_x` nodes via the drag strip below the curve
+  (`lowlight_motion_notify`, `lowlight.c:684-686`) with pinned endpoints
+  and the same 0.001 at-least neighbor clamp as atrous, and the shipped
+  "night blooming" preset stores a non-default x (`lowlight.c:424`).
+  Classifying it `fixed` would leave GUI-reachable states writable by hand
+  but not remotely, against this doc's own GUI-parity principle — so
+  `bands.transition` is `interior` (min gap 0.001, no twins).
 
 ## Wire and MCP contract
 
