@@ -82,12 +82,16 @@ static void deliver_error(dt_remote_error_t *owned_error, dt_remote_error_t **ou
 
 /* ---------------------------------------------------------------------- */
 /* lowlight adapter (milestone5 bands-class design doc SS Adapters,        */
-/* lowlight). Params v1: `transition_x[6]`/`transition_y[6]` -- two 1-D    */
-/* float leaves (lowlight.c:47-49), defaults x = k/5 (init(),              */
-/* lowlight.c:288), y = 0.5 ($DEFAULT). One semantic band-set over them:   */
-/* y range [0,1] (the GUI drag clamp), FIXED x policy (the GUI never       */
-/* moves transition_x), no twins, no predicates: always active, always     */
-/* writable.                                                               */
+/* lowlight, as amended post-Task-6). Params v1: `transition_x[6]`/        */
+/* `transition_y[6]` -- two 1-D float leaves (lowlight.c:47-49), defaults  */
+/* x = k/5 (init(), lowlight.c:288), y = 0.5 ($DEFAULT). One semantic      */
+/* band-set over them: y range [0,1] (the GUI drag clamp), INTERIOR x      */
+/* policy with minimum gap 0.001 -- the GUI's x-drag strip below the       */
+/* curve moves interior transition_x nodes with pinned endpoints and a     */
+/* 0.001 at-least neighbor clamp (lowlight_motion_notify,                  */
+/* lowlight.c:684-686), and the shipped "night blooming" preset stores a   */
+/* non-default x (lowlight.c:424) -- no twins, no predicates: always       */
+/* active, always writable.                                                */
 /* ---------------------------------------------------------------------- */
 
 static const dt_remote_path_segment_t s_lowlight_transition_x_segments[] = {
@@ -110,8 +114,8 @@ static const dt_remote_band_descriptor_t s_lowlight_bands[1] = {
     .count = 6,
     .y_minimum = 0.0,
     .y_maximum = 1.0,
-    .x_policy = DT_REMOTE_BAND_X_FIXED,
-    .minimum_gap = 0.0,
+    .x_policy = DT_REMOTE_BAND_X_INTERIOR,
+    .minimum_gap = 0.001,
     .x_shared_with = NULL,
     .active_when = NULL,
     .writable_when = NULL,

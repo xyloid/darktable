@@ -2103,13 +2103,17 @@ static void test_apply_patch_null_arguments_fail(void **state)
 
 /* ---------------------------------------------------------------------- */
 /* lowlight adapter (production registry; milestone5 bands-class design    */
-/* doc SS Adapters, lowlight). Params v1: `transition_x[6]`/               */
-/* `transition_y[6]` (1-D float leaves, lowlight.c:47-49), defaults        */
-/* x = k/5 (init(), lowlight.c:288), y = 0.5 ($DEFAULT). One semantic      */
-/* name, "bands.transition": count 6, y range [0,1], FIXED x policy, no    */
-/* twins/predicates/prepare/validate_completed. These tests exercise the   */
-/* production s_adapters[] table directly, same "real adapter, no          */
-/* override" pattern as test_remote_vector.c's borders/watermark sections. */
+/* doc SS Adapters, lowlight, as amended post-Task-6). Params v1:          */
+/* `transition_x[6]`/`transition_y[6]` (1-D float leaves,                  */
+/* lowlight.c:47-49), defaults x = k/5 (init(), lowlight.c:288), y = 0.5   */
+/* ($DEFAULT). One semantic name, "bands.transition": count 6, y range     */
+/* [0,1], INTERIOR x policy with minimum gap 0.001 — the GUI's x-drag      */
+/* strip below the curve moves interior nodes with pinned endpoints and a  */
+/* 0.001 at-least neighbor clamp (lowlight_motion_notify,                  */
+/* lowlight.c:684-686) — no twins/predicates/prepare/validate_completed.   */
+/* These tests exercise the production s_adapters[] table directly, same   */
+/* "real adapter, no override" pattern as test_remote_vector.c's           */
+/* borders/watermark sections.                                             */
 /* ---------------------------------------------------------------------- */
 
 static void test_lowlight_registry_lookup_by_version(void **state)
@@ -2154,10 +2158,10 @@ static void test_lowlight_schema_lists_transition(void **state)
   const dt_remote_band_schema_t *schema = g_ptr_array_index(schemas, 0);
   assert_string_equal(schema->name, "bands.transition");
   assert_int_equal(schema->count, LOWLIGHT_BAND_COUNT);
-  assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_FIXED);
+  assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_INTERIOR);
   assert_float_equal(schema->y_minimum, 0.0, 0.0);
   assert_float_equal(schema->y_maximum, 1.0, 0.0);
-  assert_float_equal(schema->minimum_gap, 0.0, 0.0);
+  assert_float_equal(schema->minimum_gap, 0.001, 0.0);
   assert_null(schema->x_shared_with);
   // No predicates: unconditionally writable.
   assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
@@ -2242,14 +2246,72 @@ static void test_lowlight_apply_writes_y_and_reads_back(void **state)
   band_fixture_free(fixture);
 }
 
-static void test_lowlight_x_entry_rejected_unsupported_field(void **state)
+// A valid interior-x write (endpoints exactly the stored 0.0/1.0, interior
+// nodes shifted, every gap well above 0.001) narrows into transition_x
+// alongside its y -- full params_size memcmp with both arrays poked into
+// the expected buffer, then a read_values round-trip on the projected
+// blob. Mirrors the GUI's own x-drag reachable states
+// (lowlight.c:684-686; the "night blooming" preset ships x[1]=0.15).
+static void test_lowlight_interior_x_write_round_trips(void **state)
 {
   (void)state;
   band_fixture_t *fixture = lowlight_fixture_new();
   void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
 
   static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
-  static const double x[LOWLIGHT_BAND_COUNT] = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 };
+  static const double x[LOWLIGHT_BAND_COUNT] = { 0.0, 0.15, 0.4, 0.6, 0.85, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.transition", y, LOWLIGHT_BAND_COUNT, x, LOWLIGHT_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_x[LOWLIGHT_BAND_COUNT], narrowed_y[LOWLIGHT_BAND_COUNT];
+  for(guint i = 0; i < LOWLIGHT_BAND_COUNT; i++)
+  {
+    narrowed_x[i] = (float)x[i];
+    narrowed_y[i] = (float)y[i];
+  }
+  poke_band_array(fixture->module, &s_lowlight_transition_x_path, expected, narrowed_x,
+                  LOWLIGHT_BAND_COUNT);
+  poke_band_array(fixture->module, &s_lowlight_transition_y_path, expected, narrowed_y,
+                  LOWLIGHT_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  GHashTable *out = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_band_value_t *value = g_hash_table_lookup(out, "bands.transition");
+  assert_non_null(value);
+  for(guint i = 0; i < LOWLIGHT_BAND_COUNT; i++)
+  {
+    assert_float_equal(g_array_index(value->x, double, i), x[i], 1e-6);
+    assert_float_equal(g_array_index(value->y, double, i), y[i], 1e-6);
+  }
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+// Endpoint pinning against the production adapter: x[0] = 0.01 does not
+// equal the stored 0.0 endpoint, rejected byte-atomically.
+static void test_lowlight_x_endpoint_violation_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[LOWLIGHT_BAND_COUNT] = { 0.01, 0.2, 0.4, 0.6, 0.8, 1.0 };
   dt_remote_patch_t patch = { 0 };
   patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
   g_ptr_array_add(patch.semantic_values,
@@ -2259,11 +2321,45 @@ static void test_lowlight_x_entry_rejected_unsupported_field(void **state)
   assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
                                           &error));
   assert_non_null(error);
-  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "endpoint"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
 
   dt_remote_error_free(error);
   g_ptr_array_unref(patch.semantic_values);
   g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// The 0.001 at-least gap against the production adapter: a 0.0005 gap
+// between interior neighbors is rejected byte-atomically.
+static void test_lowlight_x_gap_below_minimum_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = lowlight_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[LOWLIGHT_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[LOWLIGHT_BAND_COUNT] = { 0.0, 0.2, 0.2005, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.transition", y, LOWLIGHT_BAND_COUNT, x, LOWLIGHT_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "gap"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
   band_fixture_free(fixture);
 }
 
@@ -2874,7 +2970,11 @@ int main(void)
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_lowlight_apply_writes_y_and_reads_back,
                                     lookup_override_test_setup, lookup_override_test_teardown),
-    cmocka_unit_test_setup_teardown(test_lowlight_x_entry_rejected_unsupported_field,
+    cmocka_unit_test_setup_teardown(test_lowlight_interior_x_write_round_trips,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_x_endpoint_violation_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_lowlight_x_gap_below_minimum_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_lowlight_y_out_of_range_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
