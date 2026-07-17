@@ -78,6 +78,28 @@ void dt_remote_vector_value_free(dt_remote_vector_value_t *value)
   g_free(value);
 }
 
+void dt_remote_band_schema_free(dt_remote_band_schema_t *schema)
+{
+  if(!schema) return;
+  g_free(schema->name);
+  g_free(schema->display_name);
+  g_free(schema->description);
+  g_free(schema->x_shared_with);
+  if(schema->x) g_array_unref(schema->x);
+  dt_remote_parameter_condition_free(schema->active_when);
+  dt_remote_parameter_condition_free(schema->writable_when);
+  g_free(schema);
+}
+
+void dt_remote_band_value_free(dt_remote_band_value_t *value)
+{
+  if(!value) return;
+  g_free(value->name);
+  if(value->y) g_array_unref(value->y);
+  if(value->x) g_array_unref(value->x);
+  g_free(value);
+}
+
 void dt_remote_semantic_patch_free(gpointer patch_ptr)
 {
   dt_remote_semantic_patch_t *patch = patch_ptr;
@@ -140,6 +162,22 @@ dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_vector(dt_remote_vecto
   return wrapper;
 }
 
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_band(dt_remote_band_schema_t *s)
+{
+  dt_remote_semantic_schema_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_schema_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_BANDS;
+  wrapper->u.bands = s;
+  return wrapper;
+}
+
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_band(dt_remote_band_value_t *v)
+{
+  dt_remote_semantic_value_t *wrapper = g_malloc0(sizeof(dt_remote_semantic_value_t));
+  wrapper->class_id = DT_REMOTE_PARAMETER_BANDS;
+  wrapper->u.bands = v;
+  return wrapper;
+}
+
 void dt_remote_semantic_schema_free(gpointer schema_ptr)
 {
   dt_remote_semantic_schema_t *schema = schema_ptr;
@@ -155,8 +193,10 @@ void dt_remote_semantic_schema_free(gpointer schema_ptr)
       dt_remote_vector_schema_free(schema->u.vector);
       break;
 
-    // no other class has a union member yet (see remote_parameters.h);
-    // nothing beyond the wrapper to free.
+    case DT_REMOTE_PARAMETER_BANDS:
+      dt_remote_band_schema_free(schema->u.bands);
+      break;
+
     default:
       break;
   }
@@ -179,8 +219,10 @@ void dt_remote_semantic_value_free(gpointer value_ptr)
       dt_remote_vector_value_free(value->u.vector);
       break;
 
-    // no other class has a union member yet (see remote_parameters.h);
-    // nothing beyond the wrapper to free.
+    case DT_REMOTE_PARAMETER_BANDS:
+      dt_remote_band_value_free(value->u.bands);
+      break;
+
     default:
       break;
   }

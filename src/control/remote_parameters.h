@@ -233,6 +233,67 @@ typedef struct dt_remote_vector_value_t
 void dt_remote_vector_value_free(dt_remote_vector_value_t *value);
 
 /* ---------------------------------------------------------------------- */
+/* band schema                                                             */
+/* ---------------------------------------------------------------------- */
+
+// `dt_remote_band_x_policy_t` lives here rather than in remote_band.h for
+// the same circular-include reason `dt_remote_vector_subtype_t` lives here
+// rather than in remote_vector.h (see that type's own note in
+// remote_vector.h): dt_remote_band_schema_t below needs it, and
+// remote_band.h already includes this header (the neutral/no-introspection
+// layer) for the shared predicate/patch types, so remote_parameters.h
+// cannot include remote_band.h back without a cycle.
+typedef enum dt_remote_band_x_policy_t
+{
+  DT_REMOTE_BAND_X_FIXED = 0,
+  DT_REMOTE_BAND_X_INTERIOR
+} dt_remote_band_x_policy_t;
+
+typedef struct dt_remote_band_schema_t
+{
+  char *name;                 // stable semantic ID, for example "bands.luma"
+  char *display_name;         // presentation label
+  char *description;          // nullable
+  guint count;                // fixed band count N
+  double y_minimum, y_maximum;
+  dt_remote_band_x_policy_t x_policy;
+  double minimum_gap;         // absolute, at-least; 0.0 = none; INTERIOR only
+  char *x_shared_with;        // owned, nullable; twin semantic ID
+  GArray *x;                  // double, current positions; NULL when unavailable
+                              // (list_schema has no live params blob to read
+                              // from -- see dt_remote_band_list_schema()'s own
+                              // doc comment)
+  dt_remote_writability_t writability;
+  dt_remote_parameter_condition_t *active_when;   // owned, nullable
+  dt_remote_parameter_condition_t *writable_when; // owned, nullable
+} dt_remote_band_schema_t;
+
+/** frees a band schema, including its owned strings, its x positions array,
+ * its two optional conditions, and the schema struct itself. NULL-safe. */
+void dt_remote_band_schema_free(dt_remote_band_schema_t *schema);
+
+/* ---------------------------------------------------------------------- */
+/* band value                                                              */
+/* ---------------------------------------------------------------------- */
+
+typedef struct dt_remote_band_value_t
+{
+  char *name;                 // owned semantic ID
+  GArray *y;                  // double, owned
+  GArray *x;                  // double, owned
+  gboolean active;
+  gboolean effective;
+  gboolean writable_now;
+} dt_remote_band_value_t;
+
+// Same `active`/`effective`/`writable_now` conventions as the curve and
+// vector value types above.
+
+/** frees a band value, including its owned name and y/x arrays, and the
+ * value struct itself. NULL-safe. */
+void dt_remote_band_value_free(dt_remote_band_value_t *value);
+
+/* ---------------------------------------------------------------------- */
 /* semantic patch                                                           */
 /* ---------------------------------------------------------------------- */
 
@@ -294,13 +355,15 @@ void dt_remote_semantic_patch_free(gpointer patch_ptr);
 typedef struct dt_remote_semantic_schema_t
 {
   dt_remote_parameter_class_t class_id;
-  union { dt_remote_curve_schema_t *curve; dt_remote_vector_schema_t *vector; } u;   // owned
+  union { dt_remote_curve_schema_t *curve; dt_remote_vector_schema_t *vector;
+          dt_remote_band_schema_t *bands; } u;   // owned
 } dt_remote_semantic_schema_t;
 
 typedef struct dt_remote_semantic_value_t
 {
   dt_remote_parameter_class_t class_id;
-  union { dt_remote_curve_value_t *curve; dt_remote_vector_value_t *vector; } u;    // owned
+  union { dt_remote_curve_value_t *curve; dt_remote_vector_value_t *vector;
+          dt_remote_band_value_t *bands; } u;    // owned
 } dt_remote_semantic_value_t;
 
 /** wraps an owned curve schema in a DT_REMOTE_PARAMETER_CURVE-tagged
@@ -318,6 +381,14 @@ dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_vector(dt_remote_vec
 /** wraps an owned vector value in a DT_REMOTE_PARAMETER_VECTOR-tagged
  * wrapper, taking ownership of `v`. */
 dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_vector(dt_remote_vector_value_t *v);
+
+/** wraps an owned band schema in a DT_REMOTE_PARAMETER_BANDS-tagged
+ * wrapper, taking ownership of `s`. */
+dt_remote_semantic_schema_t *dt_remote_semantic_schema_wrap_band(dt_remote_band_schema_t *s);
+
+/** wraps an owned band value in a DT_REMOTE_PARAMETER_BANDS-tagged
+ * wrapper, taking ownership of `v`. */
+dt_remote_semantic_value_t *dt_remote_semantic_value_wrap_band(dt_remote_band_value_t *v);
 
 /** frees a tagged semantic schema wrapper and its class-specific owned
  * payload. GDestroyNotify-able. NULL-safe. */
