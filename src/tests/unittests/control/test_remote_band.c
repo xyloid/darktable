@@ -25,7 +25,8 @@
  * dt_remote_band_registry_set_lookup_override() (the same test seam
  * dt_remote_vector_registry_set_lookup_override() provides for the vector
  * registry); the per-adapter sections at the end exercise the production
- * s_adapters[] table directly (lowlight and rawdenoise since Task 5), and
+ * s_adapters[] table directly (lowlight and rawdenoise since Task 5,
+ * denoiseprofile since Task 6), and
  * the no-adapter degrade tests use "borders", a vector-registry op that
  * never gains a band adapter.
  *
@@ -2519,6 +2520,228 @@ static void test_rawdenoise_count_mismatch_rejected(void **state)
   band_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* denoiseprofile adapter (production registry; milestone5 bands-class     */
+/* design doc SS Adapters, denoiseprofile). Params v12: `x[6][7]`/         */
+/* `y[6][7]` channel rows (denoiseprofile.c:119-121,                       */
+/* dt_iop_denoiseprofile_channel_t: all=0, R=1, G=2, B=3, Y0=4, U0V0=5),   */
+/* defaults x = k/6 (init(), denoiseprofile.c:2650), y = 0.5 ($DEFAULT).   */
+/* Six semantic names over the six rows: count 7, y range [0,1], FIXED x   */
+/* policy, no twins/predicates -- all six channels always writable (the    */
+/* GUI stores all channels regardless of the active wavelet color mode);   */
+/* the noise-fit a[3]/b[3] arrays stay excluded (denylisted since          */
+/* milestone 2). The v12 layout concern from the design doc's open items   */
+/* is settled here: only introspection paths touch the blob, and           */
+/* registry_validate's resolved-length==count check is the guard.          */
+/* ---------------------------------------------------------------------- */
+
+#define DENOISEPROFILE_BAND_COUNT 7
+
+// Row-5 ("bands.u0v0") native y path, for the expected-buffer poke in the
+// apply test below.
+static const dt_remote_path_segment_t s_denoiseprofile_y5_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 5 },
+};
+static const dt_remote_introspection_path_t s_denoiseprofile_y5_path = {
+  .segments = s_denoiseprofile_y5_segments, .length = G_N_ELEMENTS(s_denoiseprofile_y5_segments)
+};
+
+static const char *const s_denoiseprofile_expected_names[] = {
+  "bands.all", "bands.red", "bands.green", "bands.blue", "bands.y0", "bands.u0v0",
+};
+
+static void test_denoiseprofile_registry_lookup_by_version(void **state)
+{
+  (void)state;
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("denoiseprofile", 12);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "denoiseprofile");
+  assert_int_equal(adapter->band_count, 6);
+
+  // Version pinned min==max==12: any other version fails closed.
+  assert_null(dt_remote_band_registry_lookup("denoiseprofile", 11));
+  assert_null(dt_remote_band_registry_lookup("denoiseprofile", 13));
+}
+
+static void test_denoiseprofile_registry_validate_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("denoiseprofile");
+  assert_non_null(so);
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("denoiseprofile", 12);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_denoiseprofile_schema_lists_six_channels(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("denoiseprofile");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, G_N_ELEMENTS(s_denoiseprofile_expected_names));
+
+  for(guint i = 0; i < schemas->len; i++)
+  {
+    const dt_remote_band_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, s_denoiseprofile_expected_names[i]);
+    assert_int_equal(schema->count, DENOISEPROFILE_BAND_COUNT);
+    assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_FIXED);
+    assert_float_equal(schema->y_minimum, 0.0, 0.0);
+    assert_float_equal(schema->y_maximum, 1.0, 0.0);
+    assert_null(schema->x_shared_with);
+    // All six channels always writable, regardless of wavelet_color_mode.
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+static void test_denoiseprofile_read_values_returns_module_defaults(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("denoiseprofile");
+
+  GHashTable *out = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, fixture->module->params, &out, &error));
+  assert_null(error);
+  assert_non_null(out);
+  assert_int_equal(g_hash_table_size(out), G_N_ELEMENTS(s_denoiseprofile_expected_names));
+
+  // Defaults are per-channel identical: x = k/6 (init(),
+  // denoiseprofile.c:2650), y = 0.5 ($DEFAULT) -- all six channels.
+  for(guint c = 0; c < G_N_ELEMENTS(s_denoiseprofile_expected_names); c++)
+  {
+    const dt_remote_band_value_t *value = g_hash_table_lookup(out, s_denoiseprofile_expected_names[c]);
+    assert_non_null(value);
+    assert_int_equal(value->y->len, DENOISEPROFILE_BAND_COUNT);
+    assert_int_equal(value->x->len, DENOISEPROFILE_BAND_COUNT);
+    for(guint i = 0; i < DENOISEPROFILE_BAND_COUNT; i++)
+    {
+      assert_float_equal(g_array_index(value->x, double, i), i / 6.0, 1e-6);
+      assert_float_equal(g_array_index(value->y, double, i), 0.5, 1e-6);
+    }
+    assert_true(value->active);
+    assert_true(value->writable_now);
+  }
+
+  g_hash_table_unref(out);
+  band_fixture_free(fixture);
+}
+
+// Writing "bands.u0v0" (row 5) narrows into y[5][*] and nothing else --
+// full params_size memcmp proves rows 0-4, the whole x array, every scalar
+// (radius/strength/..., the noise-fit a[3]/b[3]), and any padding are
+// byte-untouched.
+static void test_denoiseprofile_apply_writes_u0v0_row_and_leaves_other_bytes_untouched(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("denoiseprofile");
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[DENOISEPROFILE_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.u0v0", y, DENOISEPROFILE_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_y[DENOISEPROFILE_BAND_COUNT];
+  for(guint i = 0; i < DENOISEPROFILE_BAND_COUNT; i++) narrowed_y[i] = (float)y[i];
+  poke_band_array(fixture->module, &s_denoiseprofile_y5_path, expected, narrowed_y,
+                  DENOISEPROFILE_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  // And the write reads back through read_values on the projected blob.
+  GHashTable *out = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_band_value_t *value = g_hash_table_lookup(out, "bands.u0v0");
+  assert_non_null(value);
+  for(guint i = 0; i < DENOISEPROFILE_BAND_COUNT; i++)
+    assert_float_equal(g_array_index(value->y, double, i), y[i], 1e-6);
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+static void test_denoiseprofile_x_entry_rejected_unsupported_field(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("denoiseprofile");
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double y[DENOISEPROFILE_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7 };
+  static const double x[DENOISEPROFILE_BAND_COUNT] = { 0.0, 1 / 6.0, 2 / 6.0, 3 / 6.0,
+                                                       4 / 6.0, 5 / 6.0, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.green", y, DENOISEPROFILE_BAND_COUNT, x,
+                                  DENOISEPROFILE_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  band_fixture_free(fixture);
+}
+
+// A 6-sample y against the 7-band denoiseprofile count is a count
+// mismatch, rejected before any write -- the exact rawdenoise-count trap
+// the task brief calls out (rawdenoise takes 5, denoiseprofile 7, neither
+// takes 6).
+static void test_denoiseprofile_count_mismatch_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = real_band_module_fixture_new("denoiseprofile");
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[6] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values, make_band_entry("bands.all", y, 6, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -2671,6 +2894,22 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_rawdenoise_y_out_of_range_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_rawdenoise_count_mismatch_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_registry_lookup_by_version,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_registry_validate_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_schema_lists_six_channels,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_read_values_returns_module_defaults,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_denoiseprofile_apply_writes_u0v0_row_and_leaves_other_bytes_untouched,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_x_entry_rejected_unsupported_field,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_denoiseprofile_count_mismatch_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 

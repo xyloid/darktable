@@ -20,9 +20,9 @@
 // remote_vector_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the band engine
 // API (list_schema/read_values). The adapter table currently registers
-// lowlight and rawdenoise (Task 5); Tasks 6-7 add denoiseprofile and
-// atrous, the same way colorbalance/channelmixerrgb/rgblevels/borders/
-// watermark were added to the vector registry one at a time.
+// lowlight and rawdenoise (Task 5) and denoiseprofile (Task 6); Task 7
+// adds atrous, the same way colorbalance/channelmixerrgb/rgblevels/
+// borders/watermark were added to the vector registry one at a time.
 //
 // Like remote_band.c, this file never includes JSON, socket, or MCP
 // protocol headers -- introspection/GLib (plus develop/imageop.h, for the
@@ -197,16 +197,119 @@ static const dt_remote_band_module_adapter_t s_rawdenoise_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* denoiseprofile adapter (milestone5 bands-class design doc SS Adapters,  */
+/* denoiseprofile). Params v12: `x[6][7]`/`y[6][7]` channel rows           */
+/* (denoiseprofile.c:119-121; dt_iop_denoiseprofile_channel_t: all=0,      */
+/* R=1, G=2, B=3, Y0=4, U0V0=5), defaults x = k/6 (init(),                 */
+/* denoiseprofile.c:2650), y = 0.5 ($DEFAULT). Six semantic band-sets,     */
+/* one per channel row: y range [0,1] (the GUI drag clamp), FIXED x        */
+/* policy, no twins, no predicates -- all six channels are always          */
+/* writable: the GUI stores every channel row regardless of the active     */
+/* wavelet_color_mode, so remote writes to an inactive-mode channel are    */
+/* exactly as meaningful as GUI edits made before switching modes. The     */
+/* noise-fit a[3]/b[3] arrays stay excluded (denylisted since milestone    */
+/* 2). No byte poking anywhere: only introspection paths touch the v12     */
+/* blob, and registry_validate's resolved-length==count check guards the   */
+/* layout (the design doc's open padding question resolves to "not our     */
+/* problem").                                                              */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_path_segment_t s_denoiseprofile_x0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_x1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_x2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_x3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_x4_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 4 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y4_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 4 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_x5_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 5 },
+};
+static const dt_remote_path_segment_t s_denoiseprofile_y5_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 5 },
+};
+
+// Same shared-invariants-per-row convention as RAWDENOISE_BAND_DESCRIPTOR
+// above, with denoiseprofile's count of 7.
+#define DENOISEPROFILE_BAND_DESCRIPTOR(band_name, band_display, band_description, row)                       \
+  {                                                                                                          \
+    .name = (band_name), .display_name = (band_display), .description = (band_description),                  \
+    .native_x = { .segments = s_denoiseprofile_x##row##_segments,                                            \
+                  .length = G_N_ELEMENTS(s_denoiseprofile_x##row##_segments) },                              \
+    .native_y = { .segments = s_denoiseprofile_y##row##_segments,                                            \
+                  .length = G_N_ELEMENTS(s_denoiseprofile_y##row##_segments) },                              \
+    .count = 7, .y_minimum = 0.0, .y_maximum = 1.0, .x_policy = DT_REMOTE_BAND_X_FIXED,                      \
+    .minimum_gap = 0.0, .x_shared_with = NULL, .active_when = NULL, .writable_when = NULL,                   \
+  }
+
+static const dt_remote_band_descriptor_t s_denoiseprofile_bands[6] = {
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.all", "All",
+                                 "Wavelet force curve applied to all channels "
+                                 "(denoiseprofile.c:119-121, row 0).", 0),
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.red", "Red",
+                                 "Wavelet force curve for the red channel (RGB color mode, row 1).", 1),
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.green", "Green",
+                                 "Wavelet force curve for the green channel (RGB color mode, row 2).", 2),
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.blue", "Blue",
+                                 "Wavelet force curve for the blue channel (RGB color mode, row 3).", 3),
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.y0", "Luminance (Y0)",
+                                 "Wavelet force curve for the Y0 luminance channel (Y0U0V0 color "
+                                 "mode, row 4).", 4),
+  DENOISEPROFILE_BAND_DESCRIPTOR("bands.u0v0", "Chrominance (U0V0)",
+                                 "Wavelet force curve for the U0V0 chrominance channels (Y0U0V0 "
+                                 "color mode, row 5).", 5),
+};
+
+static const dt_remote_band_module_adapter_t s_denoiseprofile_adapter = {
+  "denoiseprofile", 12, 12, s_denoiseprofile_bands, 6, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// lowlight and rawdenoise (Task 5); Tasks 6-7 add denoiseprofile and
+// lowlight and rawdenoise (Task 5), denoiseprofile (Task 6); Task 7 adds
 // atrous here, the same convention as remote_vector_registry.c's own
 // s_adapters[] (and remote_curve_registry.c's before it): a future op adds
 // another entry here, not a parallel lookup mechanism.
 static const dt_remote_band_module_adapter_t *const s_adapters[] = {
   &s_lowlight_adapter,
   &s_rawdenoise_adapter,
+  &s_denoiseprofile_adapter,
 };
 
 static dt_remote_band_registry_lookup_override_t s_lookup_override = NULL;
