@@ -1786,6 +1786,115 @@ static void seed_atrous_channels(band_fixture_t *fixture)
                   ATROUS_BAND_COUNT);
 }
 
+// Like seed_atrous_channels() but with genuinely different stored x
+// endpoints per channel -- needed to prove the endpoint check for the
+// SECOND-processed twin in a registry-order write loop is checked against
+// its own true pre-transaction state, not against whatever the
+// FIRST-processed twin's mirror write may already have placed in its
+// native_x within the same call.
+static void seed_atrous_channels_divergent(band_fixture_t *fixture, const float *x_a, const float *x_b)
+{
+  poke_band_array(fixture->module, &s_atrous_x0_path, fixture->module->params, x_a, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_y0_path, fixture->module->params, s_atrous_stored_y,
+                  ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x1_path, fixture->module->params, x_b, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_y1_path, fixture->module->params, s_atrous_stored_y,
+                  ATROUS_BAND_COUNT);
+}
+
+// Regression test for the review finding: without checking endpoint
+// pinning against `old_params`, twin_b's own endpoint check would read its
+// "stored" x from `new_params` -- which, by the time twin_b's turn comes
+// up in the registry-order write loop, already contains the value twin_a's
+// earlier write just mirrored into it -- making the check compare the
+// submission against itself (always passing) instead of against twin_b's
+// true pre-transaction endpoints.
+static void test_apply_entries_twin_endpoint_check_uses_pre_transaction_state(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  static const float stored_x_a[ATROUS_BAND_COUNT] = { 0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f };
+  static const float stored_x_b[ATROUS_BAND_COUNT] = { 0.05f, 0.2f, 0.4f, 0.6f, 0.8f, 0.95f };
+  seed_atrous_channels_divergent(fixture, stored_x_a, stored_x_b);
+
+  dt_remote_band_descriptor_t *descs[2] = { NULL, NULL };
+  install_band_adapter(new_atrous_twin_adapter(descs));
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  // Matches twin_a's own stored endpoints (0.0/1.0, processed first in
+  // registry order) but NOT twin_b's genuinely different stored endpoints
+  // (0.05/0.95): twin_b's own endpoint check must still reject this on its
+  // own turn.
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.21, 0.4, 0.6, 0.8, 1.0 };
+  GPtrArray *entries = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(entries, make_band_entry("band.twin_a", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+  g_ptr_array_add(entries, make_band_entry("band.twin_b", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_entries(fixture->module, fixture->module->params, scratch, entries,
+                                            &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  // The two-pass validate-then-write structure (validate_band_entry() for
+  // every entry before write_band_patch() for any of them) means no write
+  // happens at all when any entry's value-level validation fails --
+  // stronger than the general "earlier entries may already be written"
+  // caveat, which only still applies to the predicate-gating failure mode.
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(entries);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// Single-entry counterpart: only twin_a is patched, and twin_b's stored
+// endpoints genuinely diverge from twin_a's. Design decision (documented
+// in the task report): twin_b's endpoint is never independently checked in
+// this case -- the mirror overwrites twin_b's entire x array
+// unconditionally, exactly matching atrous.c's own "an x drag mirrors into
+// the twin" GUI behavior (milestone 5 design doc). This is intentional,
+// not a residual instance of the bug fixed above: that bug was about a
+// twin's own *validated* entry becoming vacuously checked, not about the
+// always-unconditional mirror onto a twin with no entry of its own in this
+// call.
+static void test_apply_entries_twin_sync_overwrites_divergent_twin_endpoints(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  static const float stored_x_a[ATROUS_BAND_COUNT] = { 0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f };
+  static const float stored_x_b[ATROUS_BAND_COUNT] = { 0.05f, 0.2f, 0.4f, 0.6f, 0.8f, 0.95f };
+  seed_atrous_channels_divergent(fixture, stored_x_a, stored_x_b);
+
+  dt_remote_band_descriptor_t *descs[2] = { NULL, NULL };
+  install_band_adapter(new_atrous_twin_adapter(descs));
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  // Matches only twin_a's own stored endpoints; twin_b has no entry at all
+  // in this request.
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.25, 0.4, 0.6, 0.8, 1.0 };
+  GPtrArray *entries = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(entries, make_band_entry("band.twin_a", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_entries(fixture->module, fixture->module->params, scratch, entries,
+                                           &error));
+  assert_null(error);
+
+  float twin_b_x[ATROUS_BAND_COUNT];
+  read_band_array(fixture->module, &s_atrous_x1_path, scratch, twin_b_x, ATROUS_BAND_COUNT);
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+    assert_float_equal(twin_b_x[i], (float)x[i], 1e-6);
+
+  g_ptr_array_unref(entries);
+  g_free(scratch);
+  band_fixture_free(fixture);
+}
+
 static void test_apply_entries_twin_conflict_differing_x_rejected(void **state)
 {
   (void)state;
@@ -2084,6 +2193,10 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_apply_patch_mixed_class_entries_skip_non_bands,
                                     lookup_override_test_setup, lookup_override_test_teardown),
 
+    cmocka_unit_test_setup_teardown(test_apply_entries_twin_endpoint_check_uses_pre_transaction_state,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_apply_entries_twin_sync_overwrites_divergent_twin_endpoints,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_entries_twin_conflict_differing_x_rejected,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_entries_twin_sync_propagates_x_without_twin_entry,

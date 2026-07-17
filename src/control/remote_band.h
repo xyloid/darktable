@@ -248,20 +248,28 @@ gboolean dt_remote_band_read_values(const struct dt_iop_module_t *module,
  * ("condition_not_satisfied"); (2) an entry carrying `x` against a FIXED
  * descriptor fails with DT_REMOTE_ERR_UNSUPPORTED_FIELD
  * ("x_not_supported"); (3) dt_remote_band_validate() below is run in the
- * double domain against the descriptor's currently stored native x (for
- * endpoint pinning, INTERIOR only); (4) when the descriptor has a
- * `x_shared_with` twin and the entry carries `x`, and the twin also has an
- * entry in this same slice that carries `x`, every component of the two
- * candidate x arrays must compare exactly equal (double `==`) or the whole
- * transaction fails with DT_REMOTE_ERR_INVALID_VALUE ("twin_conflict") --
- * detected before any native write for either descriptor; (5) only once
- * every check above passes are floats narrowed and written: `y` always, to
- * `native_y`; `x`, when present, to `native_x` AND (when `x_shared_with` is
- * set) to the twin descriptor's `native_x` too, with the identical narrowed
- * values -- this is the "an x drag mirrors into the twin" behavior the twin
+ * double domain against the descriptor's OWN native x as stored in
+ * `old_params` -- never `new_params` -- for endpoint pinning (INTERIOR
+ * only): reading from `new_params` would let an earlier descriptor's twin-
+ * sync write (item 5 below) make a later descriptor's own endpoint check
+ * vacuous, since it would then compare the submitted x against a value a
+ * twin just mirrored into it rather than this descriptor's true
+ * pre-transaction endpoint; (4) when the descriptor has a `x_shared_with`
+ * twin and the entry carries `x`, and the twin also has an entry in this
+ * same slice that carries `x`, every component of the two candidate x
+ * arrays must compare exactly equal (double `==`) or the whole transaction
+ * fails with DT_REMOTE_ERR_INVALID_VALUE ("twin_conflict") -- detected
+ * before any native write for either descriptor; (5) only once every check
+ * above passes are floats narrowed and written: `y` always, to `native_y`;
+ * `x`, when present, to `native_x` AND (when `x_shared_with` is set) to the
+ * twin descriptor's `native_x` too, with the identical narrowed values --
+ * this is the "an x drag mirrors into the twin" behavior the twin
  * relationship models, applied regardless of whether the twin itself has
- * its own entry in this call. Every other byte of `new_params` is left
- * unchanged. `entries` may be empty: an op with no registered band adapter
+ * its own entry in this call, and unconditionally: the twin's own endpoint
+ * is never independently checked against the mirrored value, matching
+ * atrous.c's own unconditional mirror-on-drag behavior the design doc
+ * documents. Every other byte of `new_params` is left unchanged. `entries`
+ * may be empty: an op with no registered band adapter
  * then trivially succeeds; an op with a registered adapter still runs
  * completed-state validation against `new_params` even with zero entries
  * (the same "validate on adapter presence alone" behavior the vector engine

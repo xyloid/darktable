@@ -439,34 +439,38 @@ static gboolean resolve_band_array(const dt_remote_band_descriptor_t *desc,
   return TRUE;
 }
 
-// Applies one band entry: predicate gating, x-policy gate, value
-// validation (double domain), twin-conflict detection, then narrowing
-// writes (native_y always; native_x, and the twin's native_x, when `x` is
-// given). See dt_remote_band_apply_entries()'s own doc comment for the
-// full behavioral contract this implements.
-static gboolean write_band_patch(const dt_remote_band_module_adapter_t *adapter,
-                                 const dt_remote_band_descriptor_t *desc,
-                                 const dt_introspection_field_t *root,
-                                 void *new_params,
-                                 GPtrArray *entries,
-                                 const dt_remote_band_patch_t *band_patch,
-                                 dt_remote_error_t **error)
+// Validates one band entry's VALUE-level correctness only: x-policy gate,
+// dt_remote_band_validate() in the double domain, and twin-conflict
+// detection. Deliberately touches neither `new_params` (no writes) nor any
+// predicate (active_when/writable_when depend on the *projected* state,
+// which is this call's own responsibility as earlier entries are written --
+// see write_band_patch() below), so this can run for every entry in
+// `entries` before any of them writes anything -- see
+// dt_remote_band_apply_entries()'s own doc comment for why that ordering
+// matters.
+//
+// Endpoint pinning is checked against `old_params` (the genuinely
+// pre-transaction block), never `new_params`: this function runs for every
+// entry in `entries` before ANY of them has written anything (called from
+// a dedicated pre-pass in dt_remote_band_apply_entries(), never
+// interleaved with writes), so `old_params` and `new_params` are
+// equivalent for band-native purposes at the point this runs -- but
+// `old_params` is used explicitly (rather than relying on that
+// invariant) because it is what the type signature documents as
+// immutable, and because a future refactor that interleaves this pre-pass
+// with writes must not silently reintroduce the vacuous-check bug this
+// fixes: reading a "currently stored" endpoint from a block a twin may
+// already have mirrored into would make the check compare the submitted x
+// against a value a twin just wrote, not this descriptor's true
+// pre-transaction endpoint.
+static gboolean validate_band_entry(const dt_remote_band_module_adapter_t *adapter,
+                                    const dt_remote_band_descriptor_t *desc,
+                                    const dt_introspection_field_t *root,
+                                    const void *old_params,
+                                    GPtrArray *entries,
+                                    const dt_remote_band_patch_t *band_patch,
+                                    dt_remote_error_t **error)
 {
-  gboolean active = TRUE;
-  gboolean writable = TRUE;
-  if(!band_predicate_holds(desc->active_when, root, new_params, &active, error)
-     || !band_predicate_holds(desc->writable_when, root, new_params, &writable, error))
-    return FALSE;
-  if(!active || !writable)
-  {
-    deliver_band_error(band_parameter_error_new(
-                         DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name, "condition_not_satisfied",
-                         _("semantic band '%s' is inactive or not writable in projected state"),
-                         desc->name),
-                       error);
-    return FALSE;
-  }
-
   if(band_patch->x && desc->x_policy == DT_REMOTE_BAND_X_FIXED)
   {
     deliver_band_error(band_parameter_error_new(
@@ -481,7 +485,7 @@ static gboolean write_band_patch(const dt_remote_band_module_adapter_t *adapter,
   if(band_patch->x && desc->x_policy == DT_REMOTE_BAND_X_INTERIOR)
   {
     stored_x = g_new(float, desc->count);
-    if(!read_stored_x(desc, root, new_params, stored_x, error))
+    if(!read_stored_x(desc, root, (void *)old_params, stored_x, error))
     {
       g_free(stored_x);
       return FALSE;
@@ -519,6 +523,43 @@ static gboolean write_band_patch(const dt_remote_band_module_adapter_t *adapter,
       }
     }
   }
+
+  return TRUE;
+}
+
+// Applies one already-validated band entry: predicate gating (against the
+// *projected* `new_params` -- may already reflect earlier entries' writes
+// in this same call, "vector engine ordering"), then narrowing writes
+// (native_y always; native_x, and the twin's native_x, when `x` is given).
+// Every value-level check (x-policy gate, dt_remote_band_validate(),
+// twin-conflict) has already passed via validate_band_entry() above, run
+// for every entry in `entries` before this function is ever called for
+// any of them -- see dt_remote_band_apply_entries()'s own doc comment for
+// the full behavioral contract this implements.
+static gboolean write_band_patch(const dt_remote_band_module_adapter_t *adapter,
+                                 const dt_remote_band_descriptor_t *desc,
+                                 const dt_introspection_field_t *root,
+                                 void *new_params,
+                                 const dt_remote_band_patch_t *band_patch,
+                                 dt_remote_error_t **error)
+{
+  gboolean active = TRUE;
+  gboolean writable = TRUE;
+  if(!band_predicate_holds(desc->active_when, root, new_params, &active, error)
+     || !band_predicate_holds(desc->writable_when, root, new_params, &writable, error))
+    return FALSE;
+  if(!active || !writable)
+  {
+    deliver_band_error(band_parameter_error_new(
+                         DT_REMOTE_ERR_UNSUPPORTED_FIELD, desc->name, "condition_not_satisfied",
+                         _("semantic band '%s' is inactive or not writable in projected state"),
+                         desc->name),
+                       error);
+    return FALSE;
+  }
+
+  const dt_remote_band_descriptor_t *twin =
+    desc->x_shared_with ? find_band_descriptor(adapter, desc->x_shared_with) : NULL;
 
   // Preflight: resolve every destination element before writing any of
   // them, so a mid-write introspection drift never leaves a partial write
@@ -646,6 +687,28 @@ gboolean dt_remote_band_apply_entries(const struct dt_iop_module_t *module,
     }
   }
 
+  // Validate every entry's VALUE-level correctness (x-policy gate,
+  // dt_remote_band_validate() against `old_params`-stored endpoints,
+  // twin-conflict) in registry order BEFORE any of them writes anything --
+  // see validate_band_entry()'s own doc comment for why this must be a
+  // separate pass, not interleaved with the write loop below: without it,
+  // an earlier twin's mirror write could reach a later twin's endpoint
+  // check before that check runs, and this pass is also what makes a
+  // multi-entry rejection here leave `new_params` completely untouched
+  // (the only remaining source of a partial write on rejection is the
+  // predicate gate in the write loop below, whose "vector engine ordering"
+  // dependency on the projected block cannot be resolved without writing
+  // -- same caveat dt_remote_vector_apply_entries() documents).
+  for(guint descriptor_index = 0; descriptor_index < adapter->band_count; descriptor_index++)
+  {
+    const dt_remote_band_descriptor_t *desc = &adapter->bands[descriptor_index];
+    const dt_remote_band_patch_t *band_patch = find_band_entry(entries, desc->name);
+    if(!band_patch) continue;
+
+    if(!validate_band_entry(adapter, desc, intro->field, old_params, entries, band_patch, error))
+      return FALSE;
+  }
+
   // Apply in descriptor/registry order, never request hash/array order.
   for(guint descriptor_index = 0; descriptor_index < adapter->band_count; descriptor_index++)
   {
@@ -653,7 +716,7 @@ gboolean dt_remote_band_apply_entries(const struct dt_iop_module_t *module,
     const dt_remote_band_patch_t *band_patch = find_band_entry(entries, desc->name);
     if(!band_patch) continue;
 
-    if(!write_band_patch(adapter, desc, intro->field, new_params, entries, band_patch, error))
+    if(!write_band_patch(adapter, desc, intro->field, new_params, band_patch, error))
       return FALSE;
   }
 
