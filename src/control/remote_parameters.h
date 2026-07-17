@@ -47,7 +47,8 @@ typedef enum dt_remote_parameter_class_t
 {
   DT_REMOTE_PARAMETER_CURVE = 1,
   DT_REMOTE_PARAMETER_BANDS,               // fixed-count band samples, milestone 5
-  DT_REMOTE_PARAMETER_VECTOR              // replaces DT_REMOTE_PARAMETER_LEVELS
+  DT_REMOTE_PARAMETER_VECTOR,              // replaces DT_REMOTE_PARAMETER_LEVELS
+  DT_REMOTE_PARAMETER_QUANTITY             // named-component derived quantities, milestone 6
 } dt_remote_parameter_class_t;
 
 typedef enum dt_remote_writability_t
@@ -318,6 +319,23 @@ typedef struct dt_remote_band_patch_t
   GArray *x;       // double elements, owned, NULL when absent
 } dt_remote_band_patch_t;
 
+typedef struct dt_remote_quantity_component_value_t
+{
+  char *name;      // owned component name
+  double value;
+} dt_remote_quantity_component_value_t;
+
+typedef struct dt_remote_quantity_patch_t
+{
+  char *name;        // owned semantic ID
+  GPtrArray *values; // dt_remote_quantity_component_value_t*, owned, wire order
+} dt_remote_quantity_patch_t;
+
+/** frees a single quantity component value (its owned name and the struct
+ * itself). NULL-safe. Suitable as a GDestroyNotify for a
+ * dt_remote_quantity_patch_t.values GPtrArray. */
+void dt_remote_quantity_component_value_free(gpointer value_ptr);
+
 typedef struct dt_remote_semantic_patch_t
 {
   dt_remote_parameter_class_t class_id;
@@ -326,6 +344,7 @@ typedef struct dt_remote_semantic_patch_t
     dt_remote_curve_patch_t curve;
     dt_remote_vector_patch_t vector;
     dt_remote_band_patch_t bands;
+    dt_remote_quantity_patch_t quantity;
   } value;
 } dt_remote_semantic_patch_t;
 
@@ -336,8 +355,10 @@ typedef struct dt_remote_semantic_patch_t
 /** frees a single semantic patch entry (its class-specific owned
  * members -- name and points for DT_REMOTE_PARAMETER_CURVE, name and
  * values for DT_REMOTE_PARAMETER_VECTOR, name and y (and x, if present)
- * for DT_REMOTE_PARAMETER_BANDS -- and the patch struct itself).
- * Suitable as a GDestroyNotify for the `dt_remote_patch_t.semantic_values`
+ * for DT_REMOTE_PARAMETER_BANDS, name and values (each element's owned
+ * component name and the element struct itself) for
+ * DT_REMOTE_PARAMETER_QUANTITY -- and the patch struct itself). Suitable
+ * as a GDestroyNotify for the `dt_remote_patch_t.semantic_values`
  * GPtrArray. NULL-safe. */
 void dt_remote_semantic_patch_free(gpointer patch_ptr);
 

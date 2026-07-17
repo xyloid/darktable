@@ -1430,6 +1430,88 @@ static gboolean stub_set_module_params_bands_precision(const dt_remote_module_re
   return TRUE;
 }
 
+/* --- set_module_params semantic quantity stubs (milestone 6 Task 1) ---- */
+
+// Success stub for the quantity parse-accept test: asserts the handler
+// decoded semantic_values into exactly one DT_REMOTE_PARAMETER_QUANTITY
+// entry with the two named components from the request, in wire order,
+// preserved as doubles.
+static gboolean stub_set_module_params_quantity_capture(const dt_remote_module_ref_t *ref,
+                                                         const dt_remote_patch_t *patch,
+                                                         const uint64_t *expected_revision,
+                                                         dt_remote_mutation_result_t **out,
+                                                         dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_QUANTITY);
+  assert_string_equal(semantic->value.quantity.name, "wb.temperature");
+  assert_non_null(semantic->value.quantity.values);
+  assert_int_equal(semantic->value.quantity.values->len, 2);
+
+  const dt_remote_quantity_component_value_t *c0 =
+    g_ptr_array_index(semantic->value.quantity.values, 0);
+  assert_string_equal(c0->name, "temperature");
+  assert_float_equal(c0->value, 5500.0, 1e-12);
+
+  const dt_remote_quantity_component_value_t *c1 =
+    g_ptr_array_index(semantic->value.quantity.values, 1);
+  assert_string_equal(c1->name, "tint");
+  assert_float_equal(c1->value, 1.0, 1e-12);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
+// double-domain proof stub (curve/vector/bands design rationale, mirrored
+// for quantity): a component value that would narrow cleanly to float
+// (5500.00000001 -> 5500.0f) must survive the parser as its un-narrowed
+// double.
+static gboolean stub_set_module_params_quantity_precision(const dt_remote_module_ref_t *ref,
+                                                           const dt_remote_patch_t *patch,
+                                                           const uint64_t *expected_revision,
+                                                           dt_remote_mutation_result_t **out,
+                                                           dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->semantic_values);
+  assert_int_equal(patch->semantic_values->len, 1);
+
+  const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, 0);
+  assert_int_equal(semantic->class_id, DT_REMOTE_PARAMETER_QUANTITY);
+  assert_non_null(semantic->value.quantity.values);
+  assert_int_equal(semantic->value.quantity.values->len, 1);
+
+  const dt_remote_quantity_component_value_t *c0 =
+    g_ptr_array_index(semantic->value.quantity.values, 0);
+  assert_string_equal(c0->name, "temperature");
+  assert_true(c0->value > 5500.0);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->revision = 1;
+  *out = result;
+  return TRUE;
+}
+
 /* ---------------------------------------------------------------------- */
 /* hello                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -2782,6 +2864,185 @@ static void test_semantic_band_preserves_double_precision(void **state)
     "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
     "\"semantic_values\":{\"bands.example\":{\"class\":\"bands\","
     "\"y\":[0.50000001]}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- set_module_params semantic_values quantity class (milestone 6 Task 1) */
+
+// accept: {"class":"quantity","values":{"temperature":5500.0,"tint":1.0}}
+// decodes into a DT_REMOTE_PARAMETER_QUANTITY patch with two component
+// values, in wire order, preserved as doubles, and the semantic name kept.
+static void test_semantic_quantity_entry_parses(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_quantity_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":126,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":5500.0,\"tint\":1.0}}}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: 'values' member missing, present but not an object, and present
+// as an empty object -- an object with zero component members is never
+// valid regardless of the cap.
+static void test_semantic_quantity_requires_values_object(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // values missing entirely
+  _assert_inline_error(
+    "{\"id\":127,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\"}}}}",
+    "invalid_value");
+  // values present but not an object
+  _assert_inline_error(
+    "{\"id\":128,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\",\"values\":true}}}}",
+    "invalid_value");
+  // values present as an empty object
+  _assert_inline_error(
+    "{\"id\":129,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\",\"values\":{}}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: every non-numeric/non-finite component-value spelling -- a
+// non-numeric string, a boolean, overflow-to-Infinity in both directions
+// (1e400/-1e400 have no finite double representation), and a null member --
+// mirroring the vector/bands-class component rejections above.
+static void test_semantic_quantity_rejects_non_finite_components(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":130,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":\"hot\"}}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":131,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":true}}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":132,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":1e400}}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":133,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":-1e400}}}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":134,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":null}}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: a values object with 9 members exceeds
+// DT_REMOTE_QUANTITY_WIRE_COMPONENT_CAP (8) -- the protocol layer's flat
+// pre-engine limit, mirroring the vector component cap and the bands sample
+// cap.
+static void test_semantic_quantity_rejects_oversized_component_object(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  GString *oversized = g_string_new(
+    "{\"id\":135,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\",\"values\":{");
+  for(int i = 0; i < 9; i++)
+    g_string_append_printf(oversized, "%s\"c%d\":%.6f", i ? "," : "", i, i / 8.0);
+  g_string_append(oversized, "}}}}}");
+  _assert_inline_error(oversized->str, "invalid_value");
+  g_string_free(oversized, TRUE);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// reject: a member beyond exactly {class, values} -- here "points", a
+// curve-flavored member, leaking onto a quantity entry.
+static void test_semantic_quantity_rejects_unknown_members(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  _assert_inline_error(
+    "{\"id\":136,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":5500.0,\"tint\":1.0},"
+    "\"points\":[{\"x\":0.0,\"y\":0.0}]}}}}",
+    "invalid_value");
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// double-domain proof: a component value that would narrow cleanly to float
+// (5500.00000001 -> 5500.0f, since the difference is well under float's ULP
+// near 5500.0) must survive parsing as its un-narrowed double.
+static void test_semantic_quantity_preserves_double_precision(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_rgbcurve,
+    .set_module_params = stub_set_module_params_quantity_precision,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":137,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"rgbcurve\",\"values\":{},"
+    "\"semantic_values\":{\"wb.temperature\":{\"class\":\"quantity\","
+    "\"values\":{\"temperature\":5500.00000001}}}}}");
   JsonObject *resp = json_node_get_object(actual);
   assert_true(json_object_get_boolean_member(resp, "ok"));
   json_node_unref(actual);
@@ -4686,6 +4947,14 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_semantic_band_rejects_mismatched_x_length),
     cmocka_unit_test(test_semantic_band_rejects_unknown_members),
     cmocka_unit_test(test_semantic_band_preserves_double_precision),
+
+    cmocka_unit_test(test_semantic_quantity_entry_parses),
+    cmocka_unit_test(test_semantic_quantity_requires_values_object),
+    cmocka_unit_test(test_semantic_quantity_rejects_non_finite_components),
+    cmocka_unit_test(test_semantic_quantity_rejects_oversized_component_object),
+    cmocka_unit_test(test_semantic_quantity_rejects_unknown_members),
+    cmocka_unit_test(test_semantic_quantity_preserves_double_precision),
+
     cmocka_unit_test(test_hello_curve_params_implies_semantic_values_accepted),
 
     cmocka_unit_test(test_set_module_enabled_success),

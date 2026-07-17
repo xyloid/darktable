@@ -100,6 +100,14 @@ void dt_remote_band_value_free(dt_remote_band_value_t *value)
   g_free(value);
 }
 
+void dt_remote_quantity_component_value_free(gpointer value_ptr)
+{
+  dt_remote_quantity_component_value_t *value = value_ptr;
+  if(!value) return;
+  g_free(value->name);
+  g_free(value);
+}
+
 void dt_remote_semantic_patch_free(gpointer patch_ptr)
 {
   dt_remote_semantic_patch_t *patch = patch_ptr;
@@ -121,6 +129,11 @@ void dt_remote_semantic_patch_free(gpointer patch_ptr)
       g_free(patch->value.bands.name);
       if(patch->value.bands.y) g_array_unref(patch->value.bands.y);
       if(patch->value.bands.x) g_array_unref(patch->value.bands.x);
+      break;
+
+    case DT_REMOTE_PARAMETER_QUANTITY:
+      g_free(patch->value.quantity.name);
+      if(patch->value.quantity.values) g_ptr_array_unref(patch->value.quantity.values);
       break;
 
     default:
