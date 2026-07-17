@@ -729,6 +729,149 @@ static gboolean stub_list_modules_one_borders(GPtrArray **out, dt_remote_error_t
   return TRUE;
 }
 
+/* --- semantic band schema/value stubs (milestone 5, task 4) ------------- */
+
+// Hand-built band schemas covering the wire shapes _band_schema_to_json
+// emits: a FIXED-policy set (no min_gap/x_shared_with members, current "x"
+// array present, unconditionally writable) and an INTERIOR-policy set
+// (min_gap + x_shared_with present, no current "x" -- the NULL x a
+// list_schema-produced schema carries -- plus a writable_when condition).
+// Mirrors what a real registry adapter would produce
+// (remote_band_registry.c), fictional entries included, exactly as the
+// vector stub above hangs PLAIN/COLOR/LEVELS entries off one op.
+static dt_remote_band_schema_t *_make_band_schema(const char *name, const char *display_name,
+                                                   dt_remote_band_x_policy_t x_policy,
+                                                   double minimum_gap, const char *x_shared_with,
+                                                   const double *x, guint count,
+                                                   dt_remote_parameter_condition_t *writable_when)
+{
+  dt_remote_band_schema_t *schema = g_new0(dt_remote_band_schema_t, 1);
+  schema->name = g_strdup(name);
+  schema->display_name = g_strdup(display_name);
+  schema->count = count;
+  schema->y_minimum = 0.0;
+  schema->y_maximum = 1.0;
+  schema->x_policy = x_policy;
+  schema->minimum_gap = minimum_gap;
+  schema->x_shared_with = x_shared_with ? g_strdup(x_shared_with) : NULL;
+  if(x)
+  {
+    schema->x = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+    g_array_append_vals(schema->x, x, count);
+  }
+  schema->writability = writable_when ? DT_REMOTE_WRITABLE_CONDITIONAL : DT_REMOTE_WRITABLE_NOW;
+  schema->writable_when = writable_when;
+  return schema;
+}
+
+static const double s_band_default_x[] = { 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 };
+
+static gboolean stub_get_module_schema_band(const char *op, dt_remote_module_schema_t **out,
+                                            dt_remote_error_t **error)
+{
+  (void)op;
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup("lowlight");
+  schema->display_name = g_strdup("lowlight vision");
+  schema->params_version = 1;
+  schema->deprecated = FALSE;
+  schema->supports_multiple_instances = FALSE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+
+  dt_remote_field_t *blueness = _make_field("blueness", "blue shift", "float", TRUE);
+  blueness->has_range = TRUE;
+  blueness->minimum = 0.0;
+  blueness->maximum = 100.0;
+  blueness->has_default = TRUE;
+  blueness->default_value.type = DT_REMOTE_VALUE_FLOAT;
+  blueness->default_value.v.f = 0.0;
+  g_ptr_array_add(schema->fields, blueness);
+
+  dt_remote_field_t *transition_x = _make_field("transition_x", "", "array", FALSE);
+  transition_x->represented_by = g_ptr_array_new_with_free_func(g_free);
+  g_ptr_array_add(transition_x->represented_by, g_strdup("bands.transition"));
+  g_ptr_array_add(schema->fields, transition_x);
+
+  dt_remote_field_t *transition_y = _make_field("transition_y", "", "array", FALSE);
+  transition_y->represented_by = g_ptr_array_new_with_free_func(g_free);
+  g_ptr_array_add(transition_y->represented_by, g_strdup("bands.transition"));
+  g_ptr_array_add(schema->fields, transition_y);
+
+  schema->semantic_fields = g_ptr_array_new_with_free_func(dt_remote_semantic_schema_free);
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_band(
+                    _make_band_schema("bands.transition", "Transition", DT_REMOTE_BAND_X_FIXED, 0.0,
+                                      NULL, s_band_default_x, G_N_ELEMENTS(s_band_default_x), NULL)));
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_band(
+                    _make_band_schema("bands.shadow", "Shadow response", DT_REMOTE_BAND_X_INTERIOR,
+                                      0.001, "bands.highlight", NULL, 6,
+                                      _make_condition("mode", DT_REMOTE_PREDICATE_EQ, "ADVANCED"))));
+
+  *out = schema;
+  return TRUE;
+}
+
+static dt_remote_band_value_t *_make_band_value(const char *name, const double *y, const double *x,
+                                                 guint count)
+{
+  dt_remote_band_value_t *value = g_new0(dt_remote_band_value_t, 1);
+  value->name = g_strdup(name);
+  value->y = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+  g_array_append_vals(value->y, y, count);
+  value->x = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+  g_array_append_vals(value->x, x, count);
+  value->active = TRUE;
+  value->effective = TRUE;
+  value->writable_now = TRUE;
+  return value;
+}
+
+static gboolean stub_get_module_params_band(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                            GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  dt_remote_patch_entry_t *blueness = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  blueness->name = g_strdup("blueness");
+  blueness->value.type = DT_REMOTE_VALUE_FLOAT;
+  blueness->value.v.f = 0.0;
+  g_ptr_array_add(arr, blueness);
+
+  GHashTable *semantic =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  static const double transition_y[] = { 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+  g_hash_table_insert(semantic, g_strdup("bands.transition"),
+                      dt_remote_semantic_value_wrap_band(
+                        _make_band_value("bands.transition", transition_y, s_band_default_x,
+                                         G_N_ELEMENTS(transition_y))));
+
+  *out = arr;
+  if(semantic_out) *semantic_out = semantic;
+  else g_hash_table_unref(semantic);
+  return TRUE;
+}
+
+static gboolean stub_list_modules_one_lowlight(GPtrArray **out, dt_remote_error_t **error)
+{
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_module_free);
+  dt_remote_module_t *m = g_malloc0(sizeof(dt_remote_module_t));
+  m->op = g_strdup("lowlight");
+  m->instance = 0;
+  m->instance_name = g_strdup("");
+  m->display_name = g_strdup("lowlight vision");
+  m->enabled = TRUE;
+  m->deprecated = FALSE;
+  m->supports_multiple_instances = FALSE;
+  g_ptr_array_add(arr, m);
+  *out = arr;
+  return TRUE;
+}
+
 /* --- set_module_params stubs (plan step 7) ------------------------------ */
 
 // Like stub_get_module_schema_exposure but with the "black" field the wire
@@ -1316,18 +1459,20 @@ static void test_hello_success(void **state)
   // "params" (step 7) + "semantic_params"/"curve_params" (milestone 2:
   // capability-gated semantic curve read/write) + "vector_params"
   // (milestone 4: capability-gated semantic vector read/write) +
+  // "band_params" (milestone 5: capability-gated semantic band read/write) +
   // "instances"/"history" (step 8) + "preview" (step 9) + "scopes"
   // (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 8);
+  assert_int_equal(json_array_get_length(caps), 9);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
   assert_string_equal(json_array_get_string_element(caps, 3), "vector_params");
-  assert_string_equal(json_array_get_string_element(caps, 4), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 5), "history");
-  assert_string_equal(json_array_get_string_element(caps, 6), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 7), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 4), "band_params");
+  assert_string_equal(json_array_get_string_element(caps, 5), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 6), "history");
+  assert_string_equal(json_array_get_string_element(caps, 7), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 8), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1712,6 +1857,40 @@ static void test_get_module_params_vector_semantic_values(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_vector_request.json",
                            "get_module_params_vector_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- semantic band schema/value path (milestone 5, task 4) --------------- */
+
+// lowlight's hand-built band schemas ride on get_module_schema as
+// `semantic_fields` entries tagged `"class":"bands"`: "count", "y_range"
+// {minimum,maximum} and "x_policy" always present; "min_gap" and
+// "x_shared_with" only for the INTERIOR entry; current "x" positions only
+// when the schema carries them.
+static void test_get_module_schema_band_semantic_fields(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_schema = stub_get_module_schema_band };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_schema_band_request.json",
+                           "get_module_schema_band_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// lowlight's "bands.transition" band value rides on get_module_params as an
+// optional `semantic_values` member: class/active/effective/writable_now
+// plus the y and x sample arrays (doubles).
+static void test_get_module_params_band_semantic_values(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_band,
+    .list_modules = stub_list_modules_one_lowlight,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_params_band_request.json",
+                           "get_module_params_band_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -4469,6 +4648,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_rgbcurve_semantic_values),
     cmocka_unit_test(test_get_module_schema_vector_semantic_fields),
     cmocka_unit_test(test_get_module_params_vector_semantic_values),
+    cmocka_unit_test(test_get_module_schema_band_semantic_fields),
+    cmocka_unit_test(test_get_module_params_band_semantic_values),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),

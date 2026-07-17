@@ -46,6 +46,7 @@
 #include "common/darktable.h"
 #include "control/remote_curve.h"
 #include "control/remote_edit.h"
+#include "control/remote_band.h"
 #include "control/remote_vector.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"  // dt_iop_get_module_so()/dt_iop_module_so_t: real-module
@@ -1686,6 +1687,334 @@ static void test_transaction_vector_readback_mismatch_fails_mutation(void **stat
   g_ptr_array_unref(patch.semantic_values);
 }
 
+/* ---------------------------------------------------------------------- */
+/* band semantic seam tests (milestone 5, task 4)                          */
+/* ---------------------------------------------------------------------- */
+
+// "lowlight" test adapter: a single "bands.transition" band-set over the
+// real `transition_x`/`transition_y` float[6] fields, FIXED x policy --
+// mirrors test_remote_band.c's own lowlight fixture (the band engine's own
+// test harness), injected here through the same
+// dt_remote_band_registry_set_lookup_override() seam the curve and vector
+// suites established, to prove the remote_edit.c seams dispatch to the
+// band registry/engine through the class-ops table's third row exactly as
+// they do to the curve and vector ones.
+static const dt_remote_path_segment_t s_band_transition_x_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "transition_x" },
+};
+
+static const dt_remote_path_segment_t s_band_transition_y_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "transition_y" },
+};
+
+static const dt_remote_band_descriptor_t s_band_transition_descriptor = {
+  .name = "bands.transition",
+  .display_name = "Transition",
+  .native_x = { .segments = s_band_transition_x_segments,
+                .length = G_N_ELEMENTS(s_band_transition_x_segments) },
+  .native_y = { .segments = s_band_transition_y_segments,
+                .length = G_N_ELEMENTS(s_band_transition_y_segments) },
+  .count = 6,
+  .y_minimum = 0.0,
+  .y_maximum = 1.0,
+  .x_policy = DT_REMOTE_BAND_X_FIXED,
+};
+
+static const dt_remote_band_module_adapter_t s_band_lowlight_adapter = {
+  .operation = "lowlight",
+  .minimum_params_version = 1,
+  .maximum_params_version = 1,
+  .bands = &s_band_transition_descriptor,
+  .band_count = 1,
+};
+
+static const dt_remote_band_module_adapter_t *band_lookup_override(const char *operation,
+                                                                   guint params_version)
+{
+  return !g_strcmp0(operation, s_band_lowlight_adapter.operation)
+         && params_version >= s_band_lowlight_adapter.minimum_params_version
+         && params_version <= s_band_lowlight_adapter.maximum_params_version
+    ? &s_band_lowlight_adapter : NULL;
+}
+
+// The schema seam: get_module_schema("lowlight") advertises the one
+// injected band-set alongside every untouched primitive field, and the
+// annotation seam (_stamp_root/_annotate_represented_by) stamps the
+// band-set's semantic ID onto BOTH its native fields -- `transition_x` and
+// `transition_y`, the two-leaf shape that distinguishes a band descriptor
+// from a vector's single native path.
+static void test_schema_lowlight_band_semantic_fields_and_represented_by(void **state)
+{
+  (void)state;
+  dt_remote_band_registry_set_lookup_override(band_lookup_override);
+
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  const gboolean ok = dt_remote_get_module_schema("lowlight", &schema, &err);
+
+  dt_remote_band_registry_set_lookup_override(NULL);
+
+  assert_true(ok);
+  assert_null(err);
+  assert_non_null(schema);
+  assert_non_null(schema->semantic_fields);
+  assert_int_equal(schema->semantic_fields->len, 1);
+  const dt_remote_semantic_schema_t *wrapped = g_ptr_array_index(schema->semantic_fields, 0);
+  assert_int_equal(wrapped->class_id, DT_REMOTE_PARAMETER_BANDS);
+  assert_string_equal(wrapped->u.bands->name, "bands.transition");
+  assert_int_equal(wrapped->u.bands->count, 6);
+  assert_int_equal(wrapped->u.bands->x_policy, DT_REMOTE_BAND_X_FIXED);
+
+  const dt_remote_field_t *native_x = NULL;
+  const dt_remote_field_t *native_y = NULL;
+  gboolean found_blueness = FALSE;
+  for(guint i = 0; i < schema->fields->len; i++)
+  {
+    const dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, "transition_x")) native_x = f;
+    if(!g_strcmp0(f->name, "transition_y")) native_y = f;
+    // "blueness" is an untouched primitive float field -- present, writable,
+    // and carrying no represented_by, exactly as it would without the band
+    // class ever existing.
+    if(!g_strcmp0(f->name, "blueness"))
+    {
+      found_blueness = TRUE;
+      assert_true(f->writable);
+      assert_null(f->represented_by);
+    }
+  }
+  assert_true(found_blueness);
+  const dt_remote_field_t *natives[] = { native_x, native_y };
+  for(guint i = 0; i < G_N_ELEMENTS(natives); i++)
+  {
+    assert_non_null(natives[i]);
+    assert_false(natives[i]->writable);  // native arrays stay primitive-unwritable
+    assert_non_null(natives[i]->represented_by);
+    assert_int_equal(natives[i]->represented_by->len, 1);
+    assert_string_equal(g_ptr_array_index(natives[i]->represented_by, 0), "bands.transition");
+  }
+
+  dt_remote_module_schema_free(schema);
+}
+
+/* --- lowlight scratch-transaction fixture -------------------------------- */
+
+typedef struct live_lowlight_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+} live_lowlight_fixture_t;
+
+static live_lowlight_fixture_t *live_lowlight_fixture_new(void)
+{
+  live_lowlight_fixture_t *fixture = g_new0(live_lowlight_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+  fixture->dev.gui_attached = FALSE;
+
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so("lowlight");
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params, fixture->module->params_size);
+  fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void live_lowlight_fixture_free(live_lowlight_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static int live_lowlight_test_setup(void **state)
+{
+  *state = live_lowlight_fixture_new();
+  return 0;
+}
+
+static int live_lowlight_test_teardown(void **state)
+{
+  live_lowlight_fixture_free(*state);
+  *state = NULL;
+  return 0;
+}
+
+static dt_remote_semantic_patch_t *live_lowlight_band_patch(const char *name, const double *y,
+                                                             guint count)
+{
+  dt_remote_semantic_patch_t *semantic = g_new0(dt_remote_semantic_patch_t, 1);
+  semantic->class_id = DT_REMOTE_PARAMETER_BANDS;
+  semantic->value.bands.name = g_strdup(name);
+  semantic->value.bands.y = g_array_sized_new(FALSE, FALSE, sizeof(double), count);
+  g_array_append_vals(semantic->value.bands.y, y, count);
+  return semantic;
+}
+
+// Mirrors assert_live_vector_values -- the readback seam's underlying
+// engine call (dt_remote_band_read_values), the same one
+// dt_remote_get_module_params composes and wraps.
+static void assert_live_band_y(live_lowlight_fixture_t *fixture, const char *name,
+                               const double *expected, guint count)
+{
+  dt_remote_band_registry_set_lookup_override(band_lookup_override);
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, fixture->module->params, &values, &error));
+  dt_remote_band_registry_set_lookup_override(NULL);
+  assert_null(error);
+  dt_remote_band_value_t *value = g_hash_table_lookup(values, name);
+  assert_non_null(value);
+  assert_int_equal(value->y->len, count);
+  for(guint i = 0; i < count; i++)
+    assert_float_equal(g_array_index(value->y, double, i), expected[i], 1e-6);
+  g_hash_table_unref(values);
+}
+
+// Mirrors apply_vector_patch_with_readback_verification exactly, for the
+// band engine: the apply seam's sequence (dt_remote_patch_apply +
+// dt_remote_band_apply_patch against the same scratch block -- the same
+// dispatch-row wrapper remote_edit.c's class-ops loop calls) plus the
+// merged read-back verification pass dt_remote_set_module_params()
+// enforces.
+static gboolean apply_band_patch_with_readback_verification(live_lowlight_fixture_t *fixture,
+                                                            const dt_remote_patch_t *patch,
+                                                            dt_remote_error_t **error)
+{
+  dt_remote_band_registry_set_lookup_override(band_lookup_override);
+
+  void *projected = g_malloc(fixture->module->params_size);
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  if(patch->scalar_values
+     && !dt_remote_patch_apply(linear, dt_remote_denylist_for_op("lowlight"), patch, projected, error))
+  {
+    g_free(projected);
+    dt_remote_band_registry_set_lookup_override(NULL);
+    return FALSE;
+  }
+
+  if(!dt_remote_band_apply_patch(fixture->module, fixture->module->params, projected, patch, error))
+  {
+    g_free(projected);
+    dt_remote_band_registry_set_lookup_override(NULL);
+    return FALSE;
+  }
+
+  GHashTable *readback = NULL;
+  const gboolean read_ok = dt_remote_band_read_values(fixture->module, projected, &readback, error);
+  dt_remote_band_registry_set_lookup_override(NULL);
+
+  if(!read_ok)
+  {
+    g_free(projected);
+    return FALSE;
+  }
+
+  guint written = 0;
+  guint band_entries = 0;
+  for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    if(semantic->class_id != DT_REMOTE_PARAMETER_BANDS) continue;
+    band_entries++;
+    if(g_hash_table_lookup(readback, semantic->value.bands.name)) written++;
+  }
+  const gboolean matched = written == band_entries;
+  g_hash_table_unref(readback);
+
+  if(!matched)
+  {
+    g_free(projected);
+    if(error)
+    {
+      *error = g_new0(dt_remote_error_t, 1);
+      (*error)->code = DT_REMOTE_ERR_INTERNAL;
+      (*error)->message = g_strdup("semantic read-back is missing a written entry");
+    }
+    return FALSE;
+  }
+
+  memcpy(fixture->module->params, projected, fixture->module->params_size);
+  g_free(projected);
+  return TRUE;
+}
+
+// The readback seam: a live lowlight instance's default band values --
+// module defaults are y = 0.5 across all six bands.
+static void test_params_read_lowlight_returns_band_value(void **state)
+{
+  live_lowlight_fixture_t *fixture = *state;
+  static const double default_y[] = { 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+  assert_live_band_y(fixture, "bands.transition", default_y, G_N_ELEMENTS(default_y));
+}
+
+// The apply seam: a mixed patch -- one scalar field plus one band semantic
+// entry -- applies in the same scratch transaction and reads back the
+// written band values, with the scalar landing too.
+static void test_transaction_band_patch_applies_and_reads_back(void **state)
+{
+  live_lowlight_fixture_t *fixture = *state;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("blueness",
+                             (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 10.0 }));
+  patch.semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  static const double new_y[] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  g_ptr_array_add(patch.semantic_values,
+                  live_lowlight_band_patch("bands.transition", new_y, G_N_ELEMENTS(new_y)));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_band_patch_with_readback_verification(fixture, &patch, &error));
+  assert_null(error);
+  assert_live_band_y(fixture, "bands.transition", new_y, G_N_ELEMENTS(new_y));
+
+  // `blueness` is dt_iop_lowlight_params_t's leading float (lowlight.c) --
+  // the params struct is module-private, so read it at its known offset.
+  assert_float_equal(*(const float *)fixture->module->params, 10.0, 1e-6);
+
+  g_ptr_array_unref(patch.scalar_values);
+  g_ptr_array_unref(patch.semantic_values);
+}
+
+// Whole-request byte-atomicity: a mixed patch whose band entry fails
+// validation (y above the descriptor's maximum) rejects the whole request
+// -- the already-projected scalar write is discarded with it and the live
+// params block stays byte-identical.
+static void test_transaction_band_invalid_entry_leaves_params_unchanged(void **state)
+{
+  live_lowlight_fixture_t *fixture = *state;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("blueness",
+                             (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 10.0 }));
+  patch.semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  static const double bad_y[] = { 0.1, 0.2, 0.3, 0.4, 0.5, 1.5 };  // 1.5 > y_maximum 1.0
+  g_ptr_array_add(patch.semantic_values,
+                  live_lowlight_band_patch("bands.transition", bad_y, G_N_ELEMENTS(bad_y)));
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_error_t *error = NULL;
+  const gboolean ok = apply_band_patch_with_readback_verification(fixture, &patch, &error);
+
+  assert_false(ok);
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(before);
+  g_ptr_array_unref(patch.scalar_values);
+  g_ptr_array_unref(patch.semantic_values);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -1746,6 +2075,14 @@ int main(int argc, char *argv[])
                                    live_borders_test_setup, live_borders_test_teardown),
     cmocka_unit_test_setup_teardown(test_transaction_vector_readback_mismatch_fails_mutation,
                                    live_borders_test_setup, live_borders_test_teardown),
+
+    cmocka_unit_test(test_schema_lowlight_band_semantic_fields_and_represented_by),
+    cmocka_unit_test_setup_teardown(test_params_read_lowlight_returns_band_value,
+                                   live_lowlight_test_setup, live_lowlight_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_band_patch_applies_and_reads_back,
+                                   live_lowlight_test_setup, live_lowlight_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_band_invalid_entry_leaves_params_unchanged,
+                                   live_lowlight_test_setup, live_lowlight_test_teardown),
 
     // Keep last: the case temporarily mutates real introspection, restoring
     // it immediately after the schema call.

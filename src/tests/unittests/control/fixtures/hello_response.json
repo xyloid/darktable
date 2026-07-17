@@ -10,6 +10,7 @@
       "semantic_params",
       "curve_params",
       "vector_params",
+      "band_params",
       "instances",
       "history",
       "preview",

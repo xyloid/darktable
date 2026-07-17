@@ -1,0 +1,24 @@
+{
+  "id": 43,
+  "ok": true,
+  "result": {
+    "module": "lowlight",
+    "instance": 0,
+    "instance_name": "",
+    "enabled": true,
+    "revision": 31,
+    "values": {
+      "blueness": 0.0
+    },
+    "semantic_values": {
+      "bands.transition": {
+        "class": "bands",
+        "active": true,
+        "effective": true,
+        "writable_now": true,
+        "y": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        "x": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+      }
+    }
+  }
+}

@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/undo.h"
 #include "control/control.h"
+#include "control/remote_band.h"
 #include "control/remote_curve.h"
 #include "control/remote_revision.h"
 #include "control/remote_vector.h"
@@ -821,8 +822,8 @@ gboolean dt_remote_get_module_primitive_schema(const char *op,
 // several descriptors (rgbcurve's shared channel arrays, colorbalance/
 // rgblevels aliasing) and, for curves, several paths of one descriptor --
 // dedupe so a name is never added twice to the same field.
-// `class_name` is used to select class-specific error wording ("curve" or
-// "vector") to preserve original error message text per-class.
+// `class_name` is used to select class-specific error wording ("curve",
+// "vector", or "band") to preserve original error message text per-class.
 static gboolean _stamp_root(dt_remote_module_schema_t *schema,
                             const dt_remote_introspection_path_t *path,
                             const char *semantic_name,
@@ -836,6 +837,9 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
       if(!g_strcmp0(class_name, "curve"))
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("curve descriptor '%s' has a rootless native path"), semantic_name);
+      else if(!g_strcmp0(class_name, "band"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("band descriptor '%s' has a rootless native path"), semantic_name);
       else
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("vector descriptor '%s' has a rootless native path"), semantic_name);
@@ -857,6 +861,10 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
       if(!g_strcmp0(class_name, "curve"))
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("curve descriptor '%s' routes through unknown field '%s'"),
+                                     semantic_name, root);
+      else if(!g_strcmp0(class_name, "band"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("band descriptor '%s' routes through unknown field '%s'"),
                                      semantic_name, root);
       else
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
@@ -883,9 +891,9 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
 // class-specific type with dt_remote_parameter_class_t for the neutral
 // semantic_fields/semantic_values containers (remote_parameters.h). The four
 // seams below (schema listing, readback, apply, represented_by annotation)
-// each loop over this table once instead of making one explicit curve call
-// and one explicit vector call -- milestone 5's bands class becomes a third
-// row here without touching any seam's loop body.
+// each loop over this table once instead of making one explicit call per
+// class -- milestone 5's bands class is exactly the third row this table
+// was built for, added without touching any seam's loop body.
 typedef struct dt_remote_class_ops_t
 {
   dt_remote_parameter_class_t class_id;
@@ -919,11 +927,11 @@ typedef struct dt_remote_class_ops_t
   dt_remote_semantic_value_t *(*wrap_value)(gpointer class_value);
   // Stamps this class's represented_by back-references onto `schema`'s
   // primitive fields (see _stamp_root/_annotate_represented_by below) --
-  // kept as a per-row lookup+stamp pointer because the two classes' native
+  // kept as a per-row lookup+stamp pointer because the classes' native
   // layouts genuinely differ (a curve stamps three native paths per
-  // descriptor -- nodes/count/type -- a vector stamps one), so unlike the
-  // four members above there is no single shared loop body to drive from a
-  // uniform per-descriptor shape.
+  // descriptor -- nodes/count/type -- a vector stamps one, a band stamps
+  // two -- x/y), so unlike the four members above there is no single shared
+  // loop body to drive from a uniform per-descriptor shape.
   gboolean (*annotate_represented_by)(dt_remote_module_schema_t *schema,
                                       dt_introspection_t *intro,
                                       guint params_version,
@@ -988,7 +996,36 @@ static gboolean _annotate_vector_represented_by(dt_remote_module_schema_t *schem
   return TRUE;
 }
 
-// Row order (curve, vector) preserves today's error precedence and
+// Same rationale again for the band class -- two native paths per
+// descriptor (native_x and native_y), both stamped with the one semantic
+// name.
+static gboolean _annotate_band_represented_by(dt_remote_module_schema_t *schema,
+                                              dt_introspection_t *intro,
+                                              guint params_version,
+                                              dt_remote_error_t **error)
+{
+  const dt_remote_band_module_adapter_t *adapter =
+    intro ? dt_remote_band_registry_lookup(schema->op, params_version) : NULL;
+  if(!adapter)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("semantic bands advertised without a registry adapter for '%s'"),
+                                   schema->op);
+    return FALSE;
+  }
+
+  for(guint band = 0; band < adapter->band_count; band++)
+  {
+    const dt_remote_band_descriptor_t *desc = &adapter->bands[band];
+    const dt_remote_introspection_path_t *paths[] = { &desc->native_x, &desc->native_y };
+    for(guint p = 0; p < G_N_ELEMENTS(paths); p++)
+      if(!_stamp_root(schema, paths[p], desc->name, "band", error)) return FALSE;
+  }
+  return TRUE;
+}
+
+// Row order (curve, vector, bands) preserves today's error precedence and
 // schema/readback insertion order -- both seams below process the table
 // front to back. `wrap_schema`/`wrap_value` are cast from their concrete
 // class-typed signatures (e.g. dt_remote_curve_schema_t *) to this table's
@@ -1014,6 +1051,15 @@ static const dt_remote_class_ops_t s_class_ops[] = {
     .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_vector,
     .annotate_represented_by = _annotate_vector_represented_by,
   },
+  {
+    .class_id = DT_REMOTE_PARAMETER_BANDS,
+    .list_schema = dt_remote_band_list_schema,
+    .read_values = dt_remote_band_read_values,
+    .apply_patch = dt_remote_band_apply_patch,
+    .wrap_schema = (dt_remote_semantic_schema_t *(*)(gpointer))dt_remote_semantic_schema_wrap_band,
+    .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_band,
+    .annotate_represented_by = _annotate_band_represented_by,
+  },
 };
 
 // Stamps represented_by onto the primitive fields for every semantic
@@ -1033,8 +1079,8 @@ static gboolean _annotate_represented_by(dt_remote_module_schema_t *schema,
   const guint params_version = intro ? (guint)intro->params_version : 0;
 
   // One pass over the advertised semantic fields to learn which table rows
-  // are present, then process rows in table order (curve, vector) -- same
-  // two-phase shape the original has_curve/has_vector version used.
+  // are present, then process rows in table order (curve, vector, bands) --
+  // same two-phase shape the original has_curve/has_vector version used.
   gboolean row_present[G_N_ELEMENTS(s_class_ops)] = { FALSE };
   for(guint i = 0; schema->semantic_fields && i < schema->semantic_fields->len; i++)
   {

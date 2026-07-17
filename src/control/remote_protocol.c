@@ -634,6 +634,118 @@ static JsonNode *_vector_value_to_json(const dt_remote_vector_value_t *v)
   return node;
 }
 
+/* ---------------------------------------------------------------------- */
+/* semantic band schema/value -> JSON (milestone 5; wire shapes are the    */
+/* bands-class design doc's SS Wire and MCP contract "Schema"/"Value")     */
+/* ---------------------------------------------------------------------- */
+
+// Stable wire vocabulary for dt_remote_band_x_policy_t -- like vector
+// subtype names, these strings are part of the wire contract.
+static const char *_band_x_policy_name(dt_remote_band_x_policy_t x_policy)
+{
+  switch(x_policy)
+  {
+    case DT_REMOTE_BAND_X_INTERIOR: return "interior";
+    case DT_REMOTE_BAND_X_FIXED:
+    default: return "fixed";
+  }
+}
+
+static JsonNode *_band_schema_to_json(const dt_remote_band_schema_t *s)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "name");
+  json_builder_add_string_value(b, s->name ? s->name : "");
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "bands");
+  json_builder_set_member_name(b, "display_name");
+  json_builder_add_string_value(b, s->display_name ? s->display_name : "");
+
+  json_builder_set_member_name(b, "readable");
+  json_builder_add_boolean_value(b, TRUE);
+  // Same convention as the curve/vector schema serializers: "writable: true"
+  // means the server implements writes for the class in some valid state;
+  // writable_when below carries the static condition.
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, s->writability != DT_REMOTE_WRITABLE_NEVER);
+  _condition_to_json(b, "writable_when", s->writable_when);
+
+  json_builder_set_member_name(b, "count");
+  json_builder_add_int_value(b, s->count);
+
+  json_builder_set_member_name(b, "y_range");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "minimum");
+  json_builder_add_double_value(b, s->y_minimum);
+  json_builder_set_member_name(b, "maximum");
+  json_builder_add_double_value(b, s->y_maximum);
+  json_builder_end_object(b);
+
+  json_builder_set_member_name(b, "x_policy");
+  json_builder_add_string_value(b, _band_x_policy_name(s->x_policy));
+  if(s->x_policy == DT_REMOTE_BAND_X_INTERIOR)
+  {
+    json_builder_set_member_name(b, "min_gap");
+    json_builder_add_double_value(b, s->minimum_gap);
+  }
+  if(s->x_shared_with)
+  {
+    json_builder_set_member_name(b, "x_shared_with");
+    json_builder_add_string_value(b, s->x_shared_with);
+  }
+
+  // Current stored x positions -- present only when the schema carries them
+  // (dt_remote_band_list_schema() has no live params blob to read from, so
+  // schemas it produces omit the member).
+  if(s->x)
+  {
+    json_builder_set_member_name(b, "x");
+    json_builder_begin_array(b);
+    for(guint i = 0; i < s->x->len; i++)
+      json_builder_add_double_value(b, g_array_index(s->x, double, i));
+    json_builder_end_array(b);
+  }
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
+static JsonNode *_band_value_to_json(const dt_remote_band_value_t *v)
+{
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "class");
+  json_builder_add_string_value(b, "bands");
+  json_builder_set_member_name(b, "active");
+  json_builder_add_boolean_value(b, v->active);
+  json_builder_set_member_name(b, "effective");
+  json_builder_add_boolean_value(b, v->effective);
+  json_builder_set_member_name(b, "writable_now");
+  json_builder_add_boolean_value(b, v->writable_now);
+
+  json_builder_set_member_name(b, "y");
+  json_builder_begin_array(b);
+  for(guint i = 0; v->y && i < v->y->len; i++)
+    json_builder_add_double_value(b, g_array_index(v->y, double, i));
+  json_builder_end_array(b);
+
+  json_builder_set_member_name(b, "x");
+  json_builder_begin_array(b);
+  for(guint i = 0; v->x && i < v->x->len; i++)
+    json_builder_add_double_value(b, g_array_index(v->x, double, i));
+  json_builder_end_array(b);
+
+  json_builder_end_object(b);
+  JsonNode *node = json_builder_get_root(b);
+  g_object_unref(b);
+  return node;
+}
+
 // The semantic_fields/semantic_values containers carry class-tagged
 // wrappers (remote_parameters.h); serialization switches on the tag.
 
@@ -645,6 +757,8 @@ static JsonNode *_semantic_schema_to_json(const dt_remote_semantic_schema_t *w)
       return _curve_schema_to_json(w->u.curve);
     case DT_REMOTE_PARAMETER_VECTOR:
       return _vector_schema_to_json(w->u.vector);
+    case DT_REMOTE_PARAMETER_BANDS:
+      return _band_schema_to_json(w->u.bands);
     default:
       g_assert_not_reached();
       return NULL;
@@ -659,6 +773,8 @@ static JsonNode *_semantic_value_to_json(const dt_remote_semantic_value_t *w)
       return _curve_value_to_json(w->u.curve);
     case DT_REMOTE_PARAMETER_VECTOR:
       return _vector_value_to_json(w->u.vector);
+    case DT_REMOTE_PARAMETER_BANDS:
+      return _band_value_to_json(w->u.bands);
     default:
       g_assert_not_reached();
       return NULL;
@@ -718,11 +834,13 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // the additive semantic_fields/semantic_values wire members -- no
   // protocol_version bump, per the milestone spec's resolved decision.
   // "vector_params" (milestone 4) gates vector-class semantic_fields/
-  // semantic_values entries the same way, on top of "semantic_params".
+  // semantic_values entries the same way, on top of "semantic_params";
+  // "band_params" (milestone 5) does the same for bands-class entries.
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "semantic_params");
   json_builder_add_string_value(b, "curve_params");
   json_builder_add_string_value(b, "vector_params");
+  json_builder_add_string_value(b, "band_params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");

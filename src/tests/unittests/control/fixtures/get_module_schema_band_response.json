@@ -1,0 +1,62 @@
+{
+  "id": 42,
+  "ok": true,
+  "result": {
+    "module": "lowlight",
+    "display_name": "lowlight vision",
+    "params_version": 1,
+    "deprecated": false,
+    "supports_multiple_instances": false,
+    "fields": [
+      {
+        "name": "blueness",
+        "description": "blue shift",
+        "type": "float",
+        "minimum": 0.0,
+        "maximum": 100.0,
+        "default": 0.0,
+        "writable": true
+      },
+      {
+        "name": "transition_x",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["bands.transition"]
+      },
+      {
+        "name": "transition_y",
+        "description": "",
+        "type": "array",
+        "writable": false,
+        "represented_by": ["bands.transition"]
+      }
+    ],
+    "semantic_fields": [
+      {
+        "name": "bands.transition",
+        "class": "bands",
+        "display_name": "Transition",
+        "readable": true,
+        "writable": true,
+        "count": 6,
+        "y_range": { "minimum": 0.0, "maximum": 1.0 },
+        "x_policy": "fixed",
+        "x": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+      },
+      {
+        "name": "bands.shadow",
+        "class": "bands",
+        "display_name": "Shadow response",
+        "readable": true,
+        "writable": true,
+        "writable_when": { "field": "mode", "equals": "ADVANCED" },
+        "count": 6,
+        "y_range": { "minimum": 0.0, "maximum": 1.0 },
+        "x_policy": "interior",
+        "min_gap": 0.001,
+        "x_shared_with": "bands.highlight"
+      }
+    ]
+  }
+}

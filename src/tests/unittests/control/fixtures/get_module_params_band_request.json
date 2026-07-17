@@ -1,0 +1,5 @@
+{
+  "id": 43,
+  "method": "get_module_params",
+  "params": { "module": "lowlight", "instance": 0 }
+}
