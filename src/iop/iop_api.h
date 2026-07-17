@@ -133,6 +133,17 @@ OPTIONAL(void, gui_init, struct dt_iop_module_t *self);
 OPTIONAL(void, color_picker_apply, struct dt_iop_module_t *self,
                                    struct _GtkWidget *picker,
                                    struct dt_dev_pixelpipe_t *pipe);
+/** Remote-edit quantity hooks (darktable MCP): convert between the stored
+ * channel coefficients and the Kelvin/tint presentation pair. Component
+ * order is fixed by the remote quantity registry: [0] temperature (K),
+ * [1] tint. Both need the GUI's camera matrices (gui_data->CAM_to_XYZ /
+ * XYZ_to_CAM), so they fail closed without a built GUI. */
+OPTIONAL(gboolean, remote_quantity_read, struct dt_iop_module_t *self,
+                                         const dt_iop_params_t *params,
+                                         double *values, size_t count);
+OPTIONAL(gboolean, remote_quantity_write, struct dt_iop_module_t *self,
+                                          const double *values, size_t count,
+                                          dt_iop_params_t *params);
 /** called by standard widget callbacks after value changed */
 OPTIONAL(void, gui_changed, struct dt_iop_module_t *self,
                             GtkWidget *widget,

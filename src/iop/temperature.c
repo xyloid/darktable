@@ -501,6 +501,41 @@ static void _mul2temp(dt_iop_module_t *self,
   _XYZ_to_temperature(_mul2xyz(self, p), TempK, tint);
 }
 
+// Remote-edit quantity hooks (darktable MCP): convert between the stored
+// channel coefficients and the Kelvin/tint presentation pair. Component
+// order is fixed by the remote quantity registry: [0] temperature (K),
+// [1] tint. Both need the GUI's camera matrices (gui_data->CAM_to_XYZ /
+// XYZ_to_CAM), so they fail closed without a built GUI.
+gboolean remote_quantity_read(dt_iop_module_t *self,
+                              const dt_iop_params_t *params,
+                              double *values, size_t count)
+{
+  if(!self || !self->gui_data || !params || !values || count != 2)
+    return FALSE;
+  dt_iop_temperature_params_t p = *(const dt_iop_temperature_params_t *)params;
+  float TempK = 0.0f, tint = 0.0f;
+  _mul2temp(self, &p, &TempK, &tint);
+  values[0] = TempK;
+  values[1] = tint;
+  return TRUE;
+}
+
+gboolean remote_quantity_write(dt_iop_module_t *self,
+                               const double *values, size_t count,
+                               dt_iop_params_t *params)
+{
+  if(!self || !self->gui_data || !params || !values || count != 2)
+    return FALSE;
+  dt_iop_temperature_params_t *p = (dt_iop_temperature_params_t *)params;
+  double mul[4] = { 0.0 };
+  _temp2mul(self, values[0], values[1], mul);
+  p->red = mul[0];
+  p->green = mul[1];
+  p->blue = mul[2];
+  p->various = mul[3];
+  return TRUE;
+}
+
 DT_OMP_DECLARE_SIMD(aligned(inp,outp))
 static inline void scaled_copy_4wide(float *const outp,
                                      const float *const inp,
