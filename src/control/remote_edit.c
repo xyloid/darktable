@@ -23,6 +23,7 @@
 #include "control/control.h"
 #include "control/remote_band.h"
 #include "control/remote_curve.h"
+#include "control/remote_quantity.h"
 #include "control/remote_revision.h"
 #include "control/remote_vector.h"
 #include "common/colorspaces.h"
@@ -824,7 +825,8 @@ gboolean dt_remote_get_module_primitive_schema(const char *op,
 // rgblevels aliasing) and, for curves, several paths of one descriptor --
 // dedupe so a name is never added twice to the same field.
 // `class_name` is used to select class-specific error wording ("curve",
-// "vector", or "band") to preserve original error message text per-class.
+// "vector", "band", or "quantity") to preserve original error message text
+// per-class.
 static gboolean _stamp_root(dt_remote_module_schema_t *schema,
                             const dt_remote_introspection_path_t *path,
                             const char *semantic_name,
@@ -841,6 +843,9 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
       else if(!g_strcmp0(class_name, "band"))
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("band descriptor '%s' has a rootless native path"), semantic_name);
+      else if(!g_strcmp0(class_name, "quantity"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("quantity descriptor '%s' has a rootless native path"), semantic_name);
       else
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("vector descriptor '%s' has a rootless native path"), semantic_name);
@@ -866,6 +871,10 @@ static gboolean _stamp_root(dt_remote_module_schema_t *schema,
       else if(!g_strcmp0(class_name, "band"))
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
                                      _("band descriptor '%s' routes through unknown field '%s'"),
+                                     semantic_name, root);
+      else if(!g_strcmp0(class_name, "quantity"))
+        *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                     _("quantity descriptor '%s' routes through unknown field '%s'"),
                                      semantic_name, root);
       else
         *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
@@ -1026,7 +1035,51 @@ static gboolean _annotate_band_represented_by(dt_remote_module_schema_t *schema,
   return TRUE;
 }
 
-// Row order (curve, vector, bands) preserves today's error precedence and
+// Unlike the curve/vector/band classes above, a quantity descriptor has no
+// native storage path of its own (remote_quantity.h's own top comment): its
+// module adapter's `native_fields` (the ordinary scalar params fields the
+// conversion write hook may touch) are the closest analogue. Stamp every
+// declared native field, for every descriptor on the adapter (an adapter's
+// `native_fields` list is shared across all of its descriptors, since which
+// descriptor's conversion touches which field isn't statically known at
+// this layer), with that descriptor's semantic name -- _stamp_root leaves
+// the primitive field's `writable` flag untouched, so a stamped native
+// field keeps `writable: true` while also advertising the semantic
+// parameter(s) that can write it via conversion. This is the "coefficient
+// coexistence" exception's discoverability half (see the milestone-6
+// design doc's SS Coefficient coexistence, and remote_quantity.h's top
+// comment).
+static gboolean _annotate_quantity_represented_by(dt_remote_module_schema_t *schema,
+                                                  dt_introspection_t *intro,
+                                                  guint params_version,
+                                                  dt_remote_error_t **error)
+{
+  const dt_remote_quantity_module_adapter_t *adapter =
+    intro ? dt_remote_quantity_registry_lookup(schema->op, params_version) : NULL;
+  if(!adapter)
+  {
+    if(error)
+      *error = dt_remote_error_new(DT_REMOTE_ERR_INTERNAL,
+                                   _("semantic quantities advertised without a registry adapter for '%s'"),
+                                   schema->op);
+    return FALSE;
+  }
+
+  for(guint q = 0; q < adapter->quantity_count; q++)
+  {
+    const dt_remote_quantity_descriptor_t *desc = &adapter->quantities[q];
+    for(guint n = 0; n < adapter->native_field_count; n++)
+    {
+      const dt_remote_path_segment_t segment = { .type = DT_REMOTE_PATH_FIELD,
+                                                  .value.field = adapter->native_fields[n] };
+      const dt_remote_introspection_path_t path = { .segments = &segment, .length = 1 };
+      if(!_stamp_root(schema, &path, desc->name, "quantity", error)) return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+// Row order (curve, vector, bands, quantity) preserves today's error precedence and
 // schema/readback insertion order -- both seams below process the table
 // front to back. `wrap_schema`/`wrap_value` are cast from their concrete
 // class-typed signatures (e.g. dt_remote_curve_schema_t *) to this table's
@@ -1060,6 +1113,15 @@ static const dt_remote_class_ops_t s_class_ops[] = {
     .wrap_schema = (dt_remote_semantic_schema_t *(*)(gpointer))dt_remote_semantic_schema_wrap_band,
     .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_band,
     .annotate_represented_by = _annotate_band_represented_by,
+  },
+  {
+    .class_id = DT_REMOTE_PARAMETER_QUANTITY,
+    .list_schema = dt_remote_quantity_list_schema,
+    .read_values = dt_remote_quantity_read_values,
+    .apply_patch = dt_remote_quantity_apply_patch,
+    .wrap_schema = (dt_remote_semantic_schema_t *(*)(gpointer))dt_remote_semantic_schema_wrap_quantity,
+    .wrap_value = (dt_remote_semantic_value_t *(*)(gpointer))dt_remote_semantic_value_wrap_quantity,
+    .annotate_represented_by = _annotate_quantity_represented_by,
   },
 };
 

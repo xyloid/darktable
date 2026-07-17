@@ -11,6 +11,7 @@
       "curve_params",
       "vector_params",
       "band_params",
+      "quantity_params",
       "instances",
       "history",
       "preview",

@@ -47,6 +47,7 @@
 #include "control/remote_curve.h"
 #include "control/remote_edit.h"
 #include "control/remote_band.h"
+#include "control/remote_quantity.h"
 #include "control/remote_vector.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"  // dt_iop_get_module_so()/dt_iop_module_so_t: real-module
@@ -2071,6 +2072,408 @@ static void test_transaction_band_invalid_entry_leaves_params_unchanged(void **s
   g_ptr_array_unref(patch.semantic_values);
 }
 
+/* ---------------------------------------------------------------------- */
+/* quantity semantic seam tests (milestone 6, task 4)                      */
+/* ---------------------------------------------------------------------- */
+
+// "wb.temperature" test descriptor over the real "temperature" module's
+// red/green/blue/various coefficient scalars -- mirrors test_remote_quantity.c's
+// own "test.quantity_pair" fixture (the quantity engine's test harness),
+// injected here through the same dt_remote_quantity_registry_set_lookup_override()
+// / dt_remote_quantity_set_hooks_override() seams the curve/vector/band
+// suites established for their own registries, to prove the remote_edit.c
+// seams dispatch to the quantity registry/engine through the class-ops
+// table's fourth row exactly as they do to the other three. Unlike those
+// three classes, a quantity descriptor has no native storage path of its
+// own (remote_quantity.h's own top comment) -- its adapter's declared
+// `native_fields` are ordinary writable scalar leaves the conversion hook
+// may touch, and stay writable:true even once represented_by names them
+// (the "coefficient coexistence" exception).
+static const dt_remote_quantity_component_descriptor_t s_wb_temperature_components[2] = {
+  { "temperature", "kelvin", 0.0, 8000.0 },
+  { "tint", NULL, 0.0, 80.0 },
+};
+
+static const dt_remote_quantity_descriptor_t s_wb_temperature_descriptor = {
+  .name = "wb.temperature",
+  .display_name = "White Balance",
+  .components = s_wb_temperature_components,
+  .component_count = 2,
+  .derived = TRUE,
+};
+
+// All four of temperature's coefficient scalars -- used by the schema test
+// below to prove every one of them keeps writable:true while gaining
+// represented_by.
+static const char *const s_wb_temperature_native_fields_all[4] = { "red", "green", "blue", "various" };
+
+// Native list minus "various" -- used only by the mixed-write atomicity
+// test, so "various" can be written as an ordinary disjoint scalar
+// alongside a quantity entry without tripping the native-conflict rule.
+static const char *const s_wb_temperature_native_fields_partial[3] = { "red", "green", "blue" };
+
+static const dt_remote_quantity_module_adapter_t s_wb_temperature_adapter_full = {
+  .operation = "temperature",
+  .minimum_params_version = 4,
+  .maximum_params_version = 4,
+  .quantities = &s_wb_temperature_descriptor,
+  .quantity_count = 1,
+  .native_fields = s_wb_temperature_native_fields_all,
+  .native_field_count = G_N_ELEMENTS(s_wb_temperature_native_fields_all),
+};
+
+static const dt_remote_quantity_module_adapter_t s_wb_temperature_adapter_partial = {
+  .operation = "temperature",
+  .minimum_params_version = 4,
+  .maximum_params_version = 4,
+  .quantities = &s_wb_temperature_descriptor,
+  .quantity_count = 1,
+  .native_fields = s_wb_temperature_native_fields_partial,
+  .native_field_count = G_N_ELEMENTS(s_wb_temperature_native_fields_partial),
+};
+
+static const dt_remote_quantity_module_adapter_t *s_quantity_lookup_override_adapter = NULL;
+
+static const dt_remote_quantity_module_adapter_t *quantity_lookup_override(const char *operation,
+                                                                           guint params_version)
+{
+  return s_quantity_lookup_override_adapter
+         && !g_strcmp0(operation, s_quantity_lookup_override_adapter->operation)
+         && params_version >= s_quantity_lookup_override_adapter->minimum_params_version
+         && params_version <= s_quantity_lookup_override_adapter->maximum_params_version
+    ? s_quantity_lookup_override_adapter : NULL;
+}
+
+// Fake conversion hooks: identity-ish affine transform over red/green,
+// scaled so component_a/component_b's descriptor domains comfortably cover
+// red/green's own real [0, 8] range -- "temperature" = 1000*red,
+// "tint" = 10*green, both trivially invertible for round-trip tests.
+static gboolean fake_wb_temperature_read_hook(struct dt_iop_module_t *self, const void *params,
+                                              double *values, size_t count)
+{
+  if(!self || !params || !values || count != 2) return FALSE;
+  const float *floats = params;
+  values[0] = (double)floats[0] * 1000.0; // temperature <- red
+  values[1] = (double)floats[1] * 10.0;   // tint <- green
+  return TRUE;
+}
+
+static gboolean fake_wb_temperature_write_hook(struct dt_iop_module_t *self, const double *values,
+                                               size_t count, void *params)
+{
+  if(!self || !values || !params || count != 2) return FALSE;
+  float *floats = params;
+  floats[0] = (float)(values[0] / 1000.0); // red <- temperature
+  floats[1] = (float)(values[1] / 10.0);   // green <- tint
+  return TRUE;
+}
+
+// The schema seam: get_module_schema("temperature") advertises the one
+// injected quantity alongside every untouched primitive field, and the
+// annotation seam (_stamp_root/_annotate_represented_by) stamps
+// "wb.temperature" onto ALL FOUR declared native fields -- proving the
+// coexistence exception: every one of them stays writable:true (unlike a
+// curve/vector/band native path, which goes writable:false) while also
+// carrying represented_by.
+static void test_schema_temperature_quantity_semantic_fields_and_represented_by(void **state)
+{
+  (void)state;
+  s_quantity_lookup_override_adapter = &s_wb_temperature_adapter_full;
+  dt_remote_quantity_registry_set_lookup_override(quantity_lookup_override);
+
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  const gboolean ok = dt_remote_get_module_schema("temperature", &schema, &err);
+
+  dt_remote_quantity_registry_set_lookup_override(NULL);
+  s_quantity_lookup_override_adapter = NULL;
+
+  assert_true(ok);
+  assert_null(err);
+  assert_non_null(schema);
+  assert_non_null(schema->semantic_fields);
+  assert_int_equal(schema->semantic_fields->len, 1);
+  const dt_remote_semantic_schema_t *wrapped = g_ptr_array_index(schema->semantic_fields, 0);
+  assert_int_equal(wrapped->class_id, DT_REMOTE_PARAMETER_QUANTITY);
+  assert_string_equal(wrapped->u.quantity->name, "wb.temperature");
+  assert_true(wrapped->u.quantity->derived);
+  assert_non_null(wrapped->u.quantity->components);
+  assert_int_equal(wrapped->u.quantity->components->len, 2);
+
+  static const char *const coeffs[] = { "red", "green", "blue", "various" };
+  for(guint c = 0; c < G_N_ELEMENTS(coeffs); c++)
+  {
+    const dt_remote_field_t *field = NULL;
+    for(guint i = 0; i < schema->fields->len; i++)
+    {
+      const dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+      if(!g_strcmp0(f->name, coeffs[c])) { field = f; break; }
+    }
+    assert_non_null(field);
+    // The coexistence exception: native quantity scalars keep writable:true.
+    assert_true(field->writable);
+    assert_non_null(field->represented_by);
+    assert_int_equal(field->represented_by->len, 1);
+    assert_string_equal(g_ptr_array_index(field->represented_by, 0), "wb.temperature");
+  }
+
+  dt_remote_module_schema_free(schema);
+}
+
+/* --- temperature scratch-transaction fixture ----------------------------- */
+
+typedef struct live_temperature_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+} live_temperature_fixture_t;
+
+static live_temperature_fixture_t *live_temperature_fixture_new(void)
+{
+  live_temperature_fixture_t *fixture = g_new0(live_temperature_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+  fixture->dev.gui_attached = FALSE;
+
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so("temperature");
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params, fixture->module->params_size);
+  fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void live_temperature_fixture_free(live_temperature_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static int live_temperature_test_setup(void **state)
+{
+  *state = live_temperature_fixture_new();
+  return 0;
+}
+
+static int live_temperature_test_teardown(void **state)
+{
+  live_temperature_fixture_free(*state);
+  *state = NULL;
+  return 0;
+}
+
+static dt_remote_semantic_patch_t *live_wb_temperature_patch(double temperature, double tint)
+{
+  dt_remote_semantic_patch_t *semantic = g_new0(dt_remote_semantic_patch_t, 1);
+  semantic->class_id = DT_REMOTE_PARAMETER_QUANTITY;
+  semantic->value.quantity.name = g_strdup("wb.temperature");
+  semantic->value.quantity.values =
+    g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_quantity_component_value_free);
+  dt_remote_quantity_component_value_t *t = g_new0(dt_remote_quantity_component_value_t, 1);
+  t->name = g_strdup("temperature");
+  t->value = temperature;
+  g_ptr_array_add(semantic->value.quantity.values, t);
+  dt_remote_quantity_component_value_t *ti = g_new0(dt_remote_quantity_component_value_t, 1);
+  ti->name = g_strdup("tint");
+  ti->value = tint;
+  g_ptr_array_add(semantic->value.quantity.values, ti);
+  return semantic;
+}
+
+// Mirrors apply_band_patch_with_readback_verification exactly, for the
+// quantity engine: the apply seam's sequence (dt_remote_patch_apply +
+// dt_remote_quantity_apply_patch against the same scratch block -- the same
+// dispatch-row wrapper remote_edit.c's class-ops loop calls) plus the
+// merged read-back verification pass dt_remote_set_module_params()
+// enforces. `adapter` selects which native-fields declaration is installed
+// (the "all four" or the "red/green/blue only" one) for the duration of
+// the call.
+static gboolean apply_quantity_patch_with_readback_verification(
+  live_temperature_fixture_t *fixture, const dt_remote_patch_t *patch,
+  const dt_remote_quantity_module_adapter_t *adapter, dt_remote_error_t **error)
+{
+  s_quantity_lookup_override_adapter = adapter;
+  dt_remote_quantity_registry_set_lookup_override(quantity_lookup_override);
+  dt_remote_quantity_set_hooks_override(fake_wb_temperature_read_hook, fake_wb_temperature_write_hook);
+
+  void *projected = g_malloc(fixture->module->params_size);
+  memcpy(projected, fixture->module->params, fixture->module->params_size);
+
+  dt_introspection_field_t *linear = fixture->module->so->get_introspection_linear();
+  if(patch->scalar_values
+     && !dt_remote_patch_apply(linear, dt_remote_denylist_for_op("temperature"), patch, projected, error))
+  {
+    g_free(projected);
+    dt_remote_quantity_registry_set_lookup_override(NULL);
+    dt_remote_quantity_set_hooks_override(NULL, NULL);
+    s_quantity_lookup_override_adapter = NULL;
+    return FALSE;
+  }
+
+  if(!dt_remote_quantity_apply_patch(fixture->module, fixture->module->params, projected, patch, error))
+  {
+    g_free(projected);
+    dt_remote_quantity_registry_set_lookup_override(NULL);
+    dt_remote_quantity_set_hooks_override(NULL, NULL);
+    s_quantity_lookup_override_adapter = NULL;
+    return FALSE;
+  }
+
+  GHashTable *readback = NULL;
+  const gboolean read_ok = dt_remote_quantity_read_values(fixture->module, projected, &readback, error);
+  dt_remote_quantity_registry_set_lookup_override(NULL);
+  dt_remote_quantity_set_hooks_override(NULL, NULL);
+  s_quantity_lookup_override_adapter = NULL;
+
+  if(!read_ok)
+  {
+    g_free(projected);
+    return FALSE;
+  }
+
+  guint written = 0;
+  guint quantity_entries = 0;
+  for(guint i = 0; patch->semantic_values && i < patch->semantic_values->len; i++)
+  {
+    const dt_remote_semantic_patch_t *semantic = g_ptr_array_index(patch->semantic_values, i);
+    if(semantic->class_id != DT_REMOTE_PARAMETER_QUANTITY) continue;
+    quantity_entries++;
+    if(g_hash_table_lookup(readback, semantic->value.quantity.name)) written++;
+  }
+  const gboolean matched = written == quantity_entries;
+  g_hash_table_unref(readback);
+
+  if(!matched)
+  {
+    g_free(projected);
+    if(error)
+    {
+      *error = g_new0(dt_remote_error_t, 1);
+      (*error)->code = DT_REMOTE_ERR_INTERNAL;
+      (*error)->message = g_strdup("semantic read-back is missing a written entry");
+    }
+    return FALSE;
+  }
+
+  memcpy(fixture->module->params, projected, fixture->module->params_size);
+  g_free(projected);
+  return TRUE;
+}
+
+static void assert_live_wb_temperature(live_temperature_fixture_t *fixture, double expected_temperature,
+                                       double expected_tint)
+{
+  s_quantity_lookup_override_adapter = &s_wb_temperature_adapter_full;
+  dt_remote_quantity_registry_set_lookup_override(quantity_lookup_override);
+  dt_remote_quantity_set_hooks_override(fake_wb_temperature_read_hook, fake_wb_temperature_write_hook);
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_quantity_read_values(fixture->module, fixture->module->params, &values, &error));
+
+  dt_remote_quantity_registry_set_lookup_override(NULL);
+  dt_remote_quantity_set_hooks_override(NULL, NULL);
+  s_quantity_lookup_override_adapter = NULL;
+
+  assert_null(error);
+  dt_remote_quantity_value_t *value = g_hash_table_lookup(values, "wb.temperature");
+  assert_non_null(value);
+  assert_int_equal(value->values->len, 2);
+  for(guint i = 0; i < value->values->len; i++)
+  {
+    const dt_remote_quantity_component_value_t *c = g_ptr_array_index(value->values, i);
+    if(!g_strcmp0(c->name, "temperature")) assert_float_equal(c->value, expected_temperature, 1e-6);
+    if(!g_strcmp0(c->name, "tint")) assert_float_equal(c->value, expected_tint, 1e-6);
+  }
+  g_hash_table_unref(values);
+}
+
+// The apply seam: a quantity-only patch applies through the dispatch table
+// (dt_remote_quantity_apply_patch, the row the s_class_ops table calls) and
+// reads back through the fake hooks (dt_remote_quantity_read_values, same
+// row).
+static void test_transaction_quantity_patch_applies_and_reads_back(void **state)
+{
+  live_temperature_fixture_t *fixture = *state;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values, live_wb_temperature_patch(5500.0, 12.0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_quantity_patch_with_readback_verification(fixture, &patch,
+                                                              &s_wb_temperature_adapter_full, &error));
+  assert_null(error);
+  assert_live_wb_temperature(fixture, 5500.0, 12.0);
+
+  g_ptr_array_unref(patch.semantic_values);
+}
+
+// Whole-request atomicity, the non-conflicting mixed case: a scalar entry
+// for "various" (disjoint from the adapter's declared native_fields --
+// red/green/blue only, for this one test) plus a quantity entry for
+// "wb.temperature" apply together in one scratch transaction, exactly as
+// milestone 5's mixed scalar+band test proves for bands.
+static void test_transaction_quantity_plus_disjoint_scalar_applies_atomically(void **state)
+{
+  live_temperature_fixture_t *fixture = *state;
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("various", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 2.5 }));
+  patch.semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values, live_wb_temperature_patch(6000.0, 20.0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(apply_quantity_patch_with_readback_verification(
+    fixture, &patch, &s_wb_temperature_adapter_partial, &error));
+  assert_null(error);
+  assert_live_wb_temperature(fixture, 6000.0, 20.0);
+
+  // "various" is dt_iop_temperature_params_t's fourth float (temperature.c).
+  assert_float_equal(((const float *)fixture->module->params)[3], 2.5, 1e-6);
+
+  g_ptr_array_unref(patch.scalar_values);
+  g_ptr_array_unref(patch.semantic_values);
+}
+
+// The native-conflict rule: a scalar write to "red" (one of the partial
+// adapter's declared native_fields) alongside a quantity entry for the same
+// adapter rejects the WHOLE request with invalid_value/native_conflict, the
+// params blob left byte-identical.
+static void test_transaction_quantity_native_conflict_rejected_blob_unchanged(void **state)
+{
+  live_temperature_fixture_t *fixture = *state;
+
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("red", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_FLOAT, .v.f = 3.0 }));
+  patch.semantic_values = g_ptr_array_new_with_free_func(dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values, live_wb_temperature_patch(6000.0, 20.0));
+
+  dt_remote_error_t *error = NULL;
+  const gboolean ok = apply_quantity_patch_with_readback_verification(
+    fixture, &patch, &s_wb_temperature_adapter_partial, &error);
+
+  assert_false(ok);
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(error->details_json);
+  assert_non_null(strstr(error->details_json, "\"native_conflict\""));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(before);
+  g_ptr_array_unref(patch.scalar_values);
+  g_ptr_array_unref(patch.semantic_values);
+}
+
 int main(int argc, char *argv[])
 {
   const struct CMUnitTest tests[] = {
@@ -2141,6 +2544,14 @@ int main(int argc, char *argv[])
                                    live_lowlight_test_setup, live_lowlight_test_teardown),
     cmocka_unit_test_setup_teardown(test_transaction_band_invalid_entry_leaves_params_unchanged,
                                    live_lowlight_test_setup, live_lowlight_test_teardown),
+
+    cmocka_unit_test(test_schema_temperature_quantity_semantic_fields_and_represented_by),
+    cmocka_unit_test_setup_teardown(test_transaction_quantity_patch_applies_and_reads_back,
+                                   live_temperature_test_setup, live_temperature_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_quantity_plus_disjoint_scalar_applies_atomically,
+                                   live_temperature_test_setup, live_temperature_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transaction_quantity_native_conflict_rejected_blob_unchanged,
+                                   live_temperature_test_setup, live_temperature_test_teardown),
 
     // Keep last: the case temporarily mutates real introspection, restoring
     // it immediately after the schema call.

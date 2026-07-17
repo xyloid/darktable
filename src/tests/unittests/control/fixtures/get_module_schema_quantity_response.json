@@ -1,0 +1,55 @@
+{
+  "id": 42,
+  "ok": true,
+  "result": {
+    "module": "temperature",
+    "display_name": "white balance",
+    "params_version": 4,
+    "deprecated": false,
+    "supports_multiple_instances": false,
+    "fields": [
+      {
+        "name": "red",
+        "description": "",
+        "type": "float",
+        "writable": true,
+        "represented_by": ["wb.temperature"]
+      },
+      {
+        "name": "green",
+        "description": "",
+        "type": "float",
+        "writable": true,
+        "represented_by": ["wb.temperature"]
+      },
+      {
+        "name": "blue",
+        "description": "",
+        "type": "float",
+        "writable": true,
+        "represented_by": ["wb.temperature"]
+      },
+      {
+        "name": "various",
+        "description": "",
+        "type": "float",
+        "writable": true,
+        "represented_by": ["wb.temperature"]
+      }
+    ],
+    "semantic_fields": [
+      {
+        "name": "wb.temperature",
+        "class": "quantity",
+        "display_name": "White Balance",
+        "readable": true,
+        "writable": true,
+        "derived": true,
+        "components": [
+          { "name": "temperature", "unit": "kelvin", "minimum": 3000.0, "maximum": 25000.0 },
+          { "name": "tint", "minimum": 0.1, "maximum": 8.0 }
+        ]
+      }
+    ]
+  }
+}

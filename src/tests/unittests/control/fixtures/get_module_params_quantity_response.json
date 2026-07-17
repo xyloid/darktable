@@ -1,0 +1,29 @@
+{
+  "id": 43,
+  "ok": true,
+  "result": {
+    "module": "temperature",
+    "instance": 0,
+    "instance_name": "",
+    "enabled": true,
+    "revision": 31,
+    "values": {
+      "red": 1.0,
+      "green": 1.0,
+      "blue": 1.0,
+      "various": 1.0
+    },
+    "semantic_values": {
+      "wb.temperature": {
+        "class": "quantity",
+        "active": true,
+        "effective": true,
+        "writable_now": true,
+        "values": {
+          "temperature": 5500.0,
+          "tint": 1.2
+        }
+      }
+    }
+  }
+}

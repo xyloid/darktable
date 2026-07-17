@@ -872,6 +872,144 @@ static gboolean stub_list_modules_one_lowlight(GPtrArray **out, dt_remote_error_
   return TRUE;
 }
 
+/* --- semantic quantity schema/value stubs (milestone 6, task 4) --------- */
+
+// Hand-built quantity schema covering the wire shapes _quantity_schema_to_json
+// emits: "wb.temperature" over the real "temperature" module's red/green/
+// blue/various coefficient scalars -- a two-component ("temperature"/
+// "tint") derived quantity, unconditionally writable, one component
+// carrying a unit ("kelvin") and one not, exactly the "unit present only
+// when non-NULL" shape the wire vocabulary requires. Mirrors what a real
+// registry adapter would produce (remote_quantity_registry.c, Task 5),
+// exactly as the band stub above hangs a fictional entry off "lowlight".
+static dt_remote_quantity_schema_component_t *_make_quantity_schema_component(
+  const char *name, const char *unit, double minimum, double maximum)
+{
+  dt_remote_quantity_schema_component_t *c = g_new0(dt_remote_quantity_schema_component_t, 1);
+  c->name = g_strdup(name);
+  c->unit = unit ? g_strdup(unit) : NULL;
+  c->minimum = minimum;
+  c->maximum = maximum;
+  return c;
+}
+
+static dt_remote_quantity_schema_t *_make_quantity_schema(const char *name, const char *display_name)
+{
+  dt_remote_quantity_schema_t *schema = g_new0(dt_remote_quantity_schema_t, 1);
+  schema->name = g_strdup(name);
+  schema->display_name = g_strdup(display_name);
+  schema->components = g_ptr_array_new(); // manually freed element-by-element, see dt_remote_quantity_schema_free
+  g_ptr_array_add(schema->components,
+                  _make_quantity_schema_component("temperature", "kelvin", 3000.0, 25000.0));
+  g_ptr_array_add(schema->components, _make_quantity_schema_component("tint", NULL, 0.1, 8.0));
+  schema->derived = TRUE;
+  schema->writability = DT_REMOTE_WRITABLE_NOW;
+  return schema;
+}
+
+static gboolean stub_get_module_schema_quantity(const char *op, dt_remote_module_schema_t **out,
+                                                dt_remote_error_t **error)
+{
+  (void)op;
+  (void)error;
+  dt_remote_module_schema_t *schema = g_malloc0(sizeof(dt_remote_module_schema_t));
+  schema->op = g_strdup("temperature");
+  schema->display_name = g_strdup("white balance");
+  schema->params_version = 4;
+  schema->deprecated = FALSE;
+  schema->supports_multiple_instances = FALSE;
+  schema->fields = g_ptr_array_new_with_free_func(dt_remote_field_free);
+
+  // All four of temperature's coefficient scalars -- the "coefficient
+  // coexistence" exception: every one stays writable:true while also
+  // carrying represented_by.
+  static const char *const coeffs[] = { "red", "green", "blue", "various" };
+  for(guint i = 0; i < G_N_ELEMENTS(coeffs); i++)
+  {
+    dt_remote_field_t *f = _make_field(coeffs[i], "", "float", TRUE);
+    f->represented_by = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(f->represented_by, g_strdup("wb.temperature"));
+    g_ptr_array_add(schema->fields, f);
+  }
+
+  schema->semantic_fields = g_ptr_array_new_with_free_func(dt_remote_semantic_schema_free);
+  g_ptr_array_add(schema->semantic_fields,
+                  dt_remote_semantic_schema_wrap_quantity(
+                    _make_quantity_schema("wb.temperature", "White Balance")));
+
+  *out = schema;
+  return TRUE;
+}
+
+static dt_remote_quantity_value_t *_make_quantity_value(const char *name, const char *const *names,
+                                                        const double *values, guint n)
+{
+  dt_remote_quantity_value_t *v = g_new0(dt_remote_quantity_value_t, 1);
+  v->name = g_strdup(name);
+  v->values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_quantity_component_value_free);
+  for(guint i = 0; i < n; i++)
+  {
+    dt_remote_quantity_component_value_t *c = g_new0(dt_remote_quantity_component_value_t, 1);
+    c->name = g_strdup(names[i]);
+    c->value = values[i];
+    g_ptr_array_add(v->values, c);
+  }
+  v->active = TRUE;
+  v->effective = TRUE;
+  v->writable_now = TRUE;
+  return v;
+}
+
+static gboolean stub_get_module_params_quantity(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  static const struct { const char *name; float value; } coeffs[] = {
+    { "red", 1.0f }, { "green", 1.0f }, { "blue", 1.0f }, { "various", 1.0f },
+  };
+  for(guint i = 0; i < G_N_ELEMENTS(coeffs); i++)
+  {
+    dt_remote_patch_entry_t *e = g_malloc0(sizeof(dt_remote_patch_entry_t));
+    e->name = g_strdup(coeffs[i].name);
+    e->value.type = DT_REMOTE_VALUE_FLOAT;
+    e->value.v.f = coeffs[i].value;
+    g_ptr_array_add(arr, e);
+  }
+
+  GHashTable *semantic =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  static const char *const component_names[] = { "temperature", "tint" };
+  static const double component_values[] = { 5500.0, 1.2 };
+  g_hash_table_insert(semantic, g_strdup("wb.temperature"),
+                      dt_remote_semantic_value_wrap_quantity(
+                        _make_quantity_value("wb.temperature", component_names, component_values, 2)));
+
+  *out = arr;
+  if(semantic_out) *semantic_out = semantic;
+  else g_hash_table_unref(semantic);
+  return TRUE;
+}
+
+static gboolean stub_list_modules_one_temperature(GPtrArray **out, dt_remote_error_t **error)
+{
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_module_free);
+  dt_remote_module_t *m = g_malloc0(sizeof(dt_remote_module_t));
+  m->op = g_strdup("temperature");
+  m->instance = 0;
+  m->instance_name = g_strdup("");
+  m->display_name = g_strdup("white balance");
+  m->enabled = TRUE;
+  m->deprecated = FALSE;
+  m->supports_multiple_instances = FALSE;
+  g_ptr_array_add(arr, m);
+  *out = arr;
+  return TRUE;
+}
+
 /* --- set_module_params stubs (plan step 7) ------------------------------ */
 
 // Like stub_get_module_schema_exposure but with the "black" field the wire
@@ -1542,19 +1680,21 @@ static void test_hello_success(void **state)
   // capability-gated semantic curve read/write) + "vector_params"
   // (milestone 4: capability-gated semantic vector read/write) +
   // "band_params" (milestone 5: capability-gated semantic band read/write) +
-  // "instances"/"history" (step 8) + "preview" (step 9) + "scopes"
-  // (step 10) -- the full capability set.
+  // "quantity_params" (milestone 6: capability-gated semantic quantity
+  // read/write) + "instances"/"history" (step 8) + "preview" (step 9) +
+  // "scopes" (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 9);
+  assert_int_equal(json_array_get_length(caps), 10);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
   assert_string_equal(json_array_get_string_element(caps, 3), "vector_params");
   assert_string_equal(json_array_get_string_element(caps, 4), "band_params");
-  assert_string_equal(json_array_get_string_element(caps, 5), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 6), "history");
-  assert_string_equal(json_array_get_string_element(caps, 7), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 8), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 5), "quantity_params");
+  assert_string_equal(json_array_get_string_element(caps, 6), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 7), "history");
+  assert_string_equal(json_array_get_string_element(caps, 8), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 9), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -1973,6 +2113,41 @@ static void test_get_module_params_band_semantic_values(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_band_request.json",
                            "get_module_params_band_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* --- semantic quantity schema/value path (milestone 6, task 4) ---------- */
+
+// "wb.temperature"'s hand-built quantity schema rides on get_module_schema
+// as a `semantic_fields` entry tagged `"class":"quantity"`: "derived" and a
+// "components" array always present, each component carrying "unit" only
+// when non-NULL; the four coefficient scalars (red/green/blue/various)
+// stay writable:true while gaining `represented_by: ["wb.temperature"]` --
+// the coexistence exception.
+static void test_get_module_schema_quantity_semantic_fields(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .get_module_schema = stub_get_module_schema_quantity };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_schema_quantity_request.json",
+                           "get_module_schema_quantity_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// "wb.temperature"'s quantity value rides on get_module_params as an
+// optional `semantic_values` member: class/active/effective/writable_now
+// plus the "values" object keyed by component name (doubles).
+static void test_get_module_params_quantity_semantic_values(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_quantity,
+    .list_modules = stub_list_modules_one_temperature,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_params_quantity_request.json",
+                           "get_module_params_quantity_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -4911,6 +5086,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_vector_semantic_values),
     cmocka_unit_test(test_get_module_schema_band_semantic_fields),
     cmocka_unit_test(test_get_module_params_band_semantic_values),
+    cmocka_unit_test(test_get_module_schema_quantity_semantic_fields),
+    cmocka_unit_test(test_get_module_params_quantity_semantic_values),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),
