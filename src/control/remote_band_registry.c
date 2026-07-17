@@ -19,10 +19,10 @@
 // The per-op band module adapter registry, mirroring
 // remote_vector_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the band engine
-// API (list_schema/read_values). The adapter table currently registers
-// lowlight and rawdenoise (Task 5) and denoiseprofile (Task 6); Task 7
-// adds atrous, the same way colorbalance/channelmixerrgb/rgblevels/
-// borders/watermark were added to the vector registry one at a time.
+// API (list_schema/read_values). The adapter table registers lowlight
+// and rawdenoise (Task 5), denoiseprofile (Task 6), and atrous (Task 7),
+// the same way colorbalance/channelmixerrgb/rgblevels/borders/watermark
+// were added to the vector registry one at a time.
 //
 // Like remote_band.c, this file never includes JSON, socket, or MCP
 // protocol headers -- introspection/GLib (plus develop/imageop.h, for the
@@ -303,17 +303,116 @@ static const dt_remote_band_module_adapter_t s_denoiseprofile_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* atrous adapter (milestone5 bands-class design doc SS Adapters, atrous). */
+/* Params v2: `x[5][6]`/`y[5][6]` channel rows (atrous.c:77-78,            */
+/* atrous_channel_t: L=0, c=1, s=2, Lt=3, ct=4), defaults x = k/5          */
+/* (init(), atrous.c:618), y = 0.5 ($DEFAULT) for the boost rows but 0.0   */
+/* for the threshold rows (init() override, atrous.c:616). Five semantic   */
+/* band-sets, one per channel row: y range [0,1] (the GUI drag clamp),     */
+/* INTERIOR x policy with minimum gap 0.001 (the GUI's x-drag clamp,       */
+/* atrous.c:1404-1408), and twin x sharing exactly as the GUI mirrors an   */
+/* x drag across its boost/threshold row pair (`ch2`, atrous.c:1393-1395,  */
+/* 1408): luma<->luma_threshold and chroma<->chroma_threshold; sharpness   */
+/* has no twin. No predicates: always active, always writable. The         */
+/* `octaves` scalar is denylisted in remote_edit.c (auto-derived in        */
+/* commit_params, atrous.c:684); `mix` stays an ordinary writable scalar.  */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_path_segment_t s_atrous_x0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_atrous_y0_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 0 },
+};
+static const dt_remote_path_segment_t s_atrous_x1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_atrous_y1_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 1 },
+};
+static const dt_remote_path_segment_t s_atrous_x2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_atrous_y2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_path_segment_t s_atrous_x3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_path_segment_t s_atrous_y3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_path_segment_t s_atrous_x4_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 4 },
+};
+static const dt_remote_path_segment_t s_atrous_y4_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 4 },
+};
+
+// Same shared-invariants-per-row convention as the two macros above, with
+// atrous's count of 6, INTERIOR x, and a per-row twin link (NULL for the
+// twinless sharpness row).
+#define ATROUS_BAND_DESCRIPTOR(band_name, band_display, band_description, row, twin)                         \
+  {                                                                                                          \
+    .name = (band_name), .display_name = (band_display), .description = (band_description),                  \
+    .native_x = { .segments = s_atrous_x##row##_segments,                                                    \
+                  .length = G_N_ELEMENTS(s_atrous_x##row##_segments) },                                      \
+    .native_y = { .segments = s_atrous_y##row##_segments,                                                    \
+                  .length = G_N_ELEMENTS(s_atrous_y##row##_segments) },                                      \
+    .count = 6, .y_minimum = 0.0, .y_maximum = 1.0, .x_policy = DT_REMOTE_BAND_X_INTERIOR,                   \
+    .minimum_gap = 0.001, .x_shared_with = (twin), .active_when = NULL, .writable_when = NULL,               \
+  }
+
+static const dt_remote_band_descriptor_t s_atrous_bands[5] = {
+  ATROUS_BAND_DESCRIPTOR("bands.luma", "Luma",
+                         "Contrast-equalizer luminance boost curve (atrous.c:77-78, row 0); "
+                         "shares its x positions with bands.luma_threshold.",
+                         0, "bands.luma_threshold"),
+  ATROUS_BAND_DESCRIPTOR("bands.chroma", "Chroma",
+                         "Contrast-equalizer chrominance boost curve (row 1); shares its x "
+                         "positions with bands.chroma_threshold.",
+                         1, "bands.chroma_threshold"),
+  ATROUS_BAND_DESCRIPTOR("bands.sharpness", "Sharpness",
+                         "Contrast-equalizer edge sharpness curve (row 2); its x positions are "
+                         "shared with no other band-set.",
+                         2, NULL),
+  ATROUS_BAND_DESCRIPTOR("bands.luma_threshold", "Luma threshold",
+                         "Contrast-equalizer luminance noise threshold curve (row 3); shares its "
+                         "x positions with bands.luma.",
+                         3, "bands.luma"),
+  ATROUS_BAND_DESCRIPTOR("bands.chroma_threshold", "Chroma threshold",
+                         "Contrast-equalizer chrominance noise threshold curve (row 4); shares "
+                         "its x positions with bands.chroma.",
+                         4, "bands.chroma"),
+};
+
+static const dt_remote_band_module_adapter_t s_atrous_adapter = {
+  "atrous", 2, 2, s_atrous_bands, 5, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// lowlight and rawdenoise (Task 5), denoiseprofile (Task 6); Task 7 adds
-// atrous here, the same convention as remote_vector_registry.c's own
+// lowlight and rawdenoise (Task 5), denoiseprofile (Task 6), atrous
+// (Task 7), the same convention as remote_vector_registry.c's own
 // s_adapters[] (and remote_curve_registry.c's before it): a future op adds
 // another entry here, not a parallel lookup mechanism.
 static const dt_remote_band_module_adapter_t *const s_adapters[] = {
   &s_lowlight_adapter,
   &s_rawdenoise_adapter,
   &s_denoiseprofile_adapter,
+  &s_atrous_adapter,
 };
 
 static dt_remote_band_registry_lookup_override_t s_lookup_override = NULL;

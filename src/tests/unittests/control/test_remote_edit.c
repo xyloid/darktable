@@ -1234,6 +1234,62 @@ static void test_set_module_params_mutation_path_uses_real_denylist(void **state
   g_free(before);
 }
 
+// atrous "octaves" is auto-derived in commit_params from the image
+// dimensions (atrous.c:684) -- the stored field is ignored by the
+// pipeline, so the per-op table (Task 7) forces it writable:false. Same
+// two-sided guard as filmicrgb "version" above: present in the schema but
+// unwritable, and a scalar write to it rejected whole.
+static void test_schema_atrous_marks_octaves_unwritable(void **state)
+{
+  (void)state;
+  dt_remote_module_schema_t *schema = NULL;
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_get_module_schema("atrous", &schema, &err));
+  gboolean found = FALSE;
+  for(guint i = 0; i < schema->fields->len; i++)
+  {
+    dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, "octaves"))
+    {
+      found = TRUE;
+      assert_false(f->writable);
+    }
+  }
+  assert_true(found);
+  dt_remote_module_schema_free(schema);
+}
+
+static void test_atrous_octaves_write_rejected_via_real_denylist(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("atrous");
+  assert_non_null(so);
+  dt_introspection_field_t *linear = so->get_introspection_linear();
+  assert_non_null(linear);
+  dt_introspection_t *intro = so->get_introspection();
+  assert_non_null(intro);
+
+  void *params = g_malloc0(intro->size);
+  void *before = g_malloc(intro->size);
+  memcpy(before, params, intro->size);
+
+  dt_remote_patch_t patch = { 0 };
+  patch.scalar_values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  g_ptr_array_add(patch.scalar_values,
+                  make_entry("octaves", (dt_remote_value_t){ .type = DT_REMOTE_VALUE_INT, .v.i = 5 }));
+
+  dt_remote_error_t *err = NULL;
+  assert_false(dt_remote_patch_apply(linear, dt_remote_denylist_for_op(so->op), &patch, params, &err));
+  assert_non_null(err);
+  assert_int_equal(err->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(params, before, intro->size);  // scratch block untouched on rejection
+  dt_remote_error_free(err);
+
+  g_ptr_array_unref(patch.scalar_values);
+  g_free(params);
+  g_free(before);
+}
+
 // The production wire promise for rgbcurve (the get_module_schema_rgbcurve
 // response fixture): four semantic curves in registry order, and
 // represented_by back-references from the three native storage fields to
@@ -2041,6 +2097,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_denylist_for_op_lookup),
     cmocka_unit_test(test_schema_marks_denylisted_fields_unwritable),
     cmocka_unit_test(test_set_module_params_mutation_path_uses_real_denylist),
+    cmocka_unit_test(test_schema_atrous_marks_octaves_unwritable),
+    cmocka_unit_test(test_atrous_octaves_write_rejected_via_real_denylist),
 
     cmocka_unit_test(test_patch_apply_single_valid_field),
     cmocka_unit_test(test_patch_apply_multiple_valid_fields),

@@ -366,6 +366,7 @@ typedef struct dt_remote_op_denylist_t
 static const dt_remote_op_denylist_t s_op_denylists[] = {
   { "ashift",          DENY("cl", "cr", "ct", "cb",
                             "last_drawn_lines_count", "last_quad_lines") },
+  { "atrous",          DENY("octaves") },
   { "channelmixerrgb", DENY("x", "y", "version") },
   { "colorcontrast",   DENY("a_offset", "b_offset", "unbound") },
   { "colorize",        DENY("version") },

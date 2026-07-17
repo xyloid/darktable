@@ -26,7 +26,7 @@
  * dt_remote_vector_registry_set_lookup_override() provides for the vector
  * registry); the per-adapter sections at the end exercise the production
  * s_adapters[] table directly (lowlight and rawdenoise since Task 5,
- * denoiseprofile since Task 6), and
+ * denoiseprofile since Task 6, atrous since Task 7), and
  * the no-adapter degrade tests use "borders", a vector-registry op that
  * never gains a band adapter.
  *
@@ -2838,6 +2838,514 @@ static void test_denoiseprofile_count_mismatch_rejected(void **state)
   band_fixture_free(fixture);
 }
 
+/* ---------------------------------------------------------------------- */
+/* atrous adapter (production registry; milestone5 bands-class design doc  */
+/* SS Adapters, atrous). Params v2: `x[5][6]`/`y[5][6]` channel rows       */
+/* (atrous.c:77-78, atrous_channel_t: L=0, c=1, s=2, Lt=3, ct=4),          */
+/* defaults x = k/5 (init(), atrous.c:618), y = 0.5 ($DEFAULT) for rows    */
+/* L/c/s but 0.0 for the threshold rows Lt/ct (init() overrides them,      */
+/* atrous.c:616). Five semantic names over the five rows: count 6, y       */
+/* range [0,1], INTERIOR x policy with minimum gap 0.001 (the GUI's        */
+/* x-drag clamp, atrous.c:1404-1408), and twin x sharing exactly as the    */
+/* GUI mirrors x drags across boost/threshold row pairs (atrous.c:         */
+/* 1393-1395, 1408): luma<->luma_threshold and chroma<->chroma_threshold;  */
+/* sharpness stands alone. No predicates/prepare/validate_completed; the   */
+/* `octaves` scalar is denylisted in remote_edit.c, not this adapter's     */
+/* concern. Unlike the synthetic "band.twin_a"/"band.twin_b" engine        */
+/* fixtures above (rows 0/1, installed via lookup override), these tests   */
+/* exercise the production s_adapters[] table directly.                    */
+/* ---------------------------------------------------------------------- */
+
+// Rows 2 (sharpness) and 3 (luma_threshold) native paths -- the engine
+// fixture section above already defines rows 0/1. Row 2 proves the
+// no-twin case; row 3 is luma's mirror target.
+static const dt_remote_path_segment_t s_atrous_x2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_introspection_path_t s_atrous_x2_path = {
+  .segments = s_atrous_x2_segments, .length = G_N_ELEMENTS(s_atrous_x2_segments)
+};
+static const dt_remote_path_segment_t s_atrous_y2_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 2 },
+};
+static const dt_remote_introspection_path_t s_atrous_y2_path = {
+  .segments = s_atrous_y2_segments, .length = G_N_ELEMENTS(s_atrous_y2_segments)
+};
+static const dt_remote_path_segment_t s_atrous_x3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "x" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_introspection_path_t s_atrous_x3_path = {
+  .segments = s_atrous_x3_segments, .length = G_N_ELEMENTS(s_atrous_x3_segments)
+};
+static const dt_remote_path_segment_t s_atrous_y3_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "y" },
+  { .type = DT_REMOTE_PATH_INDEX, .value.index = 3 },
+};
+static const dt_remote_introspection_path_t s_atrous_y3_path = {
+  .segments = s_atrous_y3_segments, .length = G_N_ELEMENTS(s_atrous_y3_segments)
+};
+
+static const char *const s_atrous_expected_names[] = {
+  "bands.luma", "bands.chroma", "bands.sharpness", "bands.luma_threshold", "bands.chroma_threshold",
+};
+// x_shared_with per name above: the two GUI twin pairs, sharpness alone.
+static const char *const s_atrous_expected_twins[] = {
+  "bands.luma_threshold", "bands.chroma_threshold", NULL, "bands.luma", "bands.chroma",
+};
+
+static void test_atrous_registry_lookup_by_version(void **state)
+{
+  (void)state;
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("atrous", 2);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "atrous");
+  assert_int_equal(adapter->band_count, 5);
+
+  // Version pinned min==max==2: any other version fails closed.
+  assert_null(dt_remote_band_registry_lookup("atrous", 1));
+  assert_null(dt_remote_band_registry_lookup("atrous", 3));
+}
+
+static void test_atrous_registry_validate_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("atrous");
+  assert_non_null(so);
+  const dt_remote_band_module_adapter_t *adapter = dt_remote_band_registry_lookup("atrous", 2);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_atrous_schema_lists_five_channels_with_twin_links(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("atrous");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, G_N_ELEMENTS(s_atrous_expected_names));
+
+  for(guint i = 0; i < schemas->len; i++)
+  {
+    const dt_remote_band_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, s_atrous_expected_names[i]);
+    assert_int_equal(schema->count, ATROUS_BAND_COUNT);
+    assert_int_equal(schema->x_policy, DT_REMOTE_BAND_X_INTERIOR);
+    assert_float_equal(schema->minimum_gap, 0.001, 0.0);
+    assert_float_equal(schema->y_minimum, 0.0, 0.0);
+    assert_float_equal(schema->y_maximum, 1.0, 0.0);
+    if(s_atrous_expected_twins[i])
+      assert_string_equal(schema->x_shared_with, s_atrous_expected_twins[i]);
+    else
+      assert_null(schema->x_shared_with);
+    // No predicates: unconditionally writable.
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+static void test_atrous_read_values_returns_module_defaults(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+
+  GHashTable *out = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, fixture->module->params, &out, &error));
+  assert_null(error);
+  assert_non_null(out);
+  assert_int_equal(g_hash_table_size(out), G_N_ELEMENTS(s_atrous_expected_names));
+
+  // Defaults: x = k/5 for every row (init(), atrous.c:618); y = 0.5
+  // ($DEFAULT) for the boost rows luma/chroma/sharpness, but init()
+  // overrides the two threshold rows to 0.0 (atrous.c:616).
+  for(guint c = 0; c < G_N_ELEMENTS(s_atrous_expected_names); c++)
+  {
+    const dt_remote_band_value_t *value = g_hash_table_lookup(out, s_atrous_expected_names[c]);
+    assert_non_null(value);
+    assert_int_equal(value->y->len, ATROUS_BAND_COUNT);
+    assert_int_equal(value->x->len, ATROUS_BAND_COUNT);
+    const double default_y = (c >= 3) ? 0.0 : 0.5;
+    for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+    {
+      assert_float_equal(g_array_index(value->x, double, i), i / 5.0, 1e-6);
+      assert_float_equal(g_array_index(value->y, double, i), default_y, 1e-6);
+    }
+    assert_true(value->active);
+    assert_true(value->writable_now);
+  }
+
+  g_hash_table_unref(out);
+  band_fixture_free(fixture);
+}
+
+// A y-only write on "bands.luma" narrows into y[0][*] and nothing else --
+// full params_size memcmp proves the twin's y row (y[3][*]) is NOT
+// mirrored (only x is shared), every other row, both whole x arrays, the
+// scalars (octaves/mix), and any padding are byte-untouched. Then both
+// twins read back: luma carries the new y, luma_threshold still its 0.0
+// defaults.
+static void test_atrous_apply_luma_y_only_leaves_threshold_y_untouched(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.05, 0.15, 0.25, 0.35, 0.45, 0.55 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y, ATROUS_BAND_COUNT, NULL, 0));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_y[ATROUS_BAND_COUNT];
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++) narrowed_y[i] = (float)y[i];
+  poke_band_array(fixture->module, &s_atrous_y0_path, expected, narrowed_y, ATROUS_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  GHashTable *out = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_band_value_t *luma = g_hash_table_lookup(out, "bands.luma");
+  const dt_remote_band_value_t *threshold = g_hash_table_lookup(out, "bands.luma_threshold");
+  assert_non_null(luma);
+  assert_non_null(threshold);
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    assert_float_equal(g_array_index(luma->y, double, i), y[i], 1e-6);
+    assert_float_equal(g_array_index(threshold->y, double, i), 0.0, 1e-6);
+  }
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+// An x write on "bands.luma" lands in x[0][*] AND mirrors into the twin's
+// x[3][*] -- full params_size memcmp with y[0], x[0], and x[3] poked into
+// the expected buffer proves rows 1/2/4 (chroma, sharpness,
+// chroma_threshold) keep their x byte-exactly. Then the twin reads back
+// with the mirrored x but its own untouched y.
+static void test_atrous_x_write_on_luma_mirrors_to_threshold_row(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.15, 0.4, 0.6, 0.85, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_x[ATROUS_BAND_COUNT], narrowed_y[ATROUS_BAND_COUNT];
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    narrowed_x[i] = (float)x[i];
+    narrowed_y[i] = (float)y[i];
+  }
+  poke_band_array(fixture->module, &s_atrous_y0_path, expected, narrowed_y, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x0_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x3_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  GHashTable *out = NULL;
+  assert_true(dt_remote_band_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_band_value_t *threshold = g_hash_table_lookup(out, "bands.luma_threshold");
+  assert_non_null(threshold);
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    assert_float_equal(g_array_index(threshold->x, double, i), x[i], 1e-6);
+    assert_float_equal(g_array_index(threshold->y, double, i), 0.0, 1e-6);
+  }
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+// "bands.sharpness" has no twin: its x write lands in x[2][*] and mirrors
+// nowhere -- expected buffer pokes y[2] and x[2] only.
+static void test_atrous_x_write_on_sharpness_mirrors_nowhere(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.15, 0.4, 0.6, 0.85, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.sharpness", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_x[ATROUS_BAND_COUNT], narrowed_y[ATROUS_BAND_COUNT];
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    narrowed_x[i] = (float)x[i];
+    narrowed_y[i] = (float)y[i];
+  }
+  poke_band_array(fixture->module, &s_atrous_y2_path, expected, narrowed_y, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x2_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+// Endpoint pinning against the production adapter: x[0] = 0.01 does not
+// equal the stored 0.0 endpoint, rejected byte-atomically.
+static void test_atrous_x_endpoint_violation_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.01, 0.2, 0.4, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "endpoint"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// Strict ascent against the production adapter: x[2] < x[1] is rejected
+// with the "unordered" constraint, byte-atomically.
+static void test_atrous_x_descending_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.4, 0.2, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.chroma", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "unordered"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// The 0.001 at-least gap against the production adapter: a 0.0005 gap is
+// rejected byte-atomically ...
+static void test_atrous_x_gap_below_minimum_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.0005, 0.4, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "gap"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// ... and a gap of exactly 0.001 (the at-least comparison's boundary, in
+// the double domain: 0.001 - 0.0 is exact) is accepted and applied,
+// mirror included.
+static void test_atrous_x_gap_exactly_at_minimum_accepted(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.001, 0.4, 0.6, 0.8, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_x[ATROUS_BAND_COUNT], narrowed_y[ATROUS_BAND_COUNT];
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    narrowed_x[i] = (float)x[i];
+    narrowed_y[i] = (float)y[i];
+  }
+  poke_band_array(fixture->module, &s_atrous_y0_path, expected, narrowed_y, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x0_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x3_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
+// One request carrying x on BOTH twins, differing in one interior
+// component, is a twin conflict: rejected whole, blob byte-identical.
+static void test_atrous_twin_conflict_differing_x_rejected(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *snapshot = scratch_params_new(fixture->module);
+
+  static const double y_luma[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double y_threshold[ATROUS_BAND_COUNT] = { 0.05, 0.1, 0.15, 0.2, 0.25, 0.3 };
+  static const double x_luma[ATROUS_BAND_COUNT] = { 0.0, 0.15, 0.4, 0.6, 0.85, 1.0 };
+  static const double x_threshold[ATROUS_BAND_COUNT] = { 0.0, 0.15, 0.45, 0.6, 0.85, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y_luma, ATROUS_BAND_COUNT, x_luma, ATROUS_BAND_COUNT));
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma_threshold", y_threshold, ATROUS_BAND_COUNT, x_threshold,
+                                  ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                          &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "twin_conflict"));
+  assert_memory_equal(scratch, snapshot, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(snapshot);
+  band_fixture_free(fixture);
+}
+
+// The same x on both twins in one request is NOT a conflict: both entries
+// apply, each row keeps its own y, and the shared x lands once in each
+// native row -- expected buffer pokes y[0], y[3], and the one x into
+// x[0]/x[3].
+static void test_atrous_twin_matching_x_both_entries_accepted(void **state)
+{
+  (void)state;
+  band_fixture_t *fixture = atrous_fixture_new();
+  void *scratch = scratch_params_new(fixture->module);
+  void *expected = scratch_params_new(fixture->module);
+
+  static const double y_luma[ATROUS_BAND_COUNT] = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+  static const double y_threshold[ATROUS_BAND_COUNT] = { 0.05, 0.1, 0.15, 0.2, 0.25, 0.3 };
+  static const double x[ATROUS_BAND_COUNT] = { 0.0, 0.15, 0.4, 0.6, 0.85, 1.0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma", y_luma, ATROUS_BAND_COUNT, x, ATROUS_BAND_COUNT));
+  g_ptr_array_add(patch.semantic_values,
+                  make_band_entry("bands.luma_threshold", y_threshold, ATROUS_BAND_COUNT, x,
+                                  ATROUS_BAND_COUNT));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_band_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                         &error));
+  assert_null(error);
+
+  float narrowed_x[ATROUS_BAND_COUNT], narrowed_y_luma[ATROUS_BAND_COUNT],
+    narrowed_y_threshold[ATROUS_BAND_COUNT];
+  for(guint i = 0; i < ATROUS_BAND_COUNT; i++)
+  {
+    narrowed_x[i] = (float)x[i];
+    narrowed_y_luma[i] = (float)y_luma[i];
+    narrowed_y_threshold[i] = (float)y_threshold[i];
+  }
+  poke_band_array(fixture->module, &s_atrous_y0_path, expected, narrowed_y_luma, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_y3_path, expected, narrowed_y_threshold, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x0_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  poke_band_array(fixture->module, &s_atrous_x3_path, expected, narrowed_x, ATROUS_BAND_COUNT);
+  assert_memory_equal(scratch, expected, fixture->module->params_size);
+
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  g_free(expected);
+  band_fixture_free(fixture);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -3010,6 +3518,33 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_denoiseprofile_x_entry_rejected_unsupported_field,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_denoiseprofile_count_mismatch_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_atrous_registry_lookup_by_version,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_registry_validate_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_schema_lists_five_channels_with_twin_links,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_read_values_returns_module_defaults,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_apply_luma_y_only_leaves_threshold_y_untouched,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_write_on_luma_mirrors_to_threshold_row,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_write_on_sharpness_mirrors_nowhere,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_endpoint_violation_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_descending_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_gap_below_minimum_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_x_gap_exactly_at_minimum_accepted,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_twin_conflict_differing_x_rejected,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_atrous_twin_matching_x_both_entries_accepted,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 
