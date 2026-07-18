@@ -25,8 +25,12 @@ when they disagree, this file wins until amended.
   `invalid_value`. The sidecar and server are versioned together; forward
   compatibility is handled by the protocol version and the `capabilities`
   list, not by silently ignoring fields.
-- **Numbers.** JSON numbers only. Non-finite values (NaN, ±Inf) are rejected
-  with `invalid_value`. Integer fields reject fractional values.
+- **Numbers.** JSON numbers only. Non-finite values (NaN, ±Inf) in requests
+  are rejected with `invalid_value`. Integer fields reject fractional
+  values. In **responses**, a stored scalar float whose value is non-finite
+  is serialized as JSON `null` (JSON has no NaN/Inf token; this occurs in
+  practice — `temperature` stores NaN in its unused `various` coefficient
+  on every RGB camera).
 - **Enums.** Written as the stable introspection name (preferred) or the
   integer representation; always returned as the name. An integer with no
   matching enum member is `invalid_value`.
@@ -66,7 +70,7 @@ Result:
   "pid": 12345,
   "capabilities": ["params", "instances", "history", "preview", "scopes",
                    "semantic_params", "curve_params", "vector_params",
-                   "band_params"]
+                   "band_params", "quantity_params"]
 }
 ```
 
@@ -88,10 +92,17 @@ additionally advertises writable bands-class semantic parameters —
 fixed-count sampled-response band sets (the `semantic_values` request
 member's bands entries on `set_module_params`); the server never
 advertises `band_params` without accepting band entries in
+`semantic_values`. `quantity_params` (milestone 6) additionally
+advertises writable quantity-class semantic parameters — named component
+groups whose stored units differ from their presentation units, converted
+by the module's own hooks (the `semantic_values` request member's
+quantity entries on `set_module_params`); the server never advertises
+`quantity_params` without accepting quantity entries in
 `semantic_values`. A client must send curve patches only when
 `curve_params` is present, vector patches only when `vector_params` is
-present, and band patches only when `band_params` is present;
-capability-gated optional request members do not bump `protocol_version`
+present, band patches only when `band_params` is present, and quantity
+patches only when `quantity_params` is present; capability-gated
+optional request members do not bump `protocol_version`
 (see Maintenance).
 
 ### get_state
@@ -250,16 +261,46 @@ All policy and member names are stable wire vocabulary. Normative shape:
 }
 ```
 
+When the server advertises `quantity_params` (milestone 6), semantic
+descriptors with `class: "quantity"` may also appear: a named group of
+scalar components whose stored units differ from their presentation
+units, converted between the two domains by the module's own hooks.
+`derived: true` marks the field as a presentation-domain projection of
+the stored params: readback runs the reverse conversion and is **lossy**
+(a written 5500 K reads back as approximately 5500, not exactly —
+clients compare with tolerance; the mutation echo is the authoritative
+stored state). `unit` is present on a component only when it has one.
+Normative shape:
+
+```json
+{
+  "name": "wb.temperature", "class": "quantity",
+  "display_name": "white balance",
+  "readable": true, "writable": true, "derived": true,
+  "components": [
+    { "name": "temperature", "unit": "kelvin",
+      "minimum": 1901.0, "maximum": 25000.0 },
+    { "name": "tint", "minimum": 0.135, "maximum": 2.326 }
+  ]
+}
+```
+
 Native storage fields backing a semantic parameter stay listed in `fields`
 with `writable: false` and a `represented_by` array naming the semantic IDs
 that represent them. This applies uniformly across the curve-bearing ops
 (`rgbcurve`, `tonecurve`, `colorzones`, `basecurve`), the vector-bearing
 ops (`colorbalance`, `channelmixerrgb`, `rgblevels`, `borders`,
-`watermark`), and the band-bearing ops (`atrous`, `denoiseprofile`,
-`rawdenoise`, `lowlight`) — see the `get_module_schema_rgbcurve_*`
-fixtures for the full curve shape and the vector/band registry tests for
-the vector and band shapes; each op follows the identical wire shape with
-its own field/semantic names.
+`watermark`, `negadoctor`, `colorharmonizer`), and the band-bearing ops
+(`atrous`, `denoiseprofile`, `rawdenoise`, `lowlight`) — see the
+`get_module_schema_rgbcurve_*` fixtures for the full curve shape and the
+vector/band registry tests for the vector and band shapes; each op follows
+the identical wire shape with its own field/semantic names. The one
+deliberate exception is the quantity-bearing op `temperature`: its
+`red`/`green`/`blue`/`various` coefficient scalars were writable before
+the quantity class existed (milestone 1) and **stay `writable: true`**
+while also carrying `represented_by: ["wb.temperature"]` — the conflict
+rule under `set_module_params` below keeps the two surfaces from
+colliding in one request.
 
 Errors: `unknown_module`.
 
@@ -290,7 +331,12 @@ semantic ID mapped to its current value -- for curves `{"class": "curve",
 the same status flags curve values carry; for bands (milestone 5)
 `{"class": "bands", "active": ..., "effective": ..., "writable_now": ...,
 "y": [...], "x": [...]}` — the current samples and their stored x
-positions, both as number arrays of the schema's `count` length. Inactive
+positions, both as number arrays of the schema's `count` length; for
+quantities (milestone 6) `{"class": "quantity", "active": ...,
+"effective": ..., "writable_now": ..., "values": {"temperature": 5502.7,
+"tint": 1.003}}` — an object mapping each schema component name to its
+current presentation-domain value, produced by the module's read hook
+(derived and lossy — see `set_module_params`). Inactive
 parameters (e.g. `curve.red` in linked mode, `levels.red` in
 linked-autoscale mode) are always present with `active: false`, never
 omitted.
@@ -410,12 +456,51 @@ unknown semantic ID is `unknown_field`. Band validation errors carry
 `"y"` or `"x"`, naming the offending array, and `index` is present only
 when the failure is attributable to one sample.
 
-Semantic IDs are unique across the curve, vector, and band registries
-within a module, so a `semantic_values` object may freely mix curve,
-vector, and band entries by name with no collision. Error precedence
+When the server advertises `quantity_params` (milestone 6), the same
+`semantic_values?` object may also carry quantity entries alongside
+curve, vector, and band entries, in the same atomic history item:
+
+```json
+{
+  "semantic_values": {
+    "wb.temperature": {
+      "class": "quantity",
+      "values": { "temperature": 5500.0, "tint": 1.0 }
+    }
+  }
+}
+```
+
+Each entry requires `class: "quantity"` and `values`: an object
+containing **exactly** the schema's component names, each a finite
+number within its component domain — a patch is a **complete
+replacement** of the named quantity, never a partial write (the
+conversion is joint; a caller changing only the temperature reads the
+current pair first and sends the current tint back). Missing, extra, or
+unknown component members are `invalid_value`; nothing is clamped. The
+write runs through the module's own conversion hooks against the stored
+params, and readback is **lossy**: the reverse conversion means a
+written 5500 K reads back as approximately 5500, not exactly — the
+mutation echo is the authoritative stored state and clients compare
+with tolerance. **Coefficient coexistence:** unlike every previous
+class, `temperature`'s native `red`/`green`/`blue`/`various` scalars
+stay writable alongside `wb.temperature` (see `get_module_schema`
+above); one request that writes any of those scalars in `values` *and*
+carries a `wb.temperature` entry is rejected with `invalid_value` and
+nothing changes — the error details name the offending scalar as
+`parameter` with `constraint: "native_conflict"`. Unknown or extra
+members anywhere in the shape are `invalid_value`; an unknown semantic
+ID is `unknown_field`. Quantity validation errors carry
+`details: {"parameter", "component", "constraint"}` (`component` naming
+the offending component, present only when the failure is attributable
+to one component).
+
+Semantic IDs are unique across the curve, vector, band, and quantity
+registries within a module, so a `semantic_values` object may freely mix
+entries of all four classes by name with no collision. Error precedence
 within one request: parse errors (shape, class, duplicate-ID) surface
 first, then engine validation in dispatch-table order — curve, then
-vector, then bands.
+vector, then bands, then quantity.
 
 Result (values read back from live state):
 
@@ -610,6 +695,9 @@ and the Python fixtures in the same commit. New curve-bearing ops are
 registry entries in `src/control/remote_curve_registry.c` and require no
 protocol change — the wire shape documented above already generalizes. New
 vector-bearing ops are likewise registry entries in
-`src/control/remote_vector_registry.c` (milestone 4); the two registries
-share the `semantic_values` wire envelope and enforce unique semantic IDs
-across classes within a module.
+`src/control/remote_vector_registry.c` (milestone 4), and new
+quantity-bearing ops are registry entries in
+`src/control/remote_quantity_registry.c` plus the module's own
+`remote_quantity_read`/`remote_quantity_write` iop API hooks
+(milestone 6); the registries share the `semantic_values` wire envelope
+and enforce unique semantic IDs across classes within a module.

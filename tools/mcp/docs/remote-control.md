@@ -246,6 +246,21 @@ off. Removing/stopping the sidecar from your MCP host removes the client end.
   `y_range` and nothing is clamped. See the sidecar
   [`README`](../README.md#tools-exposed) for the full `bands` argument
   shape and worked atrous/denoiseprofile examples.
+* **Semantic quantity editing (milestone 6) is likewise capability-gated.**
+  A darktable with quantity support advertises `quantity_params` in the
+  hello `capabilities` list (protocol version stays `1`); the
+  `semantic_values` request member's quantity entries only flow when the
+  capability is present, with the same client-side refusal against older
+  servers. One module exposes a quantity: `temperature`
+  (`wb.temperature`, an atomic Kelvin + tint pair converted to and from
+  the stored RGB multipliers by the module itself — readback is derived
+  and slightly lossy, and the native multiplier scalars stay writable
+  but cannot be combined with `wb.temperature` in one request).
+  Milestone 6 also added vector semantics for `negadoctor`
+  (`dmin`/`wb_high`/`wb_low`) and `colorharmonizer`
+  (`custom_hue`/`node_saturation`). See the sidecar
+  [`README`](../README.md#tools-exposed) for the full `quantities`
+  argument shape and the worked white-balance example.
 * **darktable:** this feature targets the darktable release it ships in
   (5.x and later) on Linux, macOS, and Windows. The server reports its
   `darktable_version` in the handshake; schema responses are cacheable per

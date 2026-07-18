@@ -3,8 +3,8 @@
 Date: 2026-07-16
 Status: reference (supersedes `2026-07-05-darktable-mcp-supported-operations.md`;
 companion to `2026-07-05-darktable-mcp-design.md`)
-Source inventory: `src/iop/` and `src/control/remote_*` at milestone-5
-completion (`20e1f50e09`, branch `worktree-mcp-remote-edit`)
+Source inventory: `src/iop/` and `src/control/remote_*` at milestone-6
+completion (`976409dc65`, branch `worktree-mcp-remote-edit`)
 
 ## Purpose
 
@@ -28,7 +28,7 @@ listed module regardless of tier:
 | Category | Tools |
 |---|---|
 | state and introspection | `get_current_image`, `list_modules`, `get_module_schema`, `get_module_params` |
-| editing | `set_module_params` (scalars, plus semantic curves via `curves`, semantic vectors via `vectors`, and semantic bands via `bands`) |
+| editing | `set_module_params` (scalars, plus semantic curves via `curves`, semantic vectors via `vectors`, semantic bands via `bands`, and semantic quantities via `quantities`) |
 | module lifecycle | `set_module_enabled`, `reset_module`, `create_module_instance` |
 | history | `get_history`, `undo` |
 | visual feedback | `render_preview`, `get_scopes` |
@@ -49,6 +49,7 @@ already covered it.
 | **m3** | curve adapters for the remaining control-point-curve modules, including periodic (hue) curves and multi-channel Lab modes. Plan: `2026-07-11-darktable-mcp-milestone3-curve-adapters.md`. | `tonecurve`, `colorzones`, `basecurve` → Tier 1 |
 | **m4** | the vector semantic class (`src/control/remote_vector.c`): named fixed-length vectors in three subtypes (plain `vector`, `color` with `display_rgb`, ordered `levels` triples), gated by the `vector_params` capability; 19 semantic names across five adapters. Design: `2026-07-12-darktable-mcp-milestone4-vector-class-design.md`. | `colorbalance`, `channelmixerrgb`, `rgblevels`, `borders` → Tier 1; `watermark` color writable (stays Tier 2 for its strings) |
 | **m5** | the sampled-response (bands) semantic class (`src/control/remote_band.c`): whole-set replacement of fixed-count band arrays, with fixed or interior x policy and twin-channel x sharing, gated by the `band_params` capability; 16 semantic names across four adapters. Ride-alongs: the class-ops dispatch table in `remote_edit.c` replacing the per-class seams, and the sidecar unifying all caller-input errors on ToolError. Design: `2026-07-16-darktable-mcp-milestone5-bands-class-design.md`. | `atrous`, `denoiseprofile`, `rawdenoise`, `lowlight` → Tier 1 |
+| **m6** | the quantity semantic class (`src/control/remote_quantity.c`): named component groups whose stored units differ from their presentation units, converted by an optional iop API hook pair (`remote_quantity_read`/`remote_quantity_write` — the first time a remote engine calls module code instead of reading blobs through introspection offsets), gated by the `quantity_params` capability; `wb.temperature` (Kelvin + tint) on `temperature`, whose native coefficient scalars deliberately stay writable alongside it (coexistence exception). Ride-alongs: `negadoctor` and `colorharmonizer` vector adapters on the unchanged milestone-4 engine. Design: `2026-07-17-darktable-mcp-milestone6-quantity-class-design.md`. | `temperature`, `negadoctor`, `colorharmonizer` → Tier 1 |
 
 ## How support is determined
 
@@ -72,7 +73,16 @@ exposing writable `vector`-class semantic parameters (gated by the
 twin-channel x sharing), exposing writable `bands`-class semantic
 parameters (gated by the `band_params` capability) for `atrous`,
 `denoiseprofile`, `rawdenoise`, and `lowlight`, again leaving the native
-arrays `writable: false`. A module's tier follows from what fraction of its
+arrays `writable: false`. Milestone 6 adds a fourth class, the quantity
+(named scalar components whose stored units differ from their presentation
+units, converted by the module's own optional `remote_quantity_read`/
+`remote_quantity_write` hooks), exposing the writable `wb.temperature`
+Kelvin/tint pair (gated by the `quantity_params` capability) for
+`temperature` — uniquely, the native coefficient scalars it represents
+*stay* writable alongside it (they have been writable since milestone 1;
+a request mixing a coefficient scalar with `wb.temperature` is rejected) —
+and its vector ride-alongs promote `negadoctor` and `colorharmonizer`.
+A module's tier follows from what fraction of its
 user-facing controls survive these rules:
 
 - **Tier 1 — full support.** Every user-facing parameter is a supported
@@ -120,7 +130,7 @@ conversational steering.
   how often users deliberately *adjust* them. Note `filmicrgb` or `sigmoid`
   is also auto-applied — whichever the workflow preference selects.
 
-## Tier 1 — full support (54 modules)
+## Tier 1 — full support (57 modules)
 
 | op | display name | multi | since | usage | notes |
 |---|---|---|---|---|---|
@@ -141,6 +151,7 @@ conversational steering.
 | `colorbalancergb` | color balance rgb | yes | m1 | core | flagship grading module; 4-way Y/C/H + saturation/brilliance, all scalars |
 | `colorcontrast` | color contrast | yes | m1 | rare | a/b steepness; offsets internal |
 | `colorequal` | color equalizer | yes | m1 | common | per-hue-band saturation/hue/brightness as named scalars — ideal for "make the greens less yellow" |
+| `colorharmonizer` | color harmonizer | yes | m6 | occasional | **milestone 6, semantic vectors**: `custom_hue` (writable only when `rule` is `DT_COLORHARMONIZER_CUSTOM` — a rule switch in the same request counts) and `node_saturation` writable via `semantic_values` (`vector_params` capability); rule enum, anchor hue, pull strength/width, smoothing scalars writable; native arrays stay read-only with `represented_by` |
 | `colorize` | colorize | yes | m1 | rare | hue/saturation/lightness; `version` internal |
 | `colorreconstruct` | color reconstruction | yes | m1 | rare | threshold/spatial/range scalars; op is the CMake/plugin name (`colorreconstruction.c` is the source filename) |
 | `colorzones` | color zones | yes | m3 | common | **milestone 3, semantic curves**: `curve.lightness`/`curve.chroma`/`curve.hue`; periodic when select-by is hue; select-by change resets the curves (but not strength/mode, unlike the GUI's full reset) |
@@ -162,6 +173,7 @@ conversational steering.
 | `hotpixels` | hot pixels | no | m1 | occasional | raw only; strength/threshold + bools |
 | `lowlight` | lowlight vision | yes | m5 | rare | **milestone 5, semantic bands**: `bands.transition` (six samples, interior x) writable via `semantic_values` (`band_params` capability); `blueness` scalar writable; native `transition_x`/`transition_y` arrays stay read-only with `represented_by` |
 | `lowpass` | lowpass | yes | m1 | rare | radius/contrast/brightness/saturation; `unbound` internal |
+| `negadoctor` | negadoctor | no | m6 | rare | **milestone 6, semantic vectors**: `dmin` (color, `display_rgb` — the film-substrate color), `wb_high`, `wb_low` writable via `semantic_values` (`vector_params` capability); film stock enum, `D_max`, `offset`, `black`, `gamma`, `soft_clip`, `exposure` scalars writable; native arrays stay read-only with `represented_by` |
 | `nlmeans` | astrophoto denoise | yes | m1 | rare | patch size/strength/luma/chroma |
 | `primaries` | rgb primaries | yes | m1 | occasional | per-primary hue/purity scalars |
 | `profile_gamma` | unbreak input profile | no | m1 | rare | log/gamma scalars + mode enum |
@@ -174,25 +186,23 @@ conversational steering.
 | `sigmoid` | sigmoid | yes | m1 | core* | contrast/skew + per-primary attenuation, all scalars/enums |
 | `soften` | soften | yes | m1 | rare | orton-effect scalars |
 | `splittoning` | split-toning | yes | m1 | occasional | shadow/highlight hue+saturation, balance, compress |
+| `temperature` | white balance | no | m6 | core* | **milestone 6, semantic quantity**: `wb.temperature` — a Kelvin + tint pair written atomically, converted to/from the stored RGB multipliers by the module's own hooks — writable via `semantic_values` (`quantity_params` capability); readback is derived and lossy (compare with tolerance). The `red`/`green`/`blue`/`various` multiplier scalars **stay writable** alongside it (coexistence exception) and carry `represented_by`; a request mixing a coefficient scalar with `wb.temperature` is rejected; `preset` internal (appendix) |
 | `tonecurve` | tone curve | yes | m3 | common | **milestone 3, semantic curves**: `curve.lightness` always, `curve.a`/`curve.b` in independent-Lab mode; color-space scalar writable |
 | `toneequal` | tone equalizer | yes | m1 | core | nine named EV-band scalars — the natural target for "lift the shadows" |
 | `velvia` | velvia | yes | m1 | occasional | strength + mid-tones bias |
 | `vignette` | vignetting | yes | m1 | common | scale/falloff/brightness/saturation/shape + `center.x`/`center.y` (dotted, rangeless — finiteness-only validation); `unbound` internal |
 
-## Tier 2 — partial support (11 modules)
+## Tier 2 — partial support (8 modules)
 
 | op | display name | multi | since | usage | supported | unsupported / caveats |
 |---|---|---|---|---|---|---|
 | `colorcorrection` | color correction | yes | m1 | rare | `saturation` | `hia`/`hib`/`loa`/`lob` are unranged Lab-ish grid coordinates; stored semantics unclear |
-| `colorharmonizer` | color harmonizer | yes | m1 | occasional | rule enum, anchor hue, pull strength/width, smoothing | `custom_hue[4]`, `node_saturation[4]` arrays |
 | `colorin` | input color profile | no | m1 | rare* | profile `type`/`intent`/`normalize` enums (caution: pipeline-level change) | ICC `filename` strings |
 | `colorout` | output color profile | no | m1 | rare* | profile `type`/`intent` enums (caution) | ICC `filename` string |
 | `lens` | lens correction | yes | m1 | common | `method`/`modify_flags`/`target_geom` enums, `scale`, TCA overrides, fine-tune scalars | `camera[128]`/`lens[128]` strings; EXIF-derived `crop`/`focal`/`aperture`/`distance` (appendix) |
 | `monochrome` | monochrome | yes | m1 | occasional | `size`, `highlights` | `a`/`b` are unranged Lab filter coordinates set by GUI drag/picker |
-| `negadoctor` | negadoctor | no | m1 | rare | film stock enum, `D_max`, `offset`, `black`, `gamma`, `soft_clip`, `exposure` | `Dmin[4]`, `wb_high[4]`, `wb_low[4]` RGB arrays (usually set by picker) |
 | `overlay` | composite | yes | m1 | rare | `opacity`, `scale`, `rotate`, offsets, scale-mode enums | overlay image reference (`imgid`, `filename`) must be chosen in the GUI first |
 | `rawprepare` | raw black/white point | no | m1 | rare* | crop scalars, `raw_white_point`, flat-field enum — **caution: sensor-level values; wrong edits break the image** | `raw_black_level_separate[4]` array |
-| `temperature` | white balance | no | m1 | core* | `red`/`green`/`blue`/`various` channel coefficients — **stored values are multipliers, not Kelvin**; the GUI's Kelvin/tint is a derived presentation (future metadata layer) | `preset` internal |
 | `watermark` | watermark | yes | m4 | occasional | `opacity`, `scale`, `rotate`, offsets, alignment, scale enums; **milestone 4, semantic vectors**: `color` writable via `semantic_values` (`vector_params` capability); native array stays read-only with `represented_by` | `filename`/`text`/`font` strings still unsupported (near-Tier 1) |
 
 ## Tier 3 — parameter editing excluded (6 modules)
@@ -250,8 +260,9 @@ descriptions, because they cover most conversational editing requests with
 Tier 1 support (these are the `core`/`common` rows above):
 
 1. **Tonal**: `exposure`, `toneequal`, `filmicrgb` or `sigmoid` or `agx`
-2. **Color**: `colorbalancergb`, `colorequal`, `channelmixerrgb` (white
-   balance via illuminant/temperature)
+2. **Color**: `colorbalancergb`, `colorequal`, `temperature` (white
+   balance in real Kelvin/tint via `wb.temperature`), `channelmixerrgb`
+   (white balance via illuminant/temperature)
 3. **Presence**: `diffuse`, `sharpen`, `bilat`, `hazeremoval`, `velvia`
 4. **Noise**: `denoiseprofile`
 5. **Geometry/finishing**: `crop`, `flip`, `ashift`, `vignette`, `grain`,

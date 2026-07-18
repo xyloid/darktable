@@ -48,7 +48,7 @@ one adapter layer on top.
 | `list_modules` | `list_modules` | live module instances for the open image, in pixelpipe order |
 | `get_module_schema` | `get_module_schema` | field types/ranges/enum values/writability for one op |
 | `get_module_params` | `get_module_params` | current values for one module instance |
-| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves`, semantic vectors via `vectors`, and semantic bands via `bands`); one history item + new revision |
+| `set_module_params` | `set_module_params` | atomically patch writable fields (plus semantic curves via `curves`, semantic vectors via `vectors`, semantic bands via `bands`, and semantic quantities via `quantities`); one history item + new revision |
 | `set_module_enabled` | `set_module_enabled` | turn a module on/off; one history item + new revision |
 | `reset_module` | `reset_module` | reset a module to its defaults; returns post-reset values |
 | `create_module_instance` | `create_module_instance` | duplicate a module into a new instance |
@@ -92,20 +92,25 @@ instead of silently dropping the curve half of a patch.
 `set_module_params` also edits semantic vector parameters (milestone 4)
 through its optional `vectors` argument: semantic IDs mapped to a flat
 list of finite numbers, e.g. `{"lift": [1.0, 1.1, 1.0, 0.95]}`. Each patch
-replaces the whole named vector; unlisted vectors are untouched. Five
+replaces the whole named vector; unlisted vectors are untouched. Seven
 modules currently expose vector semantics — `colorbalance` (`lift`/
 `gamma`/`gain`, with mode-gated aliases `offset`/`power`/`slope` writable
 instead under the module's default `SLOPE_OFFSET_POWER` mode),
 `channelmixerrgb` (`red`/`green`/`blue`/`saturation`/`lightness`/`grey`
 mixing rows), `rgblevels` (`levels.linked` when `autoscale` is linked,
 `levels.red`/`levels.green`/`levels.blue` when it is independent),
-`borders` (`color`/`frame_color`), and `watermark` (`color`) — and
+`borders` (`color`/`frame_color`), `watermark` (`color`), `negadoctor`
+(`dmin`/`wb_high`/`wb_low`, since milestone 6), and `colorharmonizer`
+(`custom_hue` — writable only when `rule` is `DT_COLORHARMONIZER_CUSTOM`,
+a rule switch in the same call counts — and `node_saturation`, since
+milestone 6) — and
 `get_module_schema`'s `semantic_fields` (`"class": "vector"`) is the
 authoritative source of each module's vector IDs, component count, and
 per-component ranges. This requires a darktable that advertises the
 `vector_params` hello capability; against an older darktable the tool
 refuses client-side with an upgrade message instead of silently dropping
-the vector half of a patch. `curves`, `vectors`, and `bands` (below) may
+the vector half of a patch. `curves`, `vectors`, `bands`, and
+`quantities` (below) may
 be given together in the same call; a semantic ID given in more than one
 raises a client-side error before anything is sent.
 
@@ -208,6 +213,46 @@ denoising in the coarsest bands:
   }
 }
 ```
+
+`set_module_params` also edits semantic quantity parameters (milestone 6)
+through its optional `quantities` argument: semantic IDs mapped to an
+object of component values. One module currently exposes a quantity —
+`temperature` (`wb.temperature`, a Kelvin + tint pair converted to and
+from the stored RGB multipliers by the module itself) — and
+`get_module_schema`'s `semantic_fields` (`"class": "quantity"`) is the
+authoritative source of the component names, units, and ranges. Every
+component must be sent — the pair is written atomically because the
+conversion is joint; to change only the temperature, read the current
+pair first and send the current tint back. This requires a darktable
+that advertises the `quantity_params` hello capability; the tool refuses
+client-side with an upgrade message otherwise. Setting daylight white
+balance:
+
+```json
+{
+  "module": "temperature",
+  "values": {},
+  "quantities": {
+    "wb.temperature": { "temperature": 5500.0, "tint": 1.0 }
+  }
+}
+```
+
+Two things to know when using it:
+
+* **Conflict with the raw coefficients.** Uniquely among semantic
+  parameters, `temperature`'s native `red`/`green`/`blue`/`various`
+  multiplier scalars stay writable alongside `wb.temperature` (they are
+  a legitimate expert surface — copying coefficients between images,
+  scripted pipelines). A single call that writes one of those scalars in
+  `values` *and* sends `wb.temperature` in `quantities` is rejected
+  atomically — the two would fight over the same storage. Pick one
+  surface per call.
+* **Readback is lossy.** `wb.temperature` is derived: reading it back
+  runs the reverse conversion, so a written 5500 K reads back as
+  approximately 5500 (in practice well under 1 K off), not exactly.
+  Compare with tolerance; the stored multipliers, not the Kelvin/tint
+  projection, are the authoritative state.
 
 ## Setup
 

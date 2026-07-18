@@ -1,7 +1,10 @@
 # darktable MCP milestone 6 — quantity class (white balance) and vector mop-up
 
 Date: 2026-07-17
-Status: approved design (not yet implemented)
+Status: implemented (milestone 6 complete; amended during implementation —
+non-finite stored scalars read back as JSON `null`, a pre-existing
+milestone-1 serialization gap surfaced by `temperature`'s NaN `various`
+coefficient; see the Wire and MCP contract section)
 Companions: `2026-07-05-darktable-mcp-design.md` (base protocol),
 `2026-07-05-darktable-mcp-parameter-class-investigation.md` (class taxonomy —
 the "quantity" candidate family),
@@ -189,6 +192,15 @@ protocol reference both document this as a deliberate exception to the
   merge/overlap machinery (the three-way overlap check becomes
   four-way) and is gated on the `quantity_params` capability with the
   established upgrade-message refusal.
+- (Amended during implementation:) non-finite stored scalar floats
+  serialize as JSON `null` in responses. `temperature` stores NaN in its
+  unused `various` coefficient on every RGB camera, and JSON has no NaN
+  token — the bare `nan` json-glib emitted was invalid JSON and killed
+  the connection on every `get_module_params("temperature")`. This was a
+  pre-existing milestone-1 gap (no earlier module ever stored a
+  non-finite value) surfaced by this milestone's integration gates;
+  fixed in `remote_protocol.c` and recorded normatively in the protocol
+  reference's Numbers convention.
 
 ## Ride-along adapters (milestone-4 vector engine, no new machinery)
 
