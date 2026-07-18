@@ -374,6 +374,39 @@ static gboolean stub_get_module_params_exposure(const dt_remote_module_ref_t *re
   return TRUE;
 }
 
+// A read whose float values include a stored NaN -- temperature's `various`
+// coefficient is NAN by design on every RGB camera (temperature.c:159, and
+// the "the fourth is usually NAN for RGB" comment), so the serializer must
+// map non-finite reads to a wire-legal value instead of letting json-glib
+// emit a bare `nan` token that no strict JSON parser accepts.
+static gboolean stub_get_module_params_nan_float(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                 GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  assert_non_null(out);
+  assert_null(*out);
+  assert_non_null(semantic_out);
+  assert_null(*semantic_out);
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+
+  dt_remote_patch_entry_t *e1 = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  e1->name = g_strdup("red");
+  e1->value.type = DT_REMOTE_VALUE_FLOAT;
+  e1->value.v.f = 2.5;
+  g_ptr_array_add(arr, e1);
+
+  dt_remote_patch_entry_t *e2 = g_malloc0(sizeof(dt_remote_patch_entry_t));
+  e2->name = g_strdup("various");
+  e2->value.type = DT_REMOTE_VALUE_FLOAT;
+  e2->value.v.f = NAN;
+  g_ptr_array_add(arr, e2);
+
+  *out = arr;
+  *semantic_out = g_hash_table_new(g_str_hash, g_str_equal);
+  return TRUE;
+}
+
 static gboolean stub_get_module_params_unknown_module(const dt_remote_module_ref_t *ref, GPtrArray **out,
                                                       GHashTable **semantic_out, dt_remote_error_t **error)
 {
@@ -1979,6 +2012,53 @@ static void test_get_module_params_success(void **state)
   };
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_request.json", "get_module_params_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// A stored non-finite float (temperature's NaN `various`) serializes as
+// JSON null, keeping the emitted document parseable by strict JSON
+// parsers -- json-glib would otherwise generate a bare `nan` token, which
+// the Python sidecar rejects as malformed and tears the connection down.
+// Finite siblings are unaffected.
+static void test_get_module_params_nan_float_serializes_as_null(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_nan_float,
+    .list_modules = stub_list_modules_one_exposure,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *request_node = _load_fixture("get_module_params_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+
+  JsonObject *response = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(response, "ok"));
+  JsonObject *result = json_object_get_object_member(response, "result");
+  JsonObject *values = json_object_get_object_member(result, "values");
+  assert_true(json_object_has_member(values, "various"));
+  assert_true(json_node_is_null(json_object_get_member(values, "various")));
+  assert_float_equal(json_object_get_double_member(values, "red"), 2.5, 0.0);
+
+  // The whole response generates to a strictly-valid JSON document: a
+  // json-glib parse of the generated text round-trips (a bare `nan` token
+  // would fail here exactly as it fails the sidecar's json.loads).
+  JsonGenerator *gen = json_generator_new();
+  json_generator_set_root(gen, actual);
+  gchar *text = json_generator_to_data(gen, NULL);
+  g_object_unref(gen);
+  assert_null(strstr(text, "nan"));
+  JsonParser *parser = json_parser_new();
+  GError *parse_error = NULL;
+  assert_true(json_parser_load_from_data(parser, text, -1, &parse_error));
+  assert_null(parse_error);
+  g_object_unref(parser);
+  g_free(text);
+
+  json_node_unref(actual);
+  json_node_unref(request_node);
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -5080,6 +5160,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_schema_error_unknown_key),
 
     cmocka_unit_test(test_get_module_params_success),
+    cmocka_unit_test(test_get_module_params_nan_float_serializes_as_null),
     cmocka_unit_test(test_get_module_schema_rgbcurve_semantic_fields),
     cmocka_unit_test(test_get_module_params_rgbcurve_semantic_values),
     cmocka_unit_test(test_get_module_schema_vector_semantic_fields),

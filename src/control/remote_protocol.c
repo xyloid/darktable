@@ -288,6 +288,15 @@ static gboolean _check_known_keys(JsonObject *params, const char *const *allowed
 
 static JsonNode *_value_to_json(const dt_remote_value_t *v)
 {
+  // A stored non-finite float (temperature's `various` coefficient is NaN
+  // by design on every RGB camera) serializes as JSON null: json-glib's
+  // generator would otherwise emit a bare `nan`/`inf` token, which strict
+  // JSON parsers (the Python sidecar's json.loads included) reject,
+  // costing the whole connection. Writes are unaffected -- the parse side
+  // already rejects non-finite input values.
+  if(v->type == DT_REMOTE_VALUE_FLOAT && !isfinite(v->v.f))
+    return json_node_new(JSON_NODE_NULL);
+
   JsonNode *node = json_node_new(JSON_NODE_VALUE);
   switch(v->type)
   {
