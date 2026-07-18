@@ -1026,6 +1026,30 @@ static gboolean stub_get_module_params_quantity(const dt_remote_module_ref_t *re
   return TRUE;
 }
 
+// Same shape, but the read hook produced a NaN tint. Reachable through a
+// legal write: zeroing all three RGB coefficients (each has $MIN: 0.0)
+// makes temperature's XYZ sum zero, and _XYZ_to_temperature's tint clamps
+// use ordered comparisons that NaN sails through.
+static gboolean stub_get_module_params_quantity_nan(const dt_remote_module_ref_t *ref, GPtrArray **out,
+                                                    GHashTable **semantic_out, dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)error;
+  GPtrArray *arr = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  GHashTable *semantic =
+    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, dt_remote_semantic_value_free);
+  static const char *const component_names[] = { "temperature", "tint" };
+  static const double component_values[] = { 5500.0, NAN };
+  g_hash_table_insert(semantic, g_strdup("wb.temperature"),
+                      dt_remote_semantic_value_wrap_quantity(
+                        _make_quantity_value("wb.temperature", component_names, component_values, 2)));
+
+  *out = arr;
+  if(semantic_out) *semantic_out = semantic;
+  else g_hash_table_unref(semantic);
+  return TRUE;
+}
+
 static gboolean stub_list_modules_one_temperature(GPtrArray **out, dt_remote_error_t **error)
 {
   (void)error;
@@ -2228,6 +2252,53 @@ static void test_get_module_params_quantity_semantic_values(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("get_module_params_quantity_request.json",
                            "get_module_params_quantity_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// A non-finite quantity component value serializes as JSON null, exactly
+// like the scalar path (test_get_module_params_nan_float_serializes_as_null
+// above): the read hook's output is not engine-validated, and json-glib
+// would emit a bare `nan` token that kills the connection. Finite sibling
+// components are unaffected.
+static void test_get_module_params_quantity_nan_component_serializes_as_null(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_quantity_nan,
+    .list_modules = stub_list_modules_one_temperature,
+    .get_state = stub_get_state_revision31_no_image,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *request_node = _load_fixture("get_module_params_quantity_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+
+  JsonObject *response = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(response, "ok"));
+  JsonObject *result = json_object_get_object_member(response, "result");
+  JsonObject *semantic = json_object_get_object_member(result, "semantic_values");
+  JsonObject *wb = json_object_get_object_member(semantic, "wb.temperature");
+  JsonObject *values = json_object_get_object_member(wb, "values");
+  assert_true(json_object_has_member(values, "tint"));
+  assert_true(json_node_is_null(json_object_get_member(values, "tint")));
+  assert_float_equal(json_object_get_double_member(values, "temperature"), 5500.0, 0.0);
+
+  // The whole response generates to a strictly-valid JSON document.
+  JsonGenerator *gen = json_generator_new();
+  json_generator_set_root(gen, actual);
+  gchar *text = json_generator_to_data(gen, NULL);
+  g_object_unref(gen);
+  assert_null(strstr(text, "nan"));
+  JsonParser *parser = json_parser_new();
+  GError *parse_error = NULL;
+  assert_true(json_parser_load_from_data(parser, text, -1, &parse_error));
+  assert_null(parse_error);
+  g_object_unref(parser);
+  g_free(text);
+
+  json_node_unref(actual);
+  json_node_unref(request_node);
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -5169,6 +5240,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_get_module_params_band_semantic_values),
     cmocka_unit_test(test_get_module_schema_quantity_semantic_fields),
     cmocka_unit_test(test_get_module_params_quantity_semantic_values),
+    cmocka_unit_test(test_get_module_params_quantity_nan_component_serializes_as_null),
     cmocka_unit_test(test_get_module_params_error_unknown_module),
     cmocka_unit_test(test_get_module_params_error_internal_is_error_envelope),
     cmocka_unit_test(test_get_module_params_error_non_finite_instance),

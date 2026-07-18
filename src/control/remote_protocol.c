@@ -836,7 +836,14 @@ static JsonNode *_quantity_value_to_json(const dt_remote_quantity_value_t *v)
   {
     const dt_remote_quantity_component_value_t *c = g_ptr_array_index(v->values, i);
     json_builder_set_member_name(b, c->name ? c->name : "");
-    json_builder_add_double_value(b, c->value);
+    // Component values come from the module's read hook and are not
+    // engine-validated: temperature's tint turns NaN when all RGB
+    // coefficients are zero (a legal write). Same rule as scalar reads --
+    // non-finite serializes as null, never as json-glib's bare `nan`.
+    if(isfinite(c->value))
+      json_builder_add_double_value(b, c->value);
+    else
+      json_builder_add_null_value(b);
   }
   json_builder_end_object(b);
 

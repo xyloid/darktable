@@ -27,10 +27,12 @@ when they disagree, this file wins until amended.
   list, not by silently ignoring fields.
 - **Numbers.** JSON numbers only. Non-finite values (NaN, ±Inf) in requests
   are rejected with `invalid_value`. Integer fields reject fractional
-  values. In **responses**, a stored scalar float whose value is non-finite
-  is serialized as JSON `null` (JSON has no NaN/Inf token; this occurs in
+  values. In **responses**, a non-finite float — a stored scalar, or a
+  quantity component value produced by a module's read hook — is
+  serialized as JSON `null` (JSON has no NaN/Inf token; this occurs in
   practice — `temperature` stores NaN in its unused `various` coefficient
-  on every RGB camera).
+  on every RGB camera, and its tint conversion yields NaN when all three
+  RGB coefficients are legally written to zero).
 - **Enums.** Written as the stable introspection name (preferred) or the
   integer representation; always returned as the name. An integer with no
   matching enum member is `invalid_value`.
