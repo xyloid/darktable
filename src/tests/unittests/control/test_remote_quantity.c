@@ -79,6 +79,15 @@
  *    no-GUI-fails-closed path) rolling back, a full apply -> read
  *    round-trip through the fake hooks, and a mixed-class patch silently
  *    skipping a non-quantity entry.
+ *  - the shipped wb.temperature adapter (Task 5, remote_quantity_registry.c's
+ *    s_adapters[]): production lookup succeeds at params v4/fails at v3, the
+ *    descriptor's shape matches the normative spec verbatim (including that
+ *    `native_fields` excludes the denylisted "preset"), registry_validate
+ *    passes against the real .so with no override, list_schema reports the
+ *    single wb.temperature field with both components, and, with the fake
+ *    hooks override, a valid Kelvin/tint pair round-trips while an
+ *    out-of-domain Kelvin or tint value is rejected with a "domain"
+ *    constraint naming the right component.
  *
  * Please see README.md for more detailed documentation.
  */
@@ -296,6 +305,16 @@ static quantity_fixture_t *real_quantity_module_fixture_new(const char *op)
 static quantity_fixture_t *temperature_fixture_new(void)
 {
   return real_quantity_module_fixture_new("temperature");
+}
+
+// "exposure" has no registered quantity adapter (Task 5 only adds
+// "temperature") and no remote_quantity_read/write hooks (Task 2 presence
+// check, test_exposure_so_exports_neither_hook below) -- the genuinely
+// adapter-less op the "no adapter at all" tests need now that the
+// production table is nonempty.
+static quantity_fixture_t *exposure_fixture_new(void)
+{
+  return real_quantity_module_fixture_new("exposure");
 }
 
 static void quantity_fixture_free(quantity_fixture_t *fixture)
@@ -1003,7 +1022,10 @@ static void test_list_schema_converts_descriptor_in_registry_order(void **state)
 static void test_list_schema_no_adapter_yields_null_and_succeeds(void **state)
 {
   (void)state;
-  dt_iop_module_so_t *so = dt_iop_get_module_so("temperature");
+  // "exposure": genuinely no registered quantity adapter (unlike
+  // "temperature" as of Task 5) -- see exposure_fixture_new()'s own
+  // comment.
+  dt_iop_module_so_t *so = dt_iop_get_module_so("exposure");
 
   GPtrArray *out = NULL;
   dt_remote_error_t *error = NULL;
@@ -1073,7 +1095,13 @@ static void test_read_values_calls_hook_and_stamps_unconditional_active(void **s
 static void test_read_values_no_adapter_returns_empty_table(void **state)
 {
   (void)state;
-  quantity_fixture_t *fixture = temperature_fixture_new();
+  // "exposure": genuinely no registered quantity adapter -- see
+  // exposure_fixture_new()'s own comment. Using "temperature" here post
+  // Task 5 would instead exercise the real wb.temperature adapter (and,
+  // with no hooks override installed, its real hooks failing closed --
+  // that path is test_apply_entries_no_override_real_hooks_fail_closed's
+  // job, not this one's).
+  quantity_fixture_t *fixture = exposure_fixture_new();
 
   GHashTable *out = NULL;
   dt_remote_error_t *error = NULL;
@@ -1181,7 +1209,11 @@ static void test_apply_entries_unknown_id_with_adapter(void **state)
 static void test_apply_patch_unknown_id_no_adapter_at_all(void **state)
 {
   (void)state;
-  quantity_fixture_t *fixture = temperature_fixture_new();
+  // "exposure": genuinely no registered quantity adapter -- see
+  // exposure_fixture_new()'s own comment. The "adapter present but ID
+  // doesn't resolve" case is test_apply_entries_unknown_id_with_adapter's
+  // job (a test-local override installed on "temperature").
+  quantity_fixture_t *fixture = exposure_fixture_new();
   void *scratch = scratch_params_new(fixture->module);
 
   static const double values[2] = { 1.0, 2.0 };
@@ -1493,8 +1525,11 @@ static void test_apply_patch_null_arguments_fail(void **state)
 static void test_apply_patch_empty_semantic_values_is_trivial_success(void **state)
 {
   (void)state;
-  // No adapter installed at all -- the production table is empty. A patch
-  // with zero quantity entries must never even look up the registry.
+  // "temperature" now HAS a registered adapter (the real wb.temperature
+  // one, Task 5), and this test deliberately keeps using it: a patch with
+  // zero quantity entries must never even look up the registry, even for
+  // an op that has one -- proving the "skip lookup entirely" contract, not
+  // just the (weaker) "no adapter means no-op" case.
   quantity_fixture_t *fixture = temperature_fixture_new();
   void *scratch = scratch_params_new(fixture->module);
   dt_remote_patch_t patch = { 0 };
@@ -1583,6 +1618,246 @@ static void test_apply_patch_then_read_values_round_trips(void **state)
   assert_true(b->value == values[1]);
 
   g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  quantity_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* the shipped wb.temperature adapter (Task 5)                             */
+/* ---------------------------------------------------------------------- */
+//
+// Everything above proves the engine against a test-local, hand-rolled
+// adapter installed through the lookup override; the tests below instead
+// exercise the PRODUCTION adapter that Task 5 added to
+// remote_quantity_registry.c's s_adapters[] -- no lookup override
+// installed, `dt_remote_quantity_registry_lookup("temperature", 4)` finds
+// it natively. The conversion hooks are still faked (fake_quantity_read_
+// hook/fake_quantity_write_hook, reading/writing red/green through a
+// reversible affine transform) since the real hooks fail closed without a
+// built GUI -- same rationale as every fixture above; only the descriptor
+// SHAPE (name/components/units/domains/native_fields) is the real,
+// normative one, never the real Kelvin/tint conversion math (Task 8's
+// job).
+
+#define TEMPERATURE_KELVIN_MIN 1901.0
+#define TEMPERATURE_KELVIN_MAX 25000.0
+#define TEMPERATURE_TINT_MIN 0.135
+#define TEMPERATURE_TINT_MAX 2.326
+
+static const char *const s_temperature_component_names[2] = { "temperature", "tint" };
+
+static void test_wb_temperature_lookup_succeeds_at_version_4(void **state)
+{
+  (void)state;
+  const dt_remote_quantity_module_adapter_t *adapter =
+    dt_remote_quantity_registry_lookup("temperature", 4);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "temperature");
+}
+
+static void test_wb_temperature_lookup_fails_at_version_3(void **state)
+{
+  (void)state;
+  assert_null(dt_remote_quantity_registry_lookup("temperature", 3));
+}
+
+static void test_wb_temperature_descriptor_matches_normative_spec(void **state)
+{
+  (void)state;
+  const dt_remote_quantity_module_adapter_t *adapter =
+    dt_remote_quantity_registry_lookup("temperature", 4);
+  assert_non_null(adapter);
+  assert_int_equal(adapter->minimum_params_version, 4);
+  assert_int_equal(adapter->maximum_params_version, 4);
+  assert_int_equal(adapter->quantity_count, 1);
+  assert_non_null(adapter->quantities);
+
+  const dt_remote_quantity_descriptor_t *desc = &adapter->quantities[0];
+  assert_string_equal(desc->name, "wb.temperature");
+  assert_string_equal(desc->display_name, "white balance");
+  assert_true(desc->derived);
+  assert_null(desc->active_when);
+  assert_null(desc->writable_when);
+  assert_int_equal(desc->component_count, 2);
+  assert_non_null(desc->components);
+
+  const dt_remote_quantity_component_descriptor_t *kelvin = &desc->components[0];
+  assert_string_equal(kelvin->name, "temperature");
+  assert_string_equal(kelvin->unit, "kelvin");
+  assert_true(kelvin->minimum == TEMPERATURE_KELVIN_MIN);
+  assert_true(kelvin->maximum == TEMPERATURE_KELVIN_MAX);
+
+  const dt_remote_quantity_component_descriptor_t *tint = &desc->components[1];
+  assert_string_equal(tint->name, "tint");
+  assert_null(tint->unit);
+  assert_true(tint->minimum == TEMPERATURE_TINT_MIN);
+  assert_true(tint->maximum == TEMPERATURE_TINT_MAX);
+
+  // Coefficient coexistence: exactly the four channel scalars, and
+  // deliberately NOT "preset" -- "preset" stays denylisted
+  // (remote_edit.c's `{ "temperature", DENY("preset") }` row) and untouched
+  // by this task's coexistence work.
+  assert_int_equal(adapter->native_field_count, 4);
+  assert_non_null(adapter->native_fields);
+  static const char *const expected_native_fields[4] = { "red", "green", "blue", "various" };
+  for(guint i = 0; i < 4; i++)
+    assert_string_equal(adapter->native_fields[i], expected_native_fields[i]);
+  for(guint i = 0; i < adapter->native_field_count; i++)
+    assert_true(g_strcmp0(adapter->native_fields[i], "preset") != 0);
+}
+
+static void test_wb_temperature_registry_validate_passes_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("temperature");
+  assert_non_null(so);
+  const dt_remote_quantity_module_adapter_t *adapter =
+    dt_remote_quantity_registry_lookup("temperature", 4);
+  assert_non_null(adapter);
+
+  // No hooks override installed: this validates against the REAL so, whose
+  // hooks are present unconditionally (Task 2) -- registry_validate only
+  // checks presence, never calls them.
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_quantity_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_wb_temperature_list_schema_lists_single_field(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("temperature");
+  assert_non_null(so);
+
+  GPtrArray *out = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_quantity_list_schema(so, &out, &error));
+  assert_null(error);
+  assert_non_null(out);
+  assert_int_equal(out->len, 1);
+
+  const dt_remote_quantity_schema_t *schema = g_ptr_array_index(out, 0);
+  assert_string_equal(schema->name, "wb.temperature");
+  assert_string_equal(schema->display_name, "white balance");
+  assert_true(schema->derived);
+  assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(schema->active_when);
+  assert_null(schema->writable_when);
+  assert_non_null(schema->components);
+  assert_int_equal(schema->components->len, 2);
+
+  const dt_remote_quantity_schema_component_t *kelvin = g_ptr_array_index(schema->components, 0);
+  assert_string_equal(kelvin->name, "temperature");
+  assert_string_equal(kelvin->unit, "kelvin");
+  assert_true(kelvin->minimum == TEMPERATURE_KELVIN_MIN);
+  assert_true(kelvin->maximum == TEMPERATURE_KELVIN_MAX);
+
+  const dt_remote_quantity_schema_component_t *tint = g_ptr_array_index(schema->components, 1);
+  assert_string_equal(tint->name, "tint");
+  assert_null(tint->unit);
+  assert_true(tint->minimum == TEMPERATURE_TINT_MIN);
+  assert_true(tint->maximum == TEMPERATURE_TINT_MAX);
+
+  g_ptr_array_unref(out);
+}
+
+static void test_wb_temperature_apply_round_trips_with_fake_hooks(void **state)
+{
+  (void)state;
+  // Production adapter, no lookup override -- only the conversion hooks
+  // are faked. Kelvin = 6000.0 (-> red = 3000.0) and tint = 0.1953125
+  // (= 25/128, -> green = 0.001953125 = 2^-9) are both chosen so the fake
+  // hooks' /2 and /100 narrowing to float, and the read hook's *2/*100
+  // widening back, are exact in double precision -- no tolerance needed.
+  quantity_fixture_t *fixture = temperature_fixture_new();
+  dt_remote_quantity_set_hooks_override(fake_quantity_read_hook, fake_quantity_write_hook);
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double values[2] = { 6000.0, 0.1953125 };
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_quantity_entry("wb.temperature", s_temperature_component_names, values, 2));
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_quantity_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                             &error));
+  assert_null(error);
+
+  GHashTable *out = NULL;
+  assert_true(dt_remote_quantity_read_values(fixture->module, scratch, &out, &error));
+  assert_null(error);
+  const dt_remote_quantity_value_t *value = g_hash_table_lookup(out, "wb.temperature");
+  assert_non_null(value);
+  const dt_remote_quantity_component_value_t *kelvin = g_ptr_array_index(value->values, 0);
+  const dt_remote_quantity_component_value_t *tint = g_ptr_array_index(value->values, 1);
+  assert_string_equal(kelvin->name, "temperature");
+  assert_true(kelvin->value == values[0]);
+  assert_string_equal(tint->name, "tint");
+  assert_true(tint->value == values[1]);
+
+  g_hash_table_unref(out);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  quantity_fixture_free(fixture);
+}
+
+static void test_wb_temperature_apply_rejects_kelvin_out_of_domain(void **state)
+{
+  (void)state;
+  quantity_fixture_t *fixture = temperature_fixture_new();
+  dt_remote_quantity_set_hooks_override(fake_quantity_read_hook, fake_quantity_write_hook);
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double values[2] = { 25000.5, 1.0 }; // kelvin just above its 25000.0 maximum
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_quantity_entry("wb.temperature", s_temperature_component_names, values, 2));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_quantity_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                              &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(error->details_json);
+  assert_non_null(strstr(error->details_json, "\"parameter\":\"wb.temperature\""));
+  assert_non_null(strstr(error->details_json, "\"component\":\"temperature\""));
+  assert_non_null(strstr(error->details_json, "\"domain\""));
+  assert_memory_equal(scratch, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_ptr_array_unref(patch.semantic_values);
+  g_free(scratch);
+  quantity_fixture_free(fixture);
+}
+
+static void test_wb_temperature_apply_rejects_tint_out_of_domain(void **state)
+{
+  (void)state;
+  quantity_fixture_t *fixture = temperature_fixture_new();
+  dt_remote_quantity_set_hooks_override(fake_quantity_read_hook, fake_quantity_write_hook);
+  void *scratch = scratch_params_new(fixture->module);
+
+  static const double values[2] = { 5500.0, 0.1 }; // tint below its 0.135 minimum
+  dt_remote_patch_t patch = { 0 };
+  patch.semantic_values = g_ptr_array_new_with_free_func((GDestroyNotify)dt_remote_semantic_patch_free);
+  g_ptr_array_add(patch.semantic_values,
+                  make_quantity_entry("wb.temperature", s_temperature_component_names, values, 2));
+
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_quantity_apply_patch(fixture->module, fixture->module->params, scratch, &patch,
+                                              &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(error->details_json);
+  assert_non_null(strstr(error->details_json, "\"parameter\":\"wb.temperature\""));
+  assert_non_null(strstr(error->details_json, "\"component\":\"tint\""));
+  assert_non_null(strstr(error->details_json, "\"domain\""));
+  assert_memory_equal(scratch, fixture->module->params, fixture->module->params_size);
+
+  dt_remote_error_free(error);
   g_ptr_array_unref(patch.semantic_values);
   g_free(scratch);
   quantity_fixture_free(fixture);
@@ -1681,6 +1956,23 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_apply_patch_mixed_class_entries_skip_non_quantity,
                                     lookup_override_test_setup, lookup_override_test_teardown),
     cmocka_unit_test_setup_teardown(test_apply_patch_then_read_values_round_trips,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_wb_temperature_lookup_succeeds_at_version_4,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_lookup_fails_at_version_3,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_descriptor_matches_normative_spec,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_registry_validate_passes_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_list_schema_lists_single_field,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_apply_round_trips_with_fake_hooks,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_apply_rejects_kelvin_out_of_domain,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_wb_temperature_apply_rejects_tint_out_of_domain,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 

@@ -19,10 +19,9 @@
 // The per-op quantity module adapter registry, mirroring
 // remote_band_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the quantity
-// engine API (list_schema/read_values). The adapter table starts empty in
-// this task -- Task 5 adds the `temperature` adapter (wb.temperature,
-// Kelvin/tint), the same way lowlight/rawdenoise were the band registry's
-// first real entries.
+// engine API (list_schema/read_values). The adapter table registers the
+// `temperature` adapter (wb.temperature, Kelvin/tint, Task 5), the same
+// way lowlight/rawdenoise were the band registry's first real entries.
 //
 // This file also owns BOTH test-only override seams for the quantity
 // engine: the lookup override (same idiom as every other class registry)
@@ -91,15 +90,60 @@ static void deliver_error(dt_remote_error_t *owned_error, dt_remote_error_t **ou
 }
 
 /* ---------------------------------------------------------------------- */
+/* temperature adapter (milestone6 quantity-class design doc SS Class      */
+/* model, wb.temperature). Params v4 (DT_MODULE_INTROSPECTION(4, ...),     */
+/* temperature.c:46). One derived semantic quantity over the stored        */
+/* `red`/`green`/`blue`/`various` channel-coefficient scalars              */
+/* (temperature.c:532-535): the presentation pair is Kelvin/tint, computed */
+/* by the module's own remote_quantity_read/write hooks                   */
+/* (temperature.c:509-537), which fail closed without a built GUI          */
+/* (`self->gui_data`, for the CAM_to_XYZ matrices) -- this registry entry  */
+/* only carries the static shape (component order/units/domains and the   */
+/* native-field conflict set), never the conversion math itself (that's   */
+/* Task 8's job, per this task's own brief). Component order is fixed by  */
+/* the hooks' own contract (temperature.c:506-507): [0] temperature,      */
+/* [1] tint. No twins, no predicates: always active, always writable.     */
+/* `native_fields` deliberately excludes `preset` (denylisted since        */
+/* milestone1, remote_edit.c's `{ "temperature", DENY("preset") }` row)   */
+/* -- the coefficient-coexistence exception only ever applies to the four */
+/* channel coefficients, never to the denylisted `preset` selector.       */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_quantity_component_descriptor_t s_temperature_components[2] = {
+  { "temperature", "kelvin", 1901.0, 25000.0 },
+  { "tint", NULL, 0.135, 2.326 },
+};
+
+static const dt_remote_quantity_descriptor_t s_temperature_quantities[1] = {
+  {
+    .name = "wb.temperature",
+    .display_name = "white balance",
+    .description = "Presentation-domain white balance as Kelvin color temperature and "
+                   "green/magenta tint, derived from the stored red/green/blue/various "
+                   "channel coefficients (temperature.c:509-537).",
+    .components = s_temperature_components,
+    .component_count = 2,
+    .derived = TRUE,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const char *const s_temperature_native_fields[4] = { "red", "green", "blue", "various" };
+
+static const dt_remote_quantity_module_adapter_t s_temperature_adapter = {
+  "temperature", 4, 4, s_temperature_quantities, 1, s_temperature_native_fields, 4
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
-// Empty in this task -- Task 5 adds the first real entry (temperature),
-// the same convention as remote_band_registry.c's own s_adapters[] before
-// its first adapter landed: a placeholder NULL keeps the array
-// well-formed C, and the lookup loop below already skips NULL entries.
+// temperature (Task 5) -- the first real entry, the same convention as
+// remote_band_registry.c's own s_adapters[]: a future op adds another
+// entry here, not a parallel lookup mechanism.
 static const dt_remote_quantity_module_adapter_t *const s_adapters[] = {
-  NULL,
+  &s_temperature_adapter,
 };
 
 static dt_remote_quantity_registry_lookup_override_t s_lookup_override = NULL;

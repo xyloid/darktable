@@ -2217,6 +2217,20 @@ static void test_schema_temperature_quantity_semantic_fields_and_represented_by(
     assert_string_equal(g_ptr_array_index(field->represented_by, 0), "wb.temperature");
   }
 
+  // "preset" is untouched by the coexistence work: denylisted since
+  // milestone 1 (`{ "temperature", DENY("preset") }`), it is not in any
+  // adapter's native_fields, so the schema still marks it unwritable and
+  // it carries no represented_by.
+  const dt_remote_field_t *preset_field = NULL;
+  for(guint i = 0; i < schema->fields->len; i++)
+  {
+    const dt_remote_field_t *f = g_ptr_array_index(schema->fields, i);
+    if(!g_strcmp0(f->name, "preset")) { preset_field = f; break; }
+  }
+  assert_non_null(preset_field);
+  assert_false(preset_field->writable);
+  assert_null(preset_field->represented_by);
+
   dt_remote_module_schema_free(schema);
 }
 
