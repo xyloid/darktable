@@ -845,10 +845,10 @@ async def test_set_module_params_bands_translates_to_semantic_values(
     }
 
 
-async def test_set_module_params_curves_vectors_bands_merge_into_semantic_values(
+async def test_set_module_params_curves_vectors_bands_quantities_merge_into_semantic_values(
     tmp_path, fake_server_factory
 ):
-    """All three semantic arguments given together merge into one
+    """All four semantic arguments given together merge into one
     `semantic_values` dict on the wire."""
     server = await fake_server_factory()
     hello_response = load_fixture("hello_response.json")
@@ -877,6 +877,7 @@ async def test_set_module_params_curves_vectors_bands_merge_into_semantic_values
             "curves": {"curve.master": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
             "vectors": {"lift": [1.0, 1.1, 1.0, 0.95]},
             "bands": {"bands.luma": {"y": [0.5] * 6}},
+            "quantities": {"wb.temperature": {"temperature": 5500, "tint": 1.0}},
         },
     )
 
@@ -887,6 +888,10 @@ async def test_set_module_params_curves_vectors_bands_merge_into_semantic_values
         },
         "lift": {"class": "vector", "values": [1.0, 1.1, 1.0, 0.95]},
         "bands.luma": {"class": "bands", "y": [0.5] * 6},
+        "wb.temperature": {
+            "class": "quantity",
+            "values": {"temperature": 5500.0, "tint": 1.0},
+        },
     }
 
 
@@ -906,14 +911,41 @@ async def test_set_module_params_curves_vectors_bands_merge_into_semantic_values
             "vectors": {"bands.luma": [1.0, 1.1, 1.0]},
             "bands": {"bands.luma": {"y": [0.5] * 6}},
         },
+        {
+            "curves": {"bands.luma": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "quantities": {"bands.luma": {"temperature": 5000}},
+        },
+        {
+            "vectors": {"bands.luma": [1.0, 1.1, 1.0]},
+            "quantities": {"bands.luma": {"temperature": 5000}},
+        },
+        {
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+            "quantities": {"bands.luma": {"temperature": 5000}},
+        },
+        {
+            "curves": {"bands.luma": {"points": [[0.0, 0.0], [1.0, 1.0]]}},
+            "vectors": {"bands.luma": [1.0, 1.1, 1.0]},
+            "bands": {"bands.luma": {"y": [0.5] * 6}},
+            "quantities": {"bands.luma": {"temperature": 5000}},
+        },
     ],
-    ids=["curves-and-bands", "vectors-and-bands", "all-three"],
+    ids=[
+        "curves-and-bands",
+        "vectors-and-bands",
+        "all-three",
+        "curves-and-quantities",
+        "vectors-and-quantities",
+        "bands-and-quantities",
+        "all-four",
+    ],
 )
-async def test_set_module_params_three_way_overlap_fails_before_wire(
+async def test_set_module_params_four_way_overlap_fails_before_wire(
     tmp_path, fake_server_factory, arguments
 ):
-    """A semantic id given in more than one of `curves`/`vectors`/`bands`
-    is rejected client-side, before any wire traffic."""
+    """A semantic id given in more than one of
+    `curves`/`vectors`/`bands`/`quantities` is rejected client-side,
+    before any wire traffic."""
     server = await fake_server_factory()
     hello_response = load_fixture("hello_response.json")
     server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
@@ -1005,6 +1037,140 @@ async def test_set_module_params_bands_rejects_invalid_entries(
         await app.call_tool(
             "set_module_params",
             {"module": "atrous", "values": {}, "bands": bad_bands},
+        )
+
+    message = str(excinfo.value)
+    assert expected_name in message
+    assert calls == []
+    # Validation is pure client-side and runs before connect: the fake
+    # server never even saw a connection.
+    assert server.connections_seen == 0
+
+
+def test_wire_quantity_values_translates_components():
+    """`_wire_quantity_values` is pure translation: each spec becomes
+    `{"class": "quantity", "values": {component: float}}`."""
+    from darktable_mcp.server import _wire_quantity_values
+
+    out = _wire_quantity_values(
+        {"wb.temperature": {"temperature": 5500, "tint": 1.0}}
+    )
+
+    assert out == {
+        "wb.temperature": {
+            "class": "quantity",
+            "values": {"temperature": 5500.0, "tint": 1.0},
+        }
+    }
+
+
+async def test_set_module_params_quantities_translates_to_semantic_values(
+    tmp_path, fake_server_factory
+):
+    """`quantities` is tool-side sugar mirroring `bands`: each entry
+    becomes `{"class": "quantity", "values": {component: number}}` under
+    `semantic_values` and the wire request never carries a `quantities`
+    member."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = {}
+
+    def handler(params):
+        seen.update(params)
+        return {
+            "module": params["module"],
+            "instance": params["instance"],
+            "enabled": True,
+            "values": {},
+            "semantic_values": params["semantic_values"],
+            "revision": 3,
+        }
+
+    server.handle("set_module_params", handler)
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {
+            "module": "temperature",
+            "values": {},
+            "quantities": {"wb.temperature": {"temperature": 5500, "tint": 1.0}},
+        },
+    )
+
+    assert "quantities" not in seen
+    assert seen["semantic_values"] == {
+        "wb.temperature": {
+            "class": "quantity",
+            "values": {"temperature": 5500.0, "tint": 1.0},
+        }
+    }
+
+
+async def test_set_module_params_quantities_gated_on_quantity_params_capability(
+    tmp_path, fake_server_factory
+):
+    """A darktable whose hello does not advertise `quantity_params` (the
+    fake's default hello has `capabilities: []`) must be refused
+    client-side: clear upgrade message, and no `set_module_params` wire
+    call that the peer would reject less legibly."""
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "temperature",
+                "values": {},
+                "quantities": {"wb.temperature": {"temperature": 5500, "tint": 1.0}},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "quantity_params" in message
+    assert "upgrade darktable" in message
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_quantities,expected_name",
+    [
+        ({"wb.temperature": [5500, 1.0]}, "wb.temperature"),
+        ({"wb.temperature": {}}, "wb.temperature"),
+        ({"wb.temperature": {"temperature": True, "tint": 1.0}}, "wb.temperature"),
+        ({"wb.temperature": {"temperature": float("nan"), "tint": 1.0}}, "wb.temperature"),
+        ({"wb.temperature": {"temperature": float("inf"), "tint": 1.0}}, "wb.temperature"),
+        ({"wb.temperature": {"temperature": "warm", "tint": 1.0}}, "wb.temperature"),
+        ({"wb.temperature": {5: 5500.0}}, "wb.temperature"),
+    ],
+    ids=[
+        "non-dict-spec",
+        "empty-spec",
+        "bool-value",
+        "nan-value",
+        "inf-value",
+        "non-numeric-value",
+        "non-string-key",
+    ],
+)
+async def test_set_module_params_quantities_rejects_invalid_entries(
+    tmp_path, fake_server_factory, bad_quantities, expected_name
+):
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {"module": "temperature", "values": {}, "quantities": bad_quantities},
         )
 
     message = str(excinfo.value)

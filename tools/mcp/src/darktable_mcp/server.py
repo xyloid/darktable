@@ -157,6 +157,32 @@ def _wire_band_values(bands: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _wire_quantity_values(quantities: dict[str, Any]) -> dict[str, Any]:
+    """Translate the `quantities` tool argument to wire semantic_values
+    entries. Tool shape: {name: {component: number}}. Mirrors
+    _wire_band_values: validate fully before any wire traffic, raise
+    ToolError on bad shapes."""
+    out: dict[str, Any] = {}
+    for name, spec in quantities.items():
+        if not isinstance(spec, dict) or not spec:
+            raise ToolError(
+                f"quantity '{name}' must be a non-empty dict mapping "
+                "component names to finite numbers")
+        values: dict[str, float] = {}
+        for component, value in spec.items():
+            ok = (isinstance(component, str)
+                  and isinstance(value, (int, float))
+                  and not isinstance(value, bool)
+                  and math.isfinite(value))
+            if not ok:
+                raise ToolError(
+                    f"quantity '{name}' must map component names to "
+                    "finite numbers")
+            values[component] = float(value)
+        out[name] = {"class": "quantity", "values": values}
+    return out
+
+
 def build_server(
     *,
     discovery_path: str | None = None,
@@ -236,6 +262,7 @@ def build_server(
         curves: dict[str, Any] | None = None,
         vectors: dict[str, Any] | None = None,
         bands: dict[str, Any] | None = None,
+        quantities: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Set parameter values on one module instance, recorded as one
         history step. `module` is the internal op name, `instance` its
@@ -284,9 +311,26 @@ def build_server(
         least `min_gap`. A band whose schema names an `x_shared_with` twin
         mirrors any x write to that twin. Unlisted bands are untouched.
 
-        `curves`, `vectors`, and `bands` may be given together; a semantic
-        ID given in more than one raises an error before anything is
-        sent."""
+        `quantities` edits derived semantic quantities (see
+        `get_module_schema`'s `semantic_fields` with `"class":
+        "quantity"`, e.g. temperature's `wb.temperature`) and needs a
+        darktable that advertises the `quantity_params` capability. It
+        maps semantic IDs to `{component: number}` -- every component the
+        schema lists, exactly once, each within its `minimum`/`maximum`
+        (e.g. `{"temperature": 5500, "tint": 1.0}`). A quantity is
+        derived: the module converts it to its native stored fields
+        (the schema names them in `represented_by` -- for
+        `wb.temperature`, temperature's `red`/`green`/`blue`/`various`
+        coefficients), so do not also write those native fields in
+        `values` in the same request -- that conflict is rejected
+        server-side. Read-back is lossy: the response re-derives the
+        quantity from what was actually stored, so it may differ
+        slightly from what was written (float narrowing, conversion
+        round trip).
+
+        `curves`, `vectors`, `bands`, and `quantities` may be given
+        together; a semantic ID given in more than one raises an error
+        before anything is sent."""
         params: dict[str, Any] = {"module": module, "instance": instance, "values": values}
         if enable is not None:
             params["enable"] = enable
@@ -299,6 +343,7 @@ def build_server(
             "curves": _wire_semantic_values(curves) if curves is not None else None,
             "vectors": _wire_vector_values(vectors) if vectors is not None else None,
             "bands": _wire_band_values(bands) if bands is not None else None,
+            "quantities": _wire_quantity_values(quantities) if quantities is not None else None,
         }
         semantic_values: dict[str, Any] | None = None
         if any(entries is not None for entries in translated.values()):
@@ -314,7 +359,7 @@ def build_server(
             if overlap:
                 raise ToolError(
                     "semantic id(s) given in more than one of `curves`, "
-                    "`vectors`, `bands`: " + ", ".join(overlap)
+                    "`vectors`, `bands`, `quantities`: " + ", ".join(overlap)
                 )
             semantic_values = {
                 semantic_id: entry
@@ -338,6 +383,11 @@ def build_server(
                 raise TransportError(
                     "this darktable does not advertise band_params; "
                     "upgrade darktable to edit bands"
+                )
+            if quantities is not None and "quantity_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise quantity_params; "
+                    "upgrade darktable to edit quantities"
                 )
             params["semantic_values"] = semantic_values
         return await client.call("set_module_params", params)
