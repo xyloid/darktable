@@ -4326,23 +4326,486 @@ static void test_watermark_apply_patch_rejects_out_of_range_value_in_double_doma
 }
 
 /* ---------------------------------------------------------------------- */
-/* registry total (production registry; milestone4 vector-class design doc */
-/* SS Initial registry mapping): with all five adapters registered         */
-/* (colorbalance, channelmixerrgb, rgblevels, borders, watermark), the      */
-/* production registry advertises 19 semantic names total                  */
-/* (6 + 6 + 4 + 2 + 1). Queries dt_remote_vector_list_schema() -- the same  */
-/* public entry point each adapter section above uses -- across all five   */
-/* real module .so's and sums the returned schema counts, rather than      */
-/* reaching into the static s_adapters[] table directly.                   */
+/* negadoctor adapter (production registry; milestone6 quantity-class      */
+/* design doc SS Ride-along adapters). Params v2: `Dmin[4]` (film          */
+/* substrate color, [0.00001, 1.5] $DEFAULT 1.0), `wb_high[4]` (white      */
+/* balance RGB coeffs, [0.25, 2] $DEFAULT 1.0), and `wb_low[4]` (white     */
+/* balance RGB offsets, [0.25, 2] $DEFAULT 1.0) -- negadoctor.c:73-78.     */
+/* All three are float[4] leaves with three exposed red/green/blue         */
+/* components over native_capacity 4: the fourth element is SIMD padding   */
+/* the engine's own reserved-tail rule must never touch (the               */
+/* channelmixerrgb precedent). `dmin` is COLOR/display_rgb; the two wb     */
+/* vectors are PLAIN. No predicates: always active, always writable.       */
+/* These tests exercise the production s_adapters[] table directly, same   */
+/* "real adapter, no override" pattern as the sections above.              */
 /* ---------------------------------------------------------------------- */
 
-static void test_registry_lists_nineteen_semantic_names_across_five_adapters(void **state)
+static void test_negadoctor_lookup_pins_params_version_2(void **state)
+{
+  (void)state;
+  const dt_remote_vector_module_adapter_t *adapter = dt_remote_vector_registry_lookup("negadoctor", 2);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "negadoctor");
+  assert_null(dt_remote_vector_registry_lookup("negadoctor", 1));
+}
+
+// Validating against the real loaded .so also proves the 3-of-4 padded
+// mapping (component_count 3 over native_capacity 4) resolves against
+// negadoctor's real Dmin/wb_high/wb_low float[4] introspection leaves.
+static void test_negadoctor_registry_validate_passes_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("negadoctor");
+  assert_non_null(so);
+  const dt_remote_vector_module_adapter_t *adapter = dt_remote_vector_registry_lookup("negadoctor", 2);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_negadoctor_schema_lists_dmin_color_and_two_wb_vectors(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("negadoctor");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 3);
+
+  static const char *const expected_names[] = { "dmin", "wb_high", "wb_low" };
+  static const double expected_minimums[] = { 0.00001, 0.25, 0.25 };
+  static const double expected_maximums[] = { 1.5, 2.0, 2.0 };
+  static const char *const expected_component_names[] = { "red", "green", "blue" };
+
+  for(guint i = 0; i < 3; i++)
+  {
+    const dt_remote_vector_schema_t *schema = g_ptr_array_index(schemas, i);
+    assert_string_equal(schema->name, expected_names[i]);
+    if(i == 0)
+    {
+      assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_COLOR);
+      assert_non_null(schema->color_space);
+      assert_string_equal(schema->color_space, "display_rgb");
+    }
+    else
+    {
+      assert_int_equal(schema->subtype, DT_REMOTE_VECTOR_PLAIN);
+      assert_null(schema->color_space);
+    }
+    assert_false(schema->strictly_increasing);
+    assert_float_equal(schema->minimum_gap, 0.0, 0.0);
+    // No predicates: all three are unconditionally writable.
+    assert_int_equal(schema->writability, DT_REMOTE_WRITABLE_NOW);
+    assert_null(schema->active_when);
+    assert_null(schema->writable_when);
+
+    assert_int_equal(schema->components->len, 3);
+    for(guint c = 0; c < 3; c++)
+    {
+      const dt_remote_vector_component_schema_t *component =
+        &g_array_index(schema->components, dt_remote_vector_component_schema_t, c);
+      assert_string_equal(component->name, expected_component_names[c]);
+      assert_float_equal(component->minimum, expected_minimums[i], 0.0);
+      assert_float_equal(component->maximum, expected_maximums[i], 0.0);
+    }
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// Default read-back off the module's real default params blob. The struct
+// annotations say $DEFAULT 1.0 for all three arrays (negadoctor.c:73-78),
+// but the module's init() overrides Dmin to a typical orange film-substrate
+// color {1.00, 0.45, 0.25} (negadoctor.c's init(), `d->Dmin[0..2]`);
+// wb_high/wb_low keep their annotation defaults of 1.0 per component.
+static void test_negadoctor_read_values_defaults_match_module_init(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("negadoctor");
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+
+  dt_remote_vector_value_t *dmin = g_hash_table_lookup(values, "dmin");
+  assert_non_null(dmin);
+  assert_int_equal(dmin->values->len, 3);
+  assert_float_equal(g_array_index(dmin->values, double, 0), 1.00, 1e-6);
+  assert_float_equal(g_array_index(dmin->values, double, 1), 0.45, 1e-6);
+  assert_float_equal(g_array_index(dmin->values, double, 2), 0.25, 1e-6);
+  assert_true(dmin->active);
+  assert_true(dmin->writable_now);
+
+  static const char *const wb_names[] = { "wb_high", "wb_low" };
+  for(guint i = 0; i < G_N_ELEMENTS(wb_names); i++)
+  {
+    dt_remote_vector_value_t *value = g_hash_table_lookup(values, wb_names[i]);
+    assert_non_null(value);
+    assert_int_equal(value->values->len, 3);
+    for(guint c = 0; c < 3; c++)
+      assert_float_equal(g_array_index(value->values, double, c), 1.0, 1e-6);
+    assert_true(value->active);
+    assert_true(value->writable_now);
+  }
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+// A valid "dmin" write round-trips through read_values, and the fourth
+// element of the native Dmin[4] array (the SIMD padding component beyond
+// the three exposed ones) plus every other byte in the params block stays
+// untouched -- byte-identical against a hand-built expected buffer, same
+// convention as test_cmrgb_apply_patch_preserves_reserved_fourth_component.
+static void test_negadoctor_apply_patch_writes_dmin_preserves_padding_and_every_other_byte(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("negadoctor");
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "Dmin", 0, 0.2f);
+  write_color_component(fixture, expected, "Dmin", 1, 0.3f);
+  write_color_component(fixture, expected, "Dmin", 2, 0.4f);
+  // element 3 (the padding component) deliberately not poked: the engine's
+  // write must leave it at its stored default.
+
+  static const double dmin_values[] = { 0.2, 0.3, 0.4 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("dmin", dmin_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  // Round trip: the written components read back through the engine.
+  GHashTable *values = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, projected, &values, &error));
+  assert_null(error);
+  dt_remote_vector_value_t *dmin = g_hash_table_lookup(values, "dmin");
+  assert_non_null(dmin);
+  assert_int_equal(dmin->values->len, 3);
+  for(guint c = 0; c < 3; c++)
+    assert_float_equal(g_array_index(dmin->values, double, c), dmin_values[c], 1e-6);
+
+  g_hash_table_unref(values);
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// Out-of-range rejection in the double domain, byte-atomic on rejection --
+// same contract as the borders/watermark out-of-range tests above, now
+// against dmin's 1.5 maximum.
+static void test_negadoctor_apply_patch_rejects_out_of_range_dmin_in_double_domain(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("negadoctor");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double dmin_values[] = { 0.2, 1.50000001, 0.4 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("dmin", dmin_values, 3));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_INVALID_VALUE);
+  assert_non_null(strstr(error->details_json, "domain"));
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* colorharmonizer adapter (production registry; milestone6 quantity-class */
+/* design doc SS Ride-along adapters). Params v1: `custom_hue[4]` (custom  */
+/* node hues, [0.0, 1.0] $DEFAULT 0.0) and `node_saturation[4]` (node      */
+/* saturations, [0.0, 2.0] $DEFAULT 1.0) -- colorharmonizer.c:77-79. Both  */
+/* are whole float[4] vectors (node1..node4, native_capacity 4, no         */
+/* padding). `custom_hue` is writable only when `rule` is                  */
+/* DT_COLORHARMONIZER_CUSTOM (the same projected-params gating discipline  */
+/* as colorbalance's mode-gated aliases; the default rule is               */
+/* DT_COLORHARMONIZER_COMPLEMENTARY, colorharmonizer.c:72); it stays       */
+/* always ACTIVE (no active_when) -- the stored hues are real state under  */
+/* any rule, just not writable outside custom mode. `node_saturation` has  */
+/* no predicates. `num_custom_nodes` stays an ordinary writable scalar;    */
+/* the vector is always written whole (4 components).                      */
+/* ---------------------------------------------------------------------- */
+
+static dt_remote_patch_entry_t *make_colorharmonizer_rule_entry(const borders_fixture_t *fixture,
+                                                                const char *enum_name)
+{
+  dt_introspection_field_t *field = NULL;
+  (void)dt_introspection_get_child(fixture->module->so->get_introspection()->field,
+                                   fixture->module->params, "rule", &field);
+  int value = 0;
+  assert_true(dt_introspection_get_enum_value(field, enum_name, &value));
+
+  dt_remote_patch_entry_t *entry = g_new0(dt_remote_patch_entry_t, 1);
+  entry->name = g_strdup("rule");
+  entry->value.type = DT_REMOTE_VALUE_ENUM;
+  entry->value.v.e.value = value;
+  entry->value.v.e.name = g_strdup(enum_name);
+  return entry;
+}
+
+static void test_colorharmonizer_lookup_pins_params_version_1(void **state)
+{
+  (void)state;
+  const dt_remote_vector_module_adapter_t *adapter =
+    dt_remote_vector_registry_lookup("colorharmonizer", 1);
+  assert_non_null(adapter);
+  assert_string_equal(adapter->operation, "colorharmonizer");
+  assert_null(dt_remote_vector_registry_lookup("colorharmonizer", 2));
+}
+
+static void test_colorharmonizer_registry_validate_passes_against_real_so(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("colorharmonizer");
+  assert_non_null(so);
+  const dt_remote_vector_module_adapter_t *adapter =
+    dt_remote_vector_registry_lookup("colorharmonizer", 1);
+  assert_non_null(adapter);
+
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_registry_validate(adapter, so, &error));
+  assert_null(error);
+}
+
+static void test_colorharmonizer_schema_lists_custom_hue_gated_and_node_saturation_ungated(void **state)
+{
+  (void)state;
+  dt_iop_module_so_t *so = dt_iop_get_module_so("colorharmonizer");
+  assert_non_null(so);
+
+  GPtrArray *schemas = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_list_schema(so, &schemas, &error));
+  assert_null(error);
+  assert_non_null(schemas);
+  assert_int_equal(schemas->len, 2);
+
+  static const char *const expected_component_names[] = { "node1", "node2", "node3", "node4" };
+
+  const dt_remote_vector_schema_t *custom_hue = g_ptr_array_index(schemas, 0);
+  assert_string_equal(custom_hue->name, "custom_hue");
+  assert_int_equal(custom_hue->subtype, DT_REMOTE_VECTOR_PLAIN);
+  assert_null(custom_hue->color_space);
+  // Gated on the custom rule, but always active: writable_when only.
+  assert_int_equal(custom_hue->writability, DT_REMOTE_WRITABLE_CONDITIONAL);
+  assert_null(custom_hue->active_when);
+  assert_non_null(custom_hue->writable_when);
+  assert_string_equal(custom_hue->writable_when->field, "rule");
+  assert_int_equal(custom_hue->writable_when->op, DT_REMOTE_PREDICATE_EQ);
+  assert_string_equal(custom_hue->writable_when->enum_name, "DT_COLORHARMONIZER_CUSTOM");
+  assert_int_equal(custom_hue->components->len, 4);
+  for(guint c = 0; c < 4; c++)
+  {
+    const dt_remote_vector_component_schema_t *component =
+      &g_array_index(custom_hue->components, dt_remote_vector_component_schema_t, c);
+    assert_string_equal(component->name, expected_component_names[c]);
+    assert_float_equal(component->minimum, 0.0, 0.0);
+    assert_float_equal(component->maximum, 1.0, 0.0);
+  }
+
+  const dt_remote_vector_schema_t *node_saturation = g_ptr_array_index(schemas, 1);
+  assert_string_equal(node_saturation->name, "node_saturation");
+  assert_int_equal(node_saturation->subtype, DT_REMOTE_VECTOR_PLAIN);
+  assert_null(node_saturation->color_space);
+  assert_int_equal(node_saturation->writability, DT_REMOTE_WRITABLE_NOW);
+  assert_null(node_saturation->active_when);
+  assert_null(node_saturation->writable_when);
+  assert_int_equal(node_saturation->components->len, 4);
+  for(guint c = 0; c < 4; c++)
+  {
+    const dt_remote_vector_component_schema_t *component =
+      &g_array_index(node_saturation->components, dt_remote_vector_component_schema_t, c);
+    assert_string_equal(component->name, expected_component_names[c]);
+    assert_float_equal(component->minimum, 0.0, 0.0);
+    assert_float_equal(component->maximum, 2.0, 0.0);
+  }
+
+  g_ptr_array_unref(schemas);
+}
+
+// Default read-back off the module's real default params blob. The struct
+// annotation says $DEFAULT 0.0 for custom_hue (colorharmonizer.c:77), but
+// the module's init() overrides it to evenly spread nodes
+// {0.0, 0.25, 0.5, 0.75} ("sensible defaults for custom harmony nodes");
+// node_saturation keeps its annotation default of 1.0 x 4. Under the
+// default COMPLEMENTARY rule custom_hue reads back active (no active_when)
+// but not writable_now; node_saturation is both.
+static void test_colorharmonizer_read_values_defaults_and_default_rule_gates_custom_hue(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorharmonizer");
+
+  GHashTable *values = NULL;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_vector_read_values(fixture->module, fixture->module->params, &values, &error));
+  assert_null(error);
+
+  dt_remote_vector_value_t *custom_hue = g_hash_table_lookup(values, "custom_hue");
+  assert_non_null(custom_hue);
+  assert_int_equal(custom_hue->values->len, 4);
+  for(guint c = 0; c < 4; c++)
+    assert_float_equal(g_array_index(custom_hue->values, double, c), 0.25 * c, 1e-6);
+  assert_true(custom_hue->active);
+  assert_false(custom_hue->writable_now);
+
+  dt_remote_vector_value_t *node_saturation = g_hash_table_lookup(values, "node_saturation");
+  assert_non_null(node_saturation);
+  assert_int_equal(node_saturation->values->len, 4);
+  for(guint c = 0; c < 4; c++)
+    assert_float_equal(g_array_index(node_saturation->values, double, c), 1.0, 1e-6);
+  assert_true(node_saturation->active);
+  assert_true(node_saturation->writable_now);
+
+  g_hash_table_unref(values);
+  borders_fixture_free(fixture);
+}
+
+// A custom_hue write under the default COMPLEMENTARY rule is a gated-off
+// write: unsupported field (the colorbalance not-writable error shape),
+// byte-atomic on rejection.
+static void test_colorharmonizer_custom_hue_write_under_default_rule_rejects_unsupported_field(
+  void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorharmonizer");
+  void *before = g_malloc(fixture->module->params_size);
+  memcpy(before, fixture->module->params, fixture->module->params_size);
+
+  static const double hue_values[] = { 0.1, 0.35, 0.6, 0.85 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("custom_hue", hue_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_false(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  assert_memory_equal(fixture->module->params, before, fixture->module->params_size);
+  assert_memory_equal(projected, before, fixture->module->params_size);
+
+  dt_remote_error_free(error);
+  g_free(projected);
+  g_free(before);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// The same custom_hue write with `rule` switched to CUSTOM in the same
+// patch applies: writable_when is evaluated against the projected params
+// (post scalar writes), the colorbalance composed-mode-switch precedent.
+static void test_colorharmonizer_composed_rule_switch_to_custom_writes_custom_hue(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorharmonizer");
+
+  static const double hue_values[] = { 0.1, 0.35, 0.6, 0.85 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.scalar_values, make_colorharmonizer_rule_entry(fixture, "DT_COLORHARMONIZER_CUSTOM"));
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("custom_hue", hue_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  for(guint i = 0; i < 4; i++)
+    assert_float_equal(read_color_component(fixture, projected, "custom_hue", i),
+                       (float)hue_values[i], 1e-6);
+  // node_saturation is a separate native array; the custom_hue write must
+  // never touch it.
+  for(guint i = 0; i < 4; i++)
+    assert_float_equal(read_color_component(fixture, projected, "node_saturation", i),
+                       read_color_component(fixture, fixture->module->params, "node_saturation", i), 0.0);
+
+  g_free(projected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+// node_saturation has no predicates: it writes under the default
+// COMPLEMENTARY rule (no rule switch in the patch), leaving every other
+// byte untouched -- full-params_size memcmp against a hand-built expected
+// buffer.
+static void test_colorharmonizer_node_saturation_writes_regardless_of_rule(void **state)
+{
+  (void)state;
+  borders_fixture_t *fixture = real_vector_module_fixture_new("colorharmonizer");
+
+  void *expected = g_malloc(fixture->module->params_size);
+  memcpy(expected, fixture->module->params, fixture->module->params_size);
+  write_color_component(fixture, expected, "node_saturation", 0, 0.5f);
+  write_color_component(fixture, expected, "node_saturation", 1, 1.5f);
+  write_color_component(fixture, expected, "node_saturation", 2, 0.2f);
+  write_color_component(fixture, expected, "node_saturation", 3, 2.0f);
+
+  static const double saturation_values[] = { 0.5, 1.5, 0.2, 2.0 };
+  dt_remote_patch_t patch;
+  vector_patch_init(&patch);
+  g_ptr_array_add(patch.semantic_values, make_vector_patch("node_saturation", saturation_values, 4));
+
+  void *projected = g_malloc(fixture->module->params_size);
+  dt_remote_error_t *error = NULL;
+  assert_true(vector_apply_to_copy(fixture, &patch, projected, &error));
+  assert_null(error);
+
+  assert_memory_equal(projected, expected, fixture->module->params_size);
+
+  g_free(projected);
+  g_free(expected);
+  vector_patch_cleanup(&patch);
+  borders_fixture_free(fixture);
+}
+
+/* ---------------------------------------------------------------------- */
+/* registry total (production registry; milestone4 vector-class design doc */
+/* SS Initial registry mapping, extended by the milestone6 ride-along      */
+/* adapters): with all seven adapters registered (colorbalance,            */
+/* channelmixerrgb, rgblevels, borders, watermark, negadoctor,             */
+/* colorharmonizer), the production registry advertises 24 semantic names  */
+/* total (6 + 6 + 4 + 2 + 1 + 3 + 2). Queries                              */
+/* dt_remote_vector_list_schema() -- the same public entry point each      */
+/* adapter section above uses -- across all seven real module .so's and    */
+/* sums the returned schema counts, rather than reaching into the static   */
+/* s_adapters[] table directly.                                            */
+/* ---------------------------------------------------------------------- */
+
+static void test_registry_lists_twenty_four_semantic_names_across_seven_adapters(void **state)
 {
   (void)state;
   static const char *const ops[] = {
     "colorbalance", "channelmixerrgb", "rgblevels", "borders", "watermark",
+    "negadoctor", "colorharmonizer",
   };
-  static const guint expected_counts[] = { 6, 6, 4, 2, 1 };
+  static const guint expected_counts[] = { 6, 6, 4, 2, 1, 3, 2 };
 
   guint total = 0;
   for(guint i = 0; i < G_N_ELEMENTS(ops); i++)
@@ -4361,7 +4824,7 @@ static void test_registry_lists_nineteen_semantic_names_across_five_adapters(voi
     g_ptr_array_unref(schemas);
   }
 
-  assert_int_equal(total, 19);
+  assert_int_equal(total, 24);
 }
 
 int main(void)
@@ -4593,7 +5056,41 @@ int main(void)
       test_watermark_apply_patch_rejects_out_of_range_value_in_double_domain,
       lookup_override_test_setup, lookup_override_test_teardown),
 
-    cmocka_unit_test_setup_teardown(test_registry_lists_nineteen_semantic_names_across_five_adapters,
+    cmocka_unit_test_setup_teardown(test_negadoctor_lookup_pins_params_version_2,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_negadoctor_registry_validate_passes_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_negadoctor_schema_lists_dmin_color_and_two_wb_vectors,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_negadoctor_read_values_defaults_match_module_init,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_negadoctor_apply_patch_writes_dmin_preserves_padding_and_every_other_byte,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_negadoctor_apply_patch_rejects_out_of_range_dmin_in_double_domain,
+      lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_colorharmonizer_lookup_pins_params_version_1,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_colorharmonizer_registry_validate_passes_against_real_so,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorharmonizer_schema_lists_custom_hue_gated_and_node_saturation_ungated,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorharmonizer_read_values_defaults_and_default_rule_gates_custom_hue,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorharmonizer_custom_hue_write_under_default_rule_rejects_unsupported_field,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_colorharmonizer_composed_rule_switch_to_custom_writes_custom_hue,
+      lookup_override_test_setup, lookup_override_test_teardown),
+    cmocka_unit_test_setup_teardown(test_colorharmonizer_node_saturation_writes_regardless_of_rule,
+                                    lookup_override_test_setup, lookup_override_test_teardown),
+
+    cmocka_unit_test_setup_teardown(test_registry_lists_twenty_four_semantic_names_across_seven_adapters,
                                     lookup_override_test_setup, lookup_override_test_teardown),
   };
 

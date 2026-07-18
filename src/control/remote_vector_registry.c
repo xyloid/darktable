@@ -20,7 +20,8 @@
 // remote_curve_registry.c's own split: static adapter table, registry
 // lifecycle (lookup/validate), and the read-only half of the vector engine
 // API (list_schema/read_values). colorbalance, channelmixerrgb, rgblevels,
-// borders, and watermark are all registered here (19 semantic names
+// borders, and watermark (milestone4) plus negadoctor and colorharmonizer
+// (milestone6 ride-alongs) are all registered here (24 semantic names
 // total), the same way rgbcurve/tonecurve/colorzones/basecurve were added
 // to the curve registry one at a time.
 //
@@ -791,20 +792,219 @@ static const dt_remote_vector_module_adapter_t s_watermark_adapter = {
 };
 
 /* ---------------------------------------------------------------------- */
+/* negadoctor adapter (milestone6 quantity-class design doc SS Ride-along  */
+/* adapters). Params v2: `Dmin[4]` (film substrate color, $MIN 0.00001     */
+/* $MAX 1.5 $DEFAULT 1.0), `wb_high[4]` (white balance RGB coeffs, $MIN    */
+/* 0.25 $MAX 2 $DEFAULT 1.0), and `wb_low[4]` (white balance RGB offsets,  */
+/* same bounds) -- negadoctor.c:73-78. All three are float[4] leaves whose */
+/* fourth element is SIMD padding: three exposed red/green/blue components */
+/* over native_capacity 4, the channelmixerrgb reserved-tail precedent.    */
+/* `dmin` is a color the user picks off the film substrate, so             */
+/* COLOR/display_rgb; the two wb vectors are per-channel multipliers, so   */
+/* PLAIN. No predicates: always active, always writable.                   */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_vector_component_t s_negadoctor_dmin_components[3] = {
+  { "red", 0.00001, 1.5 }, { "green", 0.00001, 1.5 }, { "blue", 0.00001, 1.5 },
+};
+
+// wb_high and wb_low share this one component layout: per-channel
+// red/green/blue factors, all 0.25-2.0 (negadoctor.c:75-78).
+static const dt_remote_vector_component_t s_negadoctor_wb_components[3] = {
+  { "red", 0.25, 2.0 }, { "green", 0.25, 2.0 }, { "blue", 0.25, 2.0 },
+};
+
+static const dt_remote_path_segment_t s_negadoctor_dmin_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "Dmin" },
+};
+static const dt_remote_introspection_path_t s_negadoctor_dmin_path = {
+  .segments = s_negadoctor_dmin_segments, .length = G_N_ELEMENTS(s_negadoctor_dmin_segments)
+};
+
+static const dt_remote_path_segment_t s_negadoctor_wb_high_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "wb_high" },
+};
+static const dt_remote_introspection_path_t s_negadoctor_wb_high_path = {
+  .segments = s_negadoctor_wb_high_segments, .length = G_N_ELEMENTS(s_negadoctor_wb_high_segments)
+};
+
+static const dt_remote_path_segment_t s_negadoctor_wb_low_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "wb_low" },
+};
+static const dt_remote_introspection_path_t s_negadoctor_wb_low_path = {
+  .segments = s_negadoctor_wb_low_segments, .length = G_N_ELEMENTS(s_negadoctor_wb_low_segments)
+};
+
+static const dt_remote_vector_descriptor_t s_negadoctor_vectors[3] = {
+  {
+    .name = "dmin",
+    .display_name = "Film substrate color",
+    .description =
+      "Color of the film substrate (negadoctor.c:73-74): the color of the unexposed film "
+      "border, sampled or picked in display RGB. The native Dmin[4] array's fourth element "
+      "is SIMD padding, never written.",
+    .native = s_negadoctor_dmin_path,
+    .component_count = 3,
+    .components = s_negadoctor_dmin_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_COLOR,
+    .color_space = "display_rgb",
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "wb_high",
+    .display_name = "White balance (highlights)",
+    .description =
+      "White balance RGB coefficients for the illuminant (negadoctor.c:75-76): per-channel "
+      "multipliers over the dynamic range. The native wb_high[4] array's fourth element is "
+      "SIMD padding, never written.",
+    .native = s_negadoctor_wb_high_path,
+    .component_count = 3,
+    .components = s_negadoctor_wb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+  {
+    .name = "wb_low",
+    .display_name = "White balance (shadows)",
+    .description =
+      "White balance RGB offsets for the base light (negadoctor.c:77-78): per-channel "
+      "corrections at the shadows end. The native wb_low[4] array's fourth element is SIMD "
+      "padding, never written.",
+    .native = s_negadoctor_wb_low_path,
+    .component_count = 3,
+    .components = s_negadoctor_wb_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const dt_remote_vector_module_adapter_t s_negadoctor_adapter = {
+  "negadoctor", 2, 2, s_negadoctor_vectors, 3, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
+/* colorharmonizer adapter (milestone6 quantity-class design doc SS        */
+/* Ride-along adapters). Params v1: `custom_hue[4]` (custom node hues,     */
+/* $MIN 0.0 $MAX 1.0 $DEFAULT 0.0) and `node_saturation[4]` (node          */
+/* saturations, $MIN 0.0 $MAX 2.0 $DEFAULT 1.0) -- colorharmonizer.c:77-79.*/
+/* Both are whole float[4] vectors (node1..node4, native_capacity 4, no    */
+/* padding); the vector is always written whole even when                  */
+/* `num_custom_nodes` (an ordinary writable scalar, deliberately NOT a     */
+/* prepare field or descriptor here) exposes fewer nodes in the GUI.       */
+/* `custom_hue` is writable only when `rule` is DT_COLORHARMONIZER_CUSTOM  */
+/* (colorharmonizer.c:67; the default rule is COMPLEMENTARY,               */
+/* colorharmonizer.c:72) -- writable_when only, no active_when: the stored */
+/* hues are real state under any rule, just not writable outside custom    */
+/* mode. `node_saturation` applies under every rule: no predicates.        */
+/* ---------------------------------------------------------------------- */
+
+static const dt_remote_vector_component_t s_colorharmonizer_hue_components[4] = {
+  { "node1", 0.0, 1.0 }, { "node2", 0.0, 1.0 }, { "node3", 0.0, 1.0 }, { "node4", 0.0, 1.0 },
+};
+
+static const dt_remote_vector_component_t s_colorharmonizer_saturation_components[4] = {
+  { "node1", 0.0, 2.0 }, { "node2", 0.0, 2.0 }, { "node3", 0.0, 2.0 }, { "node4", 0.0, 2.0 },
+};
+
+static const dt_remote_path_segment_t s_colorharmonizer_custom_hue_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "custom_hue" },
+};
+static const dt_remote_introspection_path_t s_colorharmonizer_custom_hue_path = {
+  .segments = s_colorharmonizer_custom_hue_segments,
+  .length = G_N_ELEMENTS(s_colorharmonizer_custom_hue_segments)
+};
+
+static const dt_remote_path_segment_t s_colorharmonizer_node_saturation_segments[] = {
+  { .type = DT_REMOTE_PATH_FIELD, .value.field = "node_saturation" },
+};
+static const dt_remote_introspection_path_t s_colorharmonizer_node_saturation_path = {
+  .segments = s_colorharmonizer_node_saturation_segments,
+  .length = G_N_ELEMENTS(s_colorharmonizer_node_saturation_segments)
+};
+
+// Declared exactly as colorbalance's mode predicates above: the exact
+// introspection member name, DT_COLORHARMONIZER_CUSTOM
+// (colorharmonizer.c:67).
+static const dt_remote_parameter_predicate_t s_colorharmonizer_custom_predicate = {
+  .field = "rule", .op = DT_REMOTE_PREDICATE_EQ, .enum_name = "DT_COLORHARMONIZER_CUSTOM"
+};
+
+static const dt_remote_vector_descriptor_t s_colorharmonizer_vectors[2] = {
+  {
+    .name = "custom_hue",
+    .display_name = "Custom node hues",
+    .description =
+      "UCS hue [0,1) of each of the four custom harmony nodes (colorharmonizer.c:77): the "
+      "node positions used when the harmony rule is 'custom'. Writable only when rule is "
+      "DT_COLORHARMONIZER_CUSTOM; always written whole (4 components) regardless of "
+      "num_custom_nodes.",
+    .native = s_colorharmonizer_custom_hue_path,
+    .component_count = 4,
+    .components = s_colorharmonizer_hue_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = &s_colorharmonizer_custom_predicate,
+  },
+  {
+    .name = "node_saturation",
+    .display_name = "Node saturations",
+    .description =
+      "Saturation multiplier of each of the four harmony nodes (colorharmonizer.c:79): "
+      "applies under every harmony rule, custom or not. Always written whole (4 components) "
+      "regardless of num_custom_nodes.",
+    .native = s_colorharmonizer_node_saturation_path,
+    .component_count = 4,
+    .components = s_colorharmonizer_saturation_components,
+    .native_capacity = 4,
+    .subtype = DT_REMOTE_VECTOR_PLAIN,
+    .color_space = NULL,
+    .strictly_increasing = FALSE,
+    .minimum_gap = 0.0,
+    .active_when = NULL,
+    .writable_when = NULL,
+  },
+};
+
+static const dt_remote_vector_module_adapter_t s_colorharmonizer_adapter = {
+  "colorharmonizer", 1, 1, s_colorharmonizer_vectors, 2, NULL, 0, NULL
+};
+
+/* ---------------------------------------------------------------------- */
 /* adapter table                                                           */
 /* ---------------------------------------------------------------------- */
 
 // The full adapter table: colorbalance, channelmixerrgb, rgblevels,
-// borders, and watermark -- 19 semantic names total (6 + 6 + 4 + 2 + 1),
-// the full milestone4 vector-class set. A future op adds another entry
-// here, not a parallel lookup mechanism -- same convention as
-// remote_curve_registry.c's own s_adapters[].
+// borders, and watermark (the milestone4 vector-class set), plus the
+// milestone6 ride-along adapters negadoctor and colorharmonizer -- 24
+// semantic names total (6 + 6 + 4 + 2 + 1 + 3 + 2). A future op adds
+// another entry here, not a parallel lookup mechanism -- same convention
+// as remote_curve_registry.c's own s_adapters[].
 static const dt_remote_vector_module_adapter_t *const s_adapters[] = {
   &s_colorbalance_adapter,
   &s_cmrgb_adapter,
   &s_rgblevels_adapter,
   &s_borders_adapter,
   &s_watermark_adapter,
+  &s_negadoctor_adapter,
+  &s_colorharmonizer_adapter,
 };
 
 static dt_remote_vector_registry_lookup_override_t s_lookup_override = NULL;
