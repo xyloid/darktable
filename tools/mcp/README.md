@@ -28,6 +28,7 @@ plan); the full wire contract is
 ## Layout
 
 ```text
+env.sh           source to set up the dev environment (see Setup below)
 src/darktable_mcp/
   discovery.py   locate/validate session-<pid>.json discovery records
   protocol.py    framed-JSON client: connect, hello, correlate, reconnect
@@ -256,7 +257,25 @@ Two things to know when using it:
 
 ## Setup
 
-Requires Python >= 3.10.
+Requires Python >= 3.10. One command, from any directory (bash or zsh):
+
+```sh
+. tools/mcp/env.sh
+```
+
+Sourcing `env.sh` is idempotent and does all of the below on first use,
+then just activates on subsequent uses:
+
+* creates `tools/mcp/.venv` and installs this package with its `[dev]`
+  extras (repairing a half-made venv if the install was interrupted);
+* activates the venv in your current shell;
+* exports `DARKTABLE_BIN` pointing at the in-tree `build/bin/darktable`
+  when one exists (a value you exported beforehand always wins);
+* defines `dt-mcp-darktable`, a helper that launches darktable with remote
+  control enabled in a scratch config dir (see below).
+
+<details>
+<summary>Manual equivalent, if you prefer explicit steps</summary>
 
 ```sh
 cd tools/mcp
@@ -265,6 +284,8 @@ python3 -m venv .venv
 pip install -e '.[dev]'
 ```
 
+</details>
+
 ## Running the tests
 
 The unit tests are self-contained: they run a fake framed-JSON server
@@ -272,9 +293,20 @@ in-process (plain `asyncio` streams on loopback) and never require a real
 darktable instance.
 
 ```sh
-cd tools/mcp
-. .venv/bin/activate
-pytest
+. tools/mcp/env.sh
+pytest tools/mcp          # or: cd tools/mcp && pytest
+```
+
+The live end-to-end suite is marked `integration` and deselected by
+default: it launches a real darktable GUI under a display server (Xvfb, or
+your own `$DISPLAY`) and drives it over the wire. It needs a GUI build of
+darktable — `env.sh` exports `DARKTABLE_BIN` for you when `build/bin/`
+has one; otherwise the harness falls back to `build/bin/darktable` and
+then `PATH`, and skips loudly if none is found:
+
+```sh
+. tools/mcp/env.sh
+pytest tools/mcp -m integration
 ```
 
 `tests/test_protocol.py` reuses the shared request/response fixtures from
@@ -289,7 +321,14 @@ an installed copy of this package.
 ## Running against a real darktable instance
 
 1. Enable remote control and point darktable at a scratch config directory
-   (so it doesn't touch your real profile):
+   (so it doesn't touch your real profile). With `env.sh` sourced this is
+   one command:
+
+   ```sh
+   dt-mcp-darktable /tmp/dt-mcp-check
+   ```
+
+   which is shorthand for:
 
    ```sh
    mkdir -p /tmp/dt-mcp-check

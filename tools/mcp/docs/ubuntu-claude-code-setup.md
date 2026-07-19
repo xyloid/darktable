@@ -131,6 +131,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
+(For interactive shells, `. "$REPO/tools/mcp/env.sh"` performs this setup
+and activates the venv in one step; this guide keeps the explicit commands
+because everything below uses absolute `.venv/bin/...` paths and never
+relies on an activated shell.)
+
 Record and verify the absolute launcher path:
 
 ```sh
