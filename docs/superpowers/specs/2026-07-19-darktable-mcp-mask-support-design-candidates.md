@@ -109,6 +109,10 @@ instance, assert the preview changes and history has one new item.
 
 ## Tier 2 — parametric masks (`parametric_mask_params` capability)
 
+> Superseded by a full low-level design:
+> `2026-07-19-darktable-mcp-parametric-masks-design.md`. The sketch below
+> is kept for the tier comparison; the design doc governs.
+
 **Goal.** Read and write blendif ramps: per-channel trapezoids over input
 and output pixel values. Requires Tier 1 (it writes the same storage block
 and needs `mask_mode` to gain `"parametric"` and `"uniform+parametric"`
