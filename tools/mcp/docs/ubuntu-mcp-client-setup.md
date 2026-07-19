@@ -1,8 +1,8 @@
-# Build and use darktable MCP with Claude Code on Ubuntu
+# Build and use darktable MCP with Claude Code or Codex on Ubuntu
 
 This guide builds the `worktree-mcp-remote-edit` branch, runs its darktable
 remote-control server with an isolated profile, installs the Python MCP
-sidecar, and registers that sidecar with Claude Code.
+sidecar, and registers that sidecar with Claude Code or Codex.
 
 The darktable binary and the sidecar must come from the same checkout. The
 JSON protocol between them is private and versioned with this source tree.
@@ -12,7 +12,7 @@ JSON protocol between them is private and versioned with this source tree.
 Three processes participate:
 
 ```text
-Claude Code
+Claude Code or Codex
   |  MCP over stdio
   v
 darktable-mcp Python sidecar
@@ -21,7 +21,7 @@ darktable-mcp Python sidecar
 darktable GUI from this branch
 ```
 
-Claude Code starts the sidecar. You start darktable separately and keep it
+Your MCP client starts the sidecar. You start darktable separately and keep it
 running with an image open in the darkroom. Darktable writes a short-lived
 discovery record containing its loopback port and session token; the sidecar
 uses that record to connect.
@@ -83,7 +83,7 @@ git submodule update --init
 REPO="$PWD"
 ```
 
-Use an absolute path for `REPO`. Later Claude Code configuration stores the
+Use an absolute path for `REPO`. Later MCP client configuration stores the
 sidecar executable path, so moving the checkout invalidates that entry.
 The commands below assume the variables remain in the same shell; define
 `REPO`, `DARKTABLE_BIN`, `MCP_BIN`, `DT_CONFIG`, and `DT_CACHE` again after
@@ -145,7 +145,7 @@ test -x "$MCP_BIN"
 ```
 
 Do not run `darktable-mcp` by itself and expect an interactive prompt. It is a
-stdio MCP server; Claude Code launches it and communicates through its
+stdio MCP server; your MCP client launches it and communicates through its
 standard input and output.
 
 ## 6. Create an isolated darktable profile
@@ -211,7 +211,7 @@ The command-line setting applies only to this launch. To persist it in this
 isolated profile, enable **preferences > security > allow remote control
 (MCP)** and restart darktable.
 
-## 7. Verify discovery before configuring Claude Code
+## 7. Verify discovery before configuring an MCP client
 
 After darktable finishes starting, it should create one record:
 
@@ -232,7 +232,13 @@ If there is no record, confirm all of the following:
 3. The GUI completed startup and is still running.
 4. You are inspecting the same directory passed through `--configdir`.
 
-## 8. Register the sidecar with Claude Code
+## 8. Register the sidecar with an MCP client
+
+Choose the client you use. Both commands register the same sidecar with the
+same isolated darktable profile and 30-second request timeout. The longer
+timeout gives RAW preview rendering room to finish.
+
+### Claude Code
 
 Run the registration command from the project in which you use Claude Code.
 Local scope keeps this machine-specific absolute path out of the repository:
@@ -244,8 +250,7 @@ claude mcp add --scope local darktable -- \
   --request-timeout 30
 ```
 
-The longer request timeout gives RAW preview rendering room to finish. Verify
-the saved entry and connection status:
+Verify the saved entry and connection status:
 
 ```sh
 claude mcp get darktable
@@ -257,24 +262,54 @@ available from every Claude Code project. Use `--scope project` only if you
 intend to share and review a `.mcp.json`; it will contain checkout-specific
 absolute paths unless you deliberately make the command portable.
 
-If the sidecar was registered previously, remove and recreate the entry:
+If the sidecar was registered previously, remove it with
+`claude mcp remove darktable`, then rerun `claude mcp add`.
+
+### Codex
+
+Register the sidecar with Codex:
 
 ```sh
-claude mcp remove darktable
+codex mcp add darktable -- \
+  "$MCP_BIN" \
+  --config-dir "$DT_CONFIG" \
+  --request-timeout 30
 ```
 
-Then rerun `claude mcp add`.
+Verify the saved entry:
 
-## 9. Verify the tools from Claude Code
+```sh
+codex mcp get darktable
+codex mcp list
+```
 
-Start Claude Code in the project where the local-scoped server was registered:
+`codex mcp add` writes to `~/.codex/config.toml` by default. Local Codex
+clients on the same host, including the CLI and IDE extension, share that
+configuration. The command has no `--scope` flag. A trusted repository may
+instead define a project-scoped server in `.codex/config.toml`, but this
+guide does not require or create project configuration.
+
+If the sidecar was registered previously, remove it with
+`codex mcp remove darktable`, then rerun `codex mcp add`.
+
+## 9. Verify the tools from your MCP client
+
+Start the client you registered above:
+
+### Claude Code
 
 ```sh
 claude
 ```
 
-Run `/mcp` inside Claude Code. Confirm that `darktable` is connected and allow
-the tool when prompted. Useful first requests are:
+### Codex
+
+```sh
+codex
+```
+
+Run `/mcp` inside the client. Confirm that `darktable` is connected and
+allow the tool when prompted. Useful first requests are:
 
 ```text
 Use darktable MCP to report the currently open image and revision.
@@ -294,14 +329,14 @@ you see.
 Get histogram and waveform scopes with summaries for the current image.
 ```
 
-Claude Code receives previews and rendered scopes as native MCP image content,
-not base64 text. The preview is a developed sRGB JPEG, not the original RAW
-payload. Keep `max_px` at 1024 or lower in image-heavy conversations to reduce
-context usage.
+The MCP client receives previews and rendered scopes as native MCP image
+content, not base64 text. The preview is a developed sRGB JPEG, not the
+original RAW payload. Keep `max_px` at 1024 or lower in image-heavy
+conversations to reduce context usage.
 
 ## 10. Current MCP operations
 
-The sidecar currently exposes these Claude Code tools:
+The sidecar currently exposes these MCP tools:
 
 | Category | Tools |
 |---|---|
@@ -377,13 +412,13 @@ After the one-time build and registration, a normal session is:
 1. Start the branch's darktable binary with the same `DT_CONFIG` and remote
    control enabled.
 2. Open a photograph in the darkroom.
-3. Start Claude Code from a project where the MCP registration is in scope.
+3. Start the MCP client where the sidecar was registered.
 4. Check `/mcp` if darktable tools are missing.
-5. Ask Claude to inspect state before making any mutating call.
+5. Ask the client to inspect state before making any mutating call.
 6. Close darktable normally when finished so its discovery record is removed.
 
 The sidecar discovers darktable lazily on the first tool call. It is therefore
-fine to start Claude Code before darktable, but the first darktable tool call
+fine to start your MCP client before darktable, but the first darktable tool
 will fail until a live discovery record exists.
 
 ## 13. Troubleshooting
@@ -399,11 +434,19 @@ created by an older binary or session.
 The connection works, but the GUI is not displaying an open image in the
 darkroom. Open a photograph and retry.
 
-### Claude Code does not show the tools
+### The MCP client does not show the tools
 
-Run `claude mcp get darktable`, then inspect `/mcp` inside Claude Code. Recreate
-the registration if the checkout or virtual environment moved. Restart Claude
-Code after replacing the sidecar environment.
+Inspect the saved entry with the command for your client:
+
+```sh
+claude mcp get darktable
+# or
+codex mcp get darktable
+```
+
+Then inspect `/mcp` inside the client. Recreate the registration if the
+checkout or virtual environment moved. Start a new client session after
+replacing the sidecar environment.
 
 ### Preview or scopes time out
 
@@ -414,7 +457,7 @@ preview to finish, and retry. Request a smaller preview, such as
 ### Authentication failure
 
 The token changes every time darktable starts. Do not pin or copy tokens into
-Claude configuration. Let the sidecar re-read the current discovery record;
+MCP client configuration. Let the sidecar re-read the current discovery record;
 restart the MCP connection from `/mcp` if it retained a connection to the old
 process.
 
@@ -427,11 +470,19 @@ profile.
 ## 14. Disable or remove the setup
 
 Stop exposing remote control by closing darktable, or set
-`security/enable_remote_control=FALSE` and restart it. Remove Claude Code's
-sidecar registration with:
+`security/enable_remote_control=FALSE` and restart it. Remove the matching
+sidecar registration:
+
+### Claude Code
 
 ```sh
 claude mcp remove darktable
+```
+
+### Codex
+
+```sh
+codex mcp remove darktable
 ```
 
 The build tree, virtual environment, isolated config, and isolated cache can
