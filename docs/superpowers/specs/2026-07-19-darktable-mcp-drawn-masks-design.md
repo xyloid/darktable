@@ -1,9 +1,13 @@
 # darktable MCP — drawn masks (mask Tier 3) low-level design
 
 Date: 2026-07-19
-Status: draft design (not yet planned; awaiting review; depends on Tier 1,
-and shares its coordinate contract with the unscheduled `sample_region`
-work — see "Coordinate contract")
+Status: draft design (not yet planned; awaiting review; depends on Tier 1).
+Two contracts are prerequisites to *planning*, per the 2026-07-19 scope
+reorg: the pipe-freshness contract for coordinate transforms (shared with
+`sample_region` — whichever effort plans first writes it) and the
+GUI-edit-session guard (resolved below, decision 8). The cross-tier
+`mask_mode` transition appendix in the candidates doc is authoritative
+over this document's per-operation mode effects.
 Companions: `2026-07-19-darktable-mcp-blend-settings-design.md` (Tier 1),
 `2026-07-19-darktable-mcp-parametric-masks-design.md` (Tier 2),
 `2026-07-18-darktable-mcp-picker-and-sampling-candidates.md` (the
@@ -273,10 +277,24 @@ all mutating ones take `expected_revision` CAS like every mutation.
 - `used_by` walk, state-bit ↔ string mapping, membership upsert.
 - Coordinate conversion (`remote_transform.c` helper): point mapping via
   `dt_dev_distort_transform/backtransform` on the full pipe + the probe
-  algorithm for sizes/angles. The full pipe must be in a usable state;
-  the calls follow the same locking the GUI handlers rely on (they run
-  on the GTK thread against `darktable.develop`, as all engine calls
-  already do).
+  algorithm for sizes/angles. Locking follows the GUI handlers (GTK
+  thread against `darktable.develop`). **Freshness is a separate,
+  unresolved contract** (hard-challenge H3): locking prevents races, not
+  staleness — a transform issued between a distortion mutation and pipe
+  reprocess can be deterministically wrong with no redraw to self-correct.
+  The freshness contract (block-until-clean vs `retry_later` vs both,
+  with timeout) must be designed before this milestone is planned and is
+  shared verbatim with `sample_region`.
+- **GUI-edit-session guard** (hard-challenge H2, decision 8): before
+  mutating or deleting any form, the engine checks whether that form (or
+  its group) is the live edit target (`dev->form_visible` /
+  `dev->form_gui`, which caches derived geometry of the form being
+  dragged — `masks.c:1320`). If so, it first cancels the GUI edit
+  session via the GUI's own escape path (`dt_masks_change_form_gui(NULL)`
+  + redraw), then proceeds — matching the "remote drives the GUI"
+  posture of the reveal behavior. Covered by a unit test on the guard
+  path and a documented manual test; a use-after-free here is the
+  predicted failure mode when a user meets the agent mid-drag.
 
 ### One darktable-core change
 
@@ -345,9 +363,12 @@ Unit (`test_remote_masks.c`, headless with real modules via `dt_init`):
 
 Protocol: fixtures for all six methods, shared with `test_protocol.py`.
 
-Integration:
-- circle on exposure at a known position → preview-diff confined to that
-  region (inside/outside mean-delta assertion — the spatial gate);
+Integration (using M-B's `show_mask` render as the primary observable —
+direct assertions on the mask image; preview-diffs remain as
+end-to-end confirmation):
+- circle on exposure at a known position → mask render bright inside the
+  circle, dark outside, and preview-diff confined to that region
+  (inside/outside delta-*ratio* assertion — the spatial gate);
   update moves the region; detach makes the effect uniform; delete after
   detach leaves rendering unchanged.
 - coordinate round-trip under distortion: enable `crop` + rotation,
@@ -385,9 +406,17 @@ Integration:
 7. Per-member `opacity` and `inverted` live on `attach_mask`, not on
    the shape — mirroring storage (`dt_masks_point_group_t`), so the
    same shape can be inverted on one module and not another.
+8. **Live GUI edit sessions are cancelled, not raced** (2026-07-19 scope
+   reorg): remote form mutations first end any active edit of the target
+   form via `dt_masks_change_form_gui(NULL)` — see Engine design.
+   Challenge: a user mid-drag loses their in-progress gesture; the
+   alternative (refusing with a retryable error) was rejected as worse
+   for unattended agent operation but is cheap to revisit.
 
 ## Explicitly unresolved (to close during planning/brainstorming)
 
+- **The pipe-freshness contract** (prerequisite to planning; see Engine
+  design and hard-challenge H3) — shared with `sample_region`.
 - Final numeric ranges per geometry member (pin from GUI interaction
   clamps; the validation *policy* above is fixed).
 - Probe algorithm details: probe arm length for angle mapping, the

@@ -190,7 +190,7 @@ Semantics:
 | markers not exactly 4, non-finite, outside [0,1], or not ascending | `invalid_value`, `constraint: "markers"` with the specific violation |
 | `boost` on a channel with `boost: null`, or out of range | `invalid_value`, `constraint: "boost"` |
 | `parametric` while projected `mask_mode` lacks parametric | `invalid_value`, `constraint: "requires_parametric_mask_mode"` |
-| `mask_mode: "parametric"` while stored mode has drawn/raster bits | `invalid_value`, `constraint: "mask_configuration_present"` (Tier 1 rule, unchanged) |
+| `mask_mode` write that would change the `MASK` bit, or any write on a raster-bit state | `invalid_value` per the transition appendix in the candidates doc (authoritative; corrected 2026-07-19 — toggling `CONDITIONAL` **is** legal while `MASK` is set: `drawn ↔ drawn+parametric`) |
 
 ## Engine design (extends `remote_blend.c`)
 
@@ -244,11 +244,59 @@ unchanged — Tier 2 adds **zero** new commit/threading/history surface.
 directions; the compound read-only strings from Tier 1 keep covering
 drawn/raster combinations.
 
+## Mask rendering companion (`mask_render` capability — same milestone)
+
+Added to this milestone by the 2026-07-19 scope reorg (hard-challenge
+analysis H1): without seeing the mask, an agent cannot verify thresholds,
+so parametric masks would demo well and work poorly. darktable already
+renders per-module masks for the GUI overlay
+(`module->request_mask_display`, `DT_DEV_PIXELPIPE_DISPLAY_MASK` —
+`imageop.h:196`, `pixelpipe.h:68`); this exposes that pipeline, read-only.
+
+**Wire.** `render_preview` gains an optional argument:
+
+```json
+{ "max_px": 1024, "quality": 90,
+  "show_mask": { "op": "exposure", "instance": 1 } }
+```
+
+Response: the module's current blend mask as a grayscale JPEG (white =
+full effect), same framing as the normal preview so coordinates line up
+1:1 for side-by-side reasoning; plus `"mask_of": {op, instance,
+mask_mode}` metadata. Works for *any* mask source (uniform, parametric,
+drawn, combinations) — which also makes it M-C's primary verification
+tool. Errors: module without blending → `unsupported_field`; mask mode
+`off` → renders full-white with `mask_mode: "off"` metadata rather than
+erroring (a legal question deserves a legal answer).
+
+**Engine.** The render job sets the target module's
+`request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK`, runs the same
+bounded render path `render_preview` already uses, restores the flag
+(saved value, not assumed-zero — the GUI may own it), and serializes the
+mask channel. Flag save/restore happens on the GTK thread bracket the
+existing render job already has; the one design question to pin at
+planning is whether the export-path pipe honors `request_mask_display`
+or whether the mask render must ride the darkroom preview pipe with a
+snapshot (both exist; the GUI uses the latter).
+
+**Capability**: `mask_render`, independent of `parametric_mask_params`
+(a client may render masks of GUI-drawn state on an engine without
+parametric write support in principle, but both ship in this milestone).
+
+**Testing.** Unit: flag save/restore bracket; error rows. Integration:
+parametric luminance mask → mask render is dark in shadows and bright in
+highlights (direct assertion on the mask image — replaces the indirect
+"spatially non-uniform preview delta" gate); mask render of `off` mode is
+uniform white; flag restored after render (GUI overlay state unchanged).
+
 ## Sidecar changes
 
 - `set_module_params`: the `blend` dict passes through; client-side
   capability gate extends to refuse `parametric`/`combine` members
   without `parametric_mask_params`.
+- `render_preview`: optional `show_mask` argument passed through, gated
+  client-side on `mask_render`; the tool description tells the model to
+  use it to verify every parametric threshold it sets.
 - Tool docstring + README: a worked example — sky selection via
   luminance: `{"blend": {"mask_mode": "parametric", "parametric":
   {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0], "inverted": true}}}}`

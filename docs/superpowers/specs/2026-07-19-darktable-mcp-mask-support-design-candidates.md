@@ -1,8 +1,11 @@
 # darktable MCP — mask support: tiered design candidates
 
 Date: 2026-07-19
-Status: candidate design sketches (no milestone scheduled; written from the
-mask-support challenge research after milestone 6)
+Status: effort roadmap (no milestone scheduled). Scope reorganized
+2026-07-19 per `2026-07-19-darktable-mcp-mask-support-hard-challenges.md`;
+the per-tier low-level designs govern content, this document governs the
+milestone packaging (M-A/M-B/M-C) and the mask_mode transition appendix.
+The original per-tier sketches are retained below for comparison only.
 Companions: `2026-07-16-darktable-mcp-supported-operations.md` (current tier
 state; masks recorded as out of scope), `2026-07-05-darktable-mcp-protocol-reference.md`
 (the wire contract these sketches extend),
@@ -255,21 +258,118 @@ vs outside the circle); delete → preview returns.
 
 ---
 
-## Cross-cutting notes
+## Effort scope (reorganized 2026-07-19 per the hard-challenge analysis)
 
-- **Capabilities**: `blend_params` (T1), `parametric_mask_params` (T2),
-  `mask_shapes` (T3) — independent hello capabilities so tiers ship and
-  gate separately; the sidecar refuses client-side per capability exactly
-  as it does for `curves`/`vectors`/`bands`/`quantities`.
-- **Ordering**: T1 next whenever scheduled (self-contained, high value);
-  `sample_region` (picker doc) before T3; T2 any time after T1. T1 and T2
-  reuse all existing history/undo/revision plumbing; T3 reuses it too but
-  through the masks history entry point.
-- **Struct-churn defense** (T1/T2): the hand-written field table is the
+The risk analysis
+(`2026-07-19-darktable-mcp-mask-support-hard-challenges.md`) drove a
+repackaging of the effort into three milestones. This section is the
+governing roadmap; the per-tier design docs define the content.
+
+**Milestone M-A — blend settings** (Tier 1 design, unchanged in content):
+`blend_params` capability. Self-contained, high conversational value
+(opacity). Its plan must conform to the mask-mode transition appendix
+below (the appendix, not the design's simpler standalone rule, is
+authoritative where they differ).
+
+**Milestone M-B — parametric masks + mask rendering** (Tier 2 design +
+the H1 scope addition): `parametric_mask_params` and `mask_render`
+capabilities. The mask-render primitive (`render_preview` gains
+`show_mask`, riding darktable's existing display-mask pipeline) ships
+*with* — not after — parametric masks, because without it agents cannot
+verify thresholds and the capability demos well but works poorly. The
+render primitive is specified in the Tier 2 design's "Mask rendering
+companion" section.
+
+**Milestone M-C — drawn masks** (Tier 3 design): `mask_shapes`
+capability. Two contracts are **prerequisites to planning**, not
+implementation details:
+  1. the **pipe-freshness contract** for coordinate transforms (H3) —
+     shared verbatim with `sample_region`
+     (`2026-07-18-darktable-mcp-picker-and-sampling-candidates.md`);
+     whichever effort is planned first writes the contract, the other
+     inherits it;
+  2. the **GUI-edit-session guard** (H2) — resolved in the Tier 3 design
+     as: the engine cancels a live GUI mask-edit session before mutating
+     the affected form.
+`sample_region` itself remains unscheduled; M-C no longer waits for it as
+a milestone, only for the shared freshness contract.
+
+Cross-cutting, still true after the reorg:
+
+- **Capabilities**: `blend_params` (M-A), `parametric_mask_params` +
+  `mask_render` (M-B), `mask_shapes` (M-C) — independent hello
+  capabilities; the sidecar refuses client-side per capability exactly as
+  it does for `curves`/`vectors`/`bands`/`quantities`.
+- **Ordering**: M-A → M-B → M-C. M-A and M-B reuse all existing
+  history/undo/revision plumbing; M-C reuses it through the masks
+  history entry point.
+- **Struct-churn defense** (M-A/M-B): the hand-written field table is the
   single point of maintenance; compile-time `sizeof`/`offsetof` asserts
   against `dt_develop_blend_params_t` turn upstream struct changes into
-  build failures instead of wire corruption.
-- **Supported-operations doc impact**: T1 flips no module tiers (it adds a
-  new orthogonal surface to every Tier-1 module with blending); the
+  build failures instead of wire corruption. Additionally (H5): every
+  deliberate divergence from upstream files is listed in a divergence
+  manifest kept alongside these specs, and "upstream added a blend mode"
+  is a rehearsed table-row + test-row procedure.
+- **Supported-operations doc impact**: M-A flips no module tiers (it adds
+  a new orthogonal surface to every Tier-1 module with blending); the
   "blending out of scope" sentence gets replaced by a pointer to the
   capability matrix.
+- **Verification budget** (H6): spatial integration gates assert
+  inside/outside delta *ratios* on the preview pipe at a pinned size,
+  with fixture images chosen for high-contrast regions; M-B's mask
+  render turns most mask assertions into direct image checks instead of
+  blended-preview inference.
+- **Tool budget** (H7): M-C's six methods are re-examined at planning
+  for merging (attach/detach as one tool); every mask docstring gets a
+  hard token budget.
+
+---
+
+## Appendix: mask_mode transition table (cross-tier, authoritative)
+
+The rule (from which every row derives): a `mask_mode` write may change
+only the bits its shipped capabilities own — `ENABLED` with
+`blend_params`, `CONDITIONAL` with `parametric_mask_params` — and the
+result must be a mode darktable names. `MASK` is **never** changed by a
+`mask_mode` write: drawn masking is entered and left exclusively through
+`attach_mask`/`detach_mask`/`delete_mask_shape` (M-C), which OR it in on
+attach and clear it when a module's group empties. `RASTER` is never
+writable by any tier.
+
+Stored state (rows) × requested `mask_mode` (columns), full stack
+shipped. ✔ = applied; ✱ = no-op (already there); ✘c = `invalid_value`,
+`constraint: "drawn_via_attach_only"`; ✘r = `invalid_value`,
+`constraint: "raster_unsupported"`.
+
+| stored \ target | `off` | `uniform` | `parametric` | `drawn` | `drawn+parametric` |
+|---|---|---|---|---|---|
+| `off` | ✱ | ✔ | ✔ | ✘c | ✘c |
+| `uniform` | ✔ | ✱ | ✔ | ✘c | ✘c |
+| `parametric` | ✔ | ✔ | ✱ | ✘c | ✘c |
+| `drawn` | ✘c | ✘c | ✘c | ✱ | ✔ (adds `CONDITIONAL`) |
+| `drawn+parametric` | ✘c | ✘c | ✘c | ✔ (drops `CONDITIONAL`) | ✱ |
+| `raster` (any R-bit state) | ✘r | ✘r | ✘r | ✘r | ✘r |
+
+Derived rules the per-tier docs must conform to:
+
+- With only `blend_params` shipped (M-A alone), the write vocabulary is
+  `off`/`uniform` and the reachable rows are the first two — the Tier 1
+  design's standalone rule is this table's projection.
+- Toggling `CONDITIONAL` never touches blendif storage; channel
+  conditions survive `parametric` → `uniform` → `parametric` round trips
+  (matching GUI behavior).
+- `attach_mask` from any non-R row yields the stored state plus
+  `ENABLED|MASK` (preserving `CONDITIONAL`); on an R-bit state it fails
+  `mask_configuration_present`. Detach/delete emptying the group clears
+  `MASK` (and the row returns to `uniform` or `parametric` accordingly).
+- `reset_module` (shipped, m1) resets blend params to defaults and drops
+  the drawn mask — reaching `off` from any row; unchanged.
+- Unit tests for every cell are generated mechanically from this table
+  in whichever milestone first implements a `mask_mode` write (M-A), and
+  extended in M-B/M-C as their bits become live.
+
+**Amendment note (2026-07-19):** the Tier 2 design's original error row
+"`mask_mode: "parametric"` while stored mode has drawn bits →
+`mask_configuration_present`" contradicted the `drawn ↔
+drawn+parametric` transitions above and has been corrected in that
+document — the exact composition bug the H8 analysis predicted.

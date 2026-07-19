@@ -76,7 +76,15 @@ themselves are nearly free.
 ### Open questions for the eventual design
 
 - Coordinate space on the wire (preview-relative? full-image normalized?
-  who performs the back-transform?).
+  who performs the back-transform?). Note: the drawn-masks design
+  (`2026-07-19-darktable-mcp-drawn-masks-design.md`) has since answered
+  this for its own case (preview-normalized, engine back-transforms) and
+  the two efforts share one transform helper — align with it.
+- **Pipe-freshness contract** (added 2026-07-19, shared with the
+  drawn-masks milestone): a transform/sample issued between a mutation
+  and pipe reprocess must not silently use stale geometry — define
+  block-until-clean vs `retry_later` semantics once; whichever effort is
+  planned first writes the contract, the other inherits it.
 - Which pipeline point and colorspace the response reports — per-module
   input space is what the write side needs, but it must be explicit wire
   vocabulary, not implicit.
