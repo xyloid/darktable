@@ -176,6 +176,10 @@ threading design.
 
 ## Tier 3 — drawn masks (`mask_shapes` capability)
 
+> Superseded by a full low-level design:
+> `2026-07-19-darktable-mcp-drawn-masks-design.md`. The sketch below is
+> kept for the tier comparison; the design doc governs.
+
 **Goal.** List, create, edit, delete, and attach drawn shapes. The largest
 milestone of the three; ship after `sample_region` so the coordinate
 contract is designed once.
