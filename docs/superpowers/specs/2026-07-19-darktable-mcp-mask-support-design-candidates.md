@@ -37,6 +37,10 @@ Source-of-truth facts the sketches rest on (verified 2026-07-19):
 
 ## Tier 1 — blend settings (`blend_params` capability)
 
+> Superseded by a full low-level design:
+> `2026-07-19-darktable-mcp-blend-settings-design.md`. The sketch below is
+> kept for the tier comparison; the design doc governs.
+
 **Goal.** Read and write the per-instance blend controls that need no mask:
 opacity, blend mode, blend colorspace, fulcrum, feathering, blur, contrast,
 brightness, details threshold. Highest conversational value per unit work:
