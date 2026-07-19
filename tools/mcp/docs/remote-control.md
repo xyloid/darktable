@@ -55,6 +55,13 @@ Ways to turn it on:
 There is deliberately **no second opt-in and no “remote” CLI subcommand**:
 the one preference (optionally overridden by `--conf`) is the whole switch.
 
+A companion preference on the same page, `remote/follow_edited_module`
+(default **on**, effective immediately), makes the darkroom GUI *follow*
+remote edits: whenever a remote mutation touches a module, the right panel
+switches to that module's group, expands it and gives it focus — the same
+sequence as clicking its header — so you can watch the session being
+driven. Turn it off if you want to hand-edit while an agent works.
+
 ---
 
 ## 2. Point an MCP host at darktable

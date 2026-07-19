@@ -20,6 +20,7 @@
 
 #include "common/darktable.h"
 #include "common/undo.h"
+#include "control/conf.h"
 #include "control/control.h"
 #include "control/remote_band.h"
 #include "control/remote_curve.h"
@@ -1369,6 +1370,32 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
 /* mutation API (plan step 7)                                              */
 /* ---------------------------------------------------------------------- */
 
+// After a remote mutation, reveal the edited module in the right panel --
+// switch to its module group, expand it and give it focus -- so a watching
+// user sees darktable being operated on, the same sequence as the GUI's
+// show-module shortcut (_show_module_callback in develop/imageop.c). Gated
+// on module->expander: it is NULL in headless contexts (unit tests) where
+// dt_iop_request_focus() is not safe to call, and NULL is also how hidden
+// GUIs opt out. dt_iop_gui_set_expanded()'s collapse_others branch
+// *toggles* an already-expanded module when every other module is closed,
+// so it is only called for a collapsed module.
+static void _remote_reveal_module(dt_iop_module_t *module)
+{
+  if(!module || !module->expander) return;
+  if(!dt_conf_get_bool("remote/follow_edited_module")) return;
+
+  if(module->so->state == IOP_STATE_HIDDEN)
+    dt_iop_gui_set_state(module, IOP_STATE_ACTIVE);
+
+  if(!dt_iop_shown_in_group(module, dt_dev_modulegroups_get(module->dev)))
+    dt_dev_modulegroups_switch(darktable.develop, module);
+
+  if(!module->expanded)
+    dt_iop_gui_set_expanded(module, TRUE, dt_conf_get_bool("darkroom/ui/single_module"));
+
+  dt_iop_request_focus(module);
+}
+
 gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
                                      const dt_remote_patch_t *patch,
                                      const uint64_t *expected_revision,
@@ -1532,6 +1559,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   dt_iop_gui_update(module);
   dt_dev_add_history_item(dev, module, FALSE);
   if(module->widget) gtk_widget_queue_draw(module->widget);
+  _remote_reveal_module(module);
 
   // Step 10: the tracker has already counted the synchronous delivery;
   // read the resulting revision. Defensive fallback: if the counter did
@@ -1648,6 +1676,7 @@ gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,
   dt_iop_gui_update(module);
   dt_dev_add_history_item(dev, module, FALSE);
   if(module->widget) gtk_widget_queue_draw(module->widget);
+  _remote_reveal_module(module);
 
   const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
 
@@ -1693,6 +1722,7 @@ gboolean dt_remote_reset_module(const dt_remote_module_ref_t *ref,
   dt_iop_gui_update(module);
   dt_dev_add_history_item(dev, module, TRUE);
   if(module->widget) gtk_widget_queue_draw(module->widget);
+  _remote_reveal_module(module);
 
   const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
 
@@ -1758,6 +1788,10 @@ gboolean dt_remote_create_module_instance(const dt_remote_module_ref_t *ref,
                                    _("could not create a new instance of module '%s'"), base->op);
     return FALSE;
   }
+  // dt_iop_gui_duplicate() already expands and focuses the new instance
+  // but never switches module groups; the reveal adds the group switch and
+  // is a no-op for the rest.
+  _remote_reveal_module(module);
 
   const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
 
