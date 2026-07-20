@@ -1,7 +1,7 @@
 # darktable MCP — blend settings (mask Tier 1) low-level design
 
 Date: 2026-07-19
-Status: draft design (not yet planned; awaiting review)
+Status: implemented (see plan 2026-07-19-darktable-mcp-blend-settings-tier1.md)
 Companions: `2026-07-19-darktable-mcp-mask-support-design-candidates.md`
 (the tier split this elaborates), `2026-07-05-darktable-mcp-protocol-reference.md`
 (wire contract being extended),
@@ -388,3 +388,33 @@ disabled module does not enable it; capability advertised in hello.
    storage semantics; the GUI also preserves the value while hiding the
    slider).
 7. Whole-blend-object readback after any blend patch.
+
+## Amendments (implementation)
+
+Two deviations from the text above, adopted during planning (see the
+Tier-1 plan's "Design amendments" header) and binding on the
+implementation:
+
+1. **Blend schema is live-session data.** This design assumed
+   `get_module_schema` was computed against the live darkroom; it is
+   actually per-op/static ("from the loaded module .so alone",
+   `remote_edit.h`). Resolution: `get_module_schema` gains an optional
+   `instance` argument (default 0), and the `blend` member appears
+   **only** when darktable is in darkroom with an image and that
+   instance exists — otherwise the member is omitted (no error).
+   `mode.values`, `current_extra_bits`, `details.writable`, and the
+   colorspace choice set are computed against that live instance.
+2. **mask_mode read strings follow the transition appendix**, not this
+   design's "`uniform+` prefix" sentence: `off`, `uniform`,
+   `parametric`, `drawn`, `drawn+parametric`, `raster` (`ENABLED`
+   accompanying mask bits is implied and never spelled). The appendix in
+   `2026-07-19-darktable-mcp-mask-support-design-candidates.md` is
+   authoritative for mask_mode vocabulary and transitions.
+
+One implementation finding beyond the design (live-verified by the
+Tier-1 integration gates): unlike scalar params, the blend block also
+flows **history → module** during every pixelpipe synch
+(`dt_iop_commit_params` → `dt_iop_commit_blend_params`), so the
+mutation transaction repairs a possible mid-transaction clobber under
+`dev->history_mutex` after its history item lands — see the "Blend race
+repair" comment in `dt_remote_set_module_params`.

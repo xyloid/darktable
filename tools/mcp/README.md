@@ -255,6 +255,29 @@ Two things to know when using it:
   Compare with tolerance; the stored multipliers, not the Kelvin/tint
   projection, are the authoritative state.
 
+### Blend settings
+
+`set_module_params` also edits a module instance's blend settings (mask
+Tier 1) through its optional `blend` argument — opacity, blend mode,
+blending colorspace, mask refinement controls, and the off/uniform mask
+mode. Halving a module's overall effect:
+
+```json
+{
+  "module": "exposure",
+  "values": {},
+  "blend": { "mask_mode": "uniform", "opacity": 50 }
+}
+```
+
+This requires a darktable that advertises the `blend_params` hello
+capability; the tool refuses client-side with an upgrade message
+otherwise. WARNING: writing `colorspace` deterministically resets
+`mode`, `reverse`, `fulcrum`, and any parametric-mask thresholds to the
+new space's defaults — send replacement values in the same call if you
+want them. The response's `blend` member reads back the complete
+post-commit blend state.
+
 ## Setup
 
 Requires Python >= 3.10. One command, from any directory (bash or zsh):

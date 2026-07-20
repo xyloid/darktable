@@ -525,6 +525,84 @@ Errors: `unknown_module`, `unknown_instance`, `unknown_field`,
 `unsupported_field` (known but not writable), `invalid_value`,
 `revision_conflict`.
 
+### Blend settings (`blend_params` capability)
+
+Mask Tier 1 (M-A): per-instance blend controls — opacity, blend mode,
+blending colorspace, fulcrum, feathering, blur, contrast, brightness,
+details, and the off/uniform mask mode — ride the existing methods as an
+additive wire surface gated on the `blend_params` hello capability.
+
+**Schema member.** `get_module_schema` accepts an optional `instance`
+argument (default 0). Unlike the rest of the schema (computed from the
+loaded module .so alone), the `blend` member is **live-session data**:
+it appears only when darktable is in darkroom with an image open and
+that instance exists and supports blending — otherwise the member is
+simply omitted, never an error. Its contents are computed against the
+live instance: `mask_mode` (writable vocabulary `["off", "uniform"]`,
+plus `writable`/`current_extra_bits` reflecting whether a
+drawn/parametric/raster configuration is present), `colorspace` (the
+per-module choice set, `default`, and writability), `mode` (the writable
+mode set for the instance's **effective** colorspace, in GUI order),
+`reverse`, `feathering_guide` (the four C enumerator names), and the
+seven float fields with hard `range` (fulcrum −18..18 EV, opacity 0–100
+%, feathering_radius 0–250 px, blur_radius 0–100 px,
+contrast/brightness/details −1..1), `soft_range` where the GUI has one
+(fulcrum −3..3), `unit`, and `writable` (`details` is writable only for
+raw images).
+
+**Read.** `get_module_params` attaches a `blend` member with the
+complete current blend state. Enum values are C enumerator names
+(`"DEVELOP_BLEND_NORMAL2"`, `"DEVELOP_BLEND_CS_RGB_SCENE"`,
+`"DEVELOP_MASK_GUIDE_IN_AFTER_BLUR"`) — except `mask_mode`, which uses
+the transition-appendix vocabulary (mask-support design candidates,
+appendix): writable states `"off"`/`"uniform"`, read-only compounds
+`"parametric"`, `"drawn"`, `"drawn+parametric"`, `"raster"`. A stored
+colorspace equal to the module's default reads back as
+`"DEVELOP_BLEND_CS_NONE"` ("not explicitly chosen");
+`effective_colorspace` always carries the resolved space.
+
+**Patch.** `set_module_params` accepts a sibling `blend` object next to
+`values`. A blend-only patch (`values: {}`) is legal. The blend patch is
+atomic with the rest of the call and produces exactly **one** history
+item; it never implicitly enables a disabled module. Validation order
+inside the blend object: `mask_mode` → `colorspace` → `mode` →
+`reverse` → `feathering_guide` → numeric fields (table order); blend
+errors rank after every semantic-class error (the blend step runs after
+the class-ops loop). Writing `colorspace` **deterministically resets**
+`mode`, `reverse`, `fulcrum`, and the blendif parameters to the new
+space's defaults; later members of the same patch then apply on top
+(the GUI's history-scavenging restore is deliberately not reproduced).
+`mask_mode` is writable only to `"off"`/`"uniform"`, and only while the
+stored mode has no drawn/parametric/raster bits — see the mask_mode
+transition appendix for the full state machine. The mutation result's
+`blend` member reads back the **complete** post-commit blend object,
+never just the touched members.
+
+**Errors.** Only existing codes, with
+`details: {"parameter": "blend.<name>", "constraint": "<slug>"}`
+(`"parameter": "blend"` for the empty-object case):
+
+| condition | code | constraint |
+|---|---|---|
+| unknown member `blend.<x>` | `unsupported_field` | — |
+| empty blend object | `invalid_value` | `empty` |
+| `mask_mode` write while stored has drawn/parametric/raster bits | `invalid_value` | `mask_configuration_present` |
+| `mask_mode` value not `"off"`/`"uniform"` | `invalid_value` | `unknown_value` |
+| `colorspace` write on a fixed (RAW/NONE-default) module | `invalid_value` | `colorspace_not_available` |
+| `colorspace` value not in the choice set (incl. `CS_NONE`, `CS_RAW`, Lab on non-Lab) | `invalid_value` | `colorspace_not_available` |
+| `colorspace` unknown string | `invalid_value` | `unknown_value` |
+| `mode` unknown enumerator string | `invalid_value` | `unknown_value` |
+| `mode` valid enumerator not in the projected colorspace's set (incl. deprecated) | `invalid_value` | `mode_not_available_in_colorspace` |
+| `reverse` not a boolean | `invalid_value` | `wrong_type` |
+| `feathering_guide` unknown string | `invalid_value` | `unknown_value` |
+| float member not a JSON number | `invalid_value` | `wrong_type` |
+| float non-finite | `invalid_value` | `non_finite` |
+| float outside hard range | `invalid_value` | `range` |
+| `details` write when image is not rawprepare-supported | `invalid_value` | `requires_raw_image` |
+
+A `blend` member on a module without `IOP_FLAGS_SUPPORTS_BLENDING`
+fails the whole request with `unsupported_field`.
+
 ### set_module_enabled
 
 Request params: `{"module", "instance"?, "enabled": true, "expected_revision"?}`.

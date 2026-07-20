@@ -108,8 +108,10 @@ user-facing controls survive these rules:
 Modules flagged `IOP_FLAGS_ONE_INSTANCE` reject `create_module_instance`
 with `instance_not_supported` (column "multi" below).
 
-Blending and mask parameters (`blendop`) are out of scope for every module,
-per the design spec's non-goals.
+Blend settings (opacity, mode, colorspace, refinement controls,
+off/uniform mask mode) are supported for every module with
+`IOP_FLAGS_SUPPORTS_BLENDING` via the `blend_params` capability;
+parametric and drawn masks remain out of scope (M-B/M-C).
 
 ## Usage vocabulary
 
