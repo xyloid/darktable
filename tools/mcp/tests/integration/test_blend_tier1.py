@@ -107,7 +107,7 @@ async def test_schema_and_params_carry_blend_section(darktable_session):
         )
         assert "blend" in schema
         blend_schema = schema["blend"]
-        assert blend_schema["mask_mode"]["values"] == ["off", "uniform"]
+        assert blend_schema["mask_mode"]["values"] == ["off", "uniform", "parametric"]
         assert blend_schema["colorspace"]["default"] in RGB_COLORSPACES
         assert blend_schema["opacity"]["range"] == [0.0, 100.0]
 
@@ -258,11 +258,11 @@ async def test_blend_patch_does_not_enable_disabled_module(darktable_session):
 
 
 # ---------------------------------------------------------------------------
-# 6. mask_mode gating: compound targets rejected, off/uniform round-trip
+# 6. mask_mode drawn ownership + off/uniform round-trip
 # ---------------------------------------------------------------------------
 
 
-async def test_mask_mode_rejections_and_roundtrip(darktable_session):
+async def test_mask_mode_drawn_ownership_and_roundtrip(darktable_session):
     async with harness.connected_client(darktable_session) as client:
         before = await _module_params(client, "exposure")
 

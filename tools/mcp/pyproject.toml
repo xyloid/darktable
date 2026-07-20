@@ -41,6 +41,7 @@ Documentation = "https://github.com/darktable-org/darktable/blob/master/tools/mc
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
+  "Pillow>=10.0,<13",
 ]
 
 [project.scripts]
