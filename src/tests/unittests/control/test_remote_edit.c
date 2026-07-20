@@ -731,6 +731,25 @@ static void test_patch_apply_empty_patch_rejected(void **state)
   g_ptr_array_unref(patch.scalar_values);
 }
 
+static void test_patch_apply_blend_only_patch_passes_emptiness(void **state)
+{
+  // a blend-only patch is legal: the blend member counts as content for the
+  // emptiness rule but is applied later by the caller (the mutation path),
+  // not by this pure core -- the params blob stays untouched.
+  fixture_params_t params = { 0 };
+  dt_remote_patch_t patch = { 0 };
+  patch.blend = json_object_new();
+  json_object_set_string_member(patch.blend, "mask_mode", "off");
+
+  dt_remote_error_t *err = NULL;
+  assert_true(dt_remote_patch_apply(fixture_linear, NULL, &patch, &params, &err));
+  assert_null(err);
+  const fixture_params_t zero = { 0 };
+  assert_memory_equal(&params, &zero, sizeof(fixture_params_t));
+
+  json_object_unref(patch.blend);
+}
+
 static void test_patch_apply_null_patch_rejected(void **state)
 {
   fixture_params_t params = { 0 };
@@ -2526,6 +2545,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_patch_apply_denylisted_field_rejected),
     cmocka_unit_test(test_patch_apply_duplicate_field_rejected),
     cmocka_unit_test(test_patch_apply_empty_patch_rejected),
+    cmocka_unit_test(test_patch_apply_blend_only_patch_passes_emptiness),
     cmocka_unit_test(test_patch_apply_null_patch_rejected),
 
     cmocka_unit_test_setup_teardown(test_transaction_scalar_plus_curve_patch_commits_once,

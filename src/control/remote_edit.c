@@ -23,11 +23,13 @@
 #include "control/conf.h"
 #include "control/control.h"
 #include "control/remote_band.h"
+#include "control/remote_blend.h"
 #include "control/remote_curve.h"
 #include "control/remote_quantity.h"
 #include "control/remote_revision.h"
 #include "control/remote_vector.h"
 #include "common/colorspaces.h"
+#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
@@ -150,6 +152,7 @@ void dt_remote_mutation_result_free(dt_remote_mutation_result_t *result)
   g_free(result->instance_name);
   if(result->values) g_ptr_array_unref(result->values);
   if(result->semantic_values) g_hash_table_unref(result->semantic_values);
+  if(result->blend_readback) json_node_unref(result->blend_readback);
   g_free(result);
 }
 
@@ -594,7 +597,7 @@ gboolean dt_remote_patch_apply(const dt_introspection_field_t *linear,
   const gboolean has_scalars = patch && patch->scalar_values && patch->scalar_values->len > 0;
   const gboolean has_semantics = patch && patch->semantic_values && patch->semantic_values->len > 0;
 
-  if(!patch || (!has_scalars && !has_semantics && !patch->has_enable))
+  if(!patch || (!has_scalars && !has_semantics && !patch->has_enable && !patch->blend))
   {
     if(error) *error = dt_remote_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("values must be non-empty"));
     return FALSE;
@@ -1366,6 +1369,36 @@ gboolean dt_remote_get_module_params(const dt_remote_module_ref_t *ref,
   return TRUE;
 }
 
+static JsonNode *_blend_node_for_ref(const dt_remote_module_ref_t *ref,
+                                     JsonNode *(*build)(dt_iop_module_t *))
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+  dt_develop_t *dev = NULL;
+  dt_remote_error_t *error = NULL;
+  if(!dt_remote_require_darkroom_image(&dev, &error))
+  {
+    dt_remote_error_free(error);
+    return NULL;
+  }
+  dt_iop_module_t *module = dt_remote_find_module(dev, ref, &error);
+  if(!module)
+  {
+    dt_remote_error_free(error);
+    return NULL;
+  }
+  return build(module);
+}
+
+JsonNode *dt_remote_blend_schema_for_ref(const dt_remote_module_ref_t *ref)
+{
+  return _blend_node_for_ref(ref, dt_remote_blend_schema);
+}
+
+JsonNode *dt_remote_blend_read_for_ref(const dt_remote_module_ref_t *ref)
+{
+  return _blend_node_for_ref(ref, dt_remote_blend_read);
+}
+
 /* ---------------------------------------------------------------------- */
 /* mutation API (plan step 7)                                              */
 /* ---------------------------------------------------------------------- */
@@ -1476,6 +1509,31 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
       return FALSE;
     }
 
+  // Blend step (Tier 1 / M-A): validate the blend patch into a scratch
+  // copy of the live blend params -- same discipline as temp_params; any
+  // rejection aborts with live state untouched. Blend errors rank after
+  // every semantic class by construction (this runs after the class-ops
+  // loop).
+  dt_develop_blend_params_t temp_blend;
+  const gboolean have_blend = patch->blend != NULL;
+  if(have_blend)
+  {
+    if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    {
+      g_free(temp_params);
+      if(error)
+        *error = dt_remote_error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                                     _("module '%s' does not support blending"), module->op);
+      return FALSE;
+    }
+    temp_blend = *module->blend_params;
+    if(!dt_remote_blend_patch_apply(module, patch->blend, &temp_blend, error))
+    {
+      g_free(temp_params);
+      return FALSE;
+    }
+  }
+
   // Semantic read-back happens against the projected block, before the
   // commit: projected and post-commit params are byte-identical (the memcpy
   // below), and reading here means a read failure (registry drift racing
@@ -1533,6 +1591,12 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   // implicitly enable a disabled module (plan step 7's binding rule).
   memcpy(module->params, temp_params, module->params_size);
   g_free(temp_params);
+
+  // the preset-apply idiom's blend half (src/gui/presets.c:1091): commit
+  // the validated blend block before the shared gui_update/history step,
+  // so the single dt_dev_add_history_item() below snapshots params AND
+  // blend params together -- still exactly one history item.
+  if(have_blend) dt_iop_commit_blend_params(module, &temp_blend);
 
   if(patch->has_enable) module->enabled = patch->enable ? TRUE : FALSE;
 
@@ -1596,6 +1660,7 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
     g_ptr_array_add(result->values, entry);
   }
   result->semantic_values = semantic_readback;  // already class-tagged (wrapped above)
+  result->blend_readback = have_blend ? dt_remote_blend_read(module) : NULL;
   result->revision = new_revision;
 
   *out = result;

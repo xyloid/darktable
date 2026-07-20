@@ -34,6 +34,11 @@
 #include <gio/gio.h>   // GCancellable (dt_remote_render_preview_execute)
 #include <glib.h>
 #include <inttypes.h>
+#include <json-glib/json-glib.h>  // JsonObject/JsonNode: the blend surface
+                                  // (remote_blend.h) deliberately speaks
+                                  // JSON -- the one exception to this
+                                  // header's "no JSON" rule, see
+                                  // remote_blend.h's own top comment.
 
 G_BEGIN_DECLS
 
@@ -250,6 +255,10 @@ typedef struct dt_remote_patch_t
                                // curve-classes design)
   gboolean has_enable;
   gboolean enable;
+  JsonObject *blend;           // the request's "blend" member, borrowed
+                               // from the caller's parsed request tree
+                               // (never owned/freed here); NULL when the
+                               // request carried no blend patch
 } dt_remote_patch_t;
 // duplicates rejected at protocol layer
 
@@ -271,6 +280,9 @@ typedef struct dt_remote_mutation_result_t
                                 // (remote_parameters.h), read back for exactly
                                 // the semantic IDs the patch wrote; NULL when
                                 // the patch carried no semantic entries
+  JsonNode *blend_readback;     // complete post-commit blend object
+                                // (dt_remote_blend_read()), owned; NULL
+                                // unless the patch carried `blend`
   uint64_t revision;
 } dt_remote_mutation_result_t;
 
@@ -509,6 +521,14 @@ gboolean dt_remote_create_module_instance(const dt_remote_module_ref_t *ref,
                                           const uint64_t *expected_revision,
                                           dt_remote_mutation_result_t **out,
                                           dt_remote_error_t **error);
+
+/** live-lookup conveniences for the protocol layer: resolve `ref` against
+ * the current darkroom and return dt_remote_blend_schema()/_read() for
+ * that instance. Return NULL -- never an error -- when not in darkroom,
+ * the instance does not exist, or the op has no blending. GTK main
+ * thread only. */
+JsonNode *dt_remote_blend_schema_for_ref(const dt_remote_module_ref_t *ref);
+JsonNode *dt_remote_blend_read_for_ref(const dt_remote_module_ref_t *ref);
 
 /** Reads the darkroom history stack as model-oriented metadata only: one
  * dt_remote_history_item_t per entry (seq = stack position, op, instance,
