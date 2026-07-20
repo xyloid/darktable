@@ -111,6 +111,7 @@ FILE(GLOB SOURCE_FILES
   "control/progress.c"
   "control/remote_band.c"
   "control/remote_band_registry.c"
+  "control/remote_blend.c"
   "control/remote_curve.c"
   "control/remote_curve_registry.c"
   "control/remote_discovery.c"

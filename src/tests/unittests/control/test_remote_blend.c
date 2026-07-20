@@ -26,6 +26,7 @@
 #include <setjmp.h>
 #include <cmocka.h>
 
+#include "control/remote_blend.h"
 #include "develop/blend.h"
 
 #include <glib.h>
@@ -141,6 +142,68 @@ static void test_mode_sections_never_list_deprecated(void **state)
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Task 2: mask_mode mapping + mode expansion                          */
+/* ------------------------------------------------------------------ */
+
+static void test_mask_mode_string_mapping(void **state)
+{
+  (void)state;
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_DISABLED), "off");
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_ENABLED), "uniform");
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL),
+                      "parametric");
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK),
+                      "drawn");
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL),
+                      "drawn+parametric");
+  assert_string_equal(dt_remote_blend_mask_mode_string(DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER),
+                      "raster");
+  // raster wins over any other bit combination
+  assert_string_equal(dt_remote_blend_mask_mode_string(
+                        DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_RASTER),
+                      "raster");
+}
+
+static void test_mask_mode_from_string(void **state)
+{
+  (void)state;
+  uint32_t v = 999;
+  assert_true(dt_remote_blend_mask_mode_from_string("off", &v));
+  assert_int_equal(v, DEVELOP_MASK_DISABLED);
+  assert_true(dt_remote_blend_mask_mode_from_string("uniform", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED);
+  // read-only compounds and junk are rejected
+  assert_false(dt_remote_blend_mask_mode_from_string("drawn", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("parametric", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("raster", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string(NULL, &v));
+}
+
+static void test_mode_names_for_colorspace_matches_sections(void **state)
+{
+  (void)state;
+  // spot-check RGB scene: first name, arithmetic run, count matches the
+  // Task-1 frozen expectation (14 modes)
+  GPtrArray *names = dt_remote_blend_mode_names_for_colorspace(DEVELOP_BLEND_CS_RGB_SCENE);
+  assert_int_equal(names->len, 14);
+  assert_string_equal(g_ptr_array_index(names, 0), "DEVELOP_BLEND_NORMAL2");
+  assert_string_equal(g_ptr_array_index(names, 3), "DEVELOP_BLEND_MULTIPLY");
+  assert_string_equal(g_ptr_array_index(names, 8), "DEVELOP_BLEND_HARMONIC_MEAN");
+  assert_string_equal(g_ptr_array_index(names, 13), "DEVELOP_BLEND_CHROMATICITY");
+  g_ptr_array_unref(names);
+
+  GPtrArray *lab = dt_remote_blend_mode_names_for_colorspace(DEVELOP_BLEND_CS_LAB);
+  assert_int_equal(lab->len, 25);
+  assert_string_equal(g_ptr_array_index(lab, 16), "DEVELOP_BLEND_LAB_LIGHTNESS");
+  g_ptr_array_unref(lab);
+
+  GPtrArray *none = dt_remote_blend_mode_names_for_colorspace(DEVELOP_BLEND_CS_NONE);
+  assert_int_equal(none->len, 0);
+  g_ptr_array_unref(none);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -150,6 +213,9 @@ int main(void)
     cmocka_unit_test(test_mode_sections_parity_rgb_scene),
     cmocka_unit_test(test_mode_sections_none_is_empty),
     cmocka_unit_test(test_mode_sections_never_list_deprecated),
+    cmocka_unit_test(test_mask_mode_string_mapping),
+    cmocka_unit_test(test_mask_mode_from_string),
+    cmocka_unit_test(test_mode_names_for_colorspace_matches_sections),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }
