@@ -2006,6 +2006,8 @@ uint64_t dt_remote_current_revision(void)
 }
 
 gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
+                                          const char *show_mask_op,
+                                          int show_mask_instance,
                                           dt_remote_error_t **error)
 {
   g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
@@ -2013,15 +2015,42 @@ gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
   dt_develop_t *dev = NULL;
   if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
 
-  // Ordinary-preview caller: no mask target. Task 6 replaces this
-  // initialization with actual target capture while updating the protocol
-  // function pointer and stubs in the same commit, so no intermediate
-  // signature mismatch is introduced here.
+  // Ordinary preview: no mask target, every mask_* field zeroed. A mask
+  // request (show_mask_op != NULL) resolves the target instance, rejects a
+  // non-blending module, and captures its stored mask_mode -- and, for an
+  // off/uniform target with no spatial mask, sets force_white so the export
+  // renders normally (for framing) and is whitened afterwards (amendment 4).
   out->want_mask = FALSE;
   out->force_white = FALSE;
   out->mask_op[0] = '\0';
   out->mask_instance = 0;
   out->mask_mode_stored = 0;
+  if(show_mask_op)
+  {
+    const dt_remote_module_ref_t ref = {
+      .op = show_mask_op, .instance = show_mask_instance
+    };
+    dt_iop_module_t *module = dt_remote_find_module(dev, &ref, error);
+    if(!module) return FALSE;
+    if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    {
+      if(error)
+      {
+        *error = dt_remote_error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                                     _("module '%s' does not support blending"),
+                                     show_mask_op);
+        (*error)->details_json =
+          g_strdup("{\"parameter\":\"show_mask.op\"}");
+      }
+      return FALSE;
+    }
+    out->want_mask = TRUE;
+    g_strlcpy(out->mask_op, module->op, sizeof(out->mask_op));
+    out->mask_instance = module->multi_priority;
+    out->mask_mode_stored = module->blend_params->mask_mode;
+    out->force_white = !(out->mask_mode_stored
+      & (DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_MASK | DEVELOP_MASK_RASTER));
+  }
 
   // Binding caveat (internals §8): the export path re-loads history from
   // the database (dt_imageio_export_with_flags builds its own

@@ -111,7 +111,10 @@ typedef struct dt_remote_protocol_calls_t
                                      dt_remote_mutation_result_t **out, dt_remote_error_t **error);
   gboolean (*get_history)(int limit, GPtrArray **out, uint64_t *revision, dt_remote_error_t **error);
   gboolean (*undo)(uint64_t expected_revision, uint64_t *revision, dt_remote_error_t **error);
-  gboolean (*render_preview_prepare)(dt_remote_preview_request_t *out, dt_remote_error_t **error);
+  gboolean (*render_preview_prepare)(dt_remote_preview_request_t *out,
+                                     const char *show_mask_op,
+                                     int show_mask_instance,
+                                     dt_remote_error_t **error);
   // Live revision read at preview-completion time (internals §8 coherence
   // check): if it differs from the revision the preview was stamped with,
   // darkroom state drifted during the render and the result is discarded.

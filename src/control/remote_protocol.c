@@ -21,6 +21,7 @@
 #include "common/darktable.h"  // for the _() gettext macro
 #include "control/jobs.h"           // DT_JOB_QUEUE_SYSTEM_BG render job
 #include "control/remote_frame.h"   // DT_REMOTE_MAX_FRAME (proactive size check)
+#include "control/remote_blend.h"   // dt_remote_blend_mask_mode_string (mask_of)
 #include "control/remote_parameters.h" // semantic curve schema/value types (milestone 2)
 #include "control/remote_server.h"  // dt_remote_async_* (production async table)
 
@@ -954,6 +955,10 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // "quantity_params" (milestone 6) for quantity-class entries.
   // "blend_params" (mask Tier 1 / M-A) gates the blend
   // schema/read/patch/readback wire members.
+  // "parametric_mask_params" (mask Tier 2 / M-B) gates the blend combine +
+  // parametric (blendif) schema/read/patch members; it implies "blend_params".
+  // "mask_render" (mask Tier 2 / M-B) is independent and gates
+  // render_preview's show_mask/mask_of display-mask surface.
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "semantic_params");
   json_builder_add_string_value(b, "curve_params");
@@ -961,6 +966,8 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   json_builder_add_string_value(b, "band_params");
   json_builder_add_string_value(b, "quantity_params");
   json_builder_add_string_value(b, "blend_params");
+  json_builder_add_string_value(b, "parametric_mask_params");
+  json_builder_add_string_value(b, "mask_render");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");
@@ -2341,7 +2348,9 @@ static JsonNode *_handler_undo(JsonObject *params, dt_remote_session_t *session,
   return node;
 }
 
-static const char *const RENDER_PREVIEW_KEYS[] = { "max_px", "quality", NULL };
+static const char *const RENDER_PREVIEW_KEYS[] =
+  { "max_px", "quality", "show_mask", NULL };
+static const char *const SHOW_MASK_KEYS[] = { "op", "instance", NULL };
 
 // The first asynchronous handler: validates and clamps params, does the
 // main-thread pre-work (history flush + revision capture, via the calls
@@ -2371,12 +2380,40 @@ static JsonNode *_handler_render_preview(JsonObject *params, dt_remote_session_t
   if(quality < 50) quality = 50;
   if(quality > 95) quality = 95;
 
+  // Optional show_mask target (Tier 2 / M-B, "mask_render"): a strict
+  // {op, instance} object. A bare boolean, empty op, unknown key, wrong
+  // member type, or an out-of-range instance is invalid_value. The target
+  // is only parsed here; prepare resolves it against the live darkroom.
+  const char *show_mask_op = NULL;
+  gint64 show_mask_instance = 0;
+  if(json_object_has_member(params, "show_mask"))
+  {
+    JsonNode *node = json_object_get_member(params, "show_mask");
+    if(!node || !JSON_NODE_HOLDS_OBJECT(node))
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'show_mask' must be an object")));
+    JsonObject *show_mask = json_node_get_object(node);
+    if(!_check_known_keys(show_mask, SHOW_MASK_KEYS, &err)) return _handler_fail(err);
+    if(!_require_string(show_mask, "op", &show_mask_op, &err)) return _handler_fail(err);
+    if(!show_mask_op[0])
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'show_mask.op' must not be empty")));
+    if(!_optional_int_default(show_mask, "instance", 0,
+                              &show_mask_instance, &err))
+      return _handler_fail(err);
+    if(show_mask_instance < 0 || show_mask_instance > G_MAXINT)
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'show_mask.instance' is out of range")));
+  }
+
   // main-thread pre-work (internals §8, binding): flush live history to
   // the DB (the export re-loads it from there) and capture the revision
   // at that instant -- the preview is stamped with it. Also where
   // not_in_darkroom/no_image_open surface, synchronously.
   dt_remote_preview_request_t req = { 0 };
-  if(!s_calls.render_preview_prepare(&req, &err)) return _handler_fail(err);
+  if(!s_calls.render_preview_prepare(&req, show_mask_op,
+                                     (int)show_mask_instance, &err))
+    return _handler_fail(err);
 
   if(!pending)
     return _handler_fail(_error_new(DT_REMOTE_ERR_INTERNAL,
@@ -2694,6 +2731,21 @@ JsonNode *dt_remote_protocol_build_preview_response(gint64 request_id,
     json_builder_add_int_value(b, preview->height);
     json_builder_set_member_name(b, "revision");
     json_builder_add_int_value(b, (gint64)preview->revision);
+    if(preview->is_mask)
+    {
+      // mask_of provenance (Tier 2 / M-B): the true stored mask_mode of the
+      // rendered target, so the client sees what it configured.
+      json_builder_set_member_name(b, "mask_of");
+      json_builder_begin_object(b);
+      json_builder_set_member_name(b, "op");
+      json_builder_add_string_value(b, preview->mask_op);
+      json_builder_set_member_name(b, "instance");
+      json_builder_add_int_value(b, preview->mask_instance);
+      json_builder_set_member_name(b, "mask_mode");
+      json_builder_add_string_value(
+        b, dt_remote_blend_mask_mode_string(preview->mask_mode_stored));
+      json_builder_end_object(b);
+    }
     json_builder_set_member_name(b, "data");
     json_builder_add_string_value(b, b64);
     json_builder_end_object(b);

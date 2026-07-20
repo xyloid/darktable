@@ -1,0 +1,13 @@
+{
+  "id": 42,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "raster masks are not writable",
+    "details": {
+      "parameter": "blend.mask_mode",
+      "constraint": "raster_unsupported"
+    },
+    "retryable": false
+  }
+}

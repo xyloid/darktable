@@ -1,0 +1,12 @@
+{
+  "id": 44,
+  "ok": true,
+  "result": {
+    "mime_type": "image/jpeg",
+    "width": 512,
+    "height": 342,
+    "revision": 35,
+    "mask_of": { "op": "exposure", "instance": 1, "mask_mode": "parametric" },
+    "data": "c3R1Yi1qcGVnLWJ5dGVzLWZvci1yZW5kZXItcHJldmlldy1maXh0dXJl"
+  }
+}

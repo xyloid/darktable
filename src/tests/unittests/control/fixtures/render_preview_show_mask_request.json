@@ -1,0 +1,9 @@
+{
+  "id": 44,
+  "method": "render_preview",
+  "params": {
+    "max_px": 512,
+    "quality": 90,
+    "show_mask": { "op": "exposure", "instance": 1 }
+  }
+}

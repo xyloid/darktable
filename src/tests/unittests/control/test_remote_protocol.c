@@ -49,6 +49,7 @@
 #include "../util/assert.h"
 
 #include "common/darktable.h"
+#include "develop/blend.h"  // DEVELOP_MASK_* constants for the preview mask fixtures
 #include "control/remote_edit.h"
 #include "control/remote_parameters.h"
 #include "control/remote_protocol.h"
@@ -1742,7 +1743,7 @@ static void test_hello_success(void **state)
   // schema/read/patch/readback) + "instances"/"history" (step 8) +
   // "preview" (step 9) + "scopes" (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 11);
+  assert_int_equal(json_array_get_length(caps), 13);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
@@ -1750,10 +1751,12 @@ static void test_hello_success(void **state)
   assert_string_equal(json_array_get_string_element(caps, 4), "band_params");
   assert_string_equal(json_array_get_string_element(caps, 5), "quantity_params");
   assert_string_equal(json_array_get_string_element(caps, 6), "blend_params");
-  assert_string_equal(json_array_get_string_element(caps, 7), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 8), "history");
-  assert_string_equal(json_array_get_string_element(caps, 9), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 10), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 7), "parametric_mask_params");
+  assert_string_equal(json_array_get_string_element(caps, 8), "mask_render");
+  assert_string_equal(json_array_get_string_element(caps, 9), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 10), "history");
+  assert_string_equal(json_array_get_string_element(caps, 11), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 12), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -3425,11 +3428,68 @@ static gboolean stub_set_module_params_blend_capture(const dt_remote_module_ref_
   return TRUE;
 }
 
-static gboolean stub_set_module_params_blend_mask_configuration(const dt_remote_module_ref_t *ref,
-                                                                const dt_remote_patch_t *patch,
-                                                                const uint64_t *expected_revision,
-                                                                dt_remote_mutation_result_t **out,
-                                                                dt_remote_error_t **error)
+// Tier 2 / M-B: the parametric blend patch/readback rides the same borrowed
+// patch->blend + blend_readback passthrough; the request's parametric object
+// arrives verbatim and the stub's readback serializes as the response blend.
+static gboolean stub_set_module_params_parametric_capture(
+  const dt_remote_module_ref_t *ref, const dt_remote_patch_t *patch,
+  const uint64_t *expected_revision, dt_remote_mutation_result_t **out,
+  dt_remote_error_t **error)
+{
+  (void)expected_revision;
+  (void)error;
+  assert_non_null(patch);
+  assert_non_null(patch->blend);
+  assert_string_equal(json_object_get_string_member(patch->blend, "mask_mode"),
+                      "parametric");
+  JsonObject *parametric = json_object_get_object_member(patch->blend, "parametric");
+  JsonObject *jz = json_object_get_object_member(parametric, "Jz_in");
+  assert_false(json_object_get_boolean_member(jz, "inverted"));
+  assert_int_equal(json_array_get_length(json_object_get_array_member(jz, "markers")), 4);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(*result));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->blend_readback = json_from_string(
+    "{\"mask_mode\":\"parametric\","
+    "\"colorspace\":\"DEVELOP_BLEND_CS_NONE\","
+    "\"effective_colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\","
+    "\"mode\":\"DEVELOP_BLEND_NORMAL2\",\"reverse\":false,"
+    "\"fulcrum\":0.0,\"opacity\":100.0,\"feathering_radius\":0.0,"
+    "\"feathering_guide\":\"DEVELOP_MASK_GUIDE_IN_AFTER_BLUR\","
+    "\"blur_radius\":0.0,\"contrast\":0.0,\"brightness\":0.0,\"details\":0.0,"
+    "\"combine\":\"exclusive\",\"parametric\":{\"Jz_in\":{"
+    "\"markers\":[0.55,0.65,1.0,1.0],\"inverted\":false,"
+    "\"boost\":-6.64385619}},\"foreign_channels\":false}", NULL);
+  result->revision = 13;
+  *out = result;
+  return TRUE;
+}
+
+static void test_set_module_params_parametric_fixture_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_parametric_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_parametric_request.json",
+                           "set_module_params_parametric_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// Tier 2 / M-B replaces the obsolete mask_configuration_present rejection
+// (Tier 1 blocked every drawn/parametric/raster mode) with the still-reachable
+// raster contract: raster masks remain non-writable through the transition.
+static gboolean stub_set_module_params_blend_raster(const dt_remote_module_ref_t *ref,
+                                                    const dt_remote_patch_t *patch,
+                                                    const uint64_t *expected_revision,
+                                                    dt_remote_mutation_result_t **out,
+                                                    dt_remote_error_t **error)
 {
   (void)ref;
   (void)patch;
@@ -3438,9 +3498,10 @@ static gboolean stub_set_module_params_blend_mask_configuration(const dt_remote_
   if(error)
   {
     *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE,
-                         g_strdup("a drawn/parametric/raster mask configuration is present"));
+                         g_strdup("raster masks are not writable"));
     (*error)->details_json =
-      g_strdup("{\"parameter\":\"blend.mask_mode\",\"constraint\":\"mask_configuration_present\"}");
+      g_strdup("{\"parameter\":\"blend.mask_mode\","
+               "\"constraint\":\"raster_unsupported\"}");
   }
   return FALSE;
 }
@@ -3521,16 +3582,16 @@ static void test_set_module_params_blend_only_patch_allowed(void **state)
   dt_remote_protocol_set_calls(NULL);
 }
 
-static void test_set_module_params_blend_error_fixture(void **state)
+static void test_set_module_params_blend_raster_error_fixture(void **state)
 {
   (void)state;
   dt_remote_protocol_calls_t calls = {
     .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
-    .set_module_params = stub_set_module_params_blend_mask_configuration,
+    .set_module_params = stub_set_module_params_blend_raster,
   };
   dt_remote_protocol_set_calls(&calls);
-  _assert_dispatch_matches("set_module_params_error_blend_mask_configuration_request.json",
-                           "set_module_params_error_blend_mask_configuration_response.json");
+  _assert_dispatch_matches("set_module_params_error_blend_raster_request.json",
+                           "set_module_params_error_blend_raster_response.json");
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -4376,21 +4437,66 @@ static void _install_fake_async(gboolean queue_result)
   dt_remote_protocol_set_async(&ops);
 }
 
+// captured show_mask target from the last prepare call (Tier 2 / M-B)
+static dt_dev_operation_t g_prepare_mask_op;
+static int g_prepare_mask_instance;
+
 static gboolean stub_render_preview_prepare_ok(dt_remote_preview_request_t *out,
+                                               const char *show_mask_op,
+                                               int show_mask_instance,
                                                dt_remote_error_t **error)
 {
   (void)error;
   out->imgid = 172;
   out->revision = 34;
+  g_strlcpy(g_prepare_mask_op, show_mask_op ? show_mask_op : "",
+            sizeof(g_prepare_mask_op));
+  g_prepare_mask_instance = show_mask_instance;
+  if(show_mask_op)
+  {
+    out->want_mask = TRUE;
+    g_strlcpy(out->mask_op, show_mask_op, sizeof(out->mask_op));
+    out->mask_instance = show_mask_instance;
+    out->mask_mode_stored = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  }
   return TRUE;
 }
 
-static gboolean stub_render_preview_prepare_not_in_darkroom(dt_remote_preview_request_t *out,
-                                                            dt_remote_error_t **error)
+static gboolean stub_render_preview_prepare_not_in_darkroom(
+  dt_remote_preview_request_t *out, const char *show_mask_op,
+  int show_mask_instance, dt_remote_error_t **error)
 {
   (void)out;
-  if(error) *error = _make_error(DT_REMOTE_ERR_NOT_IN_DARKROOM, g_strdup("no darkroom view is active"));
+  (void)show_mask_op;
+  (void)show_mask_instance;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_NOT_IN_DARKROOM,
+                         g_strdup("no darkroom view is active"));
   return FALSE;
+}
+
+// The show_mask target is parsed strictly, threaded through prepare into the
+// queued request (want_mask + mask target), and the request defers as usual.
+static void test_render_preview_show_mask_parses_and_defers(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .render_preview_prepare = stub_render_preview_prepare_ok
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+  JsonNode *request = _load_fixture("render_preview_show_mask_request.json");
+  assert_null(dt_remote_protocol_dispatch(json_node_get_object(request), NULL));
+  assert_string_equal(g_prepare_mask_op, "exposure");
+  assert_int_equal(g_prepare_mask_instance, 1);
+  assert_true(g_queued_req.want_mask);
+  assert_string_equal(g_queued_req.mask_op, "exposure");
+  assert_int_equal(g_queued_req.mask_instance, 1);
+  assert_int_equal(g_queued_max_px, 512);
+  assert_int_equal(g_queued_quality, 90);
+  json_node_unref(request);
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
 }
 
 // like _dispatch_inline, but a NULL return (async deferral) is legal
@@ -4500,9 +4606,34 @@ static void test_render_preview_error_bad_shapes(void **state)
   _assert_inline_error(
     "{\"id\":23,\"method\":\"render_preview\",\"params\":{\"max_px\":512,\"format\":\"png\"}}",
     "invalid_value");
+  // show_mask must be an object, not a bare boolean/empty/mistyped shape
+  _assert_inline_error(
+    "{\"id\":24,\"method\":\"render_preview\",\"params\":{\"show_mask\":true}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":25,\"method\":\"render_preview\",\"params\":{\"show_mask\":{}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":26,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"\"}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":27,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":-1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":28,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"extra\":1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":29,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":30,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":1.5}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":31,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":2147483648}}}",
+    "invalid_value");
 
-  assert_int_equal(g_async_begin_calls, 4);
-  assert_int_equal(g_async_abort_calls, 4);  // one abort per synchronous outcome
+  assert_int_equal(g_async_begin_calls, 12);
+  assert_int_equal(g_async_abort_calls, 12);
   assert_int_equal(g_queue_preview_calls, 0);
 
   dt_remote_protocol_set_async(NULL);
@@ -4595,6 +4726,29 @@ static void test_build_preview_response_success_matches_fixture(void **state)
   assert_memory_equal(decoded, RENDER_PREVIEW_STUB_BYTES, decoded_len);
   g_free(decoded);
 
+  json_node_unref(actual);
+  json_node_unref(expected);
+}
+
+// Tier 2 / M-B: a mask render carries the `mask_of` provenance block
+// (op/instance/mask_mode) between revision and data.
+static void test_build_preview_mask_response_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_preview_t preview = {
+    .jpeg = (uint8_t *)RENDER_PREVIEW_STUB_BYTES,
+    .jpeg_len = strlen(RENDER_PREVIEW_STUB_BYTES),
+    .width = 512,
+    .height = 342,
+    .revision = 35,
+    .is_mask = TRUE,
+    .mask_instance = 1,
+    .mask_mode_stored = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+  };
+  g_strlcpy(preview.mask_op, "exposure", sizeof(preview.mask_op));
+  JsonNode *actual = dt_remote_protocol_build_preview_response(44, &preview, NULL);
+  JsonNode *expected = _load_fixture("render_preview_show_mask_response.json");
+  assert_true(_json_equal(actual, expected));
   json_node_unref(actual);
   json_node_unref(expected);
 }
@@ -5530,7 +5684,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_set_module_params_blend_fixture_round_trip),
     cmocka_unit_test(test_set_module_params_blend_must_be_object),
     cmocka_unit_test(test_set_module_params_blend_only_patch_allowed),
-    cmocka_unit_test(test_set_module_params_blend_error_fixture),
+    cmocka_unit_test(test_set_module_params_parametric_fixture_round_trip),
+    cmocka_unit_test(test_set_module_params_blend_raster_error_fixture),
     cmocka_unit_test(test_get_module_params_attaches_blend),
     cmocka_unit_test(test_get_module_schema_accepts_instance_and_attaches_blend),
 
@@ -5564,11 +5719,13 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_render_preview_defers_with_defaults),
     cmocka_unit_test(test_render_preview_request_fixture_defers),
     cmocka_unit_test(test_render_preview_clamps_out_of_range_params),
+    cmocka_unit_test(test_render_preview_show_mask_parses_and_defers),
     cmocka_unit_test(test_render_preview_error_bad_shapes),
     cmocka_unit_test(test_render_preview_error_not_in_darkroom),
     cmocka_unit_test(test_render_preview_error_queue_failure),
     cmocka_unit_test(test_render_preview_without_transport_is_internal_error),
     cmocka_unit_test(test_build_preview_response_success_matches_fixture),
+    cmocka_unit_test(test_build_preview_mask_response_matches_fixture),
     cmocka_unit_test(test_build_preview_response_error_matches_fixture),
     cmocka_unit_test(test_build_preview_response_too_large_matches_fixture),
     cmocka_unit_test(test_preview_fits_frame_boundaries),

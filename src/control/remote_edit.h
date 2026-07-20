@@ -617,8 +617,16 @@ uint64_t dt_remote_current_revision(void);
  * from the DB, so without this flush the render would miss unsaved edits
  * -- and captures the image id and the revision at that same instant into
  * `*out`. The rendered preview is stamped with THAT revision. Must be
- * called on the GTK main thread, BEFORE queueing the render job. */
+ * called on the GTK main thread, BEFORE queueing the render job.
+ *
+ * Mask render (Tier 2 / M-B): when `show_mask_op` is non-NULL, prepare also
+ * resolves that module instance (`show_mask_op`/`show_mask_instance`), rejects
+ * a non-blending target (DT_REMOTE_ERR_UNSUPPORTED_FIELD), and captures its
+ * stored mask_mode into the request so the background render emits that
+ * instance's display mask. `show_mask_op == NULL` is an ordinary preview. */
 gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
+                                          const char *show_mask_op,
+                                          int show_mask_instance,
                                           dt_remote_error_t **error);
 
 /** The background half of render_preview: renders `req->imgid` through

@@ -13,6 +13,8 @@
       "band_params",
       "quantity_params",
       "blend_params",
+      "parametric_mask_params",
+      "mask_render",
       "instances",
       "history",
       "preview",
