@@ -278,6 +278,72 @@ new space's defaults — send replacement values in the same call if you
 want them. The response's `blend` member reads back the complete
 post-commit blend state.
 
+### Parametric masks
+
+With the `parametric_mask_params` capability (which implies `blend_params`),
+the `blend` argument also reads and writes **parametric** ("conditional")
+masks: per-channel trapezoid ramps over the module's input/output values,
+with polarity, per-slot boost, and the mask-combine setting. Channels are
+named `<name>_in`/`<name>_out` and depend on the effective blend
+colorspace — Lab (`L a b C h`), RGB display (`g R G B H S l`), or RGB scene
+(`g R G B Jz Cz hz`). RAW/NONE have no parametric support.
+
+Selecting the **bright sky** on an exposure instance via scene luminance —
+markers ramp the mask to full effect above ~0.65, so no inversion is
+needed. `colorspace` is set explicitly in the same call (it applies first
+and resets the blendif block, so send it before the thresholds):
+
+```json
+{
+  "module": "exposure",
+  "values": {},
+  "blend": {
+    "colorspace": "DEVELOP_BLEND_CS_RGB_SCENE",
+    "mask_mode": "parametric",
+    "combine": "exclusive",
+    "parametric": {
+      "Jz_in": { "markers": [0.55, 0.65, 1.0, 1.0] }
+    }
+  }
+}
+```
+
+Each channel entry replaces that slot entirely (`markers` required,
+`inverted` and `boost` optional); `null` resets a slot. A channel is
+enabled only when its markers are not the full span `[0,0,1,1]`.
+
+WARNING — **boost does not rescale markers.** Unlike the GUI, changing a
+channel's `boost` on the wire never shifts its markers; if you want
+GUI-equivalent thresholds you must rescale the markers yourself.
+
+WARNING — **`combine` flips effective polarity.** An inclusive `combine`
+XORs every channel's effective inversion (`effective_inverted = inverted
+XOR (combine is inclusive)`), which flips what the mask selects. Changing
+`combine` and an explicit `inverted` in the same patch is refused unless
+you also pass `"allow_inverted_combine": true` to confirm.
+
+`drawn ↔ drawn+parametric` transitions are owned by this parametric
+surface; creating or attaching drawn geometry itself is out of scope until
+M-C (drawn masks).
+
+### Seeing the mask
+
+With the `mask_render` capability, `render_preview` takes an optional
+`show_mask` argument that renders a module's blend mask (grayscale, **white
+= full effect**) instead of the image, at the same framing as an ordinary
+preview:
+
+```json
+{ "max_px": 512, "show_mask": { "op": "exposure", "instance": 1 } }
+```
+
+For a `show_mask` request the tool returns **mixed content**: a JSON text
+block with `mime_type`, dimensions, `revision`, and `mask_of`
+(`{op, instance, mask_mode}`), immediately followed by the native JPEG
+image block. Use it to verify every parametric threshold you set — the mask
+is rendered even when the target module is disabled, and `off`/`uniform`
+masks render solid white.
+
 ## Setup
 
 Requires Python >= 3.10. One command, from any directory (bash or zsh):

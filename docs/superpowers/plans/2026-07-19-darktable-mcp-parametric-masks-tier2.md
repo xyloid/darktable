@@ -1907,7 +1907,7 @@ rows, and the H4 inverted+combine conflict guard with an explicit override."
     remains intact in this task so the intermediate commit builds; Task 6
     expands it atomically with the protocol calls table and all stubs.
 
-- [ ] **Step 1: Write the failing predicate test**
+- [x] **Step 1: Write the failing predicate test**
 
 Add `#include "develop/blend.h"` and `#include "develop/pixelpipe_hb.h"` to
 `test_remote_blend.c`, then append and register:
@@ -1928,12 +1928,12 @@ static void test_mask_display_request_gate_truth_table(void **state)
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cmake --build build -j$(nproc)`
 Expected: compile failure for the missing predicate/pipe member.
 
-- [ ] **Step 3: Add the field, one-time initialization, and shared gate**
+- [x] **Step 3: Add the field, one-time initialization, and shared gate**
 
 In `src/develop/pixelpipe_hb.h`, immediately after `mask_display`:
 
@@ -1984,7 +1984,7 @@ Replace **both** `valid_request` definitions, the CPU one around
       piece->pipe->mask_display_request);
 ```
 
-- [ ] **Step 4: Add a mask-aware export without changing existing callers**
+- [x] **Step 4: Add a mask-aware export without changing existing callers**
 
 Add to `src/imageio/imageio_common.h`:
 
@@ -2083,7 +2083,7 @@ Immediately after `dt_dev_pixelpipe_create_nodes()` and
 No call in `mipmap_cache.c`, tethering, Lua AI, neural restore, control
 jobs, or the ordinary imageio wrappers changes.
 
-- [ ] **Step 5: Extend preview prepare/execute**
+- [x] **Step 5: Extend preview prepare/execute**
 
 Add `#include "control/settings.h"` to `remote_edit.h`; this is the owning
 header for `dt_dev_operation_t` and `remote_edit.h` did not previously need
@@ -2170,13 +2170,13 @@ When constructing the result:
   }
 ```
 
-- [ ] **Step 6: Build and run the C suite**
+- [x] **Step 6: Build and run the C suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build --output-on-failure`
 Expected: all C tests pass. Task 8 supplies live CPU/pixel assertions;
 both CPU and OpenCL now consume the unit-tested predicate.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/develop/pixelpipe_hb.h src/develop/pixelpipe_hb.c \

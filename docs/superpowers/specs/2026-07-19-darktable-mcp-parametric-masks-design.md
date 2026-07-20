@@ -1,7 +1,11 @@
 # darktable MCP — parametric masks (mask Tier 2) low-level design
 
 Date: 2026-07-19
-Status: draft design (not yet planned; awaiting review; depends on Tier 1)
+Status: implemented (see plan
+`docs/superpowers/plans/2026-07-19-darktable-mcp-parametric-masks-tier2.md`).
+The seven binding Design amendments from that plan are recorded at the end
+of this document; where the original draft body below conflicts with an
+amendment, the amendment governs and the body has been reconciled in place.
 Companions: `2026-07-19-darktable-mcp-blend-settings-design.md` (Tier 1 —
 the `blend` wire object and `remote_blend.c` this extends),
 `2026-07-19-darktable-mcp-mask-support-design-candidates.md` (tier split),
@@ -60,7 +64,11 @@ All verified 2026-07-19 in source:
   Boost is only available where `boost_factor_enabled` (all except the
   hue channels and HSL `H S l`). Valid slot masks per family:
   `DEVELOP_BLENDIF_Lab_MASK` = 0x3377, `RGB_MASK` = 0x77FF. RAW
-  blending has no parametric support (no RAW blendif kernel).
+  blending has no parametric support: its CPU/OpenCL mask kernels exist
+  (`blendif_raw.c`, `blendop_mask_RAW`) but intentionally ignore the
+  blendif channel arrays/`CONDITIONAL`, and `blend_gui.c` asserts RAW
+  blendif is unsupported — so there is no RAW channel table, not a missing
+  kernel.
 - **mask_mode values** (`dt_develop_mask_mode_names`): every mask type
   carries `DEVELOP_MASK_ENABLED`; "parametric mask" =
   `ENABLED | CONDITIONAL`.
@@ -241,8 +249,13 @@ gboolean dt_remote_blendif_markers_enable(const float m[4]);
 unchanged — Tier 2 adds **zero** new commit/threading/history surface.
 
 `mask_mode` mapping gains `"parametric"` ↔ `ENABLED|CONDITIONAL` in both
-directions; the compound read-only strings from Tier 1 keep covering
-drawn/raster combinations.
+directions. With this capability the vocabulary is **state-aware and no
+longer flatly read-only**: `drawn ↔ drawn+parametric` is a legal
+`CONDITIONAL` toggle in a supported family (the engine owns only the
+`ENABLED`/`CONDITIONAL` bits and never the drawn `MASK` bit), while
+entering or leaving drawn state stays `drawn_via_attach_only` and any
+raster-bit state stays non-writable. See the transition matrix in the
+protocol reference.
 
 ## Mask rendering companion (`mask_render` capability — same milestone)
 
@@ -269,25 +282,38 @@ tool. Errors: module without blending → `unsupported_field`; mask mode
 `off` → renders full-white with `mask_mode: "off"` metadata rather than
 erroring (a legal question deserves a legal answer).
 
-**Engine.** The render job sets the target module's
-`request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK`, runs the same
-bounded render path `render_preview` already uses, restores the flag
-(saved value, not assumed-zero — the GUI may own it), and serializes the
-mask channel. Flag save/restore happens on the GTK thread bracket the
-existing render job already has; the one design question to pin at
-planning is whether the export-path pipe honors `request_mask_display`
-or whether the mask render must ride the darkroom preview pipe with a
-snapshot (both exist; the GUI uses the latter).
+**Engine (as implemented — amendment 1).** The mask render extends the
+existing background **export** render path, not the live preview pipe.
+The export pipe structurally cannot honor the live focus/full-pipe
+`request_mask_display` gate, so a persistent, guarded per-pipe opt-in
+`dt_dev_pixelpipe_t.mask_display_request` is added: initialized `FALSE`
+once at pipe creation and deliberately **not** cleared at the
+process/restart label, and consulted by both the CPU and OpenCL blend
+paths through one pure predicate
+`dt_develop_blend_mask_display_request_is_valid()`. A new additive entry
+point `dt_imageio_export_with_flags_and_mask()` owns the optional target;
+the existing `dt_imageio_export_with_flags()` signature and all its callers
+are unchanged. Inside the throwaway export pipe the target piece is
+temporarily enabled **even when its live module is disabled**, its module
+requests `DT_DEV_PIXELPIPE_DISPLAY_MASK`, and a missing target fails the
+export rather than returning an ordinary image mislabeled as a mask.
+Because the export uses a throwaway `dt_develop_t`, **no live GUI flag is
+ever changed or restored** — the disabled-target enable and the mask
+request live only inside that pipe.
 
 **Capability**: `mask_render`, independent of `parametric_mask_params`
 (a client may render masks of GUI-drawn state on an engine without
 parametric write support in principle, but both ship in this milestone).
 
-**Testing.** Unit: flag save/restore bracket; error rows. Integration:
-parametric luminance mask → mask render is dark in shadows and bright in
-highlights (direct assertion on the mask image — replaces the indirect
-"spatially non-uniform preview delta" gate); mask render of `off` mode is
-uniform white; flag restored after render (GUI overlay state unchanged).
+**Testing (as implemented).** Unit: the shared CPU/OpenCL
+`mask_display_request` gate truth table; error rows. Integration
+(`test_parametric_masks_tier2.py`, Pillow, no NumPy, pinned
+`img/DSC07350.ARW` at `max_px=512`): a parametric luminance mask → the
+rendered mask image is directly asserted dark in a fixed shadow ROI and
+bright in a fixed highlight ROI (this replaces the indirect
+"spatially non-uniform preview delta" gate); `off`/`uniform` masks render
+solid white; a `combine` flip changes the mask. No live GUI overlay flag
+is touched (the throwaway export pipe owns the mask request).
 
 ## Sidecar changes
 
@@ -297,11 +323,15 @@ uniform white; flag restored after render (GUI overlay state unchanged).
 - `render_preview`: optional `show_mask` argument passed through, gated
   client-side on `mask_render`; the tool description tells the model to
   use it to verify every parametric threshold it sets.
-- Tool docstring + README: a worked example — sky selection via
-  luminance: `{"blend": {"mask_mode": "parametric", "parametric":
-  {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0], "inverted": true}}}}`
-  on an exposure instance — plus the two sharp-edge warnings (boost does
-  not rescale markers; combine flips effective polarity).
+- Tool docstring + README: a worked example — bright-sky selection via
+  scene luminance on an exposure instance:
+  `{"blend": {"mask_mode": "parametric", "combine": "exclusive",
+  "parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}}}}`.
+  The highlight ramp (factor 1 above ~0.65) already selects the bright sky,
+  so `inverted` is omitted/`false` and `combine` is explicit `"exclusive"`
+  (an inclusive combine would flip effective polarity and select the
+  ground instead) — plus the two sharp-edge warnings (boost does not
+  rescale markers; combine flips effective polarity).
 
 ## Protocol reference impact
 
@@ -334,9 +364,11 @@ Protocol: fixtures for read/patch/error shapes, shared with
 `test_protocol.py`.
 
 Integration: parametric luminance mask on exposure (the README example) →
-preview changes and is *spatially* non-uniform (compare two preview
-regions' deltas); disable via `null` → uniform again; `combine` flip
-changes the rendered mask; capability in hello.
+the rendered **mask image** is directly asserted (Pillow) dark in a fixed
+shadow ROI and bright in a fixed highlight ROI; disable via `null` → the
+mask goes uniform; a `combine` flip changes the rendered mask; both
+capabilities appear in hello. This replaces the earlier indirect
+two-region preview-delta approach.
 
 ## Decisions recorded (and what review should challenge)
 
@@ -360,3 +392,51 @@ changes the rendered mask; capability in hello.
    needed, unlike Tier 1's mode matrix).
 7. Tier 2 adds no commit-path/threading/history surface: everything new
    is pure functions over the params copy.
+
+## Design amendments (binding; carried from the Tier 2 plan)
+
+These seven amendments were pinned during planning and implemented; they
+govern where the draft body above once differed (the body has been
+reconciled in place).
+
+1. **The mask render extends the export path with a persistent, guarded
+   per-pipe opt-in.** The export pipe cannot satisfy the live
+   focus/full-pipe gate. `mask_display_request` is added to
+   `dt_dev_pixelpipe_t` (`pixelpipe_hb.h`), initialized only at pipe
+   creation and deliberately **not** cleared at the process/restart label;
+   both the CPU and OpenCL blend paths consult one pure
+   `dt_develop_blend_mask_display_request_is_valid()` predicate. A new
+   `dt_imageio_export_with_flags_and_mask()` owns the optional target; the
+   existing `dt_imageio_export_with_flags()` and all callers are unchanged.
+   Inside the throwaway export pipe the target piece is enabled even when
+   its live module is disabled, its module requests
+   `DT_DEV_PIXELPIPE_DISPLAY_MASK`, and a missing target fails the export.
+   The throwaway `dt_develop_t` means no live GUI flag is changed/restored.
+2. **`boost.offset` is the boost-value storage offset, distinct from the
+   Lab a/b marker offset `offset_ab = 0.5`.** The engine table's
+   `boost_offset` mirrors the GUI `boost_factor_offset` (`−6.64385619` for
+   `Jz`/`Cz`, `0` elsewhere); the `0.5` for Lab `a`/`b` is the separate
+   `marker_offset` used only in the non-normative `display_hint`. No source
+   contradiction; recorded so the two are never conflated.
+3. **The `inverted`+`combine` conflict guard is server-side with an
+   explicit override.** A patch that both changes `combine` and sets any
+   explicit `inverted` inside `parametric` is refused `invalid_value`,
+   `constraint: "inverted_and_combine_conflict"`, unless the `blend` patch
+   also carries `"allow_inverted_combine": true`.
+4. **`off`/`uniform` mask render returns solid white at normal framing.**
+   For a stored `mask_mode` lacking `CONDITIONAL`/`MASK`/`RASTER`, the blend
+   path emits no display mask, so the engine renders normally (correct
+   framing) then fills the buffer white before JPEG-encoding.
+   `mask_of.mask_mode` still reports the true stored mode string.
+5. **HSL "value" channel wire name is `l` (lowercase).** `rgb_channels[]`
+   labels it `N_("L")` but its slot is `DEVELOP_BLENDIF_l_in/_out`; the wire
+   name is `l` to disambiguate from Lab `L`.
+6. **`mask_of` must cross the MCP boundary, not merely the raw wire.** For
+   `show_mask` the sidecar returns mixed content — a JSON text block
+   (`mime_type`, dimensions, `revision`, `mask_of`) followed by the native
+   JPEG image block — mirroring the `get_scopes` idiom so provenance is
+   observable to the model. Ordinary previews remain image-only.
+7. **The visual gate is deterministic with one declared dependency.** The
+   integration file adds `Pillow>=10.0,<13` to the `dev` extra, uses no
+   NumPy, pins `img/DSC07350.ARW`, `max_px=512`, exact normalized
+   bright/dark ROIs, marker values, and numeric thresholds.

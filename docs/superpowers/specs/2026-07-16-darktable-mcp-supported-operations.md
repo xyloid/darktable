@@ -110,8 +110,10 @@ with `instance_not_supported` (column "multi" below).
 
 Blend settings (opacity, mode, colorspace, refinement controls,
 off/uniform mask mode) are supported for every module with
-`IOP_FLAGS_SUPPORTS_BLENDING` via the `blend_params` capability;
-parametric and drawn masks remain out of scope (M-B/M-C).
+`IOP_FLAGS_SUPPORTS_BLENDING` via the `blend_params` capability.
+Parametric (blendif) masks and read-only mask rendering are supported via
+`parametric_mask_params` and `mask_render`; creating/attaching drawn
+geometry remains out of scope (M-C).
 
 ## Usage vocabulary
 

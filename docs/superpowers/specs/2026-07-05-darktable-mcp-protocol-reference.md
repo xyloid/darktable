@@ -70,9 +70,10 @@ Result:
   "protocol_version": 1,
   "darktable_version": "5.x",
   "pid": 12345,
-  "capabilities": ["params", "instances", "history", "preview", "scopes",
-                   "semantic_params", "curve_params", "vector_params",
-                   "band_params", "quantity_params"]
+  "capabilities": ["params", "semantic_params", "curve_params",
+                   "vector_params", "band_params", "quantity_params",
+                   "blend_params", "parametric_mask_params", "mask_render",
+                   "instances", "history", "preview", "scopes"]
 }
 ```
 
@@ -538,8 +539,10 @@ loaded module .so alone), the `blend` member is **live-session data**:
 it appears only when darktable is in darkroom with an image open and
 that instance exists and supports blending — otherwise the member is
 simply omitted, never an error. Its contents are computed against the
-live instance: `mask_mode` (writable vocabulary `["off", "uniform"]`,
-plus `writable`/`current_extra_bits` reflecting whether a
+live instance: `mask_mode` (writable vocabulary `["off", "uniform"]` at
+the Tier-1 base; when `parametric_mask_params` is advertised the
+vocabulary becomes state-aware and gains `"parametric"` — see Parametric
+masks below), plus `writable`/`current_extra_bits` reflecting whether a
 drawn/parametric/raster configuration is present), `colorspace` (the
 per-module choice set, `default`, and writability), `mode` (the writable
 mode set for the instance's **effective** colorspace, in GUI order),
@@ -555,8 +558,11 @@ complete current blend state. Enum values are C enumerator names
 (`"DEVELOP_BLEND_NORMAL2"`, `"DEVELOP_BLEND_CS_RGB_SCENE"`,
 `"DEVELOP_MASK_GUIDE_IN_AFTER_BLUR"`) — except `mask_mode`, which uses
 the transition-appendix vocabulary (mask-support design candidates,
-appendix): writable states `"off"`/`"uniform"`, read-only compounds
-`"parametric"`, `"drawn"`, `"drawn+parametric"`, `"raster"`. A stored
+appendix): at the Tier-1 base the writable states are `"off"`/`"uniform"`
+and the read-only compounds are `"parametric"`, `"drawn"`,
+`"drawn+parametric"`, `"raster"`. With `parametric_mask_params`,
+`"parametric"` and `"drawn+parametric"` become writable per the
+state-aware transition matrix documented under Parametric masks. A stored
 colorspace equal to the module's default reads back as
 `"DEVELOP_BLEND_CS_NONE"` ("not explicitly chosen");
 `effective_colorspace` always carries the resolved space.
@@ -572,9 +578,13 @@ the class-ops loop). Writing `colorspace` **deterministically resets**
 `mode`, `reverse`, `fulcrum`, and the blendif parameters to the new
 space's defaults; later members of the same patch then apply on top
 (the GUI's history-scavenging restore is deliberately not reproduced).
-`mask_mode` is writable only to `"off"`/`"uniform"`, and only while the
-stored mode has no drawn/parametric/raster bits — see the mask_mode
-transition appendix for the full state machine. The mutation result's
+At the Tier-1 base `mask_mode` is writable only to `"off"`/`"uniform"`,
+and only while the stored mode has no drawn/parametric/raster bits — see
+the mask_mode transition appendix for the full state machine;
+`parametric_mask_params` broadens this to the state-aware matrix under
+Parametric masks (the `mask_configuration_present` constraint below
+correspondingly does not fire for the newly writable transitions). The
+mutation result's
 `blend` member reads back the **complete** post-commit blend object,
 never just the touched members.
 
@@ -602,6 +612,269 @@ never just the touched members.
 
 A `blend` member on a module without `IOP_FLAGS_SUPPORTS_BLENDING`
 fails the whole request with `unsupported_field`.
+
+### Parametric masks (`parametric_mask_params`)
+
+Mask Tier 2 (M-B): read and write parametric ("conditional") blendif
+masks — per-channel trapezoid ramps over module input/output values, with
+polarity, per-slot boost, and the mask-combine setting — as additive
+members inside the Tier-1 `blend` object, gated on the
+`parametric_mask_params` hello capability. This capability **implies**
+`blend_params` (a server never advertises it without `blend_params`); the
+sidecar refuses `parametric`/`combine` members client-side without it.
+
+**State-aware `mask_mode`.** With this capability the `mask_mode`
+vocabulary and `writable` flag depend on the stored mask state, per the
+authoritative transition appendix (mask-support design candidates). The
+engine owns only the `ENABLED` and `CONDITIONAL` bits; the drawn (`MASK`)
+bit is never toggled here, and any stored raster bit makes the row
+read-only. The full non-raster transition matrix — a transition succeeds
+exactly when the stored and target drawn (`MASK`) ownership agree:
+
+| stored \ target | `off` | `uniform` | `parametric` | `drawn` | `drawn+parametric` |
+|---|---|---|---|---|---|
+| `off` | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `uniform` | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `parametric` | ✓ | ✓ | ✓ | ✗ | ✗ |
+| `drawn` | ✗ | ✗ | ✗ | ✓ | ✓ |
+| `drawn+parametric` | ✗ | ✗ | ✗ | ✓ | ✓ |
+
+Entering or leaving drawn state (`✗` cells) fails `invalid_value`,
+`constraint: "drawn_via_attach_only"` — drawn geometry is created/attached
+only through the GUI (M-C). `drawn ↔ drawn+parametric` **is** legal in a
+supported family. Any write on a stored raster state fails `invalid_value`,
+`constraint: "raster_unsupported"`. Schema `mask_mode.values` is
+state-aware: non-drawn rows expose `off`/`uniform`/`parametric`, drawn rows
+expose `drawn`/`drawn+parametric`, raster rows are non-writable. Every
+unowned/future stored bit is preserved verbatim across a transition.
+
+**Effective-family / RAW / NONE.** The parametric schema, `combine`, and
+the writable channel vocabulary appear only when the instance's
+**effective** colorspace (Tier-1 `effective_colorspace`) is one of the
+three supported families:
+
+- Lab (`DEVELOP_BLEND_CS_LAB`): channels `L a b C h`.
+- RGB display (`DEVELOP_BLEND_CS_RGB_DISPLAY`): `g R G B H S l` (the HSL
+  value channel is wire name `l`, lowercase, to disambiguate from Lab `L`).
+- RGB scene (`DEVELOP_BLEND_CS_RGB_SCENE`): `g R G B Jz Cz hz`.
+
+RAW blending (`DEVELOP_BLEND_CS_RAW`) and `DEVELOP_BLEND_CS_NONE` have **no
+parametric channel semantics**: the schema omits `parametric`/`combine`,
+and such patches fail `unsupported_field`. (RAW does have real CPU/OpenCL
+mask kernels, but they intentionally ignore the blendif channel
+arrays/`CONDITIONAL`, and the GUI marks RAW blendif unsupported — so there
+is simply no channel table, not a missing kernel.) Family availability is
+checked against the **projected** family after the same-call colorspace
+stage, so a RAW → RGB switch plus `mask_mode: "parametric"` in one patch is
+legal. A pre-existing legacy `CONDITIONAL` bit in a RAW/NONE instance stays
+representable as the current `mask_mode` and may be left or removed, but no
+patch may newly introduce that unsupported state, and no `parametric`/
+`combine` members are ever exposed there.
+
+**Channels: markers, enable, polarity, boost.** Each channel names an
+`_in` and an `_out` slot (e.g. `Jz_in`, `L_out`). A slot's condition is a
+4-tuple `markers: [m0, m1, m2, m3]` in a `[0.0, 1.0]` stored domain,
+ascending `m0 ≤ m1 ≤ m2 ≤ m3`. The mask factor ramps 0→1 over `m0..m1`, is
+1 over `m1..m2`, falls 1→0 over `m2..m3`. **Open ends:** `m0,m1 ≤ 0` is
+unbounded low, `m2,m3 ≥ 1` unbounded high; degenerate equal markers are a
+legal hard edge.
+
+- **Derived-enable rule (single source of truth):** a slot is *disabled*
+  iff its markers are the full-span identity (`m1 == 0.0 && m2 == 1.0`,
+  i.e. `[0,0,1,1]`), *enabled* otherwise — exactly the GUI rule. Enable is
+  never sent on the wire; it is derived on every patch, and only enabled
+  in-family slots appear in reads. Sending full-span markers is a legal
+  "no condition on this channel", not an error.
+- **Polarity (`inverted`)** is the stored polarity bit (`blendif` bits
+  16–31), carried verbatim on the wire and never resolved server-side. The
+  pixel kernels compute effective inversion as
+  `invert_mask = (blendif >> 16) XOR (mask_combine inclusive ? family_mask : 0)`
+  (`data/kernels/blendop.cl:204`; C twins in `src/develop/blends/`), so the
+  documented client rule is
+  `effective_inverted = inverted XOR (combine is inclusive)`. Legacy bit 31
+  (`DEVELOP_BLENDIF_active`) is never set and always stripped.
+- **Boost** is a per-slot log2 exponent applied as
+  `(stored − marker_offset) × 2^boost`, where `marker_offset = 0.5` for Lab
+  `a`/`b` and `0` elsewhere. The **boost value** itself carries a per-channel
+  storage offset (`boost.offset`): `−6.64385619` for `Jz`/`Cz`, `0` for all
+  other channels — this is a *separate* concept from the Lab a/b
+  `marker_offset`. Stored boost range is the displayed `0..18` EV shifted by
+  that offset: `[0.0, 18.0]` for offset-0 channels, `[-6.64385619,
+  11.35614381]` for `Jz`/`Cz`. Channels without boost (`h`, `H`, `S`, `l`,
+  `hz`) carry `"boost": null` in the schema and reject any `boost` write.
+  **Boost never rescales markers on the wire** — the GUI's
+  threshold-preserving marker rescale is deliberately not reproduced; each
+  member is written verbatim, so a client changing boost must rescale its
+  own markers if it wants GUI-equivalent behavior.
+
+Schema `parametric.channels` also carries non-normative `display_hint`
+metadata (`factor`, `offset`, `unit`, `boost_scales`) for clients that want
+GUI-style numbers via `display ≈ (stored − marker_offset) × 2^boost ×
+factor`; the wire itself always carries stored `0..1` values.
+
+**Schema (inside the `blend` schema object):**
+
+```json
+"combine": { "type": "enum",
+             "values": ["exclusive", "inclusive",
+                        "exclusive_inverted", "inclusive_inverted"],
+             "writable": true },
+"allow_inverted_combine": { "type": "bool", "writable": true,
+                            "write_only": true },
+"parametric": {
+  "channels": {
+    "Jz_in": { "markers_domain": [0.0, 1.0],
+               "boost": { "writable": true, "offset": -6.64385619,
+                          "range": [-6.64385619, 11.35614381] },
+               "display_hint": { "factor": 100.0, "offset": 0.0,
+                                 "unit": "%", "boost_scales": true } },
+    "hz_in": { "markers_domain": [0.0, 1.0], "boost": null,
+               "display_hint": { "factor": 360.0, "offset": 0.0,
+                                 "unit": "°", "boost_scales": false } }
+  }
+}
+```
+
+**Read (inside the `blend` object):**
+
+```json
+"combine": "exclusive",
+"parametric": {
+  "L_in":  { "markers": [0.0, 0.0, 0.55, 0.65], "inverted": false, "boost": 0.0 },
+  "Cz_out": { "markers": [0.1, 0.2, 1.0, 1.0], "inverted": true, "boost": -6.64385619 }
+}
+```
+
+Only **enabled in-family** slots appear (an empty `parametric` object means
+"parametric mode on, no channel conditions yet"). Slots enabled in storage
+but outside the effective family (legacy edits) are never listed and never
+touched by patches; a boolean `"foreign_channels": true` is surfaced when
+any exist. Reserved slot 15 and legacy bit 31 are not channels and never
+set that flag. **Defensive serialization:** a non-finite legacy marker or
+boost value in storage serializes as JSON `null` rather than a NaN/Inf
+literal, keeping reads strict-JSON.
+
+**`combine` mapping** (wire enum ↔ storage `INV`/`INCL` low bits; the
+`DEVELOP_COMBINE_MASKS_POS` drawn bit is preserved untouched): `exclusive`
+= `NORM_EXCL` (`0x00`), `inclusive` = `NORM_INCL` (`0x02`),
+`exclusive_inverted` = `INV_EXCL` (`0x01`), `inclusive_inverted` =
+`INV_INCL` (`0x03`).
+
+**Patch (inside the `blend` patch object):**
+
+```json
+"blend": {
+  "mask_mode": "parametric",
+  "combine": "exclusive",
+  "parametric": {
+    "Jz_in": { "markers": [0.0, 0.0, 0.5, 0.6] },
+    "h_in":  null
+  }
+}
+```
+
+A channel entry **replaces that slot entirely**: `markers` required,
+`inverted` optional (default `false`), `boost` optional (default = the
+channel's `boost.offset`, i.e. GUI zero). No per-member merge within a
+channel. `null` resets a slot: identity markers `[0,0,1,1]`, polarity bit
+cleared, boost reset to the channel offset — which also disables it by the
+derived rule. Unlisted slots are untouched. Writing `parametric` requires
+the *projected* `mask_mode` to include the parametric bit (set it in the
+same call or beforehand); `combine` is writable whenever the schema shows
+it. When `colorspace` and `parametric` appear in one patch, `colorspace`
+applies first (Tier-1 reset wipes the blendif block), then `parametric`
+members are validated against and applied on top of the new family.
+
+Validation order inside `blend`: `mask_mode` → `colorspace` → strict
+`allow_inverted_combine` → `combine` → `parametric` (per channel: name →
+allowed members → markers → inverted → boost) → the Tier-1 mode/reverse/
+feathering/numeric stages. Blend keeps its Tier-1 position at the end of the
+class error precedence.
+
+**Conflict override.** Because a `combine` change flips every channel's
+effective polarity, a patch that both changes `combine` (to a value
+differing from stored) **and** sets any explicit `inverted` inside
+`parametric` is refused `invalid_value`,
+`constraint: "inverted_and_combine_conflict"`, unless the same `blend`
+patch also carries `"allow_inverted_combine": true` (a write-only
+confirmation member; the engine is authoritative).
+
+**Errors** (in addition to the Tier-1 blend rows;
+`details: {"parameter": "blend.<path>", "constraint": "<slug>"}`, with
+`"constraint"` only where a slug is listed):
+
+| condition | code | constraint |
+|---|---|---|
+| `parametric`/`combine` sent without `parametric_mask_params` | sidecar client-side refusal | — |
+| `combine` on a family without parametric support (RAW/NONE) | `unsupported_field` | — (`parameter: blend.combine`) |
+| `combine` value not one of the four | `invalid_value` | `unknown_value` |
+| `allow_inverted_combine` not a boolean | `invalid_value` | `wrong_type` |
+| `parametric` on a family without parametric support (RAW/NONE) | `unsupported_field` | — (`parameter: blend.parametric`) |
+| `parametric` while projected `mask_mode` lacks the parametric bit | `invalid_value` | `requires_parametric_mask_mode` |
+| `parametric` not an object | `invalid_value` | `wrong_type` |
+| channel name not an `_in`/`_out` slot of the effective family | `unsupported_field` | — (`parameter: blend.parametric.<name>`) |
+| channel entry neither object nor `null` | `invalid_value` | `wrong_type` |
+| unknown member inside a channel entry | `unsupported_field` | — (`parameter: blend.parametric.<name>.<member>`) |
+| `markers` missing, or not an array of exactly 4 numbers | `invalid_value` | `markers` |
+| markers non-finite, not ascending, or outside `[0,1]` | `invalid_value` | `markers` |
+| `inverted` not a boolean | `invalid_value` | `wrong_type` |
+| `inverted` set together with a `combine` change, no override | `invalid_value` | `inverted_and_combine_conflict` |
+| `boost` on a channel with `boost: null` | `invalid_value` | `boost` |
+| `boost` not a number, non-finite, or out of the channel's range | `invalid_value` | `boost` |
+| `mask_mode` transition that changes the drawn (`MASK`) bit | `invalid_value` | `drawn_via_attach_only` |
+| any `mask_mode` write on a stored raster-bit state | `invalid_value` | `raster_unsupported` |
+| `mask_mode` value not recognized | `invalid_value` | `unknown_value` |
+
+### Mask render (`mask_render`)
+
+Mask Tier 2 (M-B): a read-only rendering of the blend mask a module would
+apply, so an agent can *see* the mask it configured. Gated on the
+independent `mask_render` hello capability. `render_preview` gains an
+optional `show_mask` argument:
+
+```json
+{ "max_px": 1024, "quality": 90,
+  "show_mask": { "op": "exposure", "instance": 1 } }
+```
+
+`show_mask` is a **strict** object: exactly `{op, instance}` (`instance`
+optional, default 0). A bare boolean, empty `op`, unknown key, wrong member
+type, or an out-of-range `instance` is `invalid_value`. The target module
+is rendered with its per-pipe display-mask opt-in through the same bounded
+export path as a normal preview, so the mask lines up 1:1 with the ordinary
+preview for side-by-side reasoning. The response is a grayscale JPEG where
+**white = full effect**, plus a `mask_of` object:
+
+```json
+{
+  "mime_type": "image/jpeg",
+  "width": 768, "height": 512,
+  "revision": 35,
+  "mask_of": { "op": "exposure", "instance": 1, "mask_mode": "parametric" },
+  "data": "...base64..."
+}
+```
+
+- **Disabled-target inspection.** The target's blend piece is temporarily
+  enabled *inside the throwaway export pipe only* even when the live module
+  is disabled — no live GUI flag is changed or restored — so a mask can be
+  inspected without enabling the module in the session.
+- **`off`/`uniform` → white.** For a stored `mask_mode` with no spatial-mask
+  bit (`CONDITIONAL`/`MASK`/`RASTER`), the blend path emits no display mask;
+  the engine renders normally for correct framing, then fills the buffer
+  white before encoding (full effect everywhere). `mask_of.mask_mode`
+  reports the *true* stored mode string (e.g. `"off"`, `"uniform"`).
+- **Non-blending target.** A `show_mask.op` on a module without
+  `IOP_FLAGS_SUPPORTS_BLENDING` fails `unsupported_field`,
+  `{"parameter": "show_mask.op"}`; a missing target fails the export rather
+  than returning an ordinary image mislabeled as a mask.
+- Other errors are the ordinary `render_preview` set (`preview_failed`,
+  `request_too_large`).
+
+At the MCP boundary the tool returns `show_mask` results as **mixed
+content**: a JSON text block carrying `mime_type`, dimensions, `revision`,
+and `mask_of`, immediately followed by the native JPEG image block (the
+same idiom as `get_scopes`). Ordinary previews remain image-only.
 
 ### set_module_enabled
 
@@ -684,9 +957,12 @@ new revision).
 
 ### render_preview
 
-Request params: `{"max_px": 1024?, "quality": 85?}`. `max_px` is clamped to
-[64, 2048]; `quality` to [50, 95]. Renders the active image through the
-normal pixelpipe with current history; asynchronous server-side.
+Request params: `{"max_px": 1024?, "quality": 85?, "show_mask"?}`. `max_px`
+is clamped to [64, 2048]; `quality` to [50, 95]. Renders the active image
+through the normal pixelpipe with current history; asynchronous
+server-side. The optional `show_mask` argument (capability `mask_render`)
+renders a module's blend mask instead of the image — see Mask render above;
+it adds `unsupported_field` to this method's error set.
 
 ```json
 {
@@ -745,7 +1021,7 @@ live in the sidecar per the design spec.
 | `create_module_instance` | ✓ | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | |
 | `get_history` | ✓ | ✓ | | | | | ✓ | | | | |
 | `undo` | ✓ | ✓ | | | | | ✓ | | ✓ | | |
-| `render_preview` | ✓ | ✓ | | | | | ✓ | | | ✓ | |
+| `render_preview` | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | | | ✓ | |
 | `compute_scopes` | ✓ | ✓ | | | | | ✓ | | | | ✓ |
 
 `retryable` is `true` for `revision_conflict`, `busy`, and transient
