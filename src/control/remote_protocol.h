@@ -118,6 +118,11 @@ typedef struct dt_remote_protocol_calls_t
   uint64_t (*current_revision)(void);
   // compute_scopes main-thread precondition (not_in_darkroom/no_image_open).
   gboolean (*scopes_prepare)(dt_remote_error_t **error);
+  // Tier-1 blend surface (blend_params capability): live-lookup JSON
+  // builders; NULL-returning (never erroring) -- the handlers omit the
+  // member. A NULL function pointer (older test call tables) also omits.
+  JsonNode *(*blend_schema)(const dt_remote_module_ref_t *ref);
+  JsonNode *(*blend_read)(const dt_remote_module_ref_t *ref);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to

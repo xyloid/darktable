@@ -1738,20 +1738,22 @@ static void test_hello_success(void **state)
   // (milestone 4: capability-gated semantic vector read/write) +
   // "band_params" (milestone 5: capability-gated semantic band read/write) +
   // "quantity_params" (milestone 6: capability-gated semantic quantity
-  // read/write) + "instances"/"history" (step 8) + "preview" (step 9) +
-  // "scopes" (step 10) -- the full capability set.
+  // read/write) + "blend_params" (mask Tier 1 / M-A: blend
+  // schema/read/patch/readback) + "instances"/"history" (step 8) +
+  // "preview" (step 9) + "scopes" (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 10);
+  assert_int_equal(json_array_get_length(caps), 11);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
   assert_string_equal(json_array_get_string_element(caps, 3), "vector_params");
   assert_string_equal(json_array_get_string_element(caps, 4), "band_params");
   assert_string_equal(json_array_get_string_element(caps, 5), "quantity_params");
-  assert_string_equal(json_array_get_string_element(caps, 6), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 7), "history");
-  assert_string_equal(json_array_get_string_element(caps, 8), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 9), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 6), "blend_params");
+  assert_string_equal(json_array_get_string_element(caps, 7), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 8), "history");
+  assert_string_equal(json_array_get_string_element(caps, 9), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 10), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -3371,6 +3373,247 @@ static void test_semantic_quantity_preserves_double_precision(void **state)
     "\"values\":{\"temperature\":5500.00000001}}}}}");
   JsonObject *resp = json_node_get_object(actual);
   assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* ---------------------------------------------------------------------- */
+/* blend surface (mask Tier 1 / M-A)                                       */
+/* ---------------------------------------------------------------------- */
+
+// wire-contract round trip: the request's "blend" object arrives borrowed
+// on the neutral patch, and the stub's complete blend_readback serializes
+// as the response's "blend" member. The readback JSON here is kept
+// byte-identical to set_module_params_blend_response.json's blend member.
+static gboolean stub_set_module_params_blend_capture(const dt_remote_module_ref_t *ref,
+                                                     const dt_remote_patch_t *patch,
+                                                     const uint64_t *expected_revision,
+                                                     dt_remote_mutation_result_t **out,
+                                                     dt_remote_error_t **error)
+{
+  (void)error;
+  (void)expected_revision;
+  assert_non_null(patch);
+  assert_non_null(patch->blend);
+  assert_string_equal(json_object_get_string_member(patch->blend, "mask_mode"), "uniform");
+  assert_float_equal(json_object_get_double_member(patch->blend, "opacity"), 50.0, 1e-12);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(dt_remote_mutation_result_t));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->blend_readback = json_from_string(
+    "{\"mask_mode\":\"uniform\","
+    "\"colorspace\":\"DEVELOP_BLEND_CS_NONE\","
+    "\"effective_colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\","
+    "\"mode\":\"DEVELOP_BLEND_NORMAL2\","
+    "\"reverse\":false,"
+    "\"fulcrum\":0.0,"
+    "\"opacity\":50.0,"
+    "\"feathering_radius\":0.0,"
+    "\"feathering_guide\":\"DEVELOP_MASK_GUIDE_IN_AFTER_BLUR\","
+    "\"blur_radius\":0.0,"
+    "\"contrast\":0.0,"
+    "\"brightness\":0.0,"
+    "\"details\":0.0}", NULL);
+  assert_non_null(result->blend_readback);
+  result->revision = 12;
+  *out = result;
+  return TRUE;
+}
+
+static gboolean stub_set_module_params_blend_mask_configuration(const dt_remote_module_ref_t *ref,
+                                                                const dt_remote_patch_t *patch,
+                                                                const uint64_t *expected_revision,
+                                                                dt_remote_mutation_result_t **out,
+                                                                dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)patch;
+  (void)expected_revision;
+  (void)out;
+  if(error)
+  {
+    *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE,
+                         g_strdup("a drawn/parametric/raster mask configuration is present"));
+    (*error)->details_json =
+      g_strdup("{\"parameter\":\"blend.mask_mode\",\"constraint\":\"mask_configuration_present\"}");
+  }
+  return FALSE;
+}
+
+static JsonNode *stub_blend_read_small(const dt_remote_module_ref_t *ref)
+{
+  (void)ref;
+  return json_from_string("{\"mask_mode\":\"off\",\"opacity\":100.0}", NULL);
+}
+
+static JsonNode *stub_blend_schema_small(const dt_remote_module_ref_t *ref)
+{
+  (void)ref;
+  return json_from_string("{\"mask_mode\":{\"writable\":true}}", NULL);
+}
+
+static JsonNode *stub_blend_node_null(const dt_remote_module_ref_t *ref)
+{
+  (void)ref;
+  return NULL;
+}
+
+static void test_set_module_params_blend_fixture_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_blend_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_blend_request.json",
+                           "set_module_params_blend_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_params_blend_must_be_object(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_must_not_be_called,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":138,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{},\"blend\":5}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *err_obj = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(err_obj, "code"), "invalid_value");
+  assert_non_null(strstr(json_object_get_string_member(err_obj, "message"),
+                         "'blend' must be an object"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+// a blend-only patch (empty values, no semantic_values) must NOT trip the
+// "'values' must be non-empty" rejection.
+static void test_set_module_params_blend_only_patch_allowed(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_blend_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":139,\"method\":\"set_module_params\","
+    "\"params\":{\"module\":\"exposure\",\"values\":{},"
+    "\"blend\":{\"mask_mode\":\"uniform\",\"opacity\":50.0}}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  json_node_unref(actual);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_module_params_blend_error_fixture(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_blend_mask_configuration,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_error_blend_mask_configuration_request.json",
+                           "set_module_params_error_blend_mask_configuration_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_get_module_params_attaches_blend(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_params = stub_get_module_params_exposure,
+    .list_modules = stub_list_modules_one_exposure,
+    .get_state = stub_get_state_revision31_no_image,
+    .blend_read = stub_blend_read_small,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("get_module_params_blend_request.json",
+                           "get_module_params_blend_response.json");
+
+  // a NULL-returning blend_read emits no member at all
+  calls.blend_read = stub_blend_node_null;
+  dt_remote_protocol_set_calls(&calls);
+  JsonNode *request_node = _load_fixture("get_module_params_request.json");
+  JsonNode *actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  assert_false(json_object_has_member(json_object_get_object_member(resp, "result"), "blend"));
+  json_node_unref(actual);
+  json_node_unref(request_node);
+
+  // and so does an entirely absent (NULL pointer) blend_read
+  calls.blend_read = NULL;
+  dt_remote_protocol_set_calls(&calls);
+  request_node = _load_fixture("get_module_params_request.json");
+  actual = dt_remote_protocol_dispatch(json_node_get_object(request_node), NULL);
+  assert_non_null(actual);
+  resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  assert_false(json_object_has_member(json_object_get_object_member(resp, "result"), "blend"));
+  json_node_unref(actual);
+  json_node_unref(request_node);
+
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_get_module_schema_accepts_instance_and_attaches_blend(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_schema = stub_get_module_schema_exposure,
+    .blend_schema = stub_blend_schema_small,
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  // explicit instance
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":140,\"method\":\"get_module_schema\","
+    "\"params\":{\"module\":\"exposure\",\"instance\":0}}");
+  JsonObject *resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *result = json_object_get_object_member(resp, "result");
+  assert_true(json_object_has_member(result, "blend"));
+  JsonObject *blend = json_object_get_object_member(result, "blend");
+  assert_true(json_object_get_boolean_member(
+    json_object_get_object_member(blend, "mask_mode"), "writable"));
+  json_node_unref(actual);
+
+  // instance omitted: defaults to 0, still succeeds and attaches
+  actual = _dispatch_inline(
+    "{\"id\":141,\"method\":\"get_module_schema\","
+    "\"params\":{\"module\":\"exposure\"}}");
+  resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  assert_true(json_object_has_member(json_object_get_object_member(resp, "result"), "blend"));
+  json_node_unref(actual);
+
+  // NULL-returning blend_schema: member omitted, no error
+  calls.blend_schema = stub_blend_node_null;
+  dt_remote_protocol_set_calls(&calls);
+  actual = _dispatch_inline(
+    "{\"id\":142,\"method\":\"get_module_schema\","
+    "\"params\":{\"module\":\"exposure\",\"instance\":0}}");
+  resp = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(resp, "ok"));
+  assert_false(json_object_has_member(json_object_get_object_member(resp, "result"), "blend"));
   json_node_unref(actual);
 
   dt_remote_protocol_set_calls(NULL);
@@ -5284,6 +5527,12 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_semantic_quantity_rejects_oversized_component_object),
     cmocka_unit_test(test_semantic_quantity_rejects_unknown_members),
     cmocka_unit_test(test_semantic_quantity_preserves_double_precision),
+    cmocka_unit_test(test_set_module_params_blend_fixture_round_trip),
+    cmocka_unit_test(test_set_module_params_blend_must_be_object),
+    cmocka_unit_test(test_set_module_params_blend_only_patch_allowed),
+    cmocka_unit_test(test_set_module_params_blend_error_fixture),
+    cmocka_unit_test(test_get_module_params_attaches_blend),
+    cmocka_unit_test(test_get_module_schema_accepts_instance_and_attaches_blend),
 
     cmocka_unit_test(test_hello_curve_params_implies_semantic_values_accepted),
 

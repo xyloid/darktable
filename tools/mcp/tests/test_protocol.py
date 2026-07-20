@@ -100,6 +100,18 @@ async def test_hello_wrong_token_raises_protocol_error(fake_server_factory):
             "set_module_params_curve_request.json",
             "set_module_params_curve_response.json",
         ),
+        # mask Tier 1: the blend patch/readback members ride the same
+        # passthrough.
+        (
+            "set_module_params",
+            "set_module_params_blend_request.json",
+            "set_module_params_blend_response.json",
+        ),
+        (
+            "get_module_params",
+            "get_module_params_blend_request.json",
+            "get_module_params_blend_response.json",
+        ),
     ],
 )
 async def test_success_responses_match_shared_fixtures(
@@ -134,6 +146,7 @@ async def test_client_capabilities_populated_from_hello(fake_server_factory):
     assert "curve_params" in client.capabilities
     assert "band_params" in client.capabilities
     assert "quantity_params" in client.capabilities
+    assert "blend_params" in client.capabilities
 
     await client.close()
 

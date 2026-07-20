@@ -56,6 +56,8 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .render_preview_prepare = dt_remote_render_preview_prepare,
   .current_revision = dt_remote_current_revision,
   .scopes_prepare = dt_remote_scopes_prepare,
+  .blend_schema = dt_remote_blend_schema_for_ref,
+  .blend_read = dt_remote_blend_read_for_ref,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -73,6 +75,8 @@ static dt_remote_protocol_calls_t s_calls = {
   .render_preview_prepare = dt_remote_render_preview_prepare,
   .current_revision = dt_remote_current_revision,
   .scopes_prepare = dt_remote_scopes_prepare,
+  .blend_schema = dt_remote_blend_schema_for_ref,
+  .blend_read = dt_remote_blend_read_for_ref,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -948,12 +952,15 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   // semantic_values entries the same way, on top of "semantic_params";
   // "band_params" (milestone 5) does the same for bands-class entries, and
   // "quantity_params" (milestone 6) for quantity-class entries.
+  // "blend_params" (mask Tier 1 / M-A) gates the blend
+  // schema/read/patch/readback wire members.
   json_builder_add_string_value(b, "params");
   json_builder_add_string_value(b, "semantic_params");
   json_builder_add_string_value(b, "curve_params");
   json_builder_add_string_value(b, "vector_params");
   json_builder_add_string_value(b, "band_params");
   json_builder_add_string_value(b, "quantity_params");
+  json_builder_add_string_value(b, "blend_params");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");
@@ -1093,7 +1100,7 @@ static JsonNode *_handler_list_modules(JsonObject *params, dt_remote_session_t *
   return result;
 }
 
-static const char *const GET_MODULE_SCHEMA_KEYS[] = { "module", NULL };
+static const char *const GET_MODULE_SCHEMA_KEYS[] = { "module", "instance", NULL };
 
 static JsonNode *_handler_get_module_schema(JsonObject *params, dt_remote_session_t *session,
                                             dt_remote_pending_t *pending)
@@ -1106,6 +1113,9 @@ static JsonNode *_handler_get_module_schema(JsonObject *params, dt_remote_sessio
 
   const char *module = NULL;
   if(!_require_string(params, "module", &module, &err)) return _handler_fail(err);
+
+  gint64 instance = 0;
+  if(!_optional_int_default(params, "instance", 0, &instance, &err)) return _handler_fail(err);
 
   dt_remote_module_schema_t *schema = NULL;
   if(!s_calls.get_module_schema(module, &schema, &err)) return _handler_fail(err);
@@ -1138,6 +1148,20 @@ static JsonNode *_handler_get_module_schema(JsonObject *params, dt_remote_sessio
     for(guint i = 0; i < schema->semantic_fields->len; i++)
       json_builder_add_value(b, _semantic_schema_to_json(g_ptr_array_index(schema->semantic_fields, i)));
     json_builder_end_array(b);
+  }
+  // optional, capability-gated ("blend_params"): unlike everything above,
+  // the blend schema is live-session data (mode sets and writability depend
+  // on the darkroom instance) -- outside darkroom, for an unknown instance,
+  // or for a non-blending op the member is simply omitted, never an error.
+  if(s_calls.blend_schema)
+  {
+    const dt_remote_module_ref_t ref = { .op = module, .instance = (int)instance };
+    JsonNode *blend_node = s_calls.blend_schema(&ref);
+    if(blend_node)
+    {
+      json_builder_set_member_name(b, "blend");
+      json_builder_add_value(b, blend_node);  // builder takes ownership
+    }
   }
   json_builder_end_object(b);
 
@@ -1256,6 +1280,17 @@ static JsonNode *_handler_get_module_params(JsonObject *params, dt_remote_sessio
     }
     g_list_free(keys);
     json_builder_end_object(b);
+  }
+  // optional, capability-gated ("blend_params"): the current blend values
+  // for this live instance; omitted (never an error) when unavailable.
+  if(s_calls.blend_read)
+  {
+    JsonNode *blend_node = s_calls.blend_read(&ref);
+    if(blend_node)
+    {
+      json_builder_set_member_name(b, "blend");
+      json_builder_add_value(b, blend_node);  // builder takes ownership
+    }
   }
   json_builder_end_object(b);
 
@@ -1812,7 +1847,7 @@ static gboolean _parse_semantic_values(JsonObject *params, GPtrArray **out, dt_r
 }
 
 static const char *const SET_MODULE_PARAMS_KEYS[] =
-  { "module", "instance", "values", "semantic_values", "expected_revision", "enable", NULL };
+  { "module", "instance", "values", "semantic_values", "expected_revision", "enable", "blend", NULL };
 
 static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_session_t *session,
                                             dt_remote_pending_t *pending)
@@ -1849,7 +1884,26 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   if(!_parse_semantic_values(params, &semantic_patches, &err)) return _handler_fail(err);
 
   GList *value_keys = json_object_get_members(values_obj);
-  if(!value_keys && !semantic_patches)
+
+  // Optional blend patch (mask Tier 1 / M-A): the object is borrowed from
+  // the request tree, which outlives the synchronous engine call -- same
+  // lifetime argument as ref.op. Its members are validated by the engine
+  // (dt_remote_blend_patch_apply), not here.
+  JsonObject *blend_obj = NULL;
+  if(json_object_has_member(params, "blend"))
+  {
+    JsonNode *blend_node = json_object_get_member(params, "blend");
+    if(!blend_node || !JSON_NODE_HOLDS_OBJECT(blend_node))
+    {
+      g_list_free(value_keys);
+      if(semantic_patches) g_ptr_array_unref(semantic_patches);
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'blend' must be an object")));
+    }
+    blend_obj = json_node_get_object(blend_node);
+  }
+
+  if(!value_keys && !semantic_patches && !blend_obj)
     return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE, _("'values' must be non-empty")));
 
   gboolean have_expected_revision = FALSE;
@@ -1905,6 +1959,7 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
   patch.semantic_values = semantic_patches;  // may be NULL
   patch.has_enable = have_enable;
   patch.enable = enable_value;
+  patch.blend = blend_obj;  // may be NULL; borrowed from the request tree
 
   dt_remote_error_t *convert_err = NULL;
   for(GList *k = value_keys; k; k = k->next)
@@ -1988,6 +2043,14 @@ static JsonNode *_handler_set_module_params(JsonObject *params, dt_remote_sessio
     }
     g_list_free(keys);
     json_builder_end_object(b);
+  }
+  // Complete post-commit blend read-back (never an echo of the request);
+  // requests without `blend` emit no member.
+  if(result->blend_readback)
+  {
+    json_builder_set_member_name(b, "blend");
+    json_builder_add_value(b, result->blend_readback);  // ownership moves to the builder
+    result->blend_readback = NULL;
   }
   json_builder_set_member_name(b, "revision");
   json_builder_add_int_value(b, (gint64)result->revision);

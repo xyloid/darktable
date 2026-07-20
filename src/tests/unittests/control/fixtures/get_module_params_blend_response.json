@@ -1,0 +1,13 @@
+{
+  "id": 41,
+  "ok": true,
+  "result": {
+    "module": "exposure",
+    "instance": 0,
+    "instance_name": "",
+    "enabled": true,
+    "revision": 31,
+    "values": { "exposure": 0.5, "black": 0.0, "mode": "EXPOSURE_MODE_MANUAL" },
+    "blend": { "mask_mode": "off", "opacity": 100.0 }
+  }
+}

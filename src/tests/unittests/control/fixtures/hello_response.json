@@ -12,6 +12,7 @@
       "vector_params",
       "band_params",
       "quantity_params",
+      "blend_params",
       "instances",
       "history",
       "preview",

@@ -1,0 +1,26 @@
+{
+  "id": 40,
+  "ok": true,
+  "result": {
+    "module": "exposure",
+    "instance": 0,
+    "enabled": true,
+    "values": {},
+    "blend": {
+      "mask_mode": "uniform",
+      "colorspace": "DEVELOP_BLEND_CS_NONE",
+      "effective_colorspace": "DEVELOP_BLEND_CS_RGB_SCENE",
+      "mode": "DEVELOP_BLEND_NORMAL2",
+      "reverse": false,
+      "fulcrum": 0.0,
+      "opacity": 50.0,
+      "feathering_radius": 0.0,
+      "feathering_guide": "DEVELOP_MASK_GUIDE_IN_AFTER_BLUR",
+      "blur_radius": 0.0,
+      "contrast": 0.0,
+      "brightness": 0.0,
+      "details": 0.0
+    },
+    "revision": 12
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": 42,
+  "method": "set_module_params",
+  "params": {
+    "module": "exposure",
+    "values": {},
+    "blend": { "mask_mode": "uniform" }
+  }
+}
