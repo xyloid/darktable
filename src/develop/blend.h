@@ -175,6 +175,21 @@ typedef enum dt_develop_blendif_channels_t
   DEVELOP_BLENDIF_OUTPUT_MASK = 0xF0F0
 } dt_develop_blendif_channels_t;
 
+/** one section of the blend-mode chooser: a GUI section label plus an
+ * inclusive range in dt_develop_blend_mode_names[] TUPLE order (exactly
+ * the (start, end) pair dt_bauhaus_combobox_add_introspection() takes).
+ * Shared between blend_gui.c's combobox population and the remote-edit
+ * engine so the mode x colorspace availability sets cannot drift. */
+typedef struct dt_develop_blend_mode_section_t
+{
+  const char *section;                 // N_()-marked label; GUI shows _(section)
+  dt_develop_blend_mode_t from, to;
+} dt_develop_blend_mode_section_t;
+
+/** the per-blend-colorspace section table, terminated by {NULL, 0, 0}.
+ * DEVELOP_BLEND_CS_NONE (and any unknown value) returns an empty table. */
+const dt_develop_blend_mode_section_t *
+dt_develop_blend_mode_sections(dt_develop_blend_colorspace_t csp);
 
 /** blend parameters current version */
 typedef struct dt_develop_blend_params_t

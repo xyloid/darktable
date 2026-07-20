@@ -62,6 +62,61 @@ static dt_develop_blend_params_t _default_blendop_params
         { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
         { 0 }, 0, INVALID_MASKID, FALSE };
 
+// The mode x colorspace availability sets, one row per
+// _add_blendmode_combo() call in blend_gui.c's pre-refactor population.
+// Consecutive rows sharing a section label render under one section header.
+#define BLEND_MODE_SECTIONS_COMMON \
+  { N_("normal & difference"), DEVELOP_BLEND_NORMAL2, DEVELOP_BLEND_DIFFERENCE2 }, \
+  { N_("normal & difference"), DEVELOP_BLEND_BOUNDED, DEVELOP_BLEND_BOUNDED },     \
+  { N_("lighten"), DEVELOP_BLEND_LIGHTEN, DEVELOP_BLEND_LIGHTEN },                 \
+  { N_("lighten"), DEVELOP_BLEND_ADD, DEVELOP_BLEND_ADD },                         \
+  { N_("lighten"), DEVELOP_BLEND_SCREEN, DEVELOP_BLEND_SCREEN },                   \
+  { N_("darken"), DEVELOP_BLEND_DARKEN, DEVELOP_BLEND_DARKEN },                    \
+  { N_("darken"), DEVELOP_BLEND_SUBTRACT, DEVELOP_BLEND_SUBTRACT },                \
+  { N_("darken"), DEVELOP_BLEND_MULTIPLY, DEVELOP_BLEND_MULTIPLY },                \
+  { N_("contrast enhancing"), DEVELOP_BLEND_OVERLAY, DEVELOP_BLEND_PINLIGHT }
+
+static const dt_develop_blend_mode_section_t _blend_mode_sections_raw[] = {
+  BLEND_MODE_SECTIONS_COMMON,
+  { NULL, 0, 0 } };
+
+static const dt_develop_blend_mode_section_t _blend_mode_sections_lab[] = {
+  BLEND_MODE_SECTIONS_COMMON,
+  { N_("color channel"), DEVELOP_BLEND_LAB_LIGHTNESS, DEVELOP_BLEND_LAB_COLOR },
+  { N_("color channel"), DEVELOP_BLEND_HUE, DEVELOP_BLEND_COLORADJUST },
+  { N_("chromaticity & lightness"), DEVELOP_BLEND_LIGHTNESS, DEVELOP_BLEND_CHROMATICITY },
+  { NULL, 0, 0 } };
+
+static const dt_develop_blend_mode_section_t _blend_mode_sections_rgb_display[] = {
+  BLEND_MODE_SECTIONS_COMMON,
+  { N_("color channel"), DEVELOP_BLEND_RGB_R, DEVELOP_BLEND_HSV_COLOR },
+  { N_("color channel"), DEVELOP_BLEND_HUE, DEVELOP_BLEND_COLORADJUST },
+  { N_("chromaticity & lightness"), DEVELOP_BLEND_LIGHTNESS, DEVELOP_BLEND_CHROMATICITY },
+  { NULL, 0, 0 } };
+
+static const dt_develop_blend_mode_section_t _blend_mode_sections_rgb_scene[] = {
+  { N_("normal & arithmetic"), DEVELOP_BLEND_NORMAL2, DEVELOP_BLEND_DIFFERENCE2 },
+  { N_("normal & arithmetic"), DEVELOP_BLEND_MULTIPLY, DEVELOP_BLEND_HARMONIC_MEAN },
+  { N_("color channel"), DEVELOP_BLEND_RGB_R, DEVELOP_BLEND_RGB_B },
+  { N_("chromaticity & lightness"), DEVELOP_BLEND_LIGHTNESS, DEVELOP_BLEND_CHROMATICITY },
+  { NULL, 0, 0 } };
+
+static const dt_develop_blend_mode_section_t _blend_mode_sections_none[] = {
+  { NULL, 0, 0 } };
+
+const dt_develop_blend_mode_section_t *
+dt_develop_blend_mode_sections(dt_develop_blend_colorspace_t csp)
+{
+  switch(csp)
+  {
+    case DEVELOP_BLEND_CS_RAW:         return _blend_mode_sections_raw;
+    case DEVELOP_BLEND_CS_LAB:         return _blend_mode_sections_lab;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY: return _blend_mode_sections_rgb_display;
+    case DEVELOP_BLEND_CS_RGB_SCENE:   return _blend_mode_sections_rgb_scene;
+    default:                           return _blend_mode_sections_none;
+  }
+}
+
 static inline dt_develop_blend_colorspace_t _blend_default_module_blend_colorspace(dt_iop_module_t *module,
                                                                                    const gboolean is_scene_referred)
 {
