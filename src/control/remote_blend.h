@@ -16,9 +16,10 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Tier-1 blend surface for the darktable MCP remote-edit engine: a
-// hand-written mini-introspection over dt_develop_blend_params_t (the
-// struct is NOT introspected) plus pure JSON schema/read/patch helpers.
+// Tier-1 blend base plus Tier-2 extensions for the darktable MCP
+// remote-edit engine: a hand-written mini-introspection over
+// dt_develop_blend_params_t (the struct is NOT introspected) plus pure JSON
+// schema/read/patch helpers.
 // Unlike remote_edit.h's neutral-type boundary, this layer deliberately
 // speaks json-glib: the blend object's wire shape is bespoke (see the
 // blend-settings design doc SS Wire contract), and both producers and the
@@ -84,5 +85,53 @@ gboolean dt_remote_blend_patch_apply(struct dt_iop_module_t *module,
                                      JsonObject *patch,
                                      dt_develop_blend_params_t *dst,
                                      dt_remote_error_t **error);
+
+/* ---- Tier 2 / M-B: parametric (blendif) masks ---- */
+
+/** one wire channel of a blend colorspace family: a stable ASCII name
+ * (never a translated GUI label) plus its `_in`/`_out` blendif slots and
+ * boost metadata. `boost_offset` is the STORAGE offset of the boost
+ * value's GUI zero (-6.64385619 for Jz/Cz, 0 else); `marker_offset` is
+ * the separate Lab a/b centering (0.5) used only in the non-normative
+ * display hint. See the parametric-masks design SS Boost. */
+typedef struct dt_remote_blendif_channel_t
+{
+  const char *name;
+  dt_develop_blendif_channels_t slot_in;
+  dt_develop_blendif_channels_t slot_out;
+  gboolean boost_supported;
+  float boost_offset;
+  float marker_offset;
+  float display_factor;   // non-normative display hint
+  const char *display_unit;
+} dt_remote_blendif_channel_t;
+
+/** the NULL-terminated channel table for `csp`, or NULL when the family
+ * has no parametric support (RAW / NONE). The order matches the GUI
+ * tables entry-for-entry (bound by a parity test). */
+const dt_remote_blendif_channel_t *
+dt_remote_blendif_channels(dt_develop_blend_colorspace_t csp);
+
+/** bitfield <-> per-slot views. `slot` is a usable storage slot 0..14;
+ * slot 15 is DEVELOP_BLENDIF_unused, whose polarity bit aliases the legacy
+ * DEVELOP_BLENDIF_active bit (31), and is rejected. `slot_pack` sets/clears
+ * the enable bit (slot) and polarity bit (16+slot) and always strips bit 31. */
+gboolean dt_remote_blendif_slot_enabled(uint32_t blendif, int slot);
+gboolean dt_remote_blendif_slot_inverted(uint32_t blendif, int slot);
+uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot,
+                                     gboolean enabled, gboolean inverted);
+
+/** the derived-enable rule (single source of truth): a slot is DISABLED
+ * iff its markers are the full-span identity (m[1]==0 && m[2]==1). */
+gboolean dt_remote_blendif_markers_enable(const float m[4]);
+
+/** Apply the authoritative mask-mode transition table. Only ENABLED and
+ * CONDITIONAL may change; MASK and every unknown bit are preserved.
+ * On FALSE, `*constraint` is one of the static strings unknown_value,
+ * drawn_via_attach_only, or raster_unsupported. */
+gboolean dt_remote_blend_mask_mode_transition(uint32_t stored,
+                                              const char *target,
+                                              uint32_t *out,
+                                              const char **constraint);
 
 G_END_DECLS

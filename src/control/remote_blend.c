@@ -41,6 +41,13 @@ G_STATIC_ASSERT(offsetof(dt_develop_blend_params_t, blur_radius) == 40);
 G_STATIC_ASSERT(offsetof(dt_develop_blend_params_t, contrast) == 44);
 G_STATIC_ASSERT(offsetof(dt_develop_blend_params_t, brightness) == 48);
 G_STATIC_ASSERT(offsetof(dt_develop_blend_params_t, details) == 52);
+G_STATIC_ASSERT(sizeof(((dt_develop_blend_params_t *)0)->blendif_parameters)
+                == 4 * DEVELOP_BLENDIF_SIZE * sizeof(float));
+G_STATIC_ASSERT(sizeof(((dt_develop_blend_params_t *)0)->blendif_boost_factors)
+                == DEVELOP_BLENDIF_SIZE * sizeof(float));
+G_STATIC_ASSERT(offsetof(dt_develop_blend_params_t, blendif_boost_factors)
+                == offsetof(dt_develop_blend_params_t, blendif_parameters)
+                   + 4 * DEVELOP_BLENDIF_SIZE * sizeof(float));
 
 /* ------------------------------------------------------------------ */
 /* enum name tables (wire = C enumerator names)                        */
@@ -166,12 +173,141 @@ const char *dt_remote_blend_mask_mode_string(uint32_t mask_mode)
   return (mask_mode & DEVELOP_MASK_ENABLED) ? "uniform" : "off";
 }
 
-gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out)
+static gboolean _mask_mode_target_from_string(const char *s, uint32_t *out)
 {
-  if(!s) return FALSE;
+  if(!s || !out) return FALSE;
   if(!strcmp(s, "off")) { *out = DEVELOP_MASK_DISABLED; return TRUE; }
   if(!strcmp(s, "uniform")) { *out = DEVELOP_MASK_ENABLED; return TRUE; }
+  if(!strcmp(s, "parametric"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+    return TRUE;
+  }
+  if(!strcmp(s, "drawn"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    return TRUE;
+  }
+  if(!strcmp(s, "drawn+parametric"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL;
+    return TRUE;
+  }
   return FALSE;
+}
+
+gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out)
+{
+  if(!out) return FALSE;
+  uint32_t target = 0;
+  if(!_mask_mode_target_from_string(s, &target)
+     || (target & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL)))
+    return FALSE;
+  *out = target;
+  return TRUE;
+}
+
+gboolean dt_remote_blend_mask_mode_transition(uint32_t stored,
+                                              const char *target_name,
+                                              uint32_t *out,
+                                              const char **constraint)
+{
+  if(constraint) *constraint = NULL;
+  if(stored & DEVELOP_MASK_RASTER)
+  {
+    if(constraint) *constraint = "raster_unsupported";
+    return FALSE;
+  }
+
+  uint32_t target = 0;
+  if(!_mask_mode_target_from_string(target_name, &target))
+  {
+    if(constraint) *constraint = "unknown_value";
+    return FALSE;
+  }
+  if((stored & DEVELOP_MASK_MASK) != (target & DEVELOP_MASK_MASK))
+  {
+    if(constraint) *constraint = "drawn_via_attach_only";
+    return FALSE;
+  }
+
+  *out = (stored & ~(DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL))
+         | (target & (DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL));
+  return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tier 2: blendif channel tables (wire names are stable ASCII)        */
+/* ------------------------------------------------------------------ */
+
+// display_factor/display_unit are NON-NORMATIVE metadata (clients that
+// want GUI-style numbers): display ~= (stored - marker_offset) * 2^boost
+// * display_factor. The wire itself always carries stored 0..1 values.
+static const dt_remote_blendif_channel_t _channels_lab[] = {
+  { "L", DEVELOP_BLENDIF_L_in, DEVELOP_BLENDIF_L_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "a", DEVELOP_BLENDIF_A_in, DEVELOP_BLENDIF_A_out, TRUE,  0.0f, 0.5f, 256.0f, "" },
+  { "b", DEVELOP_BLENDIF_B_in, DEVELOP_BLENDIF_B_out, TRUE,  0.0f, 0.5f, 256.0f, "" },
+  { "C", DEVELOP_BLENDIF_C_in, DEVELOP_BLENDIF_C_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "h", DEVELOP_BLENDIF_h_in, DEVELOP_BLENDIF_h_out, FALSE, 0.0f, 0.0f, 360.0f, "\xc2\xb0" },
+  { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
+
+static const dt_remote_blendif_channel_t _channels_rgb_display[] = {
+  { "g", DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "R", DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "G", DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "B", DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "H", DEVELOP_BLENDIF_H_in,     DEVELOP_BLENDIF_H_out,     FALSE, 0.0f, 0.0f, 360.0f, "\xc2\xb0" },
+  { "S", DEVELOP_BLENDIF_S_in,     DEVELOP_BLENDIF_S_out,     FALSE, 0.0f, 0.0f, 100.0f, "%" },
+  { "l", DEVELOP_BLENDIF_l_in,     DEVELOP_BLENDIF_l_out,     FALSE, 0.0f, 0.0f, 100.0f, "%" },
+  { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
+
+static const dt_remote_blendif_channel_t _channels_rgb_scene[] = {
+  { "g",  DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "R",  DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "G",  DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "B",  DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "Jz", DEVELOP_BLENDIF_Jz_in,    DEVELOP_BLENDIF_Jz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "%" },
+  { "Cz", DEVELOP_BLENDIF_Cz_in,    DEVELOP_BLENDIF_Cz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "%" },
+  { "hz", DEVELOP_BLENDIF_hz_in,    DEVELOP_BLENDIF_hz_out,    FALSE, 0.0f,         0.0f, 360.0f, "\xc2\xb0" },
+  { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
+
+const dt_remote_blendif_channel_t *
+dt_remote_blendif_channels(dt_develop_blend_colorspace_t csp)
+{
+  switch(csp)
+  {
+    case DEVELOP_BLEND_CS_LAB:         return _channels_lab;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY: return _channels_rgb_display;
+    case DEVELOP_BLEND_CS_RGB_SCENE:   return _channels_rgb_scene;
+    default:                           return NULL;  // RAW/NONE: no parametric channel table
+  }
+}
+
+gboolean dt_remote_blendif_slot_enabled(uint32_t blendif, int slot)
+{
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, FALSE);
+  return (blendif & (1u << slot)) != 0;
+}
+
+gboolean dt_remote_blendif_slot_inverted(uint32_t blendif, int slot)
+{
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, FALSE);
+  return (blendif & (1u << (16 + slot))) != 0;
+}
+
+uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot,
+                                     gboolean enabled, gboolean inverted)
+{
+  blendif &= ~(1u << 31);              // strip legacy DEVELOP_BLENDIF_active
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, blendif);
+  if(enabled)  blendif |=  (1u << slot);        else blendif &= ~(1u << slot);
+  if(inverted) blendif |=  (1u << (16 + slot)); else blendif &= ~(1u << (16 + slot));
+  return blendif;
+}
+
+gboolean dt_remote_blendif_markers_enable(const float m[4])
+{
+  return !(m[1] == 0.0f && m[2] == 1.0f);
 }
 
 dt_develop_blend_colorspace_t

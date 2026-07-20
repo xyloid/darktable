@@ -16,7 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 /*
- * cmocka unit tests for the Tier-1 blend surface:
+ * cmocka unit tests for the Tier-1 blend base plus Tier-2 extensions:
  *  - Task 1: GUI-parity of dt_develop_blend_mode_sections() against the
  *    pre-refactor hardcoded combobox population (frozen here as data).
  *  - Tasks 2-4 append their sections to this file.
@@ -30,6 +30,13 @@
 #include "common/darktable.h"
 #include "develop/develop.h"
 #include "develop/blend.h"
+
+// The GUI blendif channel tables are non-static `const` (blend_gui.c) and
+// directly linkable; extern them for the GUI-parity binding below.
+extern const dt_iop_gui_blendif_channel_t Lab_channels[];
+extern const dt_iop_gui_blendif_channel_t rgb_channels[];
+extern const dt_iop_gui_blendif_channel_t rgbj_channels[];
+
 #include "develop/imageop.h"
 
 #include <glib.h>
@@ -206,6 +213,206 @@ static void test_mode_names_for_colorspace_matches_sections(void **state)
   GPtrArray *none = dt_remote_blend_mode_names_for_colorspace(DEVELOP_BLEND_CS_NONE);
   assert_int_equal(none->len, 0);
   g_ptr_array_unref(none);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 1: blendif channel table + pure helpers (Tier 2 / M-B)         */
+/* ------------------------------------------------------------------ */
+
+static const dt_remote_blendif_channel_t *_find_channel(dt_develop_blend_colorspace_t csp,
+                                                        const char *name)
+{
+  for(const dt_remote_blendif_channel_t *c = dt_remote_blendif_channels(csp); c && c->name; c++)
+    if(!strcmp(c->name, name)) return c;
+  return NULL;
+}
+
+// Bind the engine table to the externed GUI table entry-for-entry: same
+// slots, same boost enablement, same boost storage offset. Drift in the
+// GUI tables becomes a failure here with zero GUI changes (design decision 6).
+static void _assert_parity(dt_develop_blend_colorspace_t csp,
+                           const dt_iop_gui_blendif_channel_t *gui,
+                           const char *const *wire_names)
+{
+  const dt_remote_blendif_channel_t *eng = dt_remote_blendif_channels(csp);
+  assert_non_null(eng);
+  guint i = 0;
+  for(; gui[i].label; i++)   // GUI tables terminate with a {NULL} entry
+  {
+    assert_non_null(eng[i].name);
+    assert_string_equal(eng[i].name, wire_names[i]);
+    assert_int_equal(eng[i].slot_in, gui[i].param_channels[0]);
+    assert_int_equal(eng[i].slot_out, gui[i].param_channels[1]);
+    assert_int_equal(eng[i].boost_supported, gui[i].boost_factor_enabled);
+    assert_float_equal(eng[i].boost_offset, gui[i].boost_factor_offset, 1e-6);
+  }
+  // engine table ends exactly where the GUI table ends
+  assert_null(eng[i].name);
+}
+
+static void test_channels_parity_lab(void **state)
+{
+  (void)state;
+  static const char *const names[] = { "L", "a", "b", "C", "h" };
+  _assert_parity(DEVELOP_BLEND_CS_LAB, Lab_channels, names);
+}
+static void test_channels_parity_rgb_display(void **state)
+{
+  (void)state;
+  static const char *const names[] = { "g", "R", "G", "B", "H", "S", "l" };
+  _assert_parity(DEVELOP_BLEND_CS_RGB_DISPLAY, rgb_channels, names);
+}
+static void test_channels_parity_rgb_scene(void **state)
+{
+  (void)state;
+  static const char *const names[] = { "g", "R", "G", "B", "Jz", "Cz", "hz" };
+  _assert_parity(DEVELOP_BLEND_CS_RGB_SCENE, rgbj_channels, names);
+}
+static void test_channels_none_and_raw_unsupported(void **state)
+{
+  (void)state;
+  assert_null(dt_remote_blendif_channels(DEVELOP_BLEND_CS_NONE));
+  assert_null(dt_remote_blendif_channels(DEVELOP_BLEND_CS_RAW));
+}
+
+static void test_boost_offsets_and_ranges(void **state)
+{
+  (void)state;
+  // Jz/Cz carry the -6.64385619 storage offset; everything else 0.
+  assert_float_equal(_find_channel(DEVELOP_BLEND_CS_RGB_SCENE, "Jz")->boost_offset,
+                     -6.64385619f, 1e-6);
+  assert_float_equal(_find_channel(DEVELOP_BLEND_CS_RGB_SCENE, "Cz")->boost_offset,
+                     -6.64385619f, 1e-6);
+  assert_float_equal(_find_channel(DEVELOP_BLEND_CS_LAB, "L")->boost_offset, 0.0f, 1e-6);
+  // hue channels have no boost; g/R/G/B/L do.
+  assert_false(_find_channel(DEVELOP_BLEND_CS_LAB, "h")->boost_supported);
+  assert_true(_find_channel(DEVELOP_BLEND_CS_LAB, "L")->boost_supported);
+  assert_false(_find_channel(DEVELOP_BLEND_CS_RGB_SCENE, "hz")->boost_supported);
+  // Lab a/b marker offset is 0.5; others 0.
+  assert_float_equal(_find_channel(DEVELOP_BLEND_CS_LAB, "a")->marker_offset, 0.5f, 1e-6);
+  assert_float_equal(_find_channel(DEVELOP_BLEND_CS_LAB, "L")->marker_offset, 0.0f, 1e-6);
+
+  // Bind each display-hint category to the GUI print functions: normalized
+  // channels are percentages, a/b are centered 256-scale values, and hues
+  // are degrees. Empty string means deliberately unitless.
+  const dt_remote_blendif_channel_t *lab_a =
+    _find_channel(DEVELOP_BLEND_CS_LAB, "a");
+  const dt_remote_blendif_channel_t *rgb_g =
+    _find_channel(DEVELOP_BLEND_CS_RGB_DISPLAY, "g");
+  const dt_remote_blendif_channel_t *rgb_h =
+    _find_channel(DEVELOP_BLEND_CS_RGB_DISPLAY, "H");
+  assert_float_equal(lab_a->display_factor, 256.0f, 1e-6);
+  assert_string_equal(lab_a->display_unit, "");
+  assert_float_equal(rgb_g->display_factor, 100.0f, 1e-6);
+  assert_string_equal(rgb_g->display_unit, "%");
+  assert_float_equal(rgb_h->display_factor, 360.0f, 1e-6);
+  assert_string_equal(rgb_h->display_unit, "\xc2\xb0");
+}
+
+static void test_slot_enabled_inverted_pack(void **state)
+{
+  (void)state;
+  // Exercise every in/out slot in every supported family, not one sample.
+  const dt_develop_blend_colorspace_t families[] = {
+    DEVELOP_BLEND_CS_LAB, DEVELOP_BLEND_CS_RGB_DISPLAY, DEVELOP_BLEND_CS_RGB_SCENE
+  };
+  for(guint f = 0; f < G_N_ELEMENTS(families); f++)
+    for(const dt_remote_blendif_channel_t *c = dt_remote_blendif_channels(families[f]);
+        c && c->name; c++)
+    {
+      const int slots[] = { c->slot_in, c->slot_out };
+      for(guint i = 0; i < G_N_ELEMENTS(slots); i++)
+      {
+        const int slot = slots[i];
+        uint32_t bf = dt_remote_blendif_slot_pack(0u, slot, TRUE, TRUE);
+        assert_true(dt_remote_blendif_slot_enabled(bf, slot));
+        assert_true(dt_remote_blendif_slot_inverted(bf, slot));
+        assert_int_equal(bf, (1u << slot) | (1u << (16 + slot)));
+        bf = dt_remote_blendif_slot_pack(bf, slot, FALSE, FALSE);
+        assert_false(dt_remote_blendif_slot_enabled(bf, slot));
+        assert_false(dt_remote_blendif_slot_inverted(bf, slot));
+        assert_int_equal(bf, 0u);
+      }
+    }
+
+  // the legacy DEVELOP_BLENDIF_active bit (31) is always stripped by pack
+  uint32_t bf = dt_remote_blendif_slot_pack(1u << 31, 0, TRUE, FALSE);
+  assert_int_equal(bf & (1u << 31), 0u);
+}
+
+static void test_markers_enable_rule(void **state)
+{
+  (void)state;
+  const float full_span[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+  const float half[4] = { 0.0f, 0.0f, 0.55f, 0.65f };
+  const float hard[4] = { 0.3f, 0.3f, 0.3f, 0.3f };
+  assert_false(dt_remote_blendif_markers_enable(full_span)); // identity -> disabled
+  assert_true(dt_remote_blendif_markers_enable(half));
+  assert_true(dt_remote_blendif_markers_enable(hard));
+}
+
+static void test_mask_mode_targets_and_transition_matrix(void **state)
+{
+  (void)state;
+  typedef struct { const char *name; uint32_t bits; } target_t;
+  static const target_t targets[] = {
+    { "off", DEVELOP_MASK_DISABLED },
+    { "uniform", DEVELOP_MASK_ENABLED },
+    { "parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL },
+    { "drawn", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK },
+    { "drawn+parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL },
+  };
+  static const uint32_t rows[] = {
+    DEVELOP_MASK_DISABLED,
+    DEVELOP_MASK_ENABLED,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL,
+  };
+
+  // Every target is exercised through the transition helper below. The
+  // public M-A parser remains off/uniform until Task 4 so Tasks 1-3 are
+  // independently green and do not broaden shipped patch behavior early.
+  uint32_t ignored = 0;
+
+  // Every non-raster cell in the authoritative appendix: success exactly
+  // when stored and target MASK ownership agree.
+  for(guint r = 0; r < G_N_ELEMENTS(rows); r++)
+    for(guint t = 0; t < G_N_ELEMENTS(targets); t++)
+    {
+      uint32_t projected = UINT32_MAX;
+      const char *constraint = NULL;
+      const gboolean same_drawn =
+        ((rows[r] & DEVELOP_MASK_MASK) != 0)
+        == ((targets[t].bits & DEVELOP_MASK_MASK) != 0);
+      assert_int_equal(dt_remote_blend_mask_mode_transition(
+                         rows[r], targets[t].name, &projected, &constraint),
+                       same_drawn);
+      if(same_drawn)
+      {
+        assert_null(constraint);
+        assert_int_equal(projected, targets[t].bits);
+      }
+      else
+        assert_string_equal(constraint, "drawn_via_attach_only");
+    }
+
+  // The helper owns only ENABLED|CONDITIONAL; a future/unowned bit is
+  // preserved exactly.
+  const uint32_t future_bit = 1u << 17;
+  uint32_t projected = 0;
+  const char *constraint = NULL;
+  assert_true(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_ENABLED | future_bit, "parametric", &projected, &constraint));
+  assert_int_equal(projected,
+                   DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | future_bit);
+
+  assert_false(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER, "off", &ignored, &constraint));
+  assert_string_equal(constraint, "raster_unsupported");
+  assert_false(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_DISABLED, "bogus", &ignored, &constraint));
+  assert_string_equal(constraint, "unknown_value");
 }
 
 #ifndef DT_TEST_MODULEDIR
@@ -665,6 +872,14 @@ int main(void)
     cmocka_unit_test(test_mask_mode_string_mapping),
     cmocka_unit_test(test_mask_mode_from_string),
     cmocka_unit_test(test_mode_names_for_colorspace_matches_sections),
+    cmocka_unit_test(test_channels_parity_lab),
+    cmocka_unit_test(test_channels_parity_rgb_display),
+    cmocka_unit_test(test_channels_parity_rgb_scene),
+    cmocka_unit_test(test_channels_none_and_raw_unsupported),
+    cmocka_unit_test(test_boost_offsets_and_ranges),
+    cmocka_unit_test(test_slot_enabled_inverted_pack),
+    cmocka_unit_test(test_markers_enable_rule),
+    cmocka_unit_test(test_mask_mode_targets_and_transition_matrix),
     cmocka_unit_test(test_schema_null_for_non_blending_module),
     cmocka_unit_test(test_schema_shape_for_rgb_module),
     cmocka_unit_test(test_schema_mask_mode_not_writable_with_extra_bits),
