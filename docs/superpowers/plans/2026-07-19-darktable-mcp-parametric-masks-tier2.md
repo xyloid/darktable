@@ -18,18 +18,19 @@
   - Lab (`DEVELOP_BLEND_CS_LAB`, slot mask `DEVELOP_BLENDIF_Lab_MASK` = `0x3377`): `L a b C h`.
   - RGB display (`DEVELOP_BLEND_CS_RGB_DISPLAY`, slot mask `DEVELOP_BLENDIF_RGB_MASK` = `0x77FF`): `g R G B H S l`.
   - RGB scene (`DEVELOP_BLEND_CS_RGB_SCENE`, slot mask `0x77FF`): `g R G B Jz Cz hz`.
-  - RAW blending (`DEVELOP_BLEND_CS_RAW`) and `DEVELOP_BLEND_CS_NONE`: **no** parametric support (no RAW blendif kernel) — schema omits `parametric`/`combine`; a `parametric` patch errors `unsupported_field`.
+  - RAW blending (`DEVELOP_BLEND_CS_RAW`) and `DEVELOP_BLEND_CS_NONE`: **no** parametric-channel support. RAW does have CPU/OpenCL mask implementations (`blendif_raw.c`, `blendop_mask_RAW`), but they intentionally ignore the blendif channel arrays/`CONDITIONAL`, and `blend_gui.c:dt_iop_gui_update_blendif` asserts that RAW blendif is unsupported. Therefore there is no RAW channel table: schema omits `parametric`/`combine`, and such patches error `unsupported_field`.
 - **Marker 4-tuple ordering (verbatim):** each slot stores `[m0, m1, m2, m3]` in a 0–1 stored domain, ascending `m0 ≤ m1 ≤ m2 ≤ m3`. The mask factor ramps 0→1 over `m0..m1`, is 1 over `m1..m2`, falls 1→0 over `m2..m3` (`dt_develop_blendif_process_parameters`, `blend.c`). Open ends: `m0,m1 ≤ 0` unbounded low; `m2,m3 ≥ 1` unbounded high. Degenerate equal markers are legal (hard edge). Domain is `[0.0, 1.0]` inclusive.
 - **Derived-enable rule (verbatim, single source of truth):** a slot is **disabled** iff its markers are the full-span identity `m1 == 0.0 && m2 == 1.0` (i.e. identity markers `[0,0,1,1]`); enabled otherwise. Exactly the GUI rule at `blend_gui.c:_blendop_blendif_sliders_callback` (`if(parameters[1]==0.0f && parameters[2]==1.0f) bp->blendif &= ~(1<<ch); else bp->blendif |= (1<<ch);`). Enable is never sent on the wire; it is derived on every patch and only enabled slots appear in reads.
 - **Polarity / `inverted` (verbatim rule, never resolved server-side):** `inverted` is the stored polarity bit (`blendif` bits 16–31). The pixel kernels compute effective inversion as `invert_mask = (blendif >> 16) XOR (mask_combine & DEVELOP_COMBINE_INCL ? family_mask : 0)` and use `1 − factor` for inverted channels (`data/kernels/blendop.cl:204`; C twins in `src/develop/blends/`). Documented rule for clients: `effective_inverted = inverted XOR (combine is inclusive)`. The wire always carries the stored bit.
 - **Bit 31 (`DEVELOP_BLENDIF_active`) is a legacy flag** — never set by current code; every pack helper masks it off.
 - **Boost factors (verbatim):** per **slot** (`blendif_boost_factors[16]`), a log2 exponent applied as `(stored − offset_ab) × 2^boost` where `offset_ab = 0.5` for Lab `a`/`b` slots and `0` otherwise. The **boost value** itself has a per-channel storage offset (the GUI's "zero"): `−6.64385619` for `Jz`/`Cz` (`_blend_init_blendif_boost_parameters`, `blend.c`), `0` for all other channels. Stored boost range = displayed `0..18` EV shifted by the channel offset: `[0.0, 18.0]` for offset-0 channels, `[-6.64385619, 11.35614381]` for `Jz`/`Cz`. **Boost is exp2 exponents and never rescales markers on the wire** — the GUI's threshold-preserving marker rescale (`_blendop_blendif_boost_factor_callback`) is deliberately NOT reproduced; each member is written verbatim. `offset_ab = 0.5` and the two boost offsets are distinct concepts (see Design amendment 2).
 - **`mask_combine` mapping (verbatim):** wire enum ↔ storage, low bits only (`DEVELOP_COMBINE_MASKS_POS` = `0x04` is a Tier-3 drawn bit, preserved untouched): `exclusive` = `DEVELOP_COMBINE_NORM_EXCL` (`0x00`), `inclusive` = `DEVELOP_COMBINE_NORM_INCL` (`0x02`), `exclusive_inverted` = `DEVELOP_COMBINE_INV_EXCL` (`0x01`), `inclusive_inverted` = `DEVELOP_COMBINE_INV_INCL` (`0x03`).
-- **`mask_mode` writable vocabulary gains `"parametric"`** ↔ `DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL`, per the transition appendix. The read strings (`"parametric"`, `"drawn"`, `"drawn+parametric"`, `"raster"`) are M-A's `dt_remote_blend_mask_mode_string`, unchanged. Transitions follow the appendix table (authoritative), NOT the design's stale error row — `parametric` is reachable from `off`/`uniform`/`parametric` and refused (`drawn_via_attach_only`) from drawn/raster rows.
-- **Validation order inside `blend`:** `mask_mode` → `colorspace` → `combine` → `parametric` (per channel: name → markers → inverted → boost) → Tier-1 numerics. Blend keeps its Tier-1 position at the end of the class error precedence.
-- **Foreign slots** (enabled in storage but outside the effective family) are invisible in reads (surfaced only as `"foreign_channels": true`) and never touched by patches.
+- **`mask_mode` follows the authoritative transition appendix exactly.** The target parser recognizes `"off"`, `"uniform"`, `"parametric"`, `"drawn"`, and `"drawn+parametric"`; the transition helper may change only `ENABLED|CONDITIONAL`, requires the target `MASK` bit to equal the stored `MASK` bit, preserves every unowned bit, and rejects every stored raster state. Consequently `drawn ↔ drawn+parametric` is legal in a supported family (plus removal of a legacy unsupported `CONDITIONAL` state), while entering or leaving drawn state remains `drawn_via_attach_only`. Schema vocabulary is state-aware: non-drawn rows expose `off`/`uniform`/`parametric`, drawn rows expose `drawn`/`drawn+parametric`, and raster rows are non-writable, subject to the unsupported-family legacy rule below.
+- **Unsupported-family legacy rule:** a pre-existing `CONDITIONAL` bit in RAW/NONE remains representable as the current `mask_mode`, may be left unchanged or removed, and still exposes no `parametric`/`combine` members. A patch may never newly introduce that unsupported state. Family availability is checked after the colorspace stage, against the final projected family, so a same-call RAW → RGB switch plus `mask_mode:"parametric"` is legal.
+- **Validation order inside `blend`:** `mask_mode` → `colorspace` → strict `allow_inverted_combine` → `combine` → `parametric` (per channel: name → allowed members → markers → inverted → boost) → the existing Tier-1 mode/reverse/feathering/numeric stages. Blend keeps its Tier-1 position at the end of the class error precedence.
+- **Foreign slots** (enabled usable slots 0–14 outside the effective family) are invisible in reads (surfaced only as `"foreign_channels": true`) and never touched by patches. Reserved slot 15 and legacy bit 31 are not channels and never contribute to that flag.
 - **Struct tripwire:** M-A's `#if DEVELOP_BLEND_VERSION != 14 #error` and `offsetof` asserts stay; Tier 2 adds relative `offsetof`/size asserts for `blendif_parameters` and `blendif_boost_factors`.
-- **Error vocabulary:** only existing codes (`unsupported_field` = `DT_REMOTE_ERR_UNSUPPORTED_FIELD`, `invalid_value` = `DT_REMOTE_ERR_INVALID_VALUE`), `details_json` = `{"parameter": "blend.<path>", "constraint": "<slug>"}`.
+- **Error vocabulary:** only existing codes (`unsupported_field` = `DT_REMOTE_ERR_UNSUPPORTED_FIELD`, `invalid_value` = `DT_REMOTE_ERR_INVALID_VALUE`); `details_json` always names `{"parameter":"blend.<path>"}` and adds `"constraint":"<slug>"` where the error table specifies one.
 - **Verification stack:** `cmake --build build -j$(nproc)` → `ctest --test-dir build` → `cd tools/mcp && .venv/bin/pytest -q` → (final task only) `DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp`.
 - Every commit message ends with BOTH trailers:
   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` and
@@ -37,35 +38,37 @@
 
 ## Design amendments (binding; applied to the design doc in Task 9)
 
-1. **The mask render extends the export render path with a guarded per-pipe display-mask opt-in — it cannot ride the live flag.** The design left open "whether the export-path pipe honors `request_mask_display`". **Verified answer: it does not.** `dt_develop_blend_process` (`src/develop/blend.c:555`) gates the flag on `valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe)`. The export pipe used by `dt_remote_render_preview_execute` is `DT_DEV_PIXELPIPE_EXPORT`, never `full.pipe`, and export modules never hold GUI focus, so `request_mask_display` is unconditionally ignored on that path. **Resolution (chosen for identical framing / 1:1 coordinates, background threading, and zero live-GUI disturbance — the design's stated intent):** add a `gboolean mask_display_request` field to `dt_dev_pixelpipe_t`; relax the `blend.c:555` gate to also honor `self->request_mask_display` when `piece->pipe->mask_display_request` is set; and have the mask render set the target module's `request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK` plus the pipe opt-in inside the export. Because the export builds its own throwaway `dt_develop_t`, there is no live flag to save/restore (cleaner than the design's premise). This is the single upstream divergence in a hot path, guarded by a unit test and a divergence-manifest row; its end-to-end correctness is verified by the integration mask-image gate (H6).
+1. **The mask render extends the export path with a persistent, guarded per-pipe opt-in.** The export pipe cannot satisfy the existing focus/full-pipe gate. Add `mask_display_request` to `dt_dev_pixelpipe_t` in `pixelpipe_hb.h`, initialize it only when the pipe is created, and deliberately do **not** clear it at the `pixelpipe_hb.c:3106` process/restart label. Both the CPU and OpenCL blend paths call one pure `dt_develop_blend_mask_display_request_is_valid()` predicate. A new `dt_imageio_export_with_flags_and_mask()` entry point owns the optional target; the existing `dt_imageio_export_with_flags()` signature and all existing callers remain unchanged. Inside the throwaway export pipe, the target piece is temporarily enabled even when its live module is disabled, its module requests `DT_DEV_PIXELPIPE_DISPLAY_MASK`, and a missing target fails the export instead of returning an ordinary image mislabeled as a mask. The throwaway `dt_develop_t` means no live GUI flag is changed or restored.
 2. **`boost.offset` in the schema is the boost-value storage offset, distinct from the Lab a/b marker offset `offset_ab = 0.5`.** The engine channel table's `boost_offset` field mirrors the GUI table's `boost_factor_offset` (`−6.64385619` for `Jz`/`Cz`, `0` elsewhere — verified in `rgbj_channels[]` and `_blend_init_blendif_boost_parameters`). The `0.5` for Lab `a`/`b` is the separate `offset_ab` used only in the non-normative `display_hint` formula and in the GUI's boost-rescale (which the wire deliberately does not reproduce). No source contradiction; recorded so an implementer never conflates the two.
 3. **The H4 `inverted`+`combine` conflict guard is server-side with an explicit override member.** A patch that both changes `combine` (to a value differing from stored) and sets any explicit `inverted: <bool>` inside `parametric` is refused `invalid_value`, `constraint: "inverted_and_combine_conflict"`, unless the `blend` patch also carries `"allow_inverted_combine": true`. Sidecar passes the member through; the engine is authoritative.
-4. **`off`/`uniform` (no spatial-mask bit) mask render returns solid white at normal framing.** For a target whose stored `mask_mode` lacks both `DEVELOP_MASK_CONDITIONAL` and `DEVELOP_MASK_MASK`, `blend.c:558` emits no mask, so the export would return the normal image. The engine instead renders normally (for correct framing) then fills the buffer white before JPEG-encoding. `mask_of.mask_mode` reports the true stored mode string.
+4. **`off`/`uniform` (no spatial-mask bit) mask render returns solid white at normal framing.** For a target whose stored `mask_mode` lacks `DEVELOP_MASK_CONDITIONAL`, `DEVELOP_MASK_MASK`, and `DEVELOP_MASK_RASTER`, the blend path emits no display mask, so the export would return the normal image. The engine instead renders normally (for correct framing) then fills the buffer white before JPEG-encoding. `mask_of.mask_mode` reports the true stored mode string.
 5. **HSL "value" channel wire name is `l` (lowercase).** `rgb_channels[]` labels the HSL value channel `N_("L")` but its slot is `DEVELOP_BLENDIF_l_in`/`_out`; the wire name is `l` to disambiguate from Lab `L`, matching the candidates sketch's `g R G B H S l`.
+6. **`mask_of` must cross the MCP boundary, not merely the raw wire.** `render_preview` remains image-only for ordinary previews. For `show_mask`, the sidecar returns mixed content: a JSON text block carrying `mime_type`, dimensions, revision, and `mask_of`, followed by the native JPEG image block. This mirrors the existing `get_scopes` mixed-content idiom and makes the documented provenance observable to the model.
+7. **The visual gate is deterministic and has one declared dependency.** Task 8 adds `Pillow>=10.0,<13` to the `dev` extra, uses no NumPy, pins `img/DSC07350.ARW`, `max_px=512`, exact normalized bright/dark ROIs, marker values, and numeric thresholds.
 
 ## File structure
 
 | File | Responsibility |
 |---|---|
-| `src/control/remote_blend.h` / `.c` | blendif channel table + pure helpers (Task 1); `combine`+`parametric` in schema (Task 2), read (Task 3), patch-apply (Task 4); `mask_mode` `"parametric"` in `_from_string` (Task 1) |
+| `src/control/remote_blend.h` / `.c` | blendif channel table + pure helpers/private transition parser (Task 1); `combine`+`parametric` in schema (Task 2), read (Task 3), patch-apply and public full `mask_mode` parser (Task 4) |
 | `src/tests/unittests/control/test_remote_blend.c` | parity + pack/unpack + validation + schema/read/patch tests (Tasks 1–4) |
-| `src/develop/pixelpipe.h` (`dt_dev_pixelpipe_t`) / `pixelpipe_hb.c` | `mask_display_request` field + init/reset (Task 5) |
-| `src/develop/blend.c` | relaxed `valid_request` gate (Task 5) |
-| `src/imageio/imageio_common.h` / `imageio.c`, `src/common/mipmap_cache.c` | optional mask-display target on `dt_imageio_export_with_flags` (Task 5) |
-| `src/control/remote_edit.h` / `.c` | preview request mask fields; prepare/execute mask path; white synth; `mask_of` (Task 5) |
+| `src/develop/pixelpipe_hb.h` (`dt_dev_pixelpipe_t`) / `pixelpipe_hb.c` | `mask_display_request` field + one-time initialization; restart preservation (Task 5) |
+| `src/develop/blend.h` / `.c` | shared CPU/OpenCL mask-request predicate and both gate call sites (Task 5) |
+| `src/imageio/imageio_common.h` / `imageio.c` | additive mask-aware export entry point; existing export API remains unchanged (Task 5) |
+| `src/control/remote_edit.h` / `.c` | preview request/result mask fields + execute/white path (Task 5); expanded prepare target capture (Task 6) |
 | `src/control/remote_protocol.h` / `.c` | `parametric_mask_params`+`mask_render` capabilities; `show_mask` parse/thread; `mask_of` serialize (Task 6) |
 | `src/tests/unittests/control/test_remote_protocol.c` + `fixtures/*.json` | protocol tests + shared fixtures (Task 6) |
 | `tools/mcp/src/darktable_mcp/server.py` + `tools/mcp/tests/test_tools.py` | capability gates + `show_mask` passthrough + docstrings/worked examples (Task 7) |
-| `tools/mcp/tests/integration/test_parametric_masks_tier2.py` (NEW) | live gates with `show_mask` image assertions (Task 8) |
+| `tools/mcp/pyproject.toml`, `tools/mcp/tests/integration/test_blend_tier1.py`, `test_parametric_masks_tier2.py` (NEW) | Pillow test dependency + cumulative Tier-1 expectation update + deterministic live `show_mask` assertions (Task 8) |
 | docs (protocol reference, design status, divergence manifest, README) | Task 9 |
 
 ---
 
-### Task 1: Engine blendif channel table + pure bitfield/marker helpers + `mask_mode` parametric
+### Task 1: Engine blendif channel table + pure bitfield/marker helpers + transition matrix
 
 **Files:**
 - Modify: `src/control/remote_blend.h` (append declarations)
-- Modify: `src/control/remote_blend.c` (append table, helpers; extend `dt_remote_blend_mask_mode_from_string`)
+- Modify: `src/control/remote_blend.c` (append table, helpers, and private full-target parser)
 - Test: `src/tests/unittests/control/test_remote_blend.c` (append)
 
 **Interfaces:**
@@ -77,7 +80,13 @@
   - `gboolean dt_remote_blendif_slot_inverted(uint32_t blendif, int slot);`
   - `uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot, gboolean enabled, gboolean inverted);`
   - `gboolean dt_remote_blendif_markers_enable(const float m[4]);`
-  - `dt_remote_blend_mask_mode_from_string` now also accepts `"parametric"` → `DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL`.
+  - A file-static full-target parser recognizes all five non-raster targets
+    for the transition helper. The public M-A
+    `dt_remote_blend_mask_mode_from_string` deliberately remains limited to
+    `off`/`uniform` through Tasks 1–3, so each intermediate commit keeps the
+    already-shipped M-A patch behavior; Task 4 expands it atomically with the
+    new patch stage.
+  - `gboolean dt_remote_blend_mask_mode_transition(uint32_t stored, const char *target, uint32_t *out, const char **constraint);` applies the authoritative table without changing the stored `MASK` bit.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -170,29 +179,52 @@ static void test_boost_offsets_and_ranges(void **state)
   // Lab a/b marker offset is 0.5; others 0.
   assert_float_equal(_find_channel(DEVELOP_BLEND_CS_LAB, "a")->marker_offset, 0.5f, 1e-6);
   assert_float_equal(_find_channel(DEVELOP_BLEND_CS_LAB, "L")->marker_offset, 0.0f, 1e-6);
+
+  // Bind each display-hint category to the GUI print functions: normalized
+  // channels are percentages, a/b are centered 256-scale values, and hues
+  // are degrees. Empty string means deliberately unitless.
+  const dt_remote_blendif_channel_t *lab_a =
+    _find_channel(DEVELOP_BLEND_CS_LAB, "a");
+  const dt_remote_blendif_channel_t *rgb_g =
+    _find_channel(DEVELOP_BLEND_CS_RGB_DISPLAY, "g");
+  const dt_remote_blendif_channel_t *rgb_h =
+    _find_channel(DEVELOP_BLEND_CS_RGB_DISPLAY, "H");
+  assert_float_equal(lab_a->display_factor, 256.0f, 1e-6);
+  assert_string_equal(lab_a->display_unit, "");
+  assert_float_equal(rgb_g->display_factor, 100.0f, 1e-6);
+  assert_string_equal(rgb_g->display_unit, "%");
+  assert_float_equal(rgb_h->display_factor, 360.0f, 1e-6);
+  assert_string_equal(rgb_h->display_unit, "\xc2\xb0");
 }
 
 static void test_slot_enabled_inverted_pack(void **state)
 {
   (void)state;
-  // enable bits 0..15, polarity bits 16..31
-  uint32_t bf = 0;
-  assert_false(dt_remote_blendif_slot_enabled(bf, 3));
-  assert_false(dt_remote_blendif_slot_inverted(bf, 3));
-
-  bf = dt_remote_blendif_slot_pack(bf, 3, TRUE, TRUE);
-  assert_true(dt_remote_blendif_slot_enabled(bf, 3));
-  assert_true(dt_remote_blendif_slot_inverted(bf, 3));
-  assert_int_equal(bf, (1u << 3) | (1u << (16 + 3)));
-
-  bf = dt_remote_blendif_slot_pack(bf, 3, FALSE, FALSE);
-  assert_false(dt_remote_blendif_slot_enabled(bf, 3));
-  assert_false(dt_remote_blendif_slot_inverted(bf, 3));
-  assert_int_equal(bf, 0u);
+  // Exercise every in/out slot in every supported family, not one sample.
+  const dt_develop_blend_colorspace_t families[] = {
+    DEVELOP_BLEND_CS_LAB, DEVELOP_BLEND_CS_RGB_DISPLAY, DEVELOP_BLEND_CS_RGB_SCENE
+  };
+  for(guint f = 0; f < G_N_ELEMENTS(families); f++)
+    for(const dt_remote_blendif_channel_t *c = dt_remote_blendif_channels(families[f]);
+        c && c->name; c++)
+    {
+      const int slots[] = { c->slot_in, c->slot_out };
+      for(guint i = 0; i < G_N_ELEMENTS(slots); i++)
+      {
+        const int slot = slots[i];
+        uint32_t bf = dt_remote_blendif_slot_pack(0u, slot, TRUE, TRUE);
+        assert_true(dt_remote_blendif_slot_enabled(bf, slot));
+        assert_true(dt_remote_blendif_slot_inverted(bf, slot));
+        assert_int_equal(bf, (1u << slot) | (1u << (16 + slot)));
+        bf = dt_remote_blendif_slot_pack(bf, slot, FALSE, FALSE);
+        assert_false(dt_remote_blendif_slot_enabled(bf, slot));
+        assert_false(dt_remote_blendif_slot_inverted(bf, slot));
+        assert_int_equal(bf, 0u);
+      }
+    }
 
   // the legacy DEVELOP_BLENDIF_active bit (31) is always stripped by pack
-  bf = (1u << 31);
-  bf = dt_remote_blendif_slot_pack(bf, 0, TRUE, FALSE);
+  uint32_t bf = dt_remote_blendif_slot_pack(1u << 31, 0, TRUE, FALSE);
   assert_int_equal(bf & (1u << 31), 0u);
 }
 
@@ -207,19 +239,72 @@ static void test_markers_enable_rule(void **state)
   assert_true(dt_remote_blendif_markers_enable(hard));
 }
 
-static void test_mask_mode_from_string_parametric(void **state)
+static void test_mask_mode_targets_and_transition_matrix(void **state)
 {
   (void)state;
-  uint32_t v = 0;
-  assert_true(dt_remote_blend_mask_mode_from_string("parametric", &v));
-  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
-  // drawn/raster still refused
-  assert_false(dt_remote_blend_mask_mode_from_string("drawn", &v));
-  assert_false(dt_remote_blend_mask_mode_from_string("raster", &v));
+  typedef struct { const char *name; uint32_t bits; } target_t;
+  static const target_t targets[] = {
+    { "off", DEVELOP_MASK_DISABLED },
+    { "uniform", DEVELOP_MASK_ENABLED },
+    { "parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL },
+    { "drawn", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK },
+    { "drawn+parametric", DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL },
+  };
+  static const uint32_t rows[] = {
+    DEVELOP_MASK_DISABLED,
+    DEVELOP_MASK_ENABLED,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK,
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL,
+  };
+
+  // Every target is exercised through the transition helper below. The
+  // public M-A parser remains off/uniform until Task 4 so Tasks 1-3 are
+  // independently green and do not broaden shipped patch behavior early.
+  uint32_t ignored = 0;
+
+  // Every non-raster cell in the authoritative appendix: success exactly
+  // when stored and target MASK ownership agree.
+  for(guint r = 0; r < G_N_ELEMENTS(rows); r++)
+    for(guint t = 0; t < G_N_ELEMENTS(targets); t++)
+    {
+      uint32_t projected = UINT32_MAX;
+      const char *constraint = NULL;
+      const gboolean same_drawn =
+        ((rows[r] & DEVELOP_MASK_MASK) != 0)
+        == ((targets[t].bits & DEVELOP_MASK_MASK) != 0);
+      assert_int_equal(dt_remote_blend_mask_mode_transition(
+                         rows[r], targets[t].name, &projected, &constraint),
+                       same_drawn);
+      if(same_drawn)
+      {
+        assert_null(constraint);
+        assert_int_equal(projected, targets[t].bits);
+      }
+      else
+        assert_string_equal(constraint, "drawn_via_attach_only");
+    }
+
+  // The helper owns only ENABLED|CONDITIONAL; a future/unowned bit is
+  // preserved exactly.
+  const uint32_t future_bit = 1u << 17;
+  uint32_t projected = 0;
+  const char *constraint = NULL;
+  assert_true(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_ENABLED | future_bit, "parametric", &projected, &constraint));
+  assert_int_equal(projected,
+                   DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL | future_bit);
+
+  assert_false(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER, "off", &ignored, &constraint));
+  assert_string_equal(constraint, "raster_unsupported");
+  assert_false(dt_remote_blend_mask_mode_transition(
+    DEVELOP_MASK_DISABLED, "bogus", &ignored, &constraint));
+  assert_string_equal(constraint, "unknown_value");
 }
 ```
 
-Register all eight tests in `main()`'s array.
+Register the seven parity/helper tests plus `test_mask_mode_targets_and_transition_matrix` in `main()`'s array.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -257,9 +342,10 @@ typedef struct dt_remote_blendif_channel_t
 const dt_remote_blendif_channel_t *
 dt_remote_blendif_channels(dt_develop_blend_colorspace_t csp);
 
-/** bitfield <-> per-slot views. `slot` is 0..15. `slot_pack` sets/clears
- * the enable bit (slot) and polarity bit (16+slot) and always strips the
- * legacy DEVELOP_BLENDIF_active bit (31). */
+/** bitfield <-> per-slot views. `slot` is a usable storage slot 0..14;
+ * slot 15 is DEVELOP_BLENDIF_unused, whose polarity bit aliases the legacy
+ * DEVELOP_BLENDIF_active bit (31), and is rejected. `slot_pack` sets/clears
+ * the enable bit (slot) and polarity bit (16+slot) and always strips bit 31. */
 gboolean dt_remote_blendif_slot_enabled(uint32_t blendif, int slot);
 gboolean dt_remote_blendif_slot_inverted(uint32_t blendif, int slot);
 uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot,
@@ -268,9 +354,22 @@ uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot,
 /** the derived-enable rule (single source of truth): a slot is DISABLED
  * iff its markers are the full-span identity (m[1]==0 && m[2]==1). */
 gboolean dt_remote_blendif_markers_enable(const float m[4]);
+
+/** Apply the authoritative mask-mode transition table. Only ENABLED and
+ * CONDITIONAL may change; MASK and every unknown bit are preserved.
+ * On FALSE, `*constraint` is one of the static strings unknown_value,
+ * drawn_via_attach_only, or raster_unsupported. */
+gboolean dt_remote_blend_mask_mode_transition(uint32_t stored,
+                                              const char *target,
+                                              uint32_t *out,
+                                              const char **constraint);
 ```
 
 - [ ] **Step 4: Implement the table + helpers in `remote_blend.c`**
+
+Update the top comments in `remote_blend.h` and
+`test_remote_blend.c` so they describe the Tier-1 base plus Tier-2
+extensions rather than calling the completed surface Tier-1-only.
 
 Add, next to M-A's `offsetof` asserts, two relative tripwires for the blendif arrays:
 
@@ -295,30 +394,30 @@ Append the table + helpers:
 // want GUI-style numbers): display ~= (stored - marker_offset) * 2^boost
 // * display_factor. The wire itself always carries stored 0..1 values.
 static const dt_remote_blendif_channel_t _channels_lab[] = {
-  { "L", DEVELOP_BLENDIF_L_in, DEVELOP_BLENDIF_L_out, TRUE,  0.0f, 0.0f, 100.0f, "" },
+  { "L", DEVELOP_BLENDIF_L_in, DEVELOP_BLENDIF_L_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
   { "a", DEVELOP_BLENDIF_A_in, DEVELOP_BLENDIF_A_out, TRUE,  0.0f, 0.5f, 256.0f, "" },
   { "b", DEVELOP_BLENDIF_B_in, DEVELOP_BLENDIF_B_out, TRUE,  0.0f, 0.5f, 256.0f, "" },
-  { "C", DEVELOP_BLENDIF_C_in, DEVELOP_BLENDIF_C_out, TRUE,  0.0f, 0.0f, 100.0f, "" },
+  { "C", DEVELOP_BLENDIF_C_in, DEVELOP_BLENDIF_C_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
   { "h", DEVELOP_BLENDIF_h_in, DEVELOP_BLENDIF_h_out, FALSE, 0.0f, 0.0f, 360.0f, "\xc2\xb0" },
   { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
 
 static const dt_remote_blendif_channel_t _channels_rgb_display[] = {
-  { "g", DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f, 0.0f, 255.0f, "" },
-  { "R", DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f, 0.0f, 255.0f, "" },
-  { "G", DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f, 0.0f, 255.0f, "" },
-  { "B", DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f, 0.0f, 255.0f, "" },
+  { "g", DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "R", DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "G", DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f, 0.0f, 100.0f, "%" },
+  { "B", DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f, 0.0f, 100.0f, "%" },
   { "H", DEVELOP_BLENDIF_H_in,     DEVELOP_BLENDIF_H_out,     FALSE, 0.0f, 0.0f, 360.0f, "\xc2\xb0" },
-  { "S", DEVELOP_BLENDIF_S_in,     DEVELOP_BLENDIF_S_out,     FALSE, 0.0f, 0.0f, 100.0f, "" },
-  { "l", DEVELOP_BLENDIF_l_in,     DEVELOP_BLENDIF_l_out,     FALSE, 0.0f, 0.0f, 100.0f, "" },
+  { "S", DEVELOP_BLENDIF_S_in,     DEVELOP_BLENDIF_S_out,     FALSE, 0.0f, 0.0f, 100.0f, "%" },
+  { "l", DEVELOP_BLENDIF_l_in,     DEVELOP_BLENDIF_l_out,     FALSE, 0.0f, 0.0f, 100.0f, "%" },
   { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
 
 static const dt_remote_blendif_channel_t _channels_rgb_scene[] = {
-  { "g",  DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f,         0.0f, 100.0f, "" },
-  { "R",  DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f,         0.0f, 100.0f, "" },
-  { "G",  DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f,         0.0f, 100.0f, "" },
-  { "B",  DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f,         0.0f, 100.0f, "" },
-  { "Jz", DEVELOP_BLENDIF_Jz_in,    DEVELOP_BLENDIF_Jz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "" },
-  { "Cz", DEVELOP_BLENDIF_Cz_in,    DEVELOP_BLENDIF_Cz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "" },
+  { "g",  DEVELOP_BLENDIF_GRAY_in,  DEVELOP_BLENDIF_GRAY_out,  TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "R",  DEVELOP_BLENDIF_RED_in,   DEVELOP_BLENDIF_RED_out,   TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "G",  DEVELOP_BLENDIF_GREEN_in, DEVELOP_BLENDIF_GREEN_out, TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "B",  DEVELOP_BLENDIF_BLUE_in,  DEVELOP_BLENDIF_BLUE_out,  TRUE,  0.0f,         0.0f, 100.0f, "%" },
+  { "Jz", DEVELOP_BLENDIF_Jz_in,    DEVELOP_BLENDIF_Jz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "%" },
+  { "Cz", DEVELOP_BLENDIF_Cz_in,    DEVELOP_BLENDIF_Cz_out,    TRUE,  -6.64385619f, 0.0f, 100.0f, "%" },
   { "hz", DEVELOP_BLENDIF_hz_in,    DEVELOP_BLENDIF_hz_out,    FALSE, 0.0f,         0.0f, 360.0f, "\xc2\xb0" },
   { NULL, 0, 0, FALSE, 0.0f, 0.0f, 0.0f, NULL } };
 
@@ -330,17 +429,19 @@ dt_remote_blendif_channels(dt_develop_blend_colorspace_t csp)
     case DEVELOP_BLEND_CS_LAB:         return _channels_lab;
     case DEVELOP_BLEND_CS_RGB_DISPLAY: return _channels_rgb_display;
     case DEVELOP_BLEND_CS_RGB_SCENE:   return _channels_rgb_scene;
-    default:                           return NULL;  // RAW / NONE: no blendif
+    default:                           return NULL;  // RAW/NONE: no parametric channel table
   }
 }
 
 gboolean dt_remote_blendif_slot_enabled(uint32_t blendif, int slot)
 {
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, FALSE);
   return (blendif & (1u << slot)) != 0;
 }
 
 gboolean dt_remote_blendif_slot_inverted(uint32_t blendif, int slot)
 {
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, FALSE);
   return (blendif & (1u << (16 + slot))) != 0;
 }
 
@@ -348,6 +449,7 @@ uint32_t dt_remote_blendif_slot_pack(uint32_t blendif, int slot,
                                      gboolean enabled, gboolean inverted)
 {
   blendif &= ~(1u << 31);              // strip legacy DEVELOP_BLENDIF_active
+  g_return_val_if_fail(slot >= 0 && slot < DEVELOP_BLENDIF_unused, blendif);
   if(enabled)  blendif |=  (1u << slot);        else blendif &= ~(1u << slot);
   if(inverted) blendif |=  (1u << (16 + slot)); else blendif &= ~(1u << (16 + slot));
   return blendif;
@@ -359,17 +461,84 @@ gboolean dt_remote_blendif_markers_enable(const float m[4])
 }
 ```
 
-Extend `dt_remote_blend_mask_mode_from_string` (M-A) to accept `"parametric"`:
+Add a private parser for every non-raster target. Refactor the existing
+public parser through it while retaining M-A's `off`/`uniform` projection:
 
 ```c
-  if(!strcmp(s, "parametric")) { *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL; return TRUE; }
+static gboolean _mask_mode_target_from_string(const char *s, uint32_t *out)
+{
+  if(!s || !out) return FALSE;
+  if(!strcmp(s, "off")) { *out = DEVELOP_MASK_DISABLED; return TRUE; }
+  if(!strcmp(s, "uniform")) { *out = DEVELOP_MASK_ENABLED; return TRUE; }
+  if(!strcmp(s, "parametric"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+    return TRUE;
+  }
+  if(!strcmp(s, "drawn"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+    return TRUE;
+  }
+  if(!strcmp(s, "drawn+parametric"))
+  {
+    *out = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out)
+{
+  if(!out) return FALSE;
+  uint32_t target = 0;
+  if(!_mask_mode_target_from_string(s, &target)
+     || (target & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL)))
+    return FALSE;
+  *out = target;
+  return TRUE;
+}
 ```
-(insert before the final `return FALSE;`).
+
+Then add the helper, calling the private parser rather than the temporarily
+M-A-limited public wrapper:
+
+```c
+gboolean dt_remote_blend_mask_mode_transition(uint32_t stored,
+                                              const char *target_name,
+                                              uint32_t *out,
+                                              const char **constraint)
+{
+  if(constraint) *constraint = NULL;
+  if(stored & DEVELOP_MASK_RASTER)
+  {
+    if(constraint) *constraint = "raster_unsupported";
+    return FALSE;
+  }
+
+  uint32_t target = 0;
+  if(!_mask_mode_target_from_string(target_name, &target))
+  {
+    if(constraint) *constraint = "unknown_value";
+    return FALSE;
+  }
+  if((stored & DEVELOP_MASK_MASK) != (target & DEVELOP_MASK_MASK))
+  {
+    if(constraint) *constraint = "drawn_via_attach_only";
+    return FALSE;
+  }
+
+  *out = (stored & ~(DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL))
+         | (target & (DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL));
+  return TRUE;
+}
+```
 
 - [ ] **Step 5: Build and run**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R test_remote_blend --output-on-failure`
-Expected: PASS (M-A tests + 8 new).
+Expected: PASS (M-A parser/patch behavior is unchanged; the new pure helper
+already covers the final transition vocabulary).
 
 - [ ] **Step 6: Commit**
 
@@ -380,7 +549,9 @@ git commit -m "feat: blendif channel table + pure slot/marker helpers (Tier 2 / 
 
 Family-scoped wire channel tables (Lab/RGB-display/RGB-scene) bound to the
 GUI tables by a parity test; pure enable/polarity pack/unpack and the
-derived-enable rule; mask_mode gains the 'parametric' write value."
+derived-enable rule; a private full-target parser powers the pure
+state-preserving transition helper while the public M-A parser remains
+off/uniform until the atomic Task-4 patch expansion."
 ```
 (with both Global Constraints trailers)
 
@@ -394,7 +565,7 @@ derived-enable rule; mask_mode gains the 'parametric' write value."
 
 **Interfaces:**
 - Consumes: Task 1's channel table; M-A's `blend_fixture_t` harness and `_node_object` helper.
-- Produces: `dt_remote_blend_schema()` now emits `combine`, `parametric.channels`, and `"parametric"` inside `mask_mode.values`, for Lab/RGB families only.
+- Produces: `dt_remote_blend_schema()` emits state-aware `mask_mode.values`/`writable`, `combine`, `parametric.channels`, and the write-only `allow_inverted_combine` confirmation member for Lab/RGB families only.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -412,13 +583,14 @@ static void test_schema_parametric_for_rgb_module(void **state)
   JsonNode *node = dt_remote_blend_schema(fx->module);
   JsonObject *schema = _node_object(node);
 
-  // mask_mode.values now includes "parametric"
-  JsonArray *mm = json_object_get_array_member(
-    json_object_get_object_member(schema, "mask_mode"), "values");
-  gboolean found_param = FALSE;
-  for(guint i = 0; i < json_array_get_length(mm); i++)
-    if(!strcmp(json_array_get_string_element(mm, i), "parametric")) found_param = TRUE;
-  assert_true(found_param);
+  // Non-drawn state: the exact writable vocabulary is off/uniform/parametric.
+  JsonObject *mm_schema = json_object_get_object_member(schema, "mask_mode");
+  JsonArray *mm = json_object_get_array_member(mm_schema, "values");
+  assert_int_equal(json_array_get_length(mm), 3);
+  assert_string_equal(json_array_get_string_element(mm, 0), "off");
+  assert_string_equal(json_array_get_string_element(mm, 1), "uniform");
+  assert_string_equal(json_array_get_string_element(mm, 2), "parametric");
+  assert_true(json_object_get_boolean_member(mm_schema, "writable"));
 
   // combine enum, four values, writable
   JsonObject *combine = json_object_get_object_member(schema, "combine");
@@ -429,6 +601,11 @@ static void test_schema_parametric_for_rgb_module(void **state)
   assert_string_equal(json_array_get_string_element(cv, 1), "inclusive");
   assert_string_equal(json_array_get_string_element(cv, 2), "exclusive_inverted");
   assert_string_equal(json_array_get_string_element(cv, 3), "inclusive_inverted");
+
+  JsonObject *override = json_object_get_object_member(schema, "allow_inverted_combine");
+  assert_string_equal(json_object_get_string_member(override, "type"), "bool");
+  assert_true(json_object_get_boolean_member(override, "writable"));
+  assert_true(json_object_get_boolean_member(override, "write_only"));
 
   // parametric.channels lists exactly the effective family's slots
   const dt_develop_blend_colorspace_t eff =
@@ -448,7 +625,7 @@ static void test_schema_parametric_for_rgb_module(void **state)
     JsonArray *range = json_object_get_array_member(boost, "range");
     assert_float_equal(json_array_get_double_element(range, 0), -6.64385619, 1e-5);
     assert_float_equal(json_array_get_double_element(range, 1), 11.35614381, 1e-5);
-    assert_true(json_object_get_null_member(channels, "hz_in") == FALSE); // present
+    assert_true(json_object_has_member(channels, "hz_in"));
     JsonObject *hz = json_object_get_object_member(channels, "hz_in");
     assert_true(json_object_get_null_member(hz, "boost"));
   }
@@ -462,12 +639,53 @@ static void test_schema_parametric_for_rgb_module(void **state)
   blend_fixture_free(fx);
 }
 
+static void _assert_mask_mode_schema(dt_iop_module_t *module,
+                                     uint32_t stored,
+                                     const char *const *expected,
+                                     guint expected_len,
+                                     gboolean writable)
+{
+  module->blend_params->mask_mode = stored;
+  JsonNode *node = dt_remote_blend_schema(module);
+  JsonObject *mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  JsonArray *values = json_object_get_array_member(mm, "values");
+  assert_int_equal(json_array_get_length(values), expected_len);
+  for(guint i = 0; i < expected_len; i++)
+    assert_string_equal(json_array_get_string_element(values, i), expected[i]);
+  assert_int_equal(json_object_get_boolean_member(mm, "writable"), writable);
+  json_node_unref(node);
+}
+
+static void test_schema_mask_mode_state_aware(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  static const char *const plain[] = { "off", "uniform", "parametric" };
+  static const char *const drawn[] = { "drawn", "drawn+parametric" };
+  static const char *const raster[] = { "raster" };
+
+  _assert_mask_mode_schema(fx->module, DEVELOP_MASK_DISABLED, plain, 3, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+                           plain, 3, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK,
+                           drawn, 2, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL,
+                           drawn, 2, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER,
+                           raster, 1, FALSE);
+  blend_fixture_free(fx);
+}
+
 static void test_schema_no_parametric_for_raw_module(void **state)
 {
   (void)state;
-  // "rawprepare" is a RAW-blending or non-blending module: no parametric.
-  // Use a module whose effective colorspace is RAW/NONE. "invert" or a
-  // raw-domain module; fall back to a plain assertion via effective cs.
+  // Force the blending exposure fixture into RAW to exercise the family
+  // gate without depending on a non-blending module's NULL schema.
   blend_fixture_t *fx = blend_fixture_new("exposure");
   fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
   JsonNode *node = dt_remote_blend_schema(fx->module);
@@ -475,11 +693,55 @@ static void test_schema_no_parametric_for_raw_module(void **state)
   assert_false(json_object_has_member(schema, "parametric"));
   assert_false(json_object_has_member(schema, "combine"));
   json_node_unref(node);
+
+  // A legacy conditional bit remains representable/removable, but RAW
+  // still does not expose writable channel/combine members.
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  node = dt_remote_blend_schema(fx->module);
+  schema = _node_object(node);
+  JsonObject *mm = json_object_get_object_member(schema, "mask_mode");
+  JsonArray *values = json_object_get_array_member(mm, "values");
+  assert_int_equal(json_array_get_length(values), 3);
+  assert_string_equal(json_array_get_string_element(values, 2), "parametric");
+  assert_true(json_object_get_boolean_member(mm, "writable"));
+  assert_false(json_object_has_member(schema, "parametric"));
+  assert_false(json_object_has_member(schema, "combine"));
+  json_node_unref(node);
   blend_fixture_free(fx);
 }
 ```
 
-Register both in `main()`.
+Register all three tests in `main()`. Update Tier 1's
+`test_schema_shape_for_rgb_module` by changing the `mask_mode.values`
+length assertion from 2 to 3 and adding an element-2 assertion for
+`"parametric"`. Replace
+`test_schema_mask_mode_not_writable_with_extra_bits` (and rename its
+registration to match) with this metadata regression:
+
+```c
+static void test_schema_mask_mode_extra_bits_metadata(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  assert_true(json_object_get_boolean_member(mm, "writable"));
+  assert_true(json_object_get_boolean_member(mm, "current_extra_bits"));
+  json_node_unref(node);
+
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  node = dt_remote_blend_schema(fx->module);
+  mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  assert_false(json_object_get_boolean_member(mm, "writable"));
+  assert_true(json_object_get_boolean_member(mm, "current_extra_bits"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+```
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -488,14 +750,48 @@ Expected: FAIL — schema has no `combine`/`parametric` members / `mask_mode.val
 
 - [ ] **Step 3: Implement the schema additions**
 
-In `dt_remote_blend_schema`, when building `mask_mode.values`, append `"parametric"` only when the effective colorspace has a channel table:
+In `dt_remote_blend_schema`, compute parametric support before building
+`mask_mode`, then replace Tier 1's fixed two-value schema block with the
+state-aware appendix projection:
 
 ```c
   const dt_develop_blend_colorspace_t eff_mm =
     dt_remote_blend_effective_colorspace(module, module->blend_params->blend_cst);
   const gboolean parametric_supported = dt_remote_blendif_channels(eff_mm) != NULL;
-  // ... inside the mask_mode "values" array, after "uniform":
-  if(parametric_supported) json_builder_add_string_value(b, "parametric");
+  const gboolean raster = (bp->mask_mode & DEVELOP_MASK_RASTER) != 0;
+  const gboolean drawn = (bp->mask_mode & DEVELOP_MASK_MASK) != 0;
+  const gboolean conditional = (bp->mask_mode & DEVELOP_MASK_CONDITIONAL) != 0;
+
+  json_builder_set_member_name(b, "mask_mode");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "enum");
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  if(raster)
+    json_builder_add_string_value(b, "raster");
+  else if(drawn)
+  {
+    json_builder_add_string_value(b, "drawn");
+    // Keep a legacy unsupported current value representable so it can be
+    // removed, even though it cannot be newly added in this family.
+    if(parametric_supported || conditional)
+      json_builder_add_string_value(b, "drawn+parametric");
+  }
+  else
+  {
+    json_builder_add_string_value(b, "off");
+    json_builder_add_string_value(b, "uniform");
+    if(parametric_supported || conditional)
+      json_builder_add_string_value(b, "parametric");
+  }
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(
+    b, !raster && (!drawn || parametric_supported || conditional));
+  json_builder_set_member_name(b, "current_extra_bits");
+  json_builder_add_boolean_value(b, extra_bits);
+  json_builder_end_object(b);
 ```
 
 After the M-A float-field loop, before `json_builder_end_object(b)`, add:
@@ -504,6 +800,16 @@ After the M-A float-field loop, before `json_builder_end_object(b)`, add:
   // Tier 2: combine + parametric (Lab / RGB families only; absent for RAW)
   if(parametric_supported)
   {
+    json_builder_set_member_name(b, "allow_inverted_combine");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, "bool");
+    json_builder_set_member_name(b, "writable");
+    json_builder_add_boolean_value(b, TRUE);
+    json_builder_set_member_name(b, "write_only");
+    json_builder_add_boolean_value(b, TRUE);
+    json_builder_end_object(b);
+
     json_builder_set_member_name(b, "combine");
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "type");
@@ -589,8 +895,9 @@ git commit -m "feat: parametric + combine blend schema (Tier 2 / M-B)
 
 Live-instance schema gains combine (four enum values) and parametric.channels
 (the effective family's _in/_out slots with markers_domain, boost range/offset
-or null, and a non-normative display_hint); mask_mode.values gains parametric.
-Absent for RAW/NONE families."
+or null, and a non-normative display_hint); mask_mode values/writability are
+state-aware for plain, drawn, and raster rows; the conflict override is
+advertised write-only. Parametric members remain absent for RAW/NONE."
 ```
 (plus trailers)
 
@@ -643,6 +950,7 @@ static void test_read_parametric_enabled_only(void **state)
   JsonObject *o = _node_object(node);
   assert_string_equal(json_object_get_string_member(o, "mask_mode"), "parametric");
   assert_string_equal(json_object_get_string_member(o, "combine"), "exclusive");
+  assert_false(json_object_has_member(o, "allow_inverted_combine")); // write-only
 
   JsonObject *param = json_object_get_object_member(o, "parametric");
   assert_true(json_object_has_member(param, "g_in"));
@@ -675,11 +983,39 @@ static void test_read_foreign_channels_flag(void **state)
   JsonObject *o = _node_object(node);
   assert_true(json_object_get_boolean_member(o, "foreign_channels"));
   json_node_unref(node);
+
+  // Reserved slot 15 is not a foreign channel. Its polarity twin is the
+  // legacy active bit 31; neither half may make the read flag true.
+  bp->blendif = (1u << DEVELOP_BLENDIF_unused) | (1u << DEVELOP_BLENDIF_active);
+  node = dt_remote_blend_read(fx->module);
+  o = _node_object(node);
+  assert_false(json_object_get_boolean_member(o, "foreign_channels"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_non_finite_parametric_storage_serializes_null(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _set_slot(bp, DEVELOP_BLENDIF_Jz_in, NAN, 0.2f, 0.6f, 0.7f,
+            FALSE, INFINITY);
+
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *entry = json_object_get_object_member(
+    json_object_get_object_member(_node_object(node), "parametric"), "Jz_in");
+  JsonArray *markers = json_object_get_array_member(entry, "markers");
+  assert_true(json_node_is_null(json_array_get_element(markers, 0)));
+  assert_true(json_object_get_null_member(entry, "boost"));
+  json_node_unref(node);
   blend_fixture_free(fx);
 }
 ```
 
-Register both.
+Register all three.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -688,7 +1024,9 @@ Expected: FAIL — read lacks `combine`/`parametric`/`foreign_channels`.
 
 - [ ] **Step 3: Implement the read additions**
 
-Add a `combine` mapping helper near the top of `remote_blend.c` (both directions; Task 4 reuses the reverse):
+Add the read-direction `combine` mapping helper near the top of
+`remote_blend.c` (Task 4 adds the write direction when it first has a
+caller, keeping this intermediate commit warning-free):
 
 ```c
 static const char *_combine_to_string(uint32_t mask_combine)
@@ -703,27 +1041,6 @@ static const char *_combine_to_string(uint32_t mask_combine)
   }
 }
 
-static gboolean _combine_from_string(const char *s, uint32_t *bits /* INV|INCL only */)
-{
-  if(!s) return FALSE;
-  if(!strcmp(s, "exclusive"))          { *bits = DEVELOP_COMBINE_NORM_EXCL; return TRUE; }
-  if(!strcmp(s, "inclusive"))          { *bits = DEVELOP_COMBINE_NORM_INCL; return TRUE; }
-  if(!strcmp(s, "exclusive_inverted")) { *bits = DEVELOP_COMBINE_INV_EXCL; return TRUE; }
-  if(!strcmp(s, "inclusive_inverted")) { *bits = DEVELOP_COMBINE_INV_INCL; return TRUE; }
-  return FALSE;
-}
-
-// family slot-mask for foreign detection
-static uint32_t _family_slot_mask(dt_develop_blend_colorspace_t csp)
-{
-  switch(csp)
-  {
-    case DEVELOP_BLEND_CS_LAB:         return DEVELOP_BLENDIF_Lab_MASK;
-    case DEVELOP_BLEND_CS_RGB_DISPLAY:
-    case DEVELOP_BLEND_CS_RGB_SCENE:   return DEVELOP_BLENDIF_RGB_MASK;
-    default:                           return 0u;
-  }
-}
 ```
 
 In `dt_remote_blend_read`, after the M-A float-field loop, before `json_builder_end_object(b)`:
@@ -755,30 +1072,26 @@ In `dt_remote_blend_read`, after the M-A float-field loop, before `json_builder_
         const float *p = &bp->blendif_parameters[4 * slot];
         json_builder_set_member_name(b, "markers");
         json_builder_begin_array(b);
-        for(int k = 0; k < 4; k++) json_builder_add_double_value(b, (double)p[k]);
+        for(int k = 0; k < 4; k++)
+        {
+          if(isfinite(p[k])) json_builder_add_double_value(b, (double)p[k]);
+          else json_builder_add_null_value(b); // corrupt legacy storage: keep JSON strict
+        }
         json_builder_end_array(b);
         json_builder_set_member_name(b, "inverted");
         json_builder_add_boolean_value(b, dt_remote_blendif_slot_inverted(bp->blendif, slot));
-        json_builder_set_member_name(b, "boost");
-        json_builder_add_double_value(b, (double)bp->blendif_boost_factors[slot]);
+        _add_float_member(b, "boost", bp->blendif_boost_factors[slot]);
         json_builder_end_object(b);
       }
     }
     json_builder_end_object(b);
 
     // foreign: any enabled slot outside the effective family (legacy edits)
-    const uint32_t enabled_slots = bp->blendif & 0xFFFFu & ~(1u << 31);
+    const uint32_t usable_slot_mask = (1u << DEVELOP_BLENDIF_unused) - 1u;
+    const uint32_t enabled_slots = bp->blendif & usable_slot_mask;
     json_builder_set_member_name(b, "foreign_channels");
-    json_builder_add_boolean_value(b, (enabled_slots & ~in_family & _family_slot_mask(eff_r) ? TRUE
-                                       : (enabled_slots & ~in_family) ? TRUE : FALSE));
-  }
-```
-
-(The foreign test reduces to "any enabled slot not in `in_family`"; the redundant `_family_slot_mask` term above is defensive — simplify to `(enabled_slots & ~in_family) != 0` if preferred. Keep one expression; the test asserts a raw out-of-family bit triggers it.)
-
-Simplify the `foreign_channels` line to exactly:
-```c
     json_builder_add_boolean_value(b, (enabled_slots & ~in_family) != 0);
+  }
 ```
 
 - [ ] **Step 4: Build and run**
@@ -794,7 +1107,8 @@ git commit -m "feat: parametric + combine blend read (Tier 2 / M-B)
 
 Reads emit combine (stored INV|INCL bits, MASKS_POS ignored), only
 enabled in-family slots as {markers, inverted, boost}, and a
-foreign_channels boolean when out-of-family slots are enabled."
+foreign_channels boolean when out-of-family slots are enabled. Corrupt
+non-finite marker/boost storage serializes as JSON null."
 ```
 (plus trailers)
 
@@ -803,21 +1117,27 @@ foreign_channels boolean when out-of-family slots are enabled."
 ### Task 4: `combine` + `parametric` patch apply
 
 **Files:**
-- Modify: `src/control/remote_blend.c` (`dt_remote_blend_patch_apply`)
+- Modify: `src/control/remote_blend.h` (public parser contract)
+- Modify: `src/control/remote_blend.c` (`dt_remote_blend_mask_mode_from_string`, `dt_remote_blend_patch_apply`)
 - Test: `src/tests/unittests/control/test_remote_blend.c` (append)
 
 **Interfaces:**
 - Consumes: Tasks 1–3 helpers; M-A `dt_remote_blend_patch_apply` (extended in place); `dt_develop_blend_init_blendif_parameters()`.
-- Produces: `dt_remote_blend_patch_apply` handles `combine` + `parametric` per the validation order, with the error table below.
+- Produces: the public mask-mode parser gains all five non-raster targets,
+  and `dt_remote_blend_patch_apply` handles their transitions plus `combine`
+  + `parametric` per the validation order, with the error table below.
 
 **Error table this task implements (constraint slugs normative):**
 
 | condition | code | constraint |
 |---|---|---|
-| `parametric`/`combine` on a RAW/NONE family (no blendif) | UNSUPPORTED_FIELD | (`parameter: blend.parametric`/`blend.combine`) |
+| `parametric`/`combine` on a RAW/NONE family (no parametric channel table/semantics) | UNSUPPORTED_FIELD | (`parameter: blend.parametric`/`blend.combine`) |
+| projected state would create unsupported `CONDITIONAL` (newly introduced in RAW/NONE, or moved from a supported family into RAW/NONE) | UNSUPPORTED_FIELD | (`parameter: blend.mask_mode` / `blend.colorspace`) |
 | `combine` value unknown | INVALID_VALUE | `unknown_value` |
+| `allow_inverted_combine` present but not boolean | INVALID_VALUE | `wrong_type` |
 | `parametric` not an object, or a channel entry neither object nor null | INVALID_VALUE | `wrong_type` |
 | channel name not in the effective family | UNSUPPORTED_FIELD | (`parameter: blend.parametric.<name>`) |
+| unknown member inside a channel entry | UNSUPPORTED_FIELD | (`parameter: blend.parametric.<name>.<member>`) |
 | `markers` missing / not an array of exactly 4 numbers | INVALID_VALUE | `markers` |
 | markers non-finite, outside [0,1], or not ascending | INVALID_VALUE | `markers` |
 | `inverted` present but not a boolean | INVALID_VALUE | `wrong_type` |
@@ -825,11 +1145,27 @@ foreign_channels boolean when out-of-family slots are enabled."
 | `boost` non-number, non-finite, or out of `[offset, offset+18]` | INVALID_VALUE | `boost` |
 | `parametric` while projected `mask_mode` lacks `CONDITIONAL` | INVALID_VALUE | `requires_parametric_mask_mode` |
 | `inverted` change together with a `combine` change, no override | INVALID_VALUE | `inverted_and_combine_conflict` |
-| `mask_mode: "parametric"` from a drawn/raster stored row | INVALID_VALUE | per transition appendix (`drawn_via_attach_only` / `raster_unsupported`) |
+| `mask_mode` target changes stored `MASK`, or stored row is raster | INVALID_VALUE | `drawn_via_attach_only` / `raster_unsupported` |
 
 - [ ] **Step 1: Write the failing tests**
 
 Append (reuse M-A's `_patch_from_string`, `_assert_patch_fails`, `blend_fixture_t`):
+
+First replace the compound-mode portion of the existing
+`test_mask_mode_from_string` with the final public-parser expectations:
+
+```c
+  assert_true(dt_remote_blend_mask_mode_from_string("parametric", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  assert_true(dt_remote_blend_mask_mode_from_string("drawn", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_true(dt_remote_blend_mask_mode_from_string("drawn+parametric", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL);
+  assert_false(dt_remote_blend_mask_mode_from_string("raster", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("", &v));
+  assert_false(dt_remote_blend_mask_mode_from_string(NULL, &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("off", NULL));
+```
 
 ```c
 /* ------------------------------------------------------------------ */
@@ -928,6 +1264,21 @@ static void test_patch_combine_and_colorspace_layering(void **state)
   assert_int_equal(dst.blend_cst, DEVELOP_BLEND_CS_RGB_DISPLAY);
   assert_true(dt_remote_blendif_slot_enabled(dst.blendif, DEVELOP_BLENDIF_H_in));
   json_object_unref(patch);
+
+  // Availability is checked against the FINAL projected family, not the
+  // forced legacy RAW value present before this same-call colorspace switch.
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  patch = _patch_from_string(
+    "{\"mask_mode\":\"parametric\","
+    " \"colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\","
+    " \"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7]}}}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_cst, DEVELOP_BLEND_CS_RGB_SCENE);
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, DEVELOP_BLENDIF_Jz_in));
+  json_object_unref(patch);
   blend_fixture_free(fx);
 }
 
@@ -959,6 +1310,86 @@ static void test_patch_parametric_rejections(void **state)
   blend_fixture_free(fx);
 }
 
+static void test_patch_parametric_strict_validation_and_edges(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+
+  _assert_patch_fails(fx, "{\"parametric\":[]}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":1}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx, "{\"allow_inverted_combine\":1}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"invert\":true}}}",
+    DT_REMOTE_ERR_UNSUPPORTED_FIELD, "blend.parametric.Jz_in.invert");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,true,0.6,0.7]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.0,0.1,0.6,1e400]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  // These two doubles are outside the domain before float narrowing and
+  // must not round to legal 0/1 float endpoints.
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[-1e-50,0.1,0.6,0.7]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,1.0000000001]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":1}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":1e400}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":\"high\"}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  const double min_boost =
+    (double)_find_channel(DEVELOP_BLEND_CS_RGB_SCENE, "Jz")->boost_offset;
+  const double max_boost = min_boost + 18.0;
+  gchar *below = g_strdup_printf(
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":%.17g}}}",
+    min_boost - 1e-6);
+  gchar *above = g_strdup_printf(
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":%.17g}}}",
+    max_boost + 1e-6);
+  _assert_patch_fails(fx, below, DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  _assert_patch_fails(fx, above, DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  g_free(below);
+  g_free(above);
+
+  // Degenerate markers and both inclusive boost endpoints are legal.
+  const double legal_boosts[] = { min_boost, max_boost };
+  for(guint i = 0; i < G_N_ELEMENTS(legal_boosts); i++)
+  {
+    gchar *json = g_strdup_printf(
+      "{\"parametric\":{\"Jz_in\":{\"markers\":[0.3,0.3,0.3,0.3],\"boost\":%.17g}}}",
+      legal_boosts[i]);
+    JsonObject *patch = _patch_from_string(json);
+    g_free(json);
+    dt_develop_blend_params_t dst = *fx->module->blend_params;
+    dt_remote_error_t *error = NULL;
+    assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+    assert_null(error);
+    json_object_unref(patch);
+  }
+  JsonObject *empty = _patch_from_string("{\"parametric\":{}}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, empty, &dst, &error));
+  assert_null(error); // empty object is a legal no-op channel patch
+  json_object_unref(empty);
+  blend_fixture_free(fx);
+}
+
 static void test_patch_parametric_requires_parametric_mask_mode(void **state)
 {
   (void)state;
@@ -983,12 +1414,20 @@ static void test_patch_inverted_combine_conflict_and_override(void **state)
     "{\"combine\":\"inclusive\",\"parametric\":{\"Jz_in\":"
     "{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}",
     DT_REMOTE_ERR_INVALID_VALUE, "inverted_and_combine_conflict");
-  // with the override flag it succeeds
+  // Explicit inverted is safe when combine is present but unchanged.
   JsonObject *patch = _patch_from_string(
-    "{\"allow_inverted_combine\":true,\"combine\":\"inclusive\","
-    "\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}");
+    "{\"combine\":\"exclusive\",\"parametric\":{\"Jz_in\":"
+    "{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}");
   dt_develop_blend_params_t dst = *bp;
   dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_null(error);
+  json_object_unref(patch);
+  // with the override flag it succeeds
+  patch = _patch_from_string(
+    "{\"allow_inverted_combine\":true,\"combine\":\"inclusive\","
+    "\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}");
+  dst = *bp;
   assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
   json_object_unref(patch);
   blend_fixture_free(fx);
@@ -1007,15 +1446,70 @@ static void test_patch_mask_mode_parametric_transitions(void **state)
   assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
   assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
   json_object_unref(patch);
-  // drawn stored -> parametric target: refused (drawn_via_attach_only)
+
+  // drawn -> drawn+parametric adds only CONDITIONAL and preserves MASK.
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  patch = _patch_from_string("{\"mask_mode\":\"drawn+parametric\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL);
+  json_object_unref(patch);
+
+  // drawn+parametric -> drawn drops only CONDITIONAL; channel storage survives.
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL;
+  _set_slot(fx->module->blend_params, DEVELOP_BLENDIF_Jz_in,
+            0.1f, 0.2f, 0.6f, 0.7f, FALSE, -6.64385619f);
+  const float before = fx->module->blend_params
+                         ->blendif_parameters[4 * DEVELOP_BLENDIF_Jz_in + 1];
+  patch = _patch_from_string("{\"mask_mode\":\"drawn\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_float_equal(dst.blendif_parameters[4 * DEVELOP_BLENDIF_Jz_in + 1], before, 1e-6);
+  json_object_unref(patch);
+
+  // Crossing MASK ownership remains forbidden in both directions.
   fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
   _assert_patch_fails(fx, "{\"mask_mode\":\"parametric\"}",
                       DT_REMOTE_ERR_INVALID_VALUE, "drawn_via_attach_only");
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"drawn+parametric\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "drawn_via_attach_only");
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"off\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "raster_unsupported");
+
+  // A conditional bit cannot be newly introduced while the final family
+  // remains RAW. A legacy RAW conditional value is nevertheless a legal
+  // no-op target and can be removed, matching the state-aware schema.
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"parametric\"}",
+                      DT_REMOTE_ERR_UNSUPPORTED_FIELD, "blend.mask_mode");
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  patch = _patch_from_string("{\"mask_mode\":\"parametric\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  json_object_unref(patch);
+  patch = _patch_from_string("{\"mask_mode\":\"uniform\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED);
+  json_object_unref(patch);
   blend_fixture_free(fx);
 }
 ```
 
 Register all in `main()`.
+
+Delete Tier 1's `test_patch_mask_mode_transition_table` and its `main()`
+registration. Its M-A-only `mask_configuration_present` expectations are
+obsolete; Task 1's exhaustive pure 25-cell matrix plus
+`test_patch_mask_mode_parametric_transitions` above replace it without
+duplicating the same matrix twice.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1024,56 +1518,128 @@ Expected: FAIL (combine/parametric stages not implemented; several asserts fail)
 
 - [ ] **Step 3: Extend `dt_remote_blend_patch_apply`**
 
+Add the write-direction combine helper beside Task 3's serializer:
+
+```c
+static gboolean _combine_from_string(const char *s,
+                                     uint32_t *bits /* INV|INCL only */)
+{
+  if(!s || !bits) return FALSE;
+  if(!strcmp(s, "exclusive"))
+    { *bits = DEVELOP_COMBINE_NORM_EXCL; return TRUE; }
+  if(!strcmp(s, "inclusive"))
+    { *bits = DEVELOP_COMBINE_NORM_INCL; return TRUE; }
+  if(!strcmp(s, "exclusive_inverted"))
+    { *bits = DEVELOP_COMBINE_INV_EXCL; return TRUE; }
+  if(!strcmp(s, "inclusive_inverted"))
+    { *bits = DEVELOP_COMBINE_INV_INCL; return TRUE; }
+  return FALSE;
+}
+```
+
 First, extend M-A's `allowed[]` member list with the Tier-2 members:
 ```c
     "combine", "parametric", "allow_inverted_combine",
 ```
 
-Then, **replace M-A's `mask_mode` stage** so `"parametric"` is accepted and the transition appendix is honored (M-A only allowed `off`/`uniform`; the drawn/raster refusal now distinguishes constraint slugs):
+Expand the public wrapper atomically with patch support; it now exposes the
+private full-target parser introduced in Task 1:
 
 ```c
-  // 1. mask_mode -- transition appendix (candidates doc, authoritative).
+gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out)
+{
+  return _mask_mode_target_from_string(s, out);
+}
+```
+
+Update its `remote_blend.h` comment from "Tier-1 writable vocabulary
+only" to: all five non-raster transition targets are accepted; `"raster"`,
+unknown strings, NULL input, or NULL output return FALSE without writing
+`*out`.
+
+Before the `mask_mode` stage, capture whether a conditional bit was
+already a supported state or an unsupported legacy state:
+
+```c
+  const gboolean stored_conditional =
+    (dst->mask_mode & DEVELOP_MASK_CONDITIONAL) != 0;
+  const dt_develop_blend_colorspace_t stored_eff_cs =
+    dt_remote_blend_effective_colorspace(module, dst->blend_cst);
+  const gboolean stored_parametric_supported =
+    dt_remote_blendif_channels(stored_eff_cs) != NULL;
+```
+
+Then replace M-A's `mask_mode` stage with the Task-1 transition helper.
+This stage projects bits only; family availability is deliberately checked
+after the colorspace stage so a same-call RAW -> RGB switch works:
+
+```c
+  // 1. mask_mode -- authoritative appendix; only ENABLED|CONDITIONAL
+  // may change, and MASK ownership must remain identical.
   if(json_object_has_member(patch, "mask_mode"))
   {
-    const char *target = _json_member_string(patch, "mask_mode");
-    if(dst->mask_mode & DEVELOP_MASK_RASTER)
+    const char *constraint = NULL;
+    uint32_t projected = 0;
+    if(!dt_remote_blend_mask_mode_transition(
+         dst->mask_mode, _json_member_string(patch, "mask_mode"),
+         &projected, &constraint))
     {
-      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode",
-                                      "raster_unsupported", _("raster masks are not writable"));
+      const char *message = !strcmp(constraint, "raster_unsupported")
+        ? _("raster masks are not writable")
+        : !strcmp(constraint, "drawn_via_attach_only")
+          ? _("drawn masks are entered and left through attach/detach")
+          : _("unknown mask_mode target");
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE,
+                                      "mask_mode", constraint, "%s", message);
       return FALSE;
     }
-    if(dst->mask_mode & DEVELOP_MASK_MASK)
-    {
-      // drawn stored: mask_mode is entered/left via attach/detach only
-      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode",
-                                      "drawn_via_attach_only",
-                                      _("drawn masks are managed via attach/detach"));
-      return FALSE;
-    }
-    uint32_t v = 0;
-    if(!dt_remote_blend_mask_mode_from_string(target, &v))
-    {
-      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode", "unknown_value",
-                                      _("mask_mode accepts \"off\", \"uniform\" or \"parametric\""));
-      return FALSE;
-    }
-    dst->mask_mode = v;
+    dst->mask_mode = projected;
   }
 ```
 
-After the M-A `colorspace` stage and before/around the numeric stage, insert the `combine` + `parametric` stages (validation order: after colorspace, before Tier-1 numerics). Add near the top of the function a note of whether combine changed:
+Immediately after M-A's `colorspace` stage, derive the final table and
+enforce the projected-family invariant:
 
 ```c
-  // Detect (for the H4 conflict guard) whether combine changes value.
-  gboolean combine_changed = FALSE;
-  const gboolean allow_inv_combine =
-    json_object_has_member(patch, "allow_inverted_combine")
-    && json_node_get_value_type(json_object_get_member(patch, "allow_inverted_combine")) == G_TYPE_BOOLEAN
-    && json_node_get_boolean(json_object_get_member(patch, "allow_inverted_combine"));
-
-  const dt_develop_blend_colorspace_t eff_cs =
+  const dt_develop_blend_colorspace_t eff =
     dt_remote_blend_effective_colorspace(module, dst->blend_cst);
-  const dt_remote_blendif_channel_t *table = dt_remote_blendif_channels(eff_cs);
+  const dt_remote_blendif_channel_t *table = dt_remote_blendif_channels(eff);
+  if((dst->mask_mode & DEVELOP_MASK_CONDITIONAL) && !table
+     && (!stored_conditional || stored_parametric_supported))
+  {
+    const char *field = stored_conditional ? "colorspace" : "mask_mode";
+    if(error) *error = _blend_error(
+      DT_REMOTE_ERR_UNSUPPORTED_FIELD, field, NULL,
+      _("parametric masks are unavailable in the projected blend colorspace"));
+    return FALSE;
+  }
+```
+
+The last condition permits an already-stored unsupported legacy
+`CONDITIONAL` state to remain representable or be removed, but never lets
+a patch create such a state or move one from a supported family into an
+unsupported family. Then, before M-A's `mode` stage, insert the strict
+override, `combine`, and `parametric` stages. This makes the exact order
+`mask_mode → colorspace (including projected-family validation) →
+allow_inverted_combine → combine → parametric → mode → reverse →
+feathering_guide → numeric fields`.
+
+```c
+  gboolean combine_changed = FALSE;
+  gboolean allow_inv_combine = FALSE;
+  if(json_object_has_member(patch, "allow_inverted_combine"))
+  {
+    JsonNode *node = json_object_get_member(patch, "allow_inverted_combine");
+    if(!node || !JSON_NODE_HOLDS_VALUE(node)
+       || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE,
+                                      "allow_inverted_combine", "wrong_type",
+                                      _("'allow_inverted_combine' must be a boolean"));
+      return FALSE;
+    }
+    allow_inv_combine = json_node_get_boolean(node);
+  }
 
   // 3b. combine
   if(json_object_has_member(patch, "combine"))
@@ -1167,6 +1733,31 @@ After the M-A `colorspace` stage and before/around the numeric stage, insert the
         return FALSE;
       }
       JsonObject *e = json_node_get_object(entry);
+      static const char *const entry_allowed[] = { "markers", "inverted", "boost", NULL };
+      GList *entry_members = json_object_get_members(e);
+      for(GList *em = entry_members; em; em = em->next)
+      {
+        gboolean known = FALSE;
+        for(const char *const *a = entry_allowed; *a && !known; a++)
+          known = !strcmp(*a, em->data);
+        if(!known)
+        {
+          if(error)
+          {
+            *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, NULL, NULL,
+                                  _("unknown parametric channel member"));
+            g_free((*error)->details_json);
+            (*error)->details_json = g_strdup_printf(
+              "{\"parameter\":\"blend.parametric.%s.%s\"}",
+              slot_name, (const char *)em->data);
+          }
+          g_list_free(entry_members);
+          g_list_free(names);
+          return FALSE;
+        }
+      }
+      g_list_free(entry_members);
+
       // markers: exactly 4 finite ascending in [0,1]
       JsonNode *mnode = json_object_get_member(e, "markers");
       if(!mnode || !JSON_NODE_HOLDS_ARRAY(mnode)
@@ -1179,7 +1770,7 @@ After the M-A `colorspace` stage and before/around the numeric stage, insert the
       }
       JsonArray *marr = json_node_get_array(mnode);
       float m[4];
-      float prev = -G_MAXFLOAT;
+      double prev = -G_MAXDOUBLE;
       for(int k = 0; k < 4; k++)
       {
         JsonNode *mk = json_array_get_element(marr, k);
@@ -1192,15 +1783,16 @@ After the M-A `colorspace` stage and before/around the numeric stage, insert the
           g_list_free(names);
           return FALSE;
         }
-        m[k] = (float)json_node_get_double(mk);
-        if(!isfinite(m[k]) || m[k] < 0.0f || m[k] > 1.0f || m[k] < prev)
+        const double value = json_node_get_double(mk);
+        if(!isfinite(value) || value < 0.0 || value > 1.0 || value < prev)
         {
           if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "markers",
                                           _("markers must be finite, ascending, within [0,1]"));
           g_list_free(names);
           return FALSE;
         }
-        prev = m[k];
+        prev = value;
+        m[k] = (float)value;  // narrow only after double-domain validation
       }
       // inverted (optional bool, default false)
       gboolean inverted = FALSE, has_inverted = FALSE;
@@ -1269,7 +1861,9 @@ After the M-A `colorspace` stage and before/around the numeric stage, insert the
   }
 ```
 
-Place this block after the M-A `colorspace` stage and before the M-A numeric-field loop, so the validation order is `mask_mode → colorspace → combine → parametric → numerics`.
+Place this block after M-A's `colorspace` stage and before its `mode`
+stage. Remove M-A's later `const ... eff` declaration and let the existing
+mode-validation code reuse the projected `eff` declared above.
 
 - [ ] **Step 4: Build and run**
 
@@ -1279,11 +1873,12 @@ Expected: PASS. Then full `ctest --test-dir build`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/control/remote_blend.c src/tests/unittests/control/test_remote_blend.c
+git add src/control/remote_blend.h src/control/remote_blend.c \
+        src/tests/unittests/control/test_remote_blend.c
 git commit -m "feat: parametric + combine blend patch apply (Tier 2 / M-B)
 
-Validation order mask_mode -> colorspace -> combine -> parametric ->
-numerics; derived enable, verbatim markers (no boost rescale), null reset,
+Validation order mask_mode -> colorspace -> strict override -> combine ->
+parametric -> existing Tier-1 stages; derived enable, verbatim markers, null reset,
 foreign-slot preservation, family gating, the transition-appendix mask_mode
 rows, and the H4 inverted+combine conflict guard with an explicit override."
 ```
@@ -1291,202 +1886,280 @@ rows, and the H4 inverted+combine conflict guard with an explicit override."
 
 ---
 
-### Task 5: Mask render engine — pipe opt-in, gate relax, export mask target, prepare/execute, white synth
+### Task 5: Mask render engine — persistent pipe opt-in, CPU/OpenCL parity, additive export entry point
 
 **Files:**
-- Modify: `src/develop/pixelpipe.h` (the `dt_dev_pixelpipe_t` struct — add `mask_display_request`)
-- Modify: `src/develop/pixelpipe_hb.c` (init it FALSE in `dt_dev_pixelpipe_init_export` and reset in `dt_dev_pixelpipe_cleanup` / the two `mask_display = NONE` reset points)
-- Modify: `src/develop/blend.c` (`valid_request` gate at ~line 555, and the raster twin at ~964 unchanged)
-- Modify: `src/imageio/imageio_common.h`, `src/imageio/imageio.c`, `src/common/mipmap_cache.c` (optional mask-display target param)
-- Modify: `src/control/remote_edit.h` (`dt_remote_preview_request_t` fields; `dt_remote_render_preview_prepare` signature)
-- Modify: `src/control/remote_edit.c` (prepare validation + execute mask path + white synth + `mask_of`)
-- Test: `src/tests/unittests/control/test_remote_blend.c` (pure gate-flag unit) — see note
+- Modify: `src/develop/pixelpipe_hb.h` (`dt_dev_pixelpipe_t`)
+- Modify: `src/develop/pixelpipe_hb.c` (one-time initialization only)
+- Modify: `src/develop/blend.h`, `src/develop/blend.c` (shared predicate; CPU and OpenCL gates)
+- Modify: `src/imageio/imageio_common.h`, `src/imageio/imageio.c` (additive mask-aware export entry point)
+- Modify: `src/control/remote_edit.h`, `src/control/remote_edit.c` (request/result fields, ordinary prepare initialization, mask-aware execute/white path)
+- Test: `src/tests/unittests/control/test_remote_blend.c`
 
 **Interfaces:**
-- Consumes: M-A/M-B `dt_remote_require_darkroom_image`, `dt_remote_find_module`, `dt_remote_blend_mask_mode_string`.
+- Consumes: Tier 1 preview prepare/execute and the existing, unchanged `dt_imageio_export_with_flags()` API.
 - Produces:
-  - `dt_dev_pixelpipe_t.mask_display_request` (gboolean).
-  - `dt_imageio_export_with_flags(..., const dt_imageio_mask_display_t *mask_target)` — new trailing param; `NULL` = normal export.
-  - `dt_remote_preview_request_t` gains `dt_dev_operation_t mask_op; int mask_instance; gboolean want_mask; gboolean force_white; uint32_t mask_mode_stored;`.
-  - `dt_remote_render_preview_prepare(out, show_mask_op /*nullable*/, show_mask_instance, error)`.
-  - `dt_remote_preview_t` gains `gboolean is_mask; dt_dev_operation_t mask_op; int mask_instance; uint32_t mask_mode_stored;` (for the `mask_of` response metadata).
+  - `dt_dev_pixelpipe_t.mask_display_request`.
+  - `dt_develop_blend_mask_display_request_is_valid(has_focus, is_full_pipe, pipe_opt_in)` used by both CPU and OpenCL.
+  - Additive `dt_imageio_export_with_flags_and_mask(..., history_end, mask_target)`; every pre-Tier-2 caller continues to call `dt_imageio_export_with_flags(...)` unchanged.
+  - Mask provenance fields on the preview request/result structs and a
+    mask-aware execute path. The existing two-argument prepare signature
+    remains intact in this task so the intermediate commit builds; Task 6
+    expands it atomically with the protocol calls table and all stubs.
 
-- [ ] **Step 1: Write the failing unit test (blend gate flag)**
+- [ ] **Step 1: Write the failing predicate test**
 
-The full mask render needs a live darkroom (integration, Task 8). The unit-testable slice is the blend gate: the flag must be honored when `pipe->mask_display_request` is set even without focus/full-pipe. Append to `test_remote_blend.c` a pure check that the new pipe field exists and the helper predicate reads it (a compile-level guard; the behavioral proof is Task 8):
+Add `#include "develop/blend.h"` and `#include "develop/pixelpipe_hb.h"` to
+`test_remote_blend.c`, then append and register:
 
 ```c
-/* ------------------------------------------------------------------ */
-/* Task 5: mask render plumbing (compile guard; behavior in Task 8)    */
-/* ------------------------------------------------------------------ */
-#include "develop/pixelpipe.h"
-
-static void test_pipe_has_mask_display_request_field(void **state)
+static void test_mask_display_request_gate_truth_table(void **state)
 {
   (void)state;
-  dt_dev_pixelpipe_t pipe;
-  memset(&pipe, 0, sizeof(pipe));
-  pipe.mask_display_request = TRUE;    // fails to compile if the field is missing
+  assert_false(dt_develop_blend_mask_display_request_is_valid(FALSE, FALSE, FALSE));
+  assert_false(dt_develop_blend_mask_display_request_is_valid(TRUE, FALSE, FALSE));
+  assert_false(dt_develop_blend_mask_display_request_is_valid(FALSE, TRUE, FALSE));
+  assert_true(dt_develop_blend_mask_display_request_is_valid(TRUE, TRUE, FALSE));
+  assert_true(dt_develop_blend_mask_display_request_is_valid(FALSE, FALSE, TRUE));
+
+  dt_dev_pixelpipe_t pipe = { 0 };
+  pipe.mask_display_request = TRUE; // compile guard for the real struct field
   assert_true(pipe.mask_display_request);
 }
 ```
 
-Register it in `main()`.
-
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cmake --build build -j$(nproc) 2>&1 | tail -5`
-Expected: compile FAILURE — `dt_dev_pixelpipe_t` has no member `mask_display_request`.
+Run: `cmake --build build -j$(nproc)`
+Expected: compile failure for the missing predicate/pipe member.
 
-- [ ] **Step 3: Add the pipe field + gate relax**
+- [ ] **Step 3: Add the field, one-time initialization, and shared gate**
 
-In `src/develop/pixelpipe.h`, inside `struct dt_dev_pixelpipe_t`, next to `mask_display`:
+In `src/develop/pixelpipe_hb.h`, immediately after `mask_display`:
 
 ```c
-  /** remote mask render (M-B): when TRUE, dt_develop_blend_process honors
-   * a module's request_mask_display on THIS pipe even though it is not the
-   * darkroom full pipe and the module holds no GUI focus. Set only by the
-   * remote-edit mask render on a throwaway export pipe; default FALSE. */
+  /** Remote mask render: honor a module's request_mask_display on this
+   * throwaway export pipe without GUI focus/full-pipe ownership. This is
+   * request configuration, not per-run output state, so process restart
+   * must preserve it. */
   gboolean mask_display_request;
 ```
 
-In `src/develop/pixelpipe_hb.c`, set it FALSE wherever `pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;` is initialized (the two lines ~289 and ~3106) — add `pipe->mask_display_request = FALSE;` beside each.
+In `dt_dev_pixelpipe_init()` at `pixelpipe_hb.c:289`, initialize it beside
+`mask_display`:
 
-In `src/develop/blend.c`, relax the `valid_request` at ~line 555 from:
 ```c
-  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;
+  pipe->mask_display_request = FALSE;
 ```
-to:
+
+At the `restart:` block around `pixelpipe_hb.c:3106`, continue clearing
+only `pipe->mask_display`. Do **not** clear `mask_display_request`; late
+OpenCL fallback must retain the export request.
+
+Declare in `src/develop/blend.h` and implement in `src/develop/blend.c`:
+
 ```c
-  // M-B remote mask render: a throwaway export pipe may opt in to honor
-  // request_mask_display without focus/full-pipe (parametric-masks design,
-  // amendment 1). The live darkroom path (focus + full.pipe) is unchanged.
+gboolean dt_develop_blend_mask_display_request_is_valid(gboolean has_focus,
+                                                        gboolean is_full_pipe,
+                                                        gboolean pipe_opt_in);
+```
+
+```c
+gboolean dt_develop_blend_mask_display_request_is_valid(gboolean has_focus,
+                                                        gboolean is_full_pipe,
+                                                        gboolean pipe_opt_in)
+{
+  return (has_focus && is_full_pipe) || pipe_opt_in;
+}
+```
+
+Replace **both** `valid_request` definitions, the CPU one around
+`blend.c:556` and the OpenCL one around `blend.c:957`, with:
+
+```c
   const gboolean valid_request =
-      (dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe))
-      || piece->pipe->mask_display_request;
+    dt_develop_blend_mask_display_request_is_valid(
+      dt_iop_has_focus(self), piece->pipe == self->dev->full.pipe,
+      piece->pipe->mask_display_request);
 ```
 
-- [ ] **Step 4: Add the export mask-display target parameter**
+- [ ] **Step 4: Add a mask-aware export without changing existing callers**
 
-In `src/imageio/imageio_common.h`, before the `dt_imageio_export_with_flags` declaration:
+Add to `src/imageio/imageio_common.h`:
 
 ```c
-// Optional target for the remote mask render (M-B): render the display
-// mask of this op/instance instead of the image. NULL means a normal export.
 typedef struct dt_imageio_mask_display_t
 {
-  const char *op;    // dt_dev_operation string
-  int instance;      // multi_priority discriminator
+  const char *op;
+  int instance;
 } dt_imageio_mask_display_t;
+
+gboolean dt_imageio_export_with_flags_and_mask(
+  const dt_imgid_t imgid, const char *filename,
+  struct dt_imageio_module_format_t *format,
+  struct dt_imageio_module_data_t *format_params,
+  const gboolean ignore_exif, const gboolean display_byteorder,
+  const gboolean high_quality, const gboolean upscale,
+  const gboolean is_scaling, const double scale_factor,
+  const gboolean thumbnail_export, const char *filter,
+  const gboolean copy_metadata, const gboolean export_masks,
+  dt_colorspaces_color_profile_type_t icc_type, const gchar *icc_filename,
+  dt_iop_color_intent_t icc_intent,
+  dt_imageio_module_storage_t *storage,
+  dt_imageio_module_data_t *storage_params,
+  int num, const int total, dt_export_metadata_t *metadata,
+  const int history_end,
+  const dt_imageio_mask_display_t *mask_target);
 ```
 
-Add a trailing parameter `const dt_imageio_mask_display_t *mask_target` to the `dt_imageio_export_with_flags` declaration (after `history_end`).
+In `src/imageio/imageio.c`, rename the current implementation of
+`dt_imageio_export_with_flags` to
+`dt_imageio_export_with_flags_and_mask` and add the trailing target. Add
+this wrapper with the original signature so all nine existing call
+expressions remain source-compatible:
 
-In `src/imageio/imageio.c`, update the definition signature identically. After `dt_dev_pixelpipe_create_nodes(&pipe, &dev);` / `dt_dev_pixelpipe_synch_all(&pipe, &dev);` and before the process call, insert:
+```c
+gboolean dt_imageio_export_with_flags(
+  const dt_imgid_t imgid, const char *filename,
+  dt_imageio_module_format_t *format,
+  dt_imageio_module_data_t *format_params,
+  const gboolean ignore_exif, const gboolean display_byteorder,
+  const gboolean high_quality, const gboolean upscale,
+  const gboolean is_scaling, const double scale_factor,
+  const gboolean thumbnail_export, const char *filter,
+  const gboolean copy_metadata, const gboolean export_masks,
+  const dt_colorspaces_color_profile_type_t icc_type,
+  const gchar *icc_filename, const dt_iop_color_intent_t icc_intent,
+  dt_imageio_module_storage_t *storage,
+  dt_imageio_module_data_t *storage_params,
+  int num, const int total, dt_export_metadata_t *metadata,
+  const int history_end)
+{
+  return dt_imageio_export_with_flags_and_mask(
+    imgid, filename, format, format_params, ignore_exif,
+    display_byteorder, high_quality, upscale, is_scaling, scale_factor,
+    thumbnail_export, filter, copy_metadata, export_masks, icc_type,
+    icc_filename, icc_intent, storage, storage_params, num, total,
+    metadata, history_end, NULL);
+}
+```
+
+Immediately after `dt_dev_pixelpipe_create_nodes()` and
+`dt_dev_pixelpipe_synch_all()` in the mask-aware implementation, add:
 
 ```c
   if(mask_target)
   {
-    for(GList *m = dev.iop; m; m = g_list_next(m))
+    gboolean found = FALSE;
+    for(GList *nodes = pipe.nodes; nodes; nodes = g_list_next(nodes))
     {
-      dt_iop_module_t *mod = m->data;
-      if(!g_strcmp0(mod->op, mask_target->op) && mod->multi_priority == mask_target->instance)
+      dt_dev_pixelpipe_iop_t *piece = nodes->data;
+      dt_iop_module_t *module = piece->module;
+      if(!g_strcmp0(module->op, mask_target->op)
+         && module->multi_priority == mask_target->instance)
       {
-        mod->request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
-        pipe.mask_display_request = TRUE;   // opt this export pipe in (M-B)
+        // The export dev/pipe is throwaway. Enabling here permits read-only
+        // mask inspection of a module disabled in live history without
+        // changing live state or adding history.
+        module->enabled = TRUE;
+        piece->enabled = TRUE;
+        module->request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+        pipe.mask_display_request = TRUE;
+        found = TRUE;
         break;
       }
+    }
+    if(!found)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[dt_imageio_export_with_flags_and_mask] target %s instance %d not found",
+               mask_target->op, mask_target->instance);
+      goto error;
     }
   }
 ```
 
-Update the two other call sites to pass `NULL` for the new argument: `src/common/mipmap_cache.c` (the `dt_imageio_export_with_flags(...)` call) and any internal self-call in `imageio.c` (the thumbnail path at ~line 1790).
+No call in `mipmap_cache.c`, tethering, Lua AI, neural restore, control
+jobs, or the ordinary imageio wrappers changes.
 
-- [ ] **Step 5: Thread the mask target through remote_edit prepare/execute**
+- [ ] **Step 5: Extend preview prepare/execute**
 
-In `src/control/remote_edit.h`, extend the request struct:
+Add `#include "control/settings.h"` to `remote_edit.h`; this is the owning
+header for `dt_dev_operation_t` and `remote_edit.h` did not previously need
+it.
+
+Replace the two structs in `src/control/remote_edit.h` with:
 
 ```c
 typedef struct dt_remote_preview_request_t
 {
   int32_t imgid;
   uint64_t revision;
-  // M-B mask render (parametric-masks design SS Mask rendering companion):
-  dt_dev_operation_t mask_op;   // "" when not a mask render
+  gboolean want_mask;
+  gboolean force_white;
+  dt_dev_operation_t mask_op;
   int mask_instance;
-  gboolean want_mask;           // render the display mask, not the image
-  gboolean force_white;         // target has no spatial mask -> solid white
-  uint32_t mask_mode_stored;    // for the mask_of response metadata
+  uint32_t mask_mode_stored;
 } dt_remote_preview_request_t;
-```
 
-Extend `dt_remote_preview_t` with mask metadata:
-```c
+typedef struct dt_remote_preview_t
+{
+  uint8_t *jpeg;
+  size_t jpeg_len;
+  int width, height;
+  uint64_t revision;
   gboolean is_mask;
   dt_dev_operation_t mask_op;
   int mask_instance;
   uint32_t mask_mode_stored;
+} dt_remote_preview_t;
 ```
 
-Change the prepare signature to accept the requested mask target:
-```c
-/** ... (M-A doc). If `show_mask_op` is non-NULL, this is a mask render:
- * resolve the target module, require IOP_FLAGS_SUPPORTS_BLENDING
- * (DT_REMOTE_ERR_UNSUPPORTED_FIELD naming `show_mask.op` otherwise),
- * capture its op/instance and stored mask_mode into `*out`, and set
- * force_white when the stored mode has neither CONDITIONAL nor MASK bits
- * (off/uniform render as solid white -- design SS Mask render). */
-gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
-                                          const char *show_mask_op, int show_mask_instance,
-                                          dt_remote_error_t **error);
-```
-
-In `src/control/remote_edit.c`, in `dt_remote_render_preview_prepare`, after resolving `dev`, add (before `dt_dev_write_history(dev)` so the module lookup is on the live tree):
+Keep the existing
+`dt_remote_render_preview_prepare(out, error)` declaration/definition in
+this task. At the beginning of prepare, after the darkroom precondition
+and before `dt_dev_write_history(dev)`, initialize the new fields for its
+ordinary-preview-only caller:
 
 ```c
-  memset(out->mask_op, 0, sizeof(out->mask_op));
   out->want_mask = FALSE;
   out->force_white = FALSE;
+  out->mask_op[0] = '\0';
+  out->mask_instance = 0;
   out->mask_mode_stored = 0;
-  if(show_mask_op)
-  {
-    const dt_remote_module_ref_t ref = { .op = show_mask_op, .instance = show_mask_instance };
-    dt_iop_module_t *module = dt_remote_find_module(dev, &ref, error);
-    if(!module) return FALSE;
-    if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
-    {
-      if(error)
-        *error = dt_remote_error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD,
-                                     _("module '%s' does not support blending"), show_mask_op);
-      return FALSE;
-    }
-    g_strlcpy(out->mask_op, module->op, sizeof(out->mask_op));
-    out->mask_instance = module->multi_priority;
-    out->want_mask = TRUE;
-    out->mask_mode_stored = module->blend_params->mask_mode;
-    out->force_white = !(module->blend_params->mask_mode
-                         & (DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_MASK));
-  }
 ```
 
-In `dt_remote_render_preview_execute`, build the mask target and pass it, then post-process for white and metadata:
+Task 6 replaces this initialization with target capture while updating
+the protocol function pointer and stubs in the same commit. This avoids an
+intermediate function-signature mismatch.
+
+Update the adjacent `remote_edit.h` request/prepare comments to distinguish
+ordinary requests (`want_mask == FALSE`) from the Task-6 mask target fields.
+
+In execute, replace the ordinary export call with:
 
 ```c
-  dt_imageio_mask_display_t mtarget;
-  const dt_imageio_mask_display_t *mtarget_ptr = NULL;
-  if(req->want_mask)
-  {
-    mtarget.op = req->mask_op;
-    mtarget.instance = req->mask_instance;
-    mtarget_ptr = &mtarget;
-  }
+  const dt_imageio_mask_display_t mask_target = {
+    .op = req->mask_op, .instance = req->mask_instance
+  };
+  const gboolean export_failed = dt_imageio_export_with_flags_and_mask(
+    (dt_imgid_t)req->imgid, "remote-preview", &format, &sink.head,
+    TRUE, FALSE, FALSE, FALSE, FALSE, 1.0, FALSE, NULL, FALSE, FALSE,
+    DT_COLORSPACE_SRGB, NULL, DT_INTENT_LAST, NULL, NULL, 1, 1, NULL, -1,
+    req->want_mask ? &mask_target : NULL);
 ```
-Pass `mtarget_ptr` as the new trailing `dt_imageio_export_with_flags(...)` argument. After the export returns and before JPEG-encoding, if `req->want_mask && req->force_white`, fill the RGBA buffer white:
+
+After the successful export/cancellation checks and before JPEG encode:
+
 ```c
   if(req->want_mask && req->force_white)
-    memset(sink.buf, 0xFF, sizeof(uint32_t) * (size_t)sink.width * sink.height);
+    memset(sink.buf, 0xff,
+           sizeof(uint32_t) * (size_t)sink.width * (size_t)sink.height);
 ```
-When populating `preview`, carry the mask metadata:
+
+When constructing the result:
+
 ```c
   preview->is_mask = req->want_mask;
   if(req->want_mask)
@@ -1497,128 +2170,519 @@ When populating `preview`, carry the mask metadata:
   }
 ```
 
-Update the M-A/M-B caller `_handler_render_preview` (Task 6) and the M-A protocol test stub to pass the new prepare arguments (Task 6 handles this).
-
-- [ ] **Step 6: Build and run the unit + full C suite**
+- [ ] **Step 6: Build and run the C suite**
 
 Run: `cmake --build build -j$(nproc) && ctest --test-dir build --output-on-failure`
-Expected: all C suites PASS (behavioral mask proof is Task 8's integration gate).
+Expected: all C tests pass. Task 8 supplies live CPU/pixel assertions;
+both CPU and OpenCL now consume the unit-tested predicate.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/develop/pixelpipe.h src/develop/pixelpipe_hb.c src/develop/blend.c \
-        src/imageio/imageio_common.h src/imageio/imageio.c src/common/mipmap_cache.c \
+git add src/develop/pixelpipe_hb.h src/develop/pixelpipe_hb.c \
+        src/develop/blend.h src/develop/blend.c \
+        src/imageio/imageio_common.h src/imageio/imageio.c \
         src/control/remote_edit.h src/control/remote_edit.c \
         src/tests/unittests/control/test_remote_blend.c
-git commit -m "feat: mask render engine -- export display-mask opt-in (Tier 2 / M-B)
-
-The export pipe cannot honor request_mask_display (blend.c gate requires
-the darkroom full pipe + focus), so add a guarded per-pipe opt-in
-(dt_dev_pixelpipe_t.mask_display_request), relax the blend gate for it,
-and thread an optional mask-display target through
-dt_imageio_export_with_flags. render_preview's prepare/execute resolve the
-target, render its display mask at normal framing, synthesize solid white
-for non-spatial modes, and carry mask_of metadata."
+git commit -m "feat: add isolated mask-render export path (Tier 2 / M-B)"
 ```
 (plus trailers)
 
 ---
 
-### Task 6: Protocol layer — capabilities, `show_mask` parse/thread, `mask_of` serialize, fixtures
+### Task 6: Protocol layer — capabilities, strict `show_mask`, `mask_of`, shared fixtures
 
 **Files:**
-- Modify: `src/control/remote_protocol.c` (hello; `RENDER_PREVIEW_KEYS`; `_handler_render_preview`; preview request struct plumbing; `_preview_job_params_t`; `_queue_preview_job`; `dt_remote_protocol_build_preview_response`)
-- Modify: `src/control/remote_protocol.h` (`dt_remote_protocol_async_t.queue_preview` signature already takes `req`; no change unless the calls-table needs it)
-- Create fixtures: `set_module_params_parametric_request.json`, `set_module_params_parametric_response.json`, `render_preview_show_mask_request.json`, `set_module_params_error_parametric_mask_mode_request.json`, `set_module_params_error_parametric_mask_mode_response.json`
-- Test: `src/tests/unittests/control/test_remote_protocol.c` (append), `tools/mcp/tests/test_protocol.py` (extend)
+- Modify: `src/control/remote_edit.h`, `src/control/remote_edit.c` (expanded prepare signature + target capture)
+- Modify: `src/control/remote_protocol.h`, `src/control/remote_protocol.c`
+- Modify: `src/tests/unittests/control/test_remote_protocol.c`
+- Modify: `src/tests/unittests/control/fixtures/hello_response.json`
+- Create: `src/tests/unittests/control/fixtures/set_module_params_parametric_request.json`
+- Create: `src/tests/unittests/control/fixtures/set_module_params_parametric_response.json`
+- Create: `src/tests/unittests/control/fixtures/render_preview_show_mask_request.json`
+- Create: `src/tests/unittests/control/fixtures/render_preview_show_mask_response.json`
+- Delete: `src/tests/unittests/control/fixtures/set_module_params_error_blend_mask_configuration_request.json`
+- Delete: `src/tests/unittests/control/fixtures/set_module_params_error_blend_mask_configuration_response.json`
+- Create: `src/tests/unittests/control/fixtures/set_module_params_error_blend_raster_request.json`
+- Create: `src/tests/unittests/control/fixtures/set_module_params_error_blend_raster_response.json`
+- Modify: `tools/mcp/tests/test_protocol.py`
 
 **Interfaces:**
-- Consumes: Task 5's `dt_remote_render_preview_prepare(out, op, instance, error)` and `dt_remote_preview_t` mask fields; M-A's blend parse/serialize (parametric/combine ride the existing `blend` object — no new parse code, they pass through `patch->blend`).
-- Produces: `hello` advertises `parametric_mask_params` + `mask_render`; `render_preview` accepts `show_mask {op, instance}`; the preview response gains a `mask_of` member.
+- Consumes: Task 5's preview mask fields/mask-aware execute path and Tier
+  1's borrowed `patch->blend`.
+- Produces: the expanded preview prepare signature, two hello capabilities,
+  strict `show_mask {op, instance}`, and raw-wire
+  `mask_of {op, instance, mask_mode}`.
 
-- [ ] **Step 1: Write the failing C protocol tests**
+- [ ] **Step 1: Author the exact shared fixtures**
 
-Append to `test_remote_protocol.c` (follow the neighboring stub-calls + `_assert_dispatch_matches` idiom):
+`set_module_params_parametric_request.json`:
 
-1. `test_hello_advertises_parametric_and_mask_render` — extend the hello expected-capabilities list with `"parametric_mask_params"` and `"mask_render"`; update `fixtures/hello_response.json` accordingly.
-2. `test_set_module_params_parametric_round_trip` — stub `set_module_params` asserts `patch->blend` contains a `"parametric"` member with a `"Jz_in"` child; returns a canned result whose `blend_readback` is parsed from the response fixture; `_assert_dispatch_matches("set_module_params_parametric_request.json", "set_module_params_parametric_response.json")`. (No new C parse code — the `blend` object already carries `parametric`/`combine` via M-A's borrowed `JsonObject`.)
-3. `test_render_preview_show_mask_parsed` — install a stub `render_preview_prepare` (calls-table member from M-A) that records the `show_mask_op`/`instance` arguments; dispatch `render_preview_show_mask_request.json`; assert the stub saw `op == "exposure"`, `instance == 1`. Also dispatch a request with `show_mask` present but `op` missing → `invalid_value` naming `show_mask.op`; and a request with `show_mask` not an object → `invalid_value`.
-4. `test_render_preview_show_mask_requires_capability_is_client_side` — (documentation-only C assertion) the C layer does NOT gate on `mask_render` (the sidecar does); assert a `show_mask` request is accepted at the protocol layer regardless.
-
-Note: the protocol test harness stubs the async render, so these tests exercise parse/threading, not the render itself.
-
-- [ ] **Step 2: Author fixtures**
-
-`set_module_params_parametric_request.json` — params:
 ```json
-{ "module": "exposure", "values": {},
-  "blend": { "mask_mode": "parametric", "combine": "exclusive",
-             "parametric": { "Jz_in": { "markers": [0.55, 0.65, 1.0, 1.0], "inverted": true } } } }
-```
-`set_module_params_parametric_response.json` — result mirrors M-A's blend readback shape plus:
-```json
-"blend": { "mask_mode": "parametric", "combine": "exclusive",
-           "parametric": { "Jz_in": { "markers": [0.55, 0.65, 1.0, 1.0],
-                                       "inverted": true, "boost": -6.64385619 } },
-           "foreign_channels": false, "...": "M-A scalar members elided in this doc but present in the fixture" }
-```
-(Author the full blend object mirroring M-A's `set_module_params_blend_response.json`, with the Tier-2 members added.)
-
-`render_preview_show_mask_request.json` — params:
-```json
-{ "max_px": 1024, "quality": 90, "show_mask": { "op": "exposure", "instance": 1 } }
+{
+  "id": 43,
+  "method": "set_module_params",
+  "params": {
+    "module": "exposure",
+    "values": {},
+    "blend": {
+      "mask_mode": "parametric",
+      "combine": "exclusive",
+      "parametric": {
+        "Jz_in": { "markers": [0.55, 0.65, 1.0, 1.0], "inverted": false }
+      }
+    }
+  }
+}
 ```
 
-Error pair — request sends `blend.parametric` while `mask_mode` is `uniform`; response is the standard error envelope with `code` = invalid_value, message `"set mask_mode to \"parametric\" to write parametric channels"`, details `{ "parameter": "blend.parametric", "constraint": "requires_parametric_mask_mode" }`.
+`set_module_params_parametric_response.json`:
+
+```json
+{
+  "id": 43,
+  "ok": true,
+  "result": {
+    "module": "exposure",
+    "instance": 0,
+    "enabled": true,
+    "values": {},
+    "blend": {
+      "mask_mode": "parametric",
+      "colorspace": "DEVELOP_BLEND_CS_NONE",
+      "effective_colorspace": "DEVELOP_BLEND_CS_RGB_SCENE",
+      "mode": "DEVELOP_BLEND_NORMAL2",
+      "reverse": false,
+      "fulcrum": 0.0,
+      "opacity": 100.0,
+      "feathering_radius": 0.0,
+      "feathering_guide": "DEVELOP_MASK_GUIDE_IN_AFTER_BLUR",
+      "blur_radius": 0.0,
+      "contrast": 0.0,
+      "brightness": 0.0,
+      "details": 0.0,
+      "combine": "exclusive",
+      "parametric": {
+        "Jz_in": {
+          "markers": [0.55, 0.65, 1.0, 1.0],
+          "inverted": false,
+          "boost": -6.64385619
+        }
+      },
+      "foreign_channels": false
+    },
+    "revision": 13
+  }
+}
+```
+
+`render_preview_show_mask_request.json`:
+
+```json
+{
+  "id": 44,
+  "method": "render_preview",
+  "params": {
+    "max_px": 512,
+    "quality": 90,
+    "show_mask": { "op": "exposure", "instance": 1 }
+  }
+}
+```
+
+`render_preview_show_mask_response.json` uses the existing stub JPEG bytes:
+
+```json
+{
+  "id": 44,
+  "ok": true,
+  "result": {
+    "mime_type": "image/jpeg",
+    "width": 512,
+    "height": 342,
+    "revision": 35,
+    "mask_of": { "op": "exposure", "instance": 1, "mask_mode": "parametric" },
+    "data": "c3R1Yi1qcGVnLWJ5dGVzLWZvci1yZW5kZXItcHJldmlldy1maXh0dXJl"
+  }
+}
+```
+
+Update `hello_response.json` by inserting
+`"parametric_mask_params"` and `"mask_render"` immediately after
+`"blend_params"`.
+
+Replace Tier 1's obsolete `mask_configuration_present` error fixture pair
+with the still-reachable raster transition contract.
+`set_module_params_error_blend_raster_request.json`:
+
+```json
+{
+  "id": 42,
+  "method": "set_module_params",
+  "params": {
+    "module": "exposure",
+    "values": {},
+    "blend": { "mask_mode": "uniform" }
+  }
+}
+```
+
+`set_module_params_error_blend_raster_response.json`:
+
+```json
+{
+  "id": 42,
+  "ok": false,
+  "error": {
+    "code": "invalid_value",
+    "message": "raster masks are not writable",
+    "details": {
+      "parameter": "blend.mask_mode",
+      "constraint": "raster_unsupported"
+    },
+    "retryable": false
+  }
+}
+```
+
+- [ ] **Step 2: Write the failing C tests**
+
+Add `#include "develop/blend.h"` to `test_remote_protocol.c` for the
+`DEVELOP_MASK_*` constants used by the new preview fixtures.
+
+Update `test_hello_success` to expect this exact tail and count:
+
+```c
+  assert_int_equal(json_array_get_length(caps), 13);
+  assert_string_equal(json_array_get_string_element(caps, 6), "blend_params");
+  assert_string_equal(json_array_get_string_element(caps, 7), "parametric_mask_params");
+  assert_string_equal(json_array_get_string_element(caps, 8), "mask_render");
+  assert_string_equal(json_array_get_string_element(caps, 9), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 10), "history");
+  assert_string_equal(json_array_get_string_element(caps, 11), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 12), "scopes");
+```
+
+Keep the existing assertions for indices 0–5. Add this exact parametric
+passthrough stub and test next to the Tier-1 blend stubs:
+
+```c
+static gboolean stub_set_module_params_parametric_capture(
+  const dt_remote_module_ref_t *ref, const dt_remote_patch_t *patch,
+  const uint64_t *expected_revision, dt_remote_mutation_result_t **out,
+  dt_remote_error_t **error)
+{
+  (void)expected_revision;
+  (void)error;
+  assert_non_null(patch);
+  assert_non_null(patch->blend);
+  assert_string_equal(json_object_get_string_member(patch->blend, "mask_mode"),
+                      "parametric");
+  JsonObject *parametric = json_object_get_object_member(patch->blend, "parametric");
+  JsonObject *jz = json_object_get_object_member(parametric, "Jz_in");
+  assert_false(json_object_get_boolean_member(jz, "inverted"));
+  assert_int_equal(json_array_get_length(json_object_get_array_member(jz, "markers")), 4);
+
+  dt_remote_mutation_result_t *result = g_malloc0(sizeof(*result));
+  result->op = g_strdup(ref->op);
+  result->instance = ref->instance;
+  result->instance_name = g_strdup("");
+  result->enabled = TRUE;
+  result->values = g_ptr_array_new_with_free_func(dt_remote_patch_entry_free);
+  result->blend_readback = json_from_string(
+    "{\"mask_mode\":\"parametric\","
+    "\"colorspace\":\"DEVELOP_BLEND_CS_NONE\","
+    "\"effective_colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\","
+    "\"mode\":\"DEVELOP_BLEND_NORMAL2\",\"reverse\":false,"
+    "\"fulcrum\":0.0,\"opacity\":100.0,\"feathering_radius\":0.0,"
+    "\"feathering_guide\":\"DEVELOP_MASK_GUIDE_IN_AFTER_BLUR\","
+    "\"blur_radius\":0.0,\"contrast\":0.0,\"brightness\":0.0,\"details\":0.0,"
+    "\"combine\":\"exclusive\",\"parametric\":{\"Jz_in\":{"
+    "\"markers\":[0.55,0.65,1.0,1.0],\"inverted\":false,"
+    "\"boost\":-6.64385619}},\"foreign_channels\":false}", NULL);
+  result->revision = 13;
+  *out = result;
+  return TRUE;
+}
+
+static void test_set_module_params_parametric_fixture_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .get_module_primitive_schema = stub_get_module_primitive_schema_exposure_full,
+    .set_module_params = stub_set_module_params_parametric_capture,
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_module_params_parametric_request.json",
+                           "set_module_params_parametric_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+```
+
+Register `test_set_module_params_parametric_fixture_round_trip` in
+`main()`.
+
+Change both existing preview-prepare stubs to the new signature. The
+successful stub must capture the optional target:
+
+```c
+static dt_dev_operation_t g_prepare_mask_op;
+static int g_prepare_mask_instance;
+
+static gboolean stub_render_preview_prepare_ok(dt_remote_preview_request_t *out,
+                                               const char *show_mask_op,
+                                               int show_mask_instance,
+                                               dt_remote_error_t **error)
+{
+  (void)error;
+  out->imgid = 172;
+  out->revision = 34;
+  g_strlcpy(g_prepare_mask_op, show_mask_op ? show_mask_op : "",
+            sizeof(g_prepare_mask_op));
+  g_prepare_mask_instance = show_mask_instance;
+  if(show_mask_op)
+  {
+    out->want_mask = TRUE;
+    g_strlcpy(out->mask_op, show_mask_op, sizeof(out->mask_op));
+    out->mask_instance = show_mask_instance;
+    out->mask_mode_stored = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  }
+  return TRUE;
+}
+```
+
+Replace the failure stub with:
+
+```c
+static gboolean stub_render_preview_prepare_not_in_darkroom(
+  dt_remote_preview_request_t *out, const char *show_mask_op,
+  int show_mask_instance, dt_remote_error_t **error)
+{
+  (void)out;
+  (void)show_mask_op;
+  (void)show_mask_instance;
+  if(error)
+    *error = _make_error(DT_REMOTE_ERR_NOT_IN_DARKROOM,
+                         g_strdup("no darkroom view is active"));
+  return FALSE;
+}
+```
+
+Add and register:
+
+```c
+static void test_render_preview_show_mask_parses_and_defers(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .render_preview_prepare = stub_render_preview_prepare_ok
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _install_fake_async(TRUE);
+  JsonNode *request = _load_fixture("render_preview_show_mask_request.json");
+  assert_null(dt_remote_protocol_dispatch(json_node_get_object(request), NULL));
+  assert_string_equal(g_prepare_mask_op, "exposure");
+  assert_int_equal(g_prepare_mask_instance, 1);
+  assert_true(g_queued_req.want_mask);
+  assert_string_equal(g_queued_req.mask_op, "exposure");
+  assert_int_equal(g_queued_req.mask_instance, 1);
+  assert_int_equal(g_queued_max_px, 512);
+  assert_int_equal(g_queued_quality, 90);
+  json_node_unref(request);
+  dt_remote_protocol_set_async(NULL);
+  dt_remote_protocol_set_calls(NULL);
+}
+```
+
+Rename `stub_set_module_params_blend_mask_configuration` to
+`stub_set_module_params_blend_raster` and replace its error body with:
+
+```c
+  if(error)
+  {
+    *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE,
+                         g_strdup("raster masks are not writable"));
+    (*error)->details_json =
+      g_strdup("{\"parameter\":\"blend.mask_mode\","
+               "\"constraint\":\"raster_unsupported\"}");
+  }
+  return FALSE;
+```
+
+Rename `test_set_module_params_blend_error_fixture` to
+`test_set_module_params_blend_raster_error_fixture`, update its calls-table
+stub, its two fixture names, and its `main()` registration.
+
+Extend `test_render_preview_error_bad_shapes` with these strict rows:
+
+```c
+  _assert_inline_error(
+    "{\"id\":24,\"method\":\"render_preview\",\"params\":{\"show_mask\":true}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":25,\"method\":\"render_preview\",\"params\":{\"show_mask\":{}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":26,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"\"}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":27,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":-1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":28,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"extra\":1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":29,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":1}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":30,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":1.5}}}",
+    "invalid_value");
+  _assert_inline_error(
+    "{\"id\":31,\"method\":\"render_preview\",\"params\":{\"show_mask\":{\"op\":\"exposure\",\"instance\":2147483648}}}",
+    "invalid_value");
+
+  assert_int_equal(g_async_begin_calls, 12);
+  assert_int_equal(g_async_abort_calls, 12);
+  assert_int_equal(g_queue_preview_calls, 0);
+```
+
+Replace the existing final `4`/`4` counter assertions in that function;
+do not leave both counter blocks.
+
+Add and register a pure response test:
+
+```c
+static void test_build_preview_mask_response_matches_fixture(void **state)
+{
+  (void)state;
+  dt_remote_preview_t preview = {
+    .jpeg = (uint8_t *)RENDER_PREVIEW_STUB_BYTES,
+    .jpeg_len = strlen(RENDER_PREVIEW_STUB_BYTES),
+    .width = 512,
+    .height = 342,
+    .revision = 35,
+    .is_mask = TRUE,
+    .mask_instance = 1,
+    .mask_mode_stored = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+  };
+  g_strlcpy(preview.mask_op, "exposure", sizeof(preview.mask_op));
+  JsonNode *actual = dt_remote_protocol_build_preview_response(44, &preview, NULL);
+  JsonNode *expected = _load_fixture("render_preview_show_mask_response.json");
+  assert_true(_json_equal(actual, expected));
+  json_node_unref(actual);
+  json_node_unref(expected);
+}
+```
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R test_remote_protocol --output-on-failure 2>&1 | tail -20`
-Expected: FAIL — hello lacks the two capabilities; `show_mask` not parsed; prepare signature mismatch.
+Run: `cmake --build build -j$(nproc) && ctest --test-dir build -R test_remote_protocol --output-on-failure`
+Expected: failure because capabilities, parsing, and serialization are absent.
 
-- [ ] **Step 4: Implement the protocol changes**
+- [ ] **Step 4: Implement strict parsing and serialization**
 
-1. Hello: after `"blend_params"` add:
+First expand the declaration and definition in `remote_edit.h/.c`:
+
 ```c
-  json_builder_add_string_value(b, "parametric_mask_params");
-  json_builder_add_string_value(b, "mask_render");
+gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
+                                          const char *show_mask_op,
+                                          int show_mask_instance,
+                                          dt_remote_error_t **error);
 ```
-with a comment: `// parametric_mask_params gates blend.parametric/combine; mask_render gates render_preview.show_mask (both mask Tier 2 / M-B).`
-2. `RENDER_PREVIEW_KEYS` becomes `{ "max_px", "quality", "show_mask", NULL }`.
-3. In `_handler_render_preview`, after the `quality` clamp and before `render_preview_prepare`, parse `show_mask`:
+
+In prepare, replace Task 5's ordinary-only field initialization (after
+the darkroom precondition and before `dt_dev_write_history(dev)`) with:
+
+```c
+  out->want_mask = FALSE;
+  out->force_white = FALSE;
+  out->mask_op[0] = '\0';
+  out->mask_instance = 0;
+  out->mask_mode_stored = 0;
+  if(show_mask_op)
+  {
+    const dt_remote_module_ref_t ref = {
+      .op = show_mask_op, .instance = show_mask_instance
+    };
+    dt_iop_module_t *module = dt_remote_find_module(dev, &ref, error);
+    if(!module) return FALSE;
+    if(!(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+    {
+      if(error)
+      {
+        *error = dt_remote_error_new(DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                                     _("module '%s' does not support blending"),
+                                     show_mask_op);
+        (*error)->details_json =
+          g_strdup("{\"parameter\":\"show_mask.op\"}");
+      }
+      return FALSE;
+    }
+    out->want_mask = TRUE;
+    g_strlcpy(out->mask_op, module->op, sizeof(out->mask_op));
+    out->mask_instance = module->multi_priority;
+    out->mask_mode_stored = module->blend_params->mask_mode;
+    out->force_white = !(out->mask_mode_stored
+      & (DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_MASK | DEVELOP_MASK_RASTER));
+  }
+```
+
+In `remote_protocol.h`, change the calls-table member to:
+
+```c
+  gboolean (*render_preview_prepare)(dt_remote_preview_request_t *out,
+                                     const char *show_mask_op,
+                                     int show_mask_instance,
+                                     dt_remote_error_t **error);
+```
+
+In hello, add the two capabilities after `blend_params` and extend the
+adjacent capability-ownership comment to describe both. In
+`remote_protocol.c`, define:
+
+```c
+static const char *const RENDER_PREVIEW_KEYS[] =
+  { "max_px", "quality", "show_mask", NULL };
+static const char *const SHOW_MASK_KEYS[] = { "op", "instance", NULL };
+```
+
+After quality clamping in `_handler_render_preview`, add:
+
 ```c
   const char *show_mask_op = NULL;
   gint64 show_mask_instance = 0;
   if(json_object_has_member(params, "show_mask"))
   {
-    JsonNode *sm = json_object_get_member(params, "show_mask");
-    if(!sm || !JSON_NODE_HOLDS_OBJECT(sm))
+    JsonNode *node = json_object_get_member(params, "show_mask");
+    if(!node || !JSON_NODE_HOLDS_OBJECT(node))
       return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
                                       _("parameter 'show_mask' must be an object")));
-    JsonObject *smo = json_node_get_object(sm);
-    JsonNode *opn = json_object_get_member(smo, "op");
-    if(!opn || !JSON_NODE_HOLDS_VALUE(opn) || json_node_get_value_type(opn) != G_TYPE_STRING)
+    JsonObject *show_mask = json_node_get_object(node);
+    if(!_check_known_keys(show_mask, SHOW_MASK_KEYS, &err)) return _handler_fail(err);
+    if(!_require_string(show_mask, "op", &show_mask_op, &err)) return _handler_fail(err);
+    if(!show_mask_op[0])
       return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
-                                      _("'show_mask.op' is required and must be a string")));
-    show_mask_op = json_node_get_string(opn);
-    if(json_object_has_member(smo, "instance"))
-    {
-      JsonNode *inst = json_object_get_member(smo, "instance");
-      if(!inst || !JSON_NODE_HOLDS_VALUE(inst) || json_node_get_value_type(inst) != G_TYPE_INT64)
-        return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
-                                        _("'show_mask.instance' must be an integer")));
-      show_mask_instance = json_node_get_int(inst);
-    }
+                                      _("parameter 'show_mask.op' must not be empty")));
+    if(!_optional_int_default(show_mask, "instance", 0,
+                              &show_mask_instance, &err))
+      return _handler_fail(err);
+    if(show_mask_instance < 0 || show_mask_instance > G_MAXINT)
+      return _handler_fail(_error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                                      _("parameter 'show_mask.instance' is out of range")));
   }
 ```
-Then pass the target to prepare:
+
+Call prepare with the parsed values:
+
 ```c
-  if(!s_calls.render_preview_prepare(&req, show_mask_op, (int)show_mask_instance, &err))
+  if(!s_calls.render_preview_prepare(&req, show_mask_op,
+                                     (int)show_mask_instance, &err))
     return _handler_fail(err);
 ```
-Update the calls-table member type in `remote_protocol.h` to `gboolean (*render_preview_prepare)(dt_remote_preview_request_t *, const char *, int, dt_remote_error_t **);` and both initializers (`DEFAULT_CALLS`/`s_calls`) already point at `dt_remote_render_preview_prepare` (Task 5's new signature) — no value change, only the typedef.
-4. `dt_remote_protocol_build_preview_response`: when `preview->is_mask`, add a `mask_of` object before `data`:
+
+In `dt_remote_protocol_build_preview_response`, after revision and before
+data, add:
+
 ```c
     if(preview->is_mask)
     {
@@ -1629,166 +2693,223 @@ Update the calls-table member type in `remote_protocol.h` to `gboolean (*render_
       json_builder_set_member_name(b, "instance");
       json_builder_add_int_value(b, preview->mask_instance);
       json_builder_set_member_name(b, "mask_mode");
-      json_builder_add_string_value(b, dt_remote_blend_mask_mode_string(preview->mask_mode_stored));
+      json_builder_add_string_value(
+        b, dt_remote_blend_mask_mode_string(preview->mask_mode_stored));
       json_builder_end_object(b);
     }
 ```
-(`dt_remote_blend_mask_mode_string` is declared in `remote_blend.h`; include it in `remote_protocol.c` if not already via `remote_edit.h`.)
 
-- [ ] **Step 5: Build and run C + Python protocol suites**
+Include `control/remote_blend.h` in `remote_protocol.c`.
 
-Run: `cmake --build build -j$(nproc) && ctest --test-dir build --output-on-failure`
-Expected: all PASS.
+- [ ] **Step 5: Extend Python fixture coverage and run both suites**
 
-Extend `tools/mcp/tests/test_protocol.py`'s shared-fixture parametrization with the parametric success pair and the hello-capability assertion (`assert "parametric_mask_params" in client.capabilities` and `assert "mask_render" in client.capabilities`).
+Add both the parametric set pair and the `render_preview` show-mask pair to
+`test_success_responses_match_shared_fixtures`; the latter proves the raw
+Python client preserves `mask_of` rather than reshaping the result. Add
+these two asserts to `test_client_capabilities_populated_from_hello`:
 
-Run: `cd tools/mcp && .venv/bin/pytest -q`
-Expected: all PASS.
+```python
+    assert "parametric_mask_params" in client.capabilities
+    assert "mask_render" in client.capabilities
+```
+
+Run:
+
+```bash
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+cd tools/mcp && .venv/bin/pytest -q tests/test_protocol.py
+```
+
+Expected: all commands pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/control/remote_protocol.h src/control/remote_protocol.c \
+git add src/control/remote_edit.h src/control/remote_edit.c \
+        src/control/remote_protocol.h src/control/remote_protocol.c \
         src/tests/unittests/control/test_remote_protocol.c \
         src/tests/unittests/control/fixtures/ tools/mcp/tests/test_protocol.py
-git commit -m "feat: parametric + mask_render wire surface (Tier 2 / M-B)
-
-hello advertises parametric_mask_params and mask_render; render_preview
-parses show_mask {op, instance} and threads it to prepare; the preview
-response carries mask_of {op, instance, mask_mode}. parametric/combine ride
-the existing blend object (no new parse)."
+git commit -m "feat: add parametric-mask and mask-render wire contracts (Tier 2 / M-B)"
 ```
 (plus trailers)
 
 ---
 
-### Task 7: Sidecar — capability gates + `show_mask` passthrough + worked-example docstrings (H4)
+### Task 7: Sidecar — complete capability gates and observable mask provenance
 
 **Files:**
 - Modify: `tools/mcp/src/darktable_mcp/server.py`
-- Test: `tools/mcp/tests/test_tools.py` (append)
+- Test: `tools/mcp/tests/test_tools.py`
 
-- [ ] **Step 1: Write the failing tests**
+**Interfaces:**
+- Ordinary `render_preview` remains one native image content block.
+- `render_preview(show_mask=...)` returns a JSON text metadata block followed by the native JPEG block.
 
-Append to `test_tools.py`, mirroring M-A's blend-gate tests:
+- [ ] **Step 1: Write the failing tests using the current fake-server API**
+
+Add this helper near `_built_server` in `test_tools.py`:
 
 ```python
-async def test_set_module_params_parametric_gated_on_capability(tmp_path, fake_server_factory):
-    """A `parametric`/`combine` member needs parametric_mask_params."""
-    server = await fake_server_factory(capabilities=["params", "blend_params"])
-    calls = []
+def _advertise_capabilities(server, capabilities: list[str]) -> None:
+    fixture = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {
+        **fixture,
+        "id": req_id,
+        "result": {**fixture["result"], "capabilities": capabilities},
+    }
+```
+
+Append:
+
+```python
+@pytest.mark.parametrize(
+    "blend",
+    [
+        {"parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}}},
+        {"combine": "inclusive"},
+        {"allow_inverted_combine": True},
+        {"mask_mode": "parametric"},
+        {"mask_mode": "drawn"},
+        {"mask_mode": "drawn+parametric"},
+    ],
+)
+async def test_tier2_blend_members_require_parametric_capability(
+    tmp_path, fake_server_factory, blend
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "blend_params"])
+    calls: list[dict] = []
     server.handle("set_module_params", lambda params: calls.append(params) or {})
     app = await _built_server(tmp_path, server)
-    with pytest.raises(TransportError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         await app.call_tool(
             "set_module_params",
-            {"module": "exposure", "values": {},
-             "blend": {"mask_mode": "parametric",
-                       "parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}}}},
+            {"module": "exposure", "values": {}, "blend": blend},
         )
     assert "parametric_mask_params" in str(excinfo.value)
     assert calls == []
 
 
-async def test_set_module_params_parametric_passes_when_advertised(tmp_path, fake_server_factory):
-    server = await fake_server_factory(capabilities=["params", "blend_params", "parametric_mask_params"])
-    seen = []
-    server.handle("set_module_params",
-                  lambda params: seen.append(params)
-                  or {"module": "exposure", "instance": 0, "enabled": True, "values": {}, "revision": 5})
+async def test_parametric_blend_passes_when_advertised(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(
+        server, ["params", "blend_params", "parametric_mask_params"]
+    )
+    seen: list[dict] = []
+    server.handle(
+        "set_module_params",
+        lambda params: seen.append(params)
+        or {"module": "exposure", "instance": 0, "enabled": True,
+            "values": {}, "revision": 5},
+    )
     app = await _built_server(tmp_path, server)
+    blend = {
+        "mask_mode": "parametric",
+        "combine": "exclusive",
+        "parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}},
+    }
     await app.call_tool(
         "set_module_params",
-        {"module": "exposure", "values": {},
-         "blend": {"mask_mode": "parametric", "combine": "exclusive",
-                   "parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0], "inverted": True}}}},
+        {"module": "exposure", "values": {}, "blend": blend},
     )
-    assert seen[0]["blend"]["parametric"]["Jz_in"]["inverted"] is True
+    assert seen[0]["blend"] == blend
 
 
-async def test_render_preview_show_mask_gated_on_mask_render(tmp_path, fake_server_factory):
-    server = await fake_server_factory(capabilities=["params", "preview"])
+async def test_show_mask_requires_mask_render_capability(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "preview"])
+    calls: list[dict] = []
+    server.handle("render_preview", lambda params: calls.append(params) or {})
     app = await _built_server(tmp_path, server)
-    with pytest.raises(TransportError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         await app.call_tool("render_preview", {"show_mask": {"op": "exposure"}})
     assert "mask_render" in str(excinfo.value)
+    assert calls == []
 
 
-async def test_render_preview_show_mask_passes_when_advertised(tmp_path, fake_server_factory):
-    server = await fake_server_factory(capabilities=["params", "preview", "mask_render"])
-    seen = []
-    server.handle("render_preview",
-                  lambda params: seen.append(params)
-                  or {"mime_type": "image/jpeg", "width": 8, "height": 8, "revision": 1, "data": ""})
+async def test_show_mask_returns_metadata_then_native_image(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "preview", "mask_render"])
+    fixture = load_fixture("render_preview_show_mask_response.json")
+    seen: list[dict] = []
+    server.handle(
+        "render_preview", lambda params: seen.append(params) or fixture["result"]
+    )
     app = await _built_server(tmp_path, server)
-    await app.call_tool("render_preview", {"show_mask": {"op": "exposure", "instance": 1}})
+    result = await app.call_tool(
+        "render_preview", {"show_mask": {"op": "exposure", "instance": 1}}
+    )
     assert seen[0]["show_mask"] == {"op": "exposure", "instance": 1}
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert isinstance(result[0], TextContent)
+    metadata = json.loads(result[0].text)
+    assert metadata["mask_of"] == {
+        "op": "exposure", "instance": 1, "mask_mode": "parametric"
+    }
+    assert metadata["revision"] == 35
+    assert "data" not in metadata
+    assert isinstance(result[1], ImageContent)
+    assert base64.b64decode(result[1].data) == base64.b64decode(
+        fixture["result"]["data"]
+    )
 ```
-
-(Match the file's exact capability-advertising idiom and `TransportError`/`ToolError` type used by M-A's blend gate.)
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cd tools/mcp && .venv/bin/pytest -q tests/test_tools.py -k "parametric or show_mask"`
-Expected: FAIL — `parametric`/`combine` not gated; `render_preview` has no `show_mask` argument.
+Run: `cd tools/mcp && .venv/bin/pytest -q tests/test_tools.py -k 'tier2_blend or parametric_blend or show_mask'`
+Expected: failures for incomplete gating, missing argument, or missing metadata content.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement complete Tier-2 capability detection**
 
-In `server.py`'s `set_module_params`, after the M-A `blend` capability gate, add a nested gate:
+Inside the existing `if blend is not None:` block, after the Tier-1 gate
+and before assigning `params["blend"]`, add:
+
 ```python
-        if blend is not None:
-            await client.ensure_connected()
-            if "blend_params" not in client.capabilities:
-                raise TransportError(
-                    "this darktable does not advertise blend_params; "
-                    "upgrade darktable to edit blend settings"
-                )
-            if ("parametric" in blend or "combine" in blend) \
-                    and "parametric_mask_params" not in client.capabilities:
+            tier2_mask_mode = blend.get("mask_mode") in {
+                "parametric", "drawn", "drawn+parametric"
+            }
+            needs_parametric = tier2_mask_mode or any(
+                key in blend
+                for key in ("parametric", "combine", "allow_inverted_combine")
+            )
+            if needs_parametric and "parametric_mask_params" not in client.capabilities:
                 raise TransportError(
                     "this darktable does not advertise parametric_mask_params; "
                     "upgrade darktable to edit parametric masks"
                 )
-            params["blend"] = blend
 ```
 
-Append to the `set_module_params` docstring a parametric-masks paragraph with two worked examples and the two sharp-edge warnings (H4):
-```
-        `blend.parametric` writes per-channel blendif ramps (needs
-        `parametric_mask_params`). Each channel is `<name>_in`/`<name>_out`
-        for the effective colorspace (see `get_module_schema`'s
-        `blend.parametric.channels`). A channel entry is
-        `{markers:[m0,m1,m2,m3], inverted?, boost?}` with ascending
-        markers in [0,1]; the mask ramps 0->1 over m0..m1, holds 1 over
-        m1..m2, falls 1->0 over m2..m3. Full-span [0,0,1,1] means "no
-        condition" (the slot is disabled). `null` resets a channel.
-        WORKED EXAMPLE -- select the sky by luminance on an exposure
-        instance: {"blend": {"mask_mode": "parametric", "parametric":
-        {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0], "inverted": true}}}}.
-        WORKED EXAMPLE -- restrict to shadows: {"blend": {"mask_mode":
-        "parametric", "parametric": {"Jz_in": {"markers": [0.0, 0.0, 0.2,
-        0.35]}}}}. WARNING: boost is an exp2 exponent and does NOT rescale
-        your markers -- change markers yourself if you change boost.
-        WARNING: `combine`'s inclusive setting XORs every channel's
-        effective polarity (effective_inverted = inverted XOR inclusive);
-        changing `inverted` and `combine` together is refused unless you
-        pass `blend.allow_inverted_combine: true`. Verify every threshold
-        with render_preview's show_mask.
-```
+This explicitly covers the two transition-only writes (`drawn` and
+`drawn+parametric`) and the conflict override, not only `parametric` and
+`combine`.
 
-Add a `show_mask` argument to `render_preview`:
-1. Signature: `show_mask: dict[str, Any] | None = None,`.
-2. Docstring: append:
-```
-        `show_mask` ({"op": <module>, "instance": <n>}) renders that
-        module's blend mask as a grayscale JPEG (white = full effect)
-        instead of the blended image, framed identically so coordinates
-        line up. Needs the `mask_render` capability. Use it to verify every
-        parametric threshold you set. `off`/`uniform` masks render solid
-        white; the response's `mask_of` echoes {op, instance, mask_mode}.
-```
-3. Before the wire call:
+- [ ] **Step 4: Return mask metadata as mixed MCP content**
+
+Replace the render tool with the same ordinary-preview behavior plus the
+new optional branch:
+
 ```python
+    @app.tool(structured_output=False)
+    async def render_preview(
+        max_px: int = 1024,
+        quality: int = 85,
+        show_mask: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Render the current darkroom image as a native JPEG content
+        block. `max_px` is clamped to [64, 2048] and `quality` to [50, 95].
+
+        `show_mask={"op": <module>, "instance": <n>}` instead renders that
+        module's blend mask (white = full effect), with identical framing.
+        It requires `mask_render`; off/uniform masks are solid white. Mask
+        renders return a JSON metadata block (`mime_type`, dimensions,
+        revision, `mask_of`) followed by the native JPEG block.
+        """
+        max_px = max(64, min(2048, max_px))
+        quality = max(50, min(95, quality))
+        params: dict[str, Any] = {"max_px": max_px, "quality": quality}
+        client = await _client()
         if show_mask is not None:
             await client.ensure_connected()
             if "mask_render" not in client.capabilities:
@@ -1797,61 +2918,375 @@ Add a `show_mask` argument to `render_preview`:
                     "upgrade darktable to render masks"
                 )
             params["show_mask"] = show_mask
+
+        result = await client.call("render_preview", params)
+        image = Image(data=base64.b64decode(result["data"]), format="jpeg")
+        if show_mask is None:
+            return [image]
+        if not isinstance(result.get("mask_of"), dict):
+            raise TransportError("darktable returned a mask image without mask_of metadata")
+        metadata = {key: value for key, value in result.items() if key != "data"}
+        return [json.dumps(metadata), image]
 ```
 
-- [ ] **Step 4: Run tests**
+The existing `test_render_preview_returns_native_image_content` remains
+unchanged and proves the ordinary path is still a one-image result.
+
+- [ ] **Step 5: Expand the `set_module_params` docstring with corrected examples**
+
+Extend `SERVER_INSTRUCTIONS`' preview sentence to say that agents can also
+render an individual module's blend mask when `mask_render` is available.
+
+First replace the Tier-1-only `mask_mode` sentence (`"off"/"uniform" --
+drawn/parametric/raster configurations are read-only here`) with the final
+contract: the schema gives the state-aware choice set;
+`off`/`uniform`/`parametric` are writable in non-drawn supported families,
+`drawn ↔ drawn+parametric` may toggle only `CONDITIONAL`, entering/leaving
+drawn ownership is attach/detach-only, and raster remains read-only.
+
+Then append this text to the blend section:
+
+```text
+`blend.parametric` (capability `parametric_mask_params`) maps effective-
+colorspace channel names such as `Jz_in` to complete slot replacements:
+`{markers:[m0,m1,m2,m3], inverted?, boost?}`. Markers are ascending in
+[0,1]; [0,0,1,1] disables the slot, and null resets it. To select bright
+sky/highlights deterministically, set
+`colorspace:"DEVELOP_BLEND_CS_RGB_SCENE"`, `combine:"exclusive"`,
+`mask_mode:"parametric"`, and `Jz_in:{markers:[0.55,0.65,1,1]}` with
+omitted/false `inverted`. To select
+shadows, use `Jz_in:{markers:[0,0,0.2,0.35]}`. Boost is an exp2 exponent
+and does not rescale markers. Inclusive combine XORs effective polarity;
+changing combine and explicit inverted together requires
+`allow_inverted_combine:true`. Verify thresholds with `show_mask`.
+```
+
+- [ ] **Step 6: Run the full Python suite and commit**
 
 Run: `cd tools/mcp && .venv/bin/pytest -q`
-Expected: all PASS.
-
-- [ ] **Step 5: Commit**
+Expected: all tests pass.
 
 ```bash
 git add tools/mcp/src/darktable_mcp/server.py tools/mcp/tests/test_tools.py
-git commit -m "feat: sidecar parametric + show_mask gates and worked-example docstrings"
+git commit -m "feat: expose Tier-2 mask controls through MCP"
 ```
 (plus trailers)
 
 ---
 
-### Task 8: Integration gates (H6 — direct mask-image assertions)
+### Task 8: Deterministic integration gates with direct mask-image assertions
 
 **Files:**
+- Modify: `tools/mcp/pyproject.toml` (`dev` extra)
+- Modify: `tools/mcp/tests/integration/test_blend_tier1.py` (superseded schema expectation/wording)
 - Create: `tools/mcp/tests/integration/test_parametric_masks_tier2.py`
 
-**Prereq:** a running build. Run with:
+**Fixture contract:** `harness.test_image()` is exactly
+`img/DSC07350.ARW`. At `max_px=512` its landscape preview contains a dark
+top-left background ROI and a bright central flamingo-head ROI. The test
+forces `DEVELOP_BLEND_CS_RGB_SCENE` before using `Jz_in` and uses
+normalized coordinates so the assertion remains valid if the JPEG's
+integer height changes by one pixel.
+
+- [ ] **Step 1: Write the failing integration file**
+
+First update Tier 1's cumulative integration contract: change
+`blend_schema["mask_mode"]["values"]` from `["off", "uniform"]` to
+`["off", "uniform", "parametric"]`. Rename its section-6 heading to
+"mask_mode drawn ownership + off/uniform round-trip" and rename
+`test_mask_mode_rejections_and_roundtrip` to
+`test_mask_mode_drawn_ownership_and_roundtrip`; the test body remains valid
+because a plain-state → drawn transition still fails
+`drawn_via_attach_only`.
+
+Create the file with this complete content:
+
+```python
+"""Tier-2 parametric-mask and read-only mask-render live gates."""
+
+from __future__ import annotations
+
+import base64
+import io
+
+import pytest
+from PIL import Image, ImageChops, ImageStat
+
+from darktable_mcp.errors import ProtocolError
+
+from . import harness
+
+pytestmark = pytest.mark.integration
+
+MASK_MAX_PX = 512
+MASK_QUALITY = 90
+HIGHLIGHT_MARKERS = [0.35, 0.50, 1.0, 1.0]
+
+# Normalized boxes (left, top, right, bottom), pinned by visual inspection
+# of img/DSC07350.ARW's default 512px render.
+DARK_BACKGROUND_ROI = (0.00, 0.00, 0.10, 0.18)
+BRIGHT_SUBJECT_ROI = (0.39, 0.34, 0.51, 0.48)
+
+
+async def _module_params(client, module: str, instance: int = 0) -> dict:
+    return await client.call(
+        "get_module_params", {"module": module, "instance": instance}
+    )
+
+
+async def _render_mask(client, op: str = "exposure", instance: int = 0):
+    await harness.wait_for_stable_revision(client)
+    for attempt in (1, 2):
+        try:
+            result = await client.call(
+                "render_preview",
+                {
+                    "max_px": MASK_MAX_PX,
+                    "quality": MASK_QUALITY,
+                    "show_mask": {"op": op, "instance": instance},
+                },
+            )
+            with Image.open(io.BytesIO(base64.b64decode(result["data"]))) as encoded:
+                mask = encoded.convert("L").copy()
+            return result, mask
+        except ProtocolError as exc:
+            if exc.code != "preview_failed" or attempt == 2:
+                raise
+    raise AssertionError("unreachable")
+
+
+def _mean_in_normalized_roi(image: Image.Image, roi: tuple[float, float, float, float]) -> float:
+    width, height = image.size
+    left, top, right, bottom = roi
+    box = (
+        int(round(left * width)),
+        int(round(top * height)),
+        int(round(right * width)),
+        int(round(bottom * height)),
+    )
+    return ImageStat.Stat(image.crop(box)).mean[0]
+
+
+async def _set_highlight_mask(client, *, enable: bool | None = True) -> dict:
+    params = {
+        "module": "exposure",
+        "instance": 0,
+        "values": {},
+        "blend": {
+            "colorspace": "DEVELOP_BLEND_CS_RGB_SCENE",
+            "mask_mode": "parametric",
+            "combine": "exclusive",
+            "parametric": {
+                "Jz_in": {"markers": HIGHLIGHT_MARKERS}
+            },
+        },
+    }
+    if enable is not None:
+        params["enable"] = enable
+    return await client.call("set_module_params", params)
+
+
+async def _separator_edit(client) -> None:
+    params = await _module_params(client, "temperature")
+    await client.call(
+        "set_module_params",
+        {
+            "module": "temperature",
+            "instance": 0,
+            "values": {"red": params["values"]["red"] * 1.01},
+        },
+    )
+    await harness.wait_for_stable_revision(client)
+
+
+async def test_hello_advertises_parametric_and_mask_render(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        info = client._conn.server_info
+        assert info is not None
+        assert "parametric_mask_params" in info["capabilities"]
+        assert "mask_render" in info["capabilities"]
+
+
+async def test_schema_carries_parametric_contract(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        await client.call(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "instance": 0,
+                "values": {},
+                "blend": {"colorspace": "DEVELOP_BLEND_CS_RGB_SCENE"},
+            },
+        )
+        schema = await client.call(
+            "get_module_schema", {"module": "exposure", "instance": 0}
+        )
+        blend = schema["blend"]
+        assert blend["mask_mode"]["values"] == ["off", "uniform", "parametric"]
+        assert blend["mask_mode"]["writable"] is True
+        assert blend["combine"]["values"] == [
+            "exclusive",
+            "inclusive",
+            "exclusive_inverted",
+            "inclusive_inverted",
+        ]
+        assert "Jz_in" in blend["parametric"]["channels"]
+        assert blend["parametric"]["channels"]["Jz_in"]["display_hint"]["unit"] == "%"
+        assert blend["allow_inverted_combine"]["write_only"] is True
+
+
+async def test_disabled_target_mask_is_dark_low_bright_high(darktable_session):
+    """The export temporarily enables a disabled target in its throwaway pipe."""
+    async with harness.connected_client(darktable_session) as client:
+        result = await _set_highlight_mask(client, enable=False)
+        assert result["enabled"] is False
+        response, mask = await _render_mask(client)
+        assert response["mask_of"] == {
+            "op": "exposure", "instance": 0, "mask_mode": "parametric"
+        }
+        assert mask.size[0] == MASK_MAX_PX
+        dark = _mean_in_normalized_roi(mask, DARK_BACKGROUND_ROI)
+        bright = _mean_in_normalized_roi(mask, BRIGHT_SUBJECT_ROI)
+        assert bright > 100.0
+        assert bright / max(dark, 1.0) > 3.0
+        await client.call(
+            "set_module_enabled",
+            {"module": "exposure", "instance": 0, "enabled": True},
+        )
+
+
+async def test_combine_flip_changes_mask(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        await _set_highlight_mask(client)
+        _, exclusive = await _render_mask(client)
+        await client.call(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "instance": 0,
+                "values": {},
+                "blend": {"combine": "inclusive"},
+            },
+        )
+        _, inclusive = await _render_mask(client)
+        assert ImageStat.Stat(ImageChops.difference(exclusive, inclusive)).mean[0] > 50.0
+
+
+async def test_mask_mode_off_renders_full_white(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        await client.call(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "instance": 0,
+                "values": {},
+                "blend": {"mask_mode": "off"},
+            },
+        )
+        response, mask = await _render_mask(client)
+        assert response["mask_of"]["mask_mode"] == "off"
+        minimum, maximum = mask.getextrema()
+        assert minimum > 250
+        assert maximum <= 255
+
+
+async def test_parametric_null_disables_channel(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        await _set_highlight_mask(client)
+        before = await _module_params(client, "exposure")
+        assert "Jz_in" in before["blend"]["parametric"]
+        await client.call(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "instance": 0,
+                "values": {},
+                "blend": {"parametric": {"Jz_in": None}},
+            },
+        )
+        after = await _module_params(client, "exposure")
+        assert "Jz_in" not in after["blend"]["parametric"]
+        _, mask = await _render_mask(client)
+        assert mask.getextrema()[0] > 250
+
+
+async def test_show_mask_rejects_non_blending_module(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        with pytest.raises(ProtocolError) as excinfo:
+            await client.call(
+                "render_preview",
+                {
+                    "max_px": MASK_MAX_PX,
+                    "quality": MASK_QUALITY,
+                    "show_mask": {"op": "rawprepare", "instance": 0},
+                },
+            )
+        assert excinfo.value.code == "unsupported_field"
+        assert excinfo.value.details == {"parameter": "show_mask.op"}
+
+
+async def test_parametric_write_is_one_history_item_and_undoable(darktable_session):
+    async with harness.connected_client(darktable_session) as client:
+        await client.call(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "instance": 0,
+                "values": {},
+                "blend": {"mask_mode": "uniform"},
+            },
+        )
+        await _separator_edit(client)
+        before = await client.call("get_history", {"limit": 100})
+        result = await _set_highlight_mask(client)
+        await harness.wait_for_stable_revision(client)
+        after = await client.call("get_history", {"limit": 100})
+        assert len(after["items"]) == len(before["items"]) + 1
+
+        await client.call("undo", {"expected_revision": result["revision"]})
+        restored = await _module_params(client, "exposure")
+        assert restored["blend"]["mask_mode"] == "uniform"
+```
+
+- [ ] **Step 2: Run to verify failure before adding the dependency**
+
+Run:
 `DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp/tests/integration/test_parametric_masks_tier2.py`
 
-- [ ] **Step 1: Write the gates**
+Expected: collection fails with `ModuleNotFoundError: No module named 'PIL'`
+in the completed Tier-1 environment.
 
-Model on `test_blend_tier1.py`: `from . import harness`, `pytestmark = pytest.mark.integration`, raw wire calls via `client.call(...)`, the shared `_render()` helper, history bookkeeping. Add a `_render_mask(op, instance)` helper that calls `render_preview` with `show_mask` and decodes the JPEG to a grayscale numpy array (reuse harness JPEG-decode if present; otherwise `PIL.Image.open(io.BytesIO(base64.b64decode(...))).convert("L")`). Gates (each its own test):
+- [ ] **Step 3: Declare and install the test dependency**
 
-1. `test_hello_advertises_parametric_and_mask_render` — `client.capabilities` (or raw `hello`) contains both `"parametric_mask_params"` and `"mask_render"`.
-2. `test_schema_carries_parametric_section` — `get_module_schema {"module":"exposure","instance":0}` `blend.parametric.channels` contains `"Jz_in"` (RGB-scene) or the effective family's slots; `mask_mode.values` includes `"parametric"`; `combine.values` has the four strings.
-3. `test_parametric_luminance_mask_render_is_dark_low_bright_high` — enable exposure; set `{"blend": {"mask_mode": "parametric", "parametric": {"Jz_in": {"markers": [0.5, 0.6, 1.0, 1.0]}}}}`; render the mask via `show_mask`. On a fixture image with a clear bright region and a clear dark region (pick the harness's high-contrast fixture), assert the mask's mean brightness over the bright region is **substantially greater** than over the dark region — assert the RATIO `mean_bright / (mean_dark + eps) > 3.0` (H6: ratios, pinned preview size, not absolutes). This is the direct-image gate replacing preview-diff inference.
-4. `test_combine_flip_changes_mask` — with the same parametric mask, render the mask; then set `{"blend": {"combine": "inclusive"}}`; render again; assert the two mask arrays differ (mean absolute difference above a small threshold). (Inclusive XORs effective polarity.)
-5. `test_mask_mode_off_renders_full_white` — set `{"blend": {"mask_mode": "off"}}`; `show_mask` render; assert the array is uniformly near-255 (min > 250) and the response `mask_of.mask_mode == "off"`.
-6. `test_parametric_null_disables_channel` — set a Jz_in condition, confirm the slot appears in `get_module_params` `blend.parametric`; patch `{"blend": {"parametric": {"Jz_in": null}}}`; confirm it disappears and the mask render returns to uniform white (min > 250).
-7. `test_show_mask_on_non_blending_module_errors` — `render_preview` with `show_mask` for a module without blending (e.g. `rawprepare`/`demosaic`) → `ProtocolError` with `unsupported_field`.
-8. `test_parametric_write_is_one_history_item_and_undoable` — capture revision + history length; parametric write; assert history grew by 1; `undo` with the new revision; assert `get_module_params` `blend.mask_mode` returned to the pre-write value.
+Add to `[project.optional-dependencies].dev` in `tools/mcp/pyproject.toml`:
 
-Use the neighboring files' tolerance/retry discipline (`harness.wait_for_stable_revision`, two-attempt `_render`), and a pinned `max_px` (e.g. 512) for all mask renders so ratios are stable.
+```toml
+  "Pillow>=10.0,<13",
+```
 
-- [ ] **Step 2: Run the new gates**
+Run: `cd tools/mcp && .venv/bin/pip install -e '.[dev]'`
+Expected: installation succeeds and `.venv/bin/python -c 'from PIL import Image'`
+exits zero.
 
-Run: `DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp/tests/integration/test_parametric_masks_tier2.py`
-Expected: all PASS.
+- [ ] **Step 4: Run the new gate and the complete integration suite**
 
-- [ ] **Step 3: Run the full integration suite**
-
-Run: `DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp`
-Expected: previous gates + new gates pass, 1 known OpenCL skip.
-
-- [ ] **Step 4: Commit**
+Run:
 
 ```bash
-git add tools/mcp/tests/integration/test_parametric_masks_tier2.py
-git commit -m "test: Tier-2 parametric + mask-render integration gates (H6 ratios)"
+DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp/tests/integration/test_parametric_masks_tier2.py
+DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp
+```
+
+Expected: the new file's eight tests and all prior integration tests pass;
+environmental skips remain skips rather than being assigned a fixed count.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/mcp/pyproject.toml \
+        tools/mcp/tests/integration/test_blend_tier1.py \
+        tools/mcp/tests/integration/test_parametric_masks_tier2.py
+git commit -m "test: add deterministic Tier-2 mask-render integration gates"
 ```
 (plus trailers)
 
@@ -1862,29 +3297,33 @@ git commit -m "test: Tier-2 parametric + mask-render integration gates (H6 ratio
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-05-darktable-mcp-protocol-reference.md`
 - Modify: `docs/superpowers/specs/2026-07-19-darktable-mcp-parametric-masks-design.md`
-- Modify or Create: `docs/superpowers/specs/2026-07-19-darktable-upstream-divergence-manifest.md` (created by M-A Task 9; if absent at read time, create it with the M-A preamble + M-A rows first, then append the Tier-2 rows)
+- Modify: `docs/superpowers/specs/2026-07-19-darktable-upstream-divergence-manifest.md`
 - Modify: `docs/superpowers/specs/2026-07-16-darktable-mcp-supported-operations.md`
+- Modify: `docs/superpowers/plans/2026-07-19-darktable-mcp-drawn-masks-tier3.md` (ownership wording only)
 - Modify: `tools/mcp/README.md`
 - Modify: `.superpowers/sdd/progress.md` (ledger)
 
-- [ ] **Step 1: Protocol reference** — add a "Parametric masks (`parametric_mask_params`)" subsection under the Tier-1 blend section: the derived-enable rule; the polarity XOR rule with the `blendop.cl:204` citation and the `effective_inverted = inverted XOR inclusive` formula; open-end marker semantics; the boost/marker independence note with the GUI-rescale formula for clients; foreign-slot policy; the `combine` mapping; and the Task-4 error table verbatim. Add a "Mask render (`mask_render`)" subsection: `render_preview`'s `show_mask {op, instance}`, grayscale white=full-effect output, the `mask_of` metadata, off/uniform → white, and the `unsupported_field` on non-blending modules.
+- [ ] **Step 1: Protocol reference** — add a "Parametric masks (`parametric_mask_params`)" subsection under the Tier-1 blend section: the state-aware `mask_mode` vocabulary and full transition matrix; the projected-family/legacy-conditional removal rule; RAW/NONE's lack of parametric channel semantics (without claiming the RAW mask kernel is absent); derived-enable rule; polarity XOR rule with the `blendop.cl:204` citation and `effective_inverted = inverted XOR inclusive`; open ends; boost/marker independence; foreign-slot policy; defensive `null` serialization for non-finite legacy marker/boost storage; `combine` mapping; strict nested-member validation; the conflict override; and the Task-4 error table. Add "Mask render (`mask_render`)": strict `show_mask {op, instance}`, disabled-target inspection in a throwaway pipe, white=full effect, `mask_of`, off/uniform → white, and the non-blending error. Document that the MCP tool returns mask metadata as a text block immediately before the image block.
 
-- [ ] **Step 2: Design-doc amendments** — in the parametric-masks design: (a) status → "implemented (see plan 2026-07-19-darktable-mcp-parametric-masks-tier2.md)"; (b) an "Amendments (implementation)" subsection recording this plan's five Design amendments, especially amendment 1 (export pipe cannot honor `request_mask_display`; resolved via the guarded per-pipe opt-in) with the `blend.c:555` citation.
+- [ ] **Step 2: Design-doc amendments** — set status to "implemented (see plan 2026-07-19-darktable-mcp-parametric-masks-tier2.md)" and reconcile the body, not only an appendix: replace the stale "compound read-only" language with legal `drawn ↔ drawn+parametric`; correct "no RAW blendif kernel" to the actual source contract (RAW CPU/OpenCL mask paths exist but ignore parametric channels, and the GUI marks RAW blendif unsupported); replace live-flag save/restore with the throwaway export-pipe design; state that disabled targets are enabled only in that pipe; correct the sky example to omit/false `inverted` with `combine:"exclusive"`; replace indirect preview-delta testing with direct Pillow mask assertions; and record all seven Design amendments from this plan.
 
-- [ ] **Step 3: Divergence manifest** — append these rows (create the file with the M-A preamble + M-A rows first if it does not yet exist):
+- [ ] **Step 3: Divergence manifest** — update the two existing M-A rows
+for `blend.h`/`blend.c` and `remote_blend.c` to the final contents below,
+then append the two genuinely new rows. Preserve the preamble and every
+other current row; do not create duplicate rows for the same upstream file.
 
 | upstream file | divergence | guard |
 |---|---|---|
-| `src/develop/blend.c` | `valid_request` gate relaxed to honor `pipe->mask_display_request` on any pipe (remote mask render) | unit `test_pipe_has_mask_display_request_field` + integration mask-image gate |
-| `src/develop/pixelpipe.h` / `pixelpipe_hb.c` | new `dt_dev_pixelpipe_t.mask_display_request` field (init/reset FALSE) | same |
-| `src/imageio/imageio_common.h` / `imageio.c` | optional `dt_imageio_mask_display_t *` trailing arg on `dt_imageio_export_with_flags` (sets the target module's `request_mask_display` + pipe opt-in) | mask-render integration gates |
-| `src/control/remote_blend.c` | engine blendif channel tables mirror the GUI `Lab_channels[]`/`rgb_channels[]`/`rgbj_channels[]` | GUI-parity test `test_channels_parity_*` |
+| `src/develop/blend.h` / `blend.c` | existing shared blend-mode section table; plus shared mask-display predicate used by both CPU and OpenCL gates, where export-pipe opt-in joins the unchanged focus/full-pipe condition | existing frozen mode-list parity + `test_mask_display_request_gate_truth_table` + direct mask integration gate |
+| `src/develop/pixelpipe_hb.h` / `pixelpipe_hb.c` | new `dt_dev_pixelpipe_t.mask_display_request`, initialized FALSE once and intentionally preserved across process/OpenCL restart | `test_mask_display_request_gate_truth_table` + direct mask integration gate |
+| `src/imageio/imageio_common.h` / `imageio.c` | additive `dt_imageio_export_with_flags_and_mask`; existing export signature/callers unchanged; target piece enabled only in throwaway export state | disabled-target direct mask integration gate |
+| `src/control/remote_blend.c` | existing hand-written table over `dt_develop_blend_params_t`; plus engine blendif channel tables mirroring GUI `Lab_channels[]`/`rgb_channels[]`/`rgbj_channels[]` | existing `DEVELOP_BLEND_VERSION`/`offsetof` guards + GUI-parity test `test_channels_parity_*` |
 
 Add a "rehearsed procedure: upstream changes a blendif channel/boost offset" paragraph: update the engine channel table row, rerun `test_channels_parity_*`; the parity test turns silent drift into a build/test failure.
 
-- [ ] **Step 4: Supported operations** — extend the M-A blend sentence: "Parametric (blendif) masks and read-only mask rendering are supported via `parametric_mask_params` and `mask_render`; drawn masks remain out of scope (M-C)."
+- [ ] **Step 4: Supported operations and downstream ownership** — extend the M-A blend sentence: "Parametric (blendif) masks and read-only mask rendering are supported via `parametric_mask_params` and `mask_render`; creating/attaching drawn geometry remains out of scope (M-C)." In the Tier-3 plan's Global Constraints, change "`drawn ↔ drawn+parametric` transitions are handled by M-A" to "handled by M-B"; change no other Tier-3 task.
 
-- [ ] **Step 5: README** — add a "Parametric masks" subsection with the sky-selection worked example and the two sharp-edge warnings, and a "Seeing the mask" note pointing at `render_preview(show_mask=...)`.
+- [ ] **Step 5: README** — add a "Parametric masks" subsection with the corrected deterministic highlight/sky example (explicit `DEVELOP_BLEND_CS_RGB_SCENE`, `combine:"exclusive"`, no inversion), the boost and combine warnings, `drawn ↔ drawn+parametric` ownership, and a "Seeing the mask" example explaining the metadata text block followed by the JPEG block.
 
 - [ ] **Step 6: Full verification stack**
 
@@ -1895,11 +3334,23 @@ ctest --test-dir build
 cd tools/mcp && .venv/bin/pytest -q && cd ../..
 DARKTABLE_BIN=$PWD/build/bin/darktable tools/mcp/.venv/bin/pytest -q -m integration tools/mcp
 ```
-Expected: all green.
+Expected: each command exits zero with no failures. Integration tests may
+retain an explicitly reported skip only for an unrelated gate already
+encoded by the harness (for example, the shutdown-only private
+D-Bus/`gdbus` gate); do not encode a fixed suite-wide skip count. The eight
+tests in `test_parametric_masks_tier2.py` must have actually run and passed
+with zero skips before recording Tier 2 complete. A missing GUI build or
+display that skips that file is a completion blocker, not verification.
 
 - [ ] **Step 7: Ledger + commit**
 
-Append one line to `.superpowers/sdd/progress.md` (task list, final commit, "full stack verified"). Then:
+Append this exact line to `.superpowers/sdd/progress.md`:
+
+```text
+Mask Tier 2 / M-B: complete (Tasks 1-9; full C, Python unit, and integration stacks verified)
+```
+
+Then:
 ```bash
 git add docs/ tools/mcp/README.md .superpowers/sdd/progress.md
 git commit -m "docs: parametric masks + mask render (Tier 2 / M-B) -- reference, manifest, amendments"
@@ -1910,9 +3361,12 @@ git commit -m "docs: parametric masks + mask render (Tier 2 / M-B) -- reference,
 
 ## Self-review notes (performed while writing)
 
-- **Spec coverage:** `parametric`+`combine` wire members → Tasks 2–4/6; capability `parametric_mask_params` → Tasks 6–7; channel vocabulary per family + derived enable + inverted stored bit + boost exp2 + null reset + foreign preservation → Tasks 1/3/4; `mask_mode` `parametric` transitions → Tasks 1/4; `mask_render` capability + `render_preview.show_mask` + off→white + grayscale + `mask_of` → Tasks 5–8; GUI-parity binding → Task 1; H4 inverted+combine guard + worked examples → Tasks 4/7; H6 ratio gates on the mask image → Task 8; docs/manifest/amendments → Task 9. Design decisions 1–7 land (1 derived-enable Task 1/3/4; 2 stored polarity Task 3; 3 no marker rescale Task 4; 4 whole-slot replace + null Task 4; 5 enabled-only + foreign boolean Task 3; 6 parity-by-test Task 1; 7 zero commit surface — Tasks 1–4 write only the scratch copy).
-- **Contradiction found and resolved (flagged in Design amendment 1):** the export path structurally cannot honor `request_mask_display` (`blend.c:555` gate on `full.pipe` + focus). Resolved with a guarded per-pipe opt-in rather than silently assuming the design's export-honors-flag premise.
+- **Spec coverage:** Tasks 1–4 cover every supported-family slot, derived enable, stored polarity, boost defaults/range edges, strict marker validation, null reset, foreign preservation, defensive non-finite reads, all authoritative `mask_mode` cells, and the combine conflict override. Tasks 5–8 cover persistent restart-safe mask request state, shared CPU/OpenCL gating, disabled targets, strict `show_mask`, raw-wire and MCP-visible `mask_of`, off/uniform white, direct pixel ratios, history, and undo. Task 9 covers reference/design/downstream-plan synchronization and the divergence manifest.
+- **Mask-render lifecycle:** `mask_display_request` is initialized once, deliberately survives the process restart label, and is consumed by both CPU and OpenCL through one tested predicate. The additive export function leaves all existing export callers untouched and refuses a missing target.
+- **Transition ownership:** the pure matrix test covers all 25 non-raster cells plus raster and unknown-target failures. Schema vocabulary is drawn-state-aware and stays writable for `CONDITIONAL` toggles while `MASK` is present in supported families, or when removing a legacy unsupported `CONDITIONAL` state.
 - **Non-contradiction clarified (amendment 2):** the design's two "offsets" (Lab a/b marker `0.5` vs boost storage `−6.64385619`) are distinct; both are in the GUI tables verbatim (`boost_factor_offset` and the a/b branch of `_blendop_blendif_boost_factor_callback`).
-- **Verified TRUE:** the GUI channel tables `Lab_channels[]`/`rgb_channels[]`/`rgbj_channels[]` are non-`static` `const` and directly linkable (blend_gui.c:2340+); the parity test externs them.
-- **Type consistency:** `dt_remote_blendif_channel_t` fields, `dt_remote_blendif_slot_pack/enabled/inverted`, `dt_remote_blendif_markers_enable`, `_combine_from_string/_to_string` names are identical across Tasks 1–4; `dt_remote_preview_request_t`/`dt_remote_preview_t` mask fields and the `dt_remote_render_preview_prepare(out, op, instance, error)` signature match across Tasks 5–6.
-- Implementers adapting stub-table/test-helper names in Tasks 6–7 must match the existing local idioms in those files (`_assert_dispatch_matches`, `fake_server_factory`, the capability-advertising mechanism) — the plan names them but the neighboring tests are the authority.
+- **Current-tree binding:** the plan uses `pixelpipe_hb.h`, preserves the public `dt_imageio_export_with_flags` signature, uses the existing fake server's `hello_override`, expects FastMCP `ToolError`, and declares Pillow explicitly. No task depends on an API absent from the completed Tier-1 tree.
+- **RAW source audit:** RAW has real CPU/OpenCL mask paths, but both omit parametric-channel evaluation and the GUI explicitly rejects RAW blendif. The plan now states that precise reason instead of the false shorthand "no RAW kernel."
+- **Intermediate buildability:** Task 1 keeps the public M-A parser projected to `off`/`uniform` until Task 4 changes parser and patch semantics together. Task 5 keeps the old preview-prepare signature until Task 6 updates `remote_edit`, the protocol calls table, handler, and stubs together.
+- **Cumulative-suite hygiene:** superseded Tier-1 parser/schema/transition assertions, the obsolete `mask_configuration_present` fixture, and the Tier-1 integration schema expectation are explicitly replaced rather than left as downstream surprises.
+- **Type consistency:** `dt_remote_blend_mask_mode_transition`, channel helper names, preview mask fields, the expanded prepare signature, the mask-aware export signature, and `mask_of` names match across every producer and consumer.
