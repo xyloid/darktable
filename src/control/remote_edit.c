@@ -2013,6 +2013,16 @@ gboolean dt_remote_render_preview_prepare(dt_remote_preview_request_t *out,
   dt_develop_t *dev = NULL;
   if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
 
+  // Ordinary-preview caller: no mask target. Task 6 replaces this
+  // initialization with actual target capture while updating the protocol
+  // function pointer and stubs in the same commit, so no intermediate
+  // signature mismatch is introduced here.
+  out->want_mask = FALSE;
+  out->force_white = FALSE;
+  out->mask_op[0] = '\0';
+  out->mask_instance = 0;
+  out->mask_mode_stored = 0;
+
   // Binding caveat (internals §8): the export path re-loads history from
   // the database (dt_imageio_export_with_flags builds its own
   // dt_develop_t), so any not-yet-written live history must be flushed
@@ -2132,14 +2142,21 @@ gboolean dt_remote_render_preview_execute(const dt_remote_preview_request_t *req
   // cap, not a target), thumbnail_export FALSE, sRGB output profile
   // (portable interchange -- the display profile would be wrong
   // off-machine), history_end -1 (the full current history).
-  const gboolean export_failed = dt_imageio_export_with_flags(
+  // For a mask request, name the target so the throwaway export pipe renders
+  // that module's display mask instead of the ordinary image (design
+  // amendment 1). NULL target reproduces the ordinary-preview export exactly.
+  const dt_imageio_mask_display_t mask_target = {
+    .op = req->mask_op, .instance = req->mask_instance
+  };
+  const gboolean export_failed = dt_imageio_export_with_flags_and_mask(
     (dt_imgid_t)req->imgid, "remote-preview", &format, &sink.head,
     TRUE /*ignore_exif*/, FALSE /*display_byteorder*/, FALSE /*high_quality*/,
     FALSE /*upscale*/, FALSE /*is_scaling*/, 1.0 /*scale_factor*/,
     FALSE /*thumbnail_export*/, NULL /*filter*/, FALSE /*copy_metadata*/,
     FALSE /*export_masks*/, DT_COLORSPACE_SRGB, NULL /*icc_filename*/,
     DT_INTENT_LAST, NULL /*storage*/, NULL /*storage_params*/, 1, 1,
-    NULL /*metadata*/, -1 /*history_end*/);
+    NULL /*metadata*/, -1 /*history_end*/,
+    req->want_mask ? &mask_target : NULL);
 
   if(export_failed || !sink.buf)
   {
@@ -2156,6 +2173,14 @@ gboolean dt_remote_render_preview_execute(const dt_remote_preview_request_t *req
       *error = dt_remote_error_new(DT_REMOTE_ERR_PREVIEW_FAILED, _("preview render was cancelled"));
     return FALSE;
   }
+
+  // Off/uniform targets carry no spatial mask, so the blend path emits no
+  // display mask and the export returned the ordinary image. Render it
+  // normally for correct framing, then whiten before encoding (design
+  // amendment 4); mask_mode_stored still reports the true stored mode.
+  if(req->want_mask && req->force_white)
+    memset(sink.buf, 0xff,
+           sizeof(uint32_t) * (size_t)sink.width * (size_t)sink.height);
 
   // dt_imageio_jpeg_compress()'s contract: caller allocates out >= 4*w*h;
   // it returns the encoded byte length, or 1 from its setjmp error path.
@@ -2178,6 +2203,13 @@ gboolean dt_remote_render_preview_execute(const dt_remote_preview_request_t *req
   preview->width = sink.width;
   preview->height = sink.height;
   preview->revision = req->revision;
+  preview->is_mask = req->want_mask;
+  if(req->want_mask)
+  {
+    g_strlcpy(preview->mask_op, req->mask_op, sizeof(preview->mask_op));
+    preview->mask_instance = req->mask_instance;
+    preview->mask_mode_stored = req->mask_mode_stored;
+  }
 
   *out = preview;
   return TRUE;

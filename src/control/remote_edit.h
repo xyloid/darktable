@@ -30,6 +30,7 @@
 #pragma once
 
 #include "common/introspection.h"
+#include "control/settings.h"  // dt_dev_operation_t (mask render target)
 
 #include <gio/gio.h>   // GCancellable (dt_remote_render_preview_execute)
 #include <glib.h>
@@ -567,10 +568,25 @@ gboolean dt_remote_undo(uint64_t expected_revision,
 // the darkroom image id and the revision stamped at the exact instant the
 // live history was flushed to the database (the export path re-loads
 // history from there -- internals §8's binding caveat).
+//
+// Mask render (Tier 2 / M-B): an ordinary preview request leaves
+// `want_mask == FALSE` and every mask_* field zeroed. A mask request sets
+// `want_mask` and names the target module instance (`mask_op`/
+// `mask_instance`) whose display mask the export should render, carries the
+// target's true stored mask_mode (`mask_mode_stored`) for provenance
+// reporting, and sets `force_white` for off/uniform targets that have no
+// spatial mask (rendered normally for framing, then whitened -- design
+// amendment 4). The target capture itself lands with Task 6; this task only
+// carries the fields and honors them in execute.
 typedef struct dt_remote_preview_request_t
 {
   int32_t imgid;
   uint64_t revision;
+  gboolean want_mask;
+  gboolean force_white;
+  dt_dev_operation_t mask_op;
+  int mask_instance;
+  uint32_t mask_mode_stored;
 } dt_remote_preview_request_t;
 
 typedef struct dt_remote_preview_t   // <- render_preview (pre-base64)
@@ -579,6 +595,10 @@ typedef struct dt_remote_preview_t   // <- render_preview (pre-base64)
   size_t jpeg_len;
   int width, height;    // pixel dimensions of the encoded preview
   uint64_t revision;    // the revision actually rendered (from the request)
+  gboolean is_mask;     // TRUE when this is a mask render (want_mask echoed)
+  dt_dev_operation_t mask_op;   // target op; "" for ordinary previews
+  int mask_instance;            // target multi_priority
+  uint32_t mask_mode_stored;    // target's true stored mask_mode
 } dt_remote_preview_t;
 
 /** frees a preview result, including its JPEG buffer. NULL-safe. */

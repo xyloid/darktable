@@ -1042,6 +1042,9 @@ static double _get_pipescale(dt_dev_pixelpipe_t *pipe,
 
 // internal function: to avoid exif blob reading + 8-bit byteorder
 // flag + high-quality override
+// Pre-Tier-2 entry point: identical behavior, no mask target. Kept so all
+// existing callers remain source-compatible; delegates to the mask-aware
+// superset below with a NULL target.
 gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
                                       const char *filename,
                                       dt_imageio_module_format_t *format,
@@ -1065,6 +1068,39 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
                                       const int total,
                                       dt_export_metadata_t *metadata,
                                       const int history_end)
+{
+  return dt_imageio_export_with_flags_and_mask(
+    imgid, filename, format, format_params, ignore_exif,
+    display_byteorder, high_quality, upscale, is_scaling, scale_factor,
+    thumbnail_export, filter, copy_metadata, export_masks, icc_type,
+    icc_filename, icc_intent, storage, storage_params, num, total,
+    metadata, history_end, NULL);
+}
+
+gboolean dt_imageio_export_with_flags_and_mask(const dt_imgid_t imgid,
+                                      const char *filename,
+                                      dt_imageio_module_format_t *format,
+                                      dt_imageio_module_data_t *format_params,
+                                      const gboolean ignore_exif,
+                                      const gboolean display_byteorder,
+                                      const gboolean high_quality,
+                                      const gboolean upscale,
+                                      const gboolean is_scaling,
+                                      const double scale_factor,
+                                      const gboolean thumbnail_export,
+                                      const char *filter,
+                                      const gboolean copy_metadata,
+                                      const gboolean export_masks,
+                                      const dt_colorspaces_color_profile_type_t icc_type,
+                                      const gchar *icc_filename,
+                                      const dt_iop_color_intent_t icc_intent,
+                                      dt_imageio_module_storage_t *storage,
+                                      dt_imageio_module_data_t *storage_params,
+                                      int num,
+                                      const int total,
+                                      dt_export_metadata_t *metadata,
+                                      const int history_end,
+                                      const dt_imageio_mask_display_t *mask_target)
 {
   dt_develop_t dev;
   dt_dev_init(&dev, FALSE);
@@ -1215,6 +1251,36 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid,
                              buf.width, buf.height, buf.iscale);
   dt_dev_pixelpipe_create_nodes(&pipe, &dev);
   dt_dev_pixelpipe_synch_all(&pipe, &dev);
+
+  if(mask_target)
+  {
+    gboolean found = FALSE;
+    for(GList *nodes = pipe.nodes; nodes; nodes = g_list_next(nodes))
+    {
+      dt_dev_pixelpipe_iop_t *piece = nodes->data;
+      dt_iop_module_t *module = piece->module;
+      if(!g_strcmp0(module->op, mask_target->op)
+         && module->multi_priority == mask_target->instance)
+      {
+        // The export dev/pipe is throwaway. Enabling here permits read-only
+        // mask inspection of a module disabled in live history without
+        // changing live state or adding history.
+        module->enabled = TRUE;
+        piece->enabled = TRUE;
+        module->request_mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+        pipe.mask_display_request = TRUE;
+        found = TRUE;
+        break;
+      }
+    }
+    if(!found)
+    {
+      dt_print(DT_DEBUG_ALWAYS,
+               "[dt_imageio_export_with_flags_and_mask] target %s instance %d not found",
+               mask_target->op, mask_target->instance);
+      goto error;
+    }
+  }
 
   if(darktable.unmuted & DT_DEBUG_IMAGEIO)
   {

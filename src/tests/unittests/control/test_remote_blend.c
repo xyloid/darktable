@@ -30,6 +30,7 @@
 #include "common/darktable.h"
 #include "develop/develop.h"
 #include "develop/blend.h"
+#include "develop/pixelpipe_hb.h"
 
 // The GUI blendif channel tables are non-static `const` (blend_gui.c) and
 // directly linkable; extern them for the GUI-parity binding below.
@@ -1441,6 +1442,24 @@ static void test_patch_mask_mode_parametric_transitions(void **state)
   blend_fixture_free(fx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Task 5: mask-render display-request gate predicate                  */
+/* ------------------------------------------------------------------ */
+
+static void test_mask_display_request_gate_truth_table(void **state)
+{
+  (void)state;
+  assert_false(dt_develop_blend_mask_display_request_is_valid(FALSE, FALSE, FALSE));
+  assert_false(dt_develop_blend_mask_display_request_is_valid(TRUE, FALSE, FALSE));
+  assert_false(dt_develop_blend_mask_display_request_is_valid(FALSE, TRUE, FALSE));
+  assert_true(dt_develop_blend_mask_display_request_is_valid(TRUE, TRUE, FALSE));
+  assert_true(dt_develop_blend_mask_display_request_is_valid(FALSE, FALSE, TRUE));
+
+  dt_dev_pixelpipe_t pipe = { 0 };
+  pipe.mask_display_request = TRUE; // compile guard for the real struct field
+  assert_true(pipe.mask_display_request);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1492,6 +1511,7 @@ int main(void)
     cmocka_unit_test(test_patch_parametric_requires_parametric_mask_mode),
     cmocka_unit_test(test_patch_inverted_combine_conflict_and_override),
     cmocka_unit_test(test_patch_mask_mode_parametric_transitions),
+    cmocka_unit_test(test_mask_display_request_gate_truth_table),
   };
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }

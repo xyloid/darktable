@@ -387,6 +387,15 @@ void dt_develop_blend_process(dt_iop_module_t *self,
                               const dt_iop_roi_t *const roi_in,
                               const dt_iop_roi_t *const roi_out);
 
+/** Whether a module's request_mask_display should be honored on a pipe.
+ * The live darkroom path grants it only to the focused module on the full
+ * pipe; the remote mask render sets a per-pipe opt-in on its throwaway
+ * export pipe instead (that pipe can never satisfy the focus/full-pipe
+ * gate). Both CPU and OpenCL blend paths call this one predicate. */
+gboolean dt_develop_blend_mask_display_request_is_valid(gboolean has_focus,
+                                                        gboolean is_full_pipe,
+                                                        gboolean pipe_opt_in);
+
 /** get blend version */
 int dt_develop_blend_version(void);
 

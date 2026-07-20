@@ -553,7 +553,10 @@ void dt_develop_blend_process(dt_iop_module_t *self,
     return;
   }
 
-  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  const gboolean valid_request =
+    dt_develop_blend_mask_display_request_is_valid(
+      dt_iop_has_focus(self), piece->pipe == self->dev->full.pipe,
+      piece->pipe->mask_display_request);
 
   // does user want us to display a specific channel?
   const dt_dev_pixelpipe_display_mask_t request_mask_display =
@@ -954,7 +957,10 @@ gboolean dt_develop_blend_process_cl(dt_iop_module_t *self,
   // only non-zero if mask_display was set by an _earlier_ module
   const dt_dev_pixelpipe_display_mask_t mask_display = piece->pipe->mask_display;
 
-  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  const gboolean valid_request =
+    dt_develop_blend_mask_display_request_is_valid(
+      dt_iop_has_focus(self), piece->pipe == self->dev->full.pipe,
+      piece->pipe->mask_display_request);
 
   const gboolean raster = mask_mode & DEVELOP_MASK_RASTER;
   const gboolean mode_drawn = mask_mode & DEVELOP_MASK_MASK;
@@ -1501,6 +1507,13 @@ void dt_develop_blend_free_cl_global(dt_blendop_cl_global_t *b)
 int dt_develop_blend_version(void)
 {
   return DEVELOP_BLEND_VERSION;
+}
+
+gboolean dt_develop_blend_mask_display_request_is_valid(gboolean has_focus,
+                                                        gboolean is_full_pipe,
+                                                        gboolean pipe_opt_in)
+{
+  return (has_focus && is_full_pipe) || pipe_opt_in;
 }
 
 /** report back specific memory requirements for blend step (only relevant for OpenCL path).

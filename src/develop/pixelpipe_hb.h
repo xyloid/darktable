@@ -230,6 +230,11 @@ typedef struct dt_dev_pixelpipe_t
   gboolean tiling;
   // should this pixelpipe display a mask in the end?
   dt_dev_pixelpipe_display_mask_t mask_display;
+  /** Remote mask render: honor a module's request_mask_display on this
+   * throwaway export pipe without GUI focus/full-pipe ownership. This is
+   * request configuration, not per-run output state, so process restart
+   * must preserve it. */
+  gboolean mask_display_request;
   // should this pixelpipe completely suppressed the blendif module?
   gboolean bypass_blendif;
   // input data based on this timestamp:

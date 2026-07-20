@@ -127,6 +127,37 @@ gboolean dt_imageio_export_with_flags(const dt_imgid_t imgid, const char *filena
                                  dt_export_metadata_t *metadata,
                                  const int history_end);
 
+// Remote mask render (Tier 2 / M-B): addresses one module instance whose
+// display mask the throwaway export pipe should render instead of the
+// ordinary image. Borrowed strings, not owned.
+typedef struct dt_imageio_mask_display_t
+{
+  const char *op;
+  int instance;
+} dt_imageio_mask_display_t;
+
+// Mask-aware superset of dt_imageio_export_with_flags(): when `mask_target`
+// is non-NULL the throwaway export pipe temporarily enables that module
+// instance and requests its display mask (failing the export if the target
+// is absent). NULL reproduces dt_imageio_export_with_flags() exactly, which
+// is now a thin wrapper over this. All other parameters are identical.
+gboolean dt_imageio_export_with_flags_and_mask(
+  const dt_imgid_t imgid, const char *filename,
+  struct dt_imageio_module_format_t *format,
+  struct dt_imageio_module_data_t *format_params,
+  const gboolean ignore_exif, const gboolean display_byteorder,
+  const gboolean high_quality, const gboolean upscale,
+  const gboolean is_scaling, const double scale_factor,
+  const gboolean thumbnail_export, const char *filter,
+  const gboolean copy_metadata, const gboolean export_masks,
+  dt_colorspaces_color_profile_type_t icc_type, const gchar *icc_filename,
+  dt_iop_color_intent_t icc_intent,
+  dt_imageio_module_storage_t *storage,
+  dt_imageio_module_data_t *storage_params,
+  int num, const int total, dt_export_metadata_t *metadata,
+  const int history_end,
+  const dt_imageio_mask_display_t *mask_target);
+
 // general, efficient buffer flipping function using memcopies
 void dt_imageio_flip_buffers(char *out,
                              const char *in,
