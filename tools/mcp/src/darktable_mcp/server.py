@@ -263,6 +263,7 @@ def build_server(
         vectors: dict[str, Any] | None = None,
         bands: dict[str, Any] | None = None,
         quantities: dict[str, Any] | None = None,
+        blend: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Set parameter values on one module instance, recorded as one
         history step. `module` is the internal op name, `instance` its
@@ -328,6 +329,22 @@ def build_server(
         slightly from what was written (float narrowing, conversion
         round trip).
 
+        `blend` edits the module's blend settings (opacity, blend mode,
+        blending colorspace, mask refinement) and needs a darktable that
+        advertises the `blend_params` capability. Members: `mask_mode`
+        ("off"/"uniform" -- drawn/parametric/raster configurations are
+        read-only here), `colorspace` and `mode` (C enumerator names; see
+        `get_module_schema`'s `blend` section for this instance's choice
+        sets), `reverse` (bool), `fulcrum` (EV), `opacity` (0-100),
+        `feathering_radius` (0-250 px), `feathering_guide`,
+        `blur_radius` (0-100 px), `contrast`/`brightness`/`details`
+        (-1..1; `details` needs a raw image). WARNING: writing
+        `colorspace` deterministically resets `mode`, `reverse`,
+        `fulcrum`, and any parametric-mask thresholds to the new space's
+        defaults -- send replacement values in the same call if you want
+        them. The response's `blend` member reads back the complete
+        post-commit blend state.
+
         `curves`, `vectors`, `bands`, and `quantities` may be given
         together; a semantic ID given in more than one raises an error
         before anything is sent."""
@@ -390,6 +407,14 @@ def build_server(
                     "upgrade darktable to edit quantities"
                 )
             params["semantic_values"] = semantic_values
+        if blend is not None:
+            await client.ensure_connected()
+            if "blend_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise blend_params; "
+                    "upgrade darktable to edit blend settings"
+                )
+            params["blend"] = blend
         return await client.call("set_module_params", params)
 
     @app.tool()

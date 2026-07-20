@@ -1516,3 +1516,55 @@ async def test_no_discovery_record_surfaces_discovery_error(tmp_path):
         await app.call_tool("get_current_image", {})
 
     assert "no live darktable discovery record" in str(excinfo.value)
+
+
+async def test_set_module_params_blend_gated_on_blend_params_capability(
+    tmp_path, fake_server_factory
+):
+    """A darktable whose hello does not advertise `blend_params` (the
+    fake's default hello has `capabilities: []`) must be refused
+    client-side with an upgrade message, before any wire call."""
+    server = await fake_server_factory()
+    calls = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {
+                "module": "exposure",
+                "values": {},
+                "blend": {"mask_mode": "uniform", "opacity": 50.0},
+            },
+        )
+
+    message = str(excinfo.value)
+    assert "blend_params" in message
+    assert "upgrade darktable" in message
+    assert calls == []
+
+
+async def test_set_module_params_blend_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    """With the capability advertised, the `blend` dict is forwarded
+    verbatim as the wire `blend` member."""
+    server = await fake_server_factory()
+    hello_response = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {**hello_response, "id": req_id}
+    seen = []
+    server.handle(
+        "set_module_params",
+        lambda params: seen.append(params)
+        or {"module": "exposure", "instance": 0, "enabled": True, "values": {}, "revision": 3},
+    )
+
+    app = await _built_server(tmp_path, server)
+    await app.call_tool(
+        "set_module_params",
+        {"module": "exposure", "values": {}, "blend": {"opacity": 50.0}},
+    )
+
+    assert len(seen) == 1
+    assert seen[0]["blend"] == {"opacity": 50.0}
