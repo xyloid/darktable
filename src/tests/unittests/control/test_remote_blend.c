@@ -408,6 +408,251 @@ static void test_read_non_finite_serializes_null(void **state)
   blend_fixture_free(fx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Task 4: patch apply                                                 */
+/* ------------------------------------------------------------------ */
+
+static JsonObject *_patch_from_string(const char *json)
+{
+  JsonParser *parser = json_parser_new();
+  assert_true(json_parser_load_from_data(parser, json, -1, NULL));
+  JsonObject *o = json_node_dup_object(json_parser_get_root(parser));
+  g_object_unref(parser);
+  return o;
+}
+
+static void _assert_patch_fails(blend_fixture_t *fx, const char *patch_json,
+                                dt_remote_error_code_t code, const char *constraint)
+{
+  JsonObject *patch = _patch_from_string(patch_json);
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_false(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, code);
+  if(constraint)
+  {
+    assert_non_null(error->details_json);
+    assert_non_null(strstr(error->details_json, constraint));
+  }
+  dt_remote_error_free(error);
+  json_object_unref(patch);
+}
+
+static void test_patch_opacity_and_mask_mode(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  JsonObject *patch = _patch_from_string("{\"mask_mode\":\"uniform\",\"opacity\":50.0}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_null(error);
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED);
+  assert_float_equal(dst.opacity, 50.0f, 1e-6);
+  // untouched members stay untouched
+  assert_float_equal(dst.feathering_radius, fx->module->blend_params->feathering_radius, 1e-6);
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_unknown_member_and_empty(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  _assert_patch_fails(fx, "{\"blendif\":3}", DT_REMOTE_ERR_UNSUPPORTED_FIELD, NULL);
+  _assert_patch_fails(fx, "{}", DT_REMOTE_ERR_INVALID_VALUE, "empty");
+  blend_fixture_free(fx);
+}
+
+// Mechanical M-A projection of the transition appendix: stored state x
+// target in {"off","uniform"}. Rows off/uniform succeed (including the
+// no-op diagonal); every masked row refuses with
+// mask_configuration_present.
+static void test_patch_mask_mode_transition_table(void **state)
+{
+  (void)state;
+  const struct { uint32_t stored; gboolean writable; } rows[] = {
+    { DEVELOP_MASK_DISABLED, TRUE },
+    { DEVELOP_MASK_ENABLED, TRUE },
+    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL, FALSE },
+    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK, FALSE },
+    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL, FALSE },
+    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER, FALSE },
+  };
+  const struct { const char *target; uint32_t bits; } targets[] = {
+    { "off", DEVELOP_MASK_DISABLED }, { "uniform", DEVELOP_MASK_ENABLED },
+  };
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  for(guint r = 0; r < G_N_ELEMENTS(rows); r++)
+    for(guint t = 0; t < G_N_ELEMENTS(targets); t++)
+    {
+      fx->module->blend_params->mask_mode = rows[r].stored;
+      gchar *json = g_strdup_printf("{\"mask_mode\":\"%s\"}", targets[t].target);
+      if(rows[r].writable)
+      {
+        JsonObject *patch = _patch_from_string(json);
+        dt_develop_blend_params_t dst = *fx->module->blend_params;
+        dt_remote_error_t *error = NULL;
+        assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+        assert_int_equal(dst.mask_mode, targets[t].bits);
+        json_object_unref(patch);
+      }
+      else
+        _assert_patch_fails(fx, json, DT_REMOTE_ERR_INVALID_VALUE, "mask_configuration_present");
+      g_free(json);
+    }
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"drawn\"}", DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_colorspace_reset_then_overrides(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  // start from a non-default state so the reset is observable
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_DISPLAY;
+  fx->module->blend_params->blend_mode = DEVELOP_BLEND_HSV_VALUE | DEVELOP_BLEND_REVERSE;
+  fx->module->blend_params->blend_parameter = 2.5f;
+
+  // switch alone: mode/reverse/fulcrum reset to defaults for the new space
+  JsonObject *patch = _patch_from_string("{\"colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\"}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_cst, DEVELOP_BLEND_CS_RGB_SCENE);
+  assert_int_equal(dst.blend_mode, DEVELOP_BLEND_NORMAL2);
+  assert_float_equal(dst.blend_parameter, 0.0f, 1e-6);
+  json_object_unref(patch);
+
+  // switch + same-patch overrides: deterministic composition
+  patch = _patch_from_string(
+    "{\"colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\",\"mode\":\"DEVELOP_BLEND_MULTIPLY\",\"fulcrum\":1.5}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_mode, DEVELOP_BLEND_MULTIPLY);
+  assert_float_equal(dst.blend_parameter, 1.5f, 1e-6);
+  json_object_unref(patch);
+
+  // writing the ALREADY-stored colorspace must NOT reset anything
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  fx->module->blend_params->blend_mode = DEVELOP_BLEND_MULTIPLY;
+  patch = _patch_from_string("{\"colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_mode, DEVELOP_BLEND_MULTIPLY);
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_colorspace_rejections(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  // exposure is RGB-default: Lab is not in its choice set
+  _assert_patch_fails(fx, "{\"colorspace\":\"DEVELOP_BLEND_CS_LAB\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "colorspace_not_available");
+  _assert_patch_fails(fx, "{\"colorspace\":\"DEVELOP_BLEND_CS_NONE\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "colorspace_not_available");
+  _assert_patch_fails(fx, "{\"colorspace\":\"bogus\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_mode_validated_against_projected_colorspace(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  // HSV_VALUE exists only in RGB display -> rejected in scene space
+  _assert_patch_fails(fx, "{\"mode\":\"DEVELOP_BLEND_HSV_VALUE\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "mode_not_available_in_colorspace");
+  // deprecated modes are never writable
+  _assert_patch_fails(fx, "{\"mode\":\"DEVELOP_BLEND_LAB_L\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "mode_not_available_in_colorspace");
+  _assert_patch_fails(fx, "{\"mode\":\"nonsense\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
+  // projection: colorspace + mode in one patch validates mode against the NEW space
+  JsonObject *patch = _patch_from_string(
+    "{\"colorspace\":\"DEVELOP_BLEND_CS_RGB_DISPLAY\",\"mode\":\"DEVELOP_BLEND_HSV_VALUE\"}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_mode & DEVELOP_BLEND_MODE_MASK, DEVELOP_BLEND_HSV_VALUE);
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_reverse_flag(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  JsonObject *patch = _patch_from_string("{\"reverse\":true}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_true((dst.blend_mode & DEVELOP_BLEND_REVERSE) != 0);
+  assert_int_equal(dst.blend_mode & DEVELOP_BLEND_MODE_MASK,
+                   fx->module->blend_params->blend_mode & DEVELOP_BLEND_MODE_MASK);
+  json_object_unref(patch);
+  patch = _patch_from_string("{\"reverse\":false}");
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_true((dst.blend_mode & DEVELOP_BLEND_REVERSE) == 0);
+  json_object_unref(patch);
+  _assert_patch_fails(fx, "{\"reverse\":1}", DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_numeric_edges(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  // hard-range edges are inclusive
+  JsonObject *patch = _patch_from_string(
+    "{\"opacity\":0.0,\"fulcrum\":-18.0,\"feathering_radius\":250.0,\"blur_radius\":100.0,"
+    "\"contrast\":1.0,\"brightness\":-1.0}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_float_equal(dst.opacity, 0.0f, 1e-6);
+  assert_float_equal(dst.blend_parameter, -18.0f, 1e-6);
+  assert_float_equal(dst.feathering_radius, 250.0f, 1e-6);
+  json_object_unref(patch);
+  // soft range is NOT a write limit: fulcrum 10 (beyond soft 3) is legal
+  patch = _patch_from_string("{\"fulcrum\":10.0}");
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  json_object_unref(patch);
+  _assert_patch_fails(fx, "{\"opacity\":100.001}", DT_REMOTE_ERR_INVALID_VALUE, "range");
+  _assert_patch_fails(fx, "{\"opacity\":-0.001}", DT_REMOTE_ERR_INVALID_VALUE, "range");
+  _assert_patch_fails(fx, "{\"opacity\":\"high\"}", DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_feathering_guide(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  JsonObject *patch = _patch_from_string("{\"feathering_guide\":\"DEVELOP_MASK_GUIDE_OUT_AFTER_BLUR\"}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.feathering_guide, DEVELOP_MASK_GUIDE_OUT_AFTER_BLUR);
+  json_object_unref(patch);
+  _assert_patch_fails(fx, "{\"feathering_guide\":\"sideways\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_details_requires_raw_image(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  // fixture dev has no image -> details is never writable here
+  _assert_patch_fails(fx, "{\"details\":0.5}", DT_REMOTE_ERR_INVALID_VALUE, "requires_raw_image");
+  blend_fixture_free(fx);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -426,6 +671,16 @@ int main(void)
     cmocka_unit_test(test_read_defaults),
     cmocka_unit_test(test_read_reverse_and_deprecated_mode),
     cmocka_unit_test(test_read_non_finite_serializes_null),
+    cmocka_unit_test(test_patch_opacity_and_mask_mode),
+    cmocka_unit_test(test_patch_unknown_member_and_empty),
+    cmocka_unit_test(test_patch_mask_mode_transition_table),
+    cmocka_unit_test(test_patch_colorspace_reset_then_overrides),
+    cmocka_unit_test(test_patch_colorspace_rejections),
+    cmocka_unit_test(test_patch_mode_validated_against_projected_colorspace),
+    cmocka_unit_test(test_patch_reverse_flag),
+    cmocka_unit_test(test_patch_numeric_edges),
+    cmocka_unit_test(test_patch_feathering_guide),
+    cmocka_unit_test(test_patch_details_requires_raw_image),
   };
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }

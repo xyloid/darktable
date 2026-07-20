@@ -414,3 +414,229 @@ JsonNode *dt_remote_blend_read(dt_iop_module_t *module)
   g_object_unref(b);
   return root;
 }
+
+/* ------------------------------------------------------------------ */
+/* patch apply                                                         */
+/* ------------------------------------------------------------------ */
+
+static dt_remote_error_t *_blend_error(dt_remote_error_code_t code,
+                                       const char *member, const char *constraint,
+                                       const char *fmt, ...) G_GNUC_PRINTF(4, 5);
+static dt_remote_error_t *_blend_error(dt_remote_error_code_t code,
+                                       const char *member, const char *constraint,
+                                       const char *fmt, ...)
+{
+  dt_remote_error_t *error = g_malloc0(sizeof(dt_remote_error_t));
+  error->code = code;
+  va_list args;
+  va_start(args, fmt);
+  error->message = g_strdup_vprintf(fmt, args);
+  va_end(args);
+  if(member && constraint)
+    error->details_json =
+      g_strdup_printf("{\"parameter\":\"blend.%s\",\"constraint\":\"%s\"}", member, constraint);
+  else if(constraint)
+    error->details_json =
+      g_strdup_printf("{\"parameter\":\"blend\",\"constraint\":\"%s\"}", constraint);
+  else if(member)
+    error->details_json = g_strdup_printf("{\"parameter\":\"blend.%s\"}", member);
+  return error;
+}
+
+static gboolean _json_member_double(JsonObject *o, const char *name, double *out)
+{
+  JsonNode *node = json_object_get_member(o, name);
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)) return FALSE;
+  const GType t = json_node_get_value_type(node);
+  if(t == G_TYPE_DOUBLE) { *out = json_node_get_double(node); return TRUE; }
+  if(t == G_TYPE_INT64) { *out = (double)json_node_get_int(node); return TRUE; }
+  return FALSE;
+}
+
+static const char *_json_member_string(JsonObject *o, const char *name)
+{
+  JsonNode *node = json_object_get_member(o, name);
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)
+     || json_node_get_value_type(node) != G_TYPE_STRING)
+    return NULL;
+  return json_node_get_string(node);
+}
+
+gboolean dt_remote_blend_patch_apply(dt_iop_module_t *module,
+                                     JsonObject *patch,
+                                     dt_develop_blend_params_t *dst,
+                                     dt_remote_error_t **error)
+{
+  static const char *const allowed[] = {
+    "mask_mode", "colorspace", "mode", "reverse", "fulcrum", "opacity",
+    "feathering_radius", "feathering_guide", "blur_radius", "contrast",
+    "brightness", "details", NULL };
+
+  GList *members = json_object_get_members(patch);
+  if(!members)
+  {
+    if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, NULL, "empty",
+                                    _("'blend' must be non-empty"));
+    return FALSE;
+  }
+  for(GList *m = members; m; m = m->next)
+  {
+    gboolean known = FALSE;
+    for(const char *const *a = allowed; *a && !known; a++)
+      known = !strcmp(*a, m->data);
+    if(!known)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, (const char *)m->data, NULL,
+                                      _("unknown blend member 'blend.%s'"), (const char *)m->data);
+      g_list_free(members);
+      return FALSE;
+    }
+  }
+  g_list_free(members);
+
+  // 1. mask_mode -- gated by the transition appendix's M-A projection:
+  // writable only while the stored mode has no drawn/parametric/raster
+  // bits, and only to "off"/"uniform".
+  if(json_object_has_member(patch, "mask_mode"))
+  {
+    if(dst->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode",
+                                      "mask_configuration_present",
+                                      _("a drawn/parametric/raster mask configuration is present"));
+      return FALSE;
+    }
+    uint32_t target = 0;
+    if(!dt_remote_blend_mask_mode_from_string(_json_member_string(patch, "mask_mode"), &target))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode", "unknown_value",
+                                      _("mask_mode accepts \"off\" or \"uniform\""));
+      return FALSE;
+    }
+    dst->mask_mode = target;
+  }
+
+  // 2. colorspace -- deterministic reset semantics (design decision 3):
+  // a change resets mode/reverse/fulcrum/blendif to the new space's
+  // defaults; later members of the SAME patch then apply on top. The
+  // GUI's history-scavenging restore is deliberately not reproduced.
+  if(json_object_has_member(patch, "colorspace"))
+  {
+    dt_develop_blend_colorspace_t choices[3];
+    gboolean cs_writable = FALSE;
+    const guint n_choices = _colorspace_choices(module, choices, &cs_writable);
+    const char *cs_string = _json_member_string(patch, "colorspace");
+    uint32_t cs_value = 0;
+    if(!cs_string || !_enum_value_for_name(_colorspace_names, cs_string, &cs_value))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "colorspace", "unknown_value",
+                                      _("unknown blend colorspace"));
+      return FALSE;
+    }
+    gboolean in_choices = FALSE;
+    for(guint i = 0; cs_writable && i < n_choices && !in_choices; i++)
+      in_choices = (choices[i] == (dt_develop_blend_colorspace_t)cs_value);
+    if(!in_choices)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "colorspace",
+                                      "colorspace_not_available",
+                                      _("blend colorspace not available for this module"));
+      return FALSE;
+    }
+    if((int32_t)cs_value != dst->blend_cst)
+      dt_develop_blend_init_blendif_parameters(dst, (dt_develop_blend_colorspace_t)cs_value);
+  }
+
+  // 3. mode -- validated against the PROJECTED effective colorspace.
+  const dt_develop_blend_colorspace_t eff =
+    dt_remote_blend_effective_colorspace(module, dst->blend_cst);
+  if(json_object_has_member(patch, "mode"))
+  {
+    const char *mode_string = _json_member_string(patch, "mode");
+    uint32_t mode_value = 0;
+    if(!mode_string || !_enum_value_for_name(_mode_c_names, mode_string, &mode_value))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mode", "unknown_value",
+                                      _("unknown blend mode"));
+      return FALSE;
+    }
+    GPtrArray *names = dt_remote_blend_mode_names_for_colorspace(eff);
+    gboolean available = FALSE;
+    for(guint i = 0; i < names->len && !available; i++)
+      available = !strcmp(g_ptr_array_index(names, i), mode_string);
+    g_ptr_array_unref(names);
+    if(!available)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mode",
+                                      "mode_not_available_in_colorspace",
+                                      _("blend mode not available in the effective colorspace"));
+      return FALSE;
+    }
+    dst->blend_mode = (dst->blend_mode & DEVELOP_BLEND_REVERSE) | mode_value;
+  }
+
+  // 4. reverse
+  if(json_object_has_member(patch, "reverse"))
+  {
+    JsonNode *node = json_object_get_member(patch, "reverse");
+    if(!node || !JSON_NODE_HOLDS_VALUE(node)
+       || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "reverse", "wrong_type",
+                                      _("'reverse' must be a boolean"));
+      return FALSE;
+    }
+    if(json_node_get_boolean(node)) dst->blend_mode |= DEVELOP_BLEND_REVERSE;
+    else dst->blend_mode &= ~DEVELOP_BLEND_REVERSE;
+  }
+
+  // 5. feathering_guide
+  if(json_object_has_member(patch, "feathering_guide"))
+  {
+    uint32_t fg_value = 0;
+    const char *fg_string = _json_member_string(patch, "feathering_guide");
+    if(!fg_string || !_enum_value_for_name(_feathering_guide_names, fg_string, &fg_value))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "feathering_guide",
+                                      "unknown_value", _("unknown feathering guide"));
+      return FALSE;
+    }
+    dst->feathering_guide = fg_value;
+  }
+
+  // 6. numeric fields, table order
+  for(const _float_field_t *f = _float_fields; f->name; f++)
+  {
+    if(!json_object_has_member(patch, f->name)) continue;
+    if(!strcmp(f->name, "details") && !_details_writable(module))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "details",
+                                      "requires_raw_image",
+                                      _("the details threshold needs a raw image"));
+      return FALSE;
+    }
+    double value = 0.0;
+    if(!_json_member_double(patch, f->name, &value))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, f->name, "wrong_type",
+                                      _("'%s' must be a number"), f->name);
+      return FALSE;
+    }
+    if(!isfinite(value))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, f->name, "non_finite",
+                                      _("'%s' must be finite"), f->name);
+      return FALSE;
+    }
+    if(value < (double)f->min || value > (double)f->max)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, f->name, "range",
+                                      _("'%s' must be within [%g, %g]"), f->name,
+                                      (double)f->min, (double)f->max);
+      return FALSE;
+    }
+    *(float *)((guint8 *)dst + f->offset) = (float)value;
+  }
+
+  return TRUE;
+}
