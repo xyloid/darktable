@@ -198,13 +198,7 @@ static gboolean _mask_mode_target_from_string(const char *s, uint32_t *out)
 
 gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out)
 {
-  if(!out) return FALSE;
-  uint32_t target = 0;
-  if(!_mask_mode_target_from_string(s, &target)
-     || (target & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL)))
-    return FALSE;
-  *out = target;
-  return TRUE;
+  return _mask_mode_target_from_string(s, out);
 }
 
 gboolean dt_remote_blend_mask_mode_transition(uint32_t stored,
@@ -621,6 +615,21 @@ static const char *_combine_to_string(uint32_t mask_combine)
   }
 }
 
+static gboolean _combine_from_string(const char *s,
+                                     uint32_t *bits /* INV|INCL only */)
+{
+  if(!s || !bits) return FALSE;
+  if(!strcmp(s, "exclusive"))
+    { *bits = DEVELOP_COMBINE_NORM_EXCL; return TRUE; }
+  if(!strcmp(s, "inclusive"))
+    { *bits = DEVELOP_COMBINE_NORM_INCL; return TRUE; }
+  if(!strcmp(s, "exclusive_inverted"))
+    { *bits = DEVELOP_COMBINE_INV_EXCL; return TRUE; }
+  if(!strcmp(s, "inclusive_inverted"))
+    { *bits = DEVELOP_COMBINE_INV_INCL; return TRUE; }
+  return FALSE;
+}
+
 JsonNode *dt_remote_blend_read(dt_iop_module_t *module)
 {
   if(!module || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) return NULL;
@@ -770,7 +779,8 @@ gboolean dt_remote_blend_patch_apply(dt_iop_module_t *module,
   static const char *const allowed[] = {
     "mask_mode", "colorspace", "mode", "reverse", "fulcrum", "opacity",
     "feathering_radius", "feathering_guide", "blur_radius", "contrast",
-    "brightness", "details", NULL };
+    "brightness", "details",
+    "combine", "parametric", "allow_inverted_combine", NULL };
 
   GList *members = json_object_get_members(patch);
   if(!members)
@@ -794,26 +804,39 @@ gboolean dt_remote_blend_patch_apply(dt_iop_module_t *module,
   }
   g_list_free(members);
 
-  // 1. mask_mode -- gated by the transition appendix's M-A projection:
-  // writable only while the stored mode has no drawn/parametric/raster
-  // bits, and only to "off"/"uniform".
+  // Capture, before any stage runs, whether a stored conditional bit was a
+  // supported state or an unsupported legacy one. The projected-family gate
+  // after the colorspace stage uses this to permit removing a legacy
+  // CONDITIONAL while still forbidding a patch from creating one.
+  const gboolean stored_conditional =
+    (dst->mask_mode & DEVELOP_MASK_CONDITIONAL) != 0;
+  const dt_develop_blend_colorspace_t stored_eff_cs =
+    dt_remote_blend_effective_colorspace(module, dst->blend_cst);
+  const gboolean stored_parametric_supported =
+    dt_remote_blendif_channels(stored_eff_cs) != NULL;
+
+  // 1. mask_mode -- authoritative appendix; only ENABLED|CONDITIONAL
+  // may change, and MASK ownership must remain identical. This stage
+  // projects bits only; family availability is deliberately checked
+  // after the colorspace stage so a same-call RAW -> RGB switch works.
   if(json_object_has_member(patch, "mask_mode"))
   {
-    if(dst->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER))
+    const char *constraint = NULL;
+    uint32_t projected = 0;
+    if(!dt_remote_blend_mask_mode_transition(
+         dst->mask_mode, _json_member_string(patch, "mask_mode"),
+         &projected, &constraint))
     {
-      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode",
-                                      "mask_configuration_present",
-                                      _("a drawn/parametric/raster mask configuration is present"));
+      const char *message = !strcmp(constraint, "raster_unsupported")
+        ? _("raster masks are not writable")
+        : !strcmp(constraint, "drawn_via_attach_only")
+          ? _("drawn masks are entered and left through attach/detach")
+          : _("unknown mask_mode target");
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE,
+                                      "mask_mode", constraint, "%s", message);
       return FALSE;
     }
-    uint32_t target = 0;
-    if(!dt_remote_blend_mask_mode_from_string(_json_member_string(patch, "mask_mode"), &target))
-    {
-      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "mask_mode", "unknown_value",
-                                      _("mask_mode accepts \"off\" or \"uniform\""));
-      return FALSE;
-    }
-    dst->mask_mode = target;
+    dst->mask_mode = projected;
   }
 
   // 2. colorspace -- deterministic reset semantics (design decision 3):
@@ -847,9 +870,261 @@ gboolean dt_remote_blend_patch_apply(dt_iop_module_t *module,
       dt_develop_blend_init_blendif_parameters(dst, (dt_develop_blend_colorspace_t)cs_value);
   }
 
-  // 3. mode -- validated against the PROJECTED effective colorspace.
+  // Projected-family gate. Derived from the FINAL blend_cst so a same-call
+  // colorspace switch is honored. A conditional bit is unavailable in
+  // RAW/NONE; permit an already-stored unsupported legacy CONDITIONAL to
+  // remain representable or be removed, but never let a patch create such a
+  // state or move one from a supported family into an unsupported one.
   const dt_develop_blend_colorspace_t eff =
     dt_remote_blend_effective_colorspace(module, dst->blend_cst);
+  const dt_remote_blendif_channel_t *table = dt_remote_blendif_channels(eff);
+  if((dst->mask_mode & DEVELOP_MASK_CONDITIONAL) && !table
+     && (!stored_conditional || stored_parametric_supported))
+  {
+    const char *field = stored_conditional ? "colorspace" : "mask_mode";
+    if(error) *error = _blend_error(
+      DT_REMOTE_ERR_UNSUPPORTED_FIELD, field, NULL,
+      _("parametric masks are unavailable in the projected blend colorspace"));
+    return FALSE;
+  }
+
+  // 3a. allow_inverted_combine -- strict boolean override for the H4 guard.
+  gboolean combine_changed = FALSE;
+  gboolean allow_inv_combine = FALSE;
+  if(json_object_has_member(patch, "allow_inverted_combine"))
+  {
+    JsonNode *node = json_object_get_member(patch, "allow_inverted_combine");
+    if(!node || !JSON_NODE_HOLDS_VALUE(node)
+       || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE,
+                                      "allow_inverted_combine", "wrong_type",
+                                      _("'allow_inverted_combine' must be a boolean"));
+      return FALSE;
+    }
+    allow_inv_combine = json_node_get_boolean(node);
+  }
+
+  // 3b. combine
+  if(json_object_has_member(patch, "combine"))
+  {
+    if(!table)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, "combine", NULL,
+                                      _("combine is not available for this blend colorspace"));
+      return FALSE;
+    }
+    uint32_t bits = 0;
+    if(!_combine_from_string(_json_member_string(patch, "combine"), &bits))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "combine", "unknown_value",
+                                      _("unknown combine value"));
+      return FALSE;
+    }
+    const uint32_t before = dst->mask_combine & (DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL);
+    combine_changed = (before != bits);
+    dst->mask_combine =
+      (dst->mask_combine & ~(DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL)) | bits;  // MASKS_POS preserved
+  }
+
+  // 3c. parametric
+  if(json_object_has_member(patch, "parametric"))
+  {
+    if(!table)
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, "parametric", NULL,
+                                      _("parametric masks are not available for this blend colorspace"));
+      return FALSE;
+    }
+    if(!(dst->mask_mode & DEVELOP_MASK_CONDITIONAL))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric",
+                                      "requires_parametric_mask_mode",
+                                      _("set mask_mode to \"parametric\" to write parametric channels"));
+      return FALSE;
+    }
+    JsonNode *pnode = json_object_get_member(patch, "parametric");
+    if(!pnode || !JSON_NODE_HOLDS_OBJECT(pnode))
+    {
+      if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "wrong_type",
+                                      _("'parametric' must be an object"));
+      return FALSE;
+    }
+    JsonObject *pobj = json_node_get_object(pnode);
+    GList *names = json_object_get_members(pobj);
+    for(GList *n = names; n; n = n->next)
+    {
+      const char *slot_name = n->data;
+      // resolve slot_name -> channel + in/out
+      const dt_remote_blendif_channel_t *ch = NULL;
+      int slot = -1;
+      for(const dt_remote_blendif_channel_t *c = table; c->name && slot < 0; c++)
+      {
+        gchar *in_name = g_strdup_printf("%s_in", c->name);
+        gchar *out_name = g_strdup_printf("%s_out", c->name);
+        if(!strcmp(slot_name, in_name))  { ch = c; slot = (int)c->slot_in; }
+        else if(!strcmp(slot_name, out_name)) { ch = c; slot = (int)c->slot_out; }
+        g_free(in_name); g_free(out_name);
+      }
+      if(!ch)
+      {
+        if(error) *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, NULL, NULL,
+                                        _("unknown parametric channel"));
+        if(error && *error)
+        {
+          g_free((*error)->details_json);
+          (*error)->details_json = g_strdup_printf(
+            "{\"parameter\":\"blend.parametric.%s\"}", slot_name);
+        }
+        g_list_free(names);
+        return FALSE;
+      }
+      JsonNode *entry = json_object_get_member(pobj, slot_name);
+      float *p = &dst->blendif_parameters[4 * slot];
+      if(json_node_is_null(entry))
+      {
+        // null resets: identity markers, polarity cleared, boost -> channel offset
+        p[0] = 0.0f; p[1] = 0.0f; p[2] = 1.0f; p[3] = 1.0f;
+        dst->blendif = dt_remote_blendif_slot_pack(dst->blendif, slot, FALSE, FALSE);
+        dst->blendif_boost_factors[slot] = ch->boost_offset;
+        continue;
+      }
+      if(!JSON_NODE_HOLDS_OBJECT(entry))
+      {
+        if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "wrong_type",
+                                        _("a parametric channel entry must be an object or null"));
+        g_list_free(names);
+        return FALSE;
+      }
+      JsonObject *e = json_node_get_object(entry);
+      static const char *const entry_allowed[] = { "markers", "inverted", "boost", NULL };
+      GList *entry_members = json_object_get_members(e);
+      for(GList *em = entry_members; em; em = em->next)
+      {
+        gboolean known = FALSE;
+        for(const char *const *a = entry_allowed; *a && !known; a++)
+          known = !strcmp(*a, em->data);
+        if(!known)
+        {
+          if(error)
+          {
+            *error = _blend_error(DT_REMOTE_ERR_UNSUPPORTED_FIELD, NULL, NULL,
+                                  _("unknown parametric channel member"));
+            g_free((*error)->details_json);
+            (*error)->details_json = g_strdup_printf(
+              "{\"parameter\":\"blend.parametric.%s.%s\"}",
+              slot_name, (const char *)em->data);
+          }
+          g_list_free(entry_members);
+          g_list_free(names);
+          return FALSE;
+        }
+      }
+      g_list_free(entry_members);
+
+      // markers: exactly 4 finite ascending in [0,1]
+      JsonNode *mnode = json_object_get_member(e, "markers");
+      if(!mnode || !JSON_NODE_HOLDS_ARRAY(mnode)
+         || json_array_get_length(json_node_get_array(mnode)) != 4)
+      {
+        if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "markers",
+                                        _("'markers' must be an array of exactly 4 numbers"));
+        g_list_free(names);
+        return FALSE;
+      }
+      JsonArray *marr = json_node_get_array(mnode);
+      float m[4];
+      double prev = -G_MAXDOUBLE;
+      for(int k = 0; k < 4; k++)
+      {
+        JsonNode *mk = json_array_get_element(marr, k);
+        if(!JSON_NODE_HOLDS_VALUE(mk)
+           || (json_node_get_value_type(mk) != G_TYPE_DOUBLE
+               && json_node_get_value_type(mk) != G_TYPE_INT64))
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "markers",
+                                          _("markers must be numbers"));
+          g_list_free(names);
+          return FALSE;
+        }
+        const double value = json_node_get_double(mk);
+        if(!isfinite(value) || value < 0.0 || value > 1.0 || value < prev)
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "markers",
+                                          _("markers must be finite, ascending, within [0,1]"));
+          g_list_free(names);
+          return FALSE;
+        }
+        prev = value;
+        m[k] = (float)value;  // narrow only after double-domain validation
+      }
+      // inverted (optional bool, default false)
+      gboolean inverted = FALSE, has_inverted = FALSE;
+      if(json_object_has_member(e, "inverted"))
+      {
+        JsonNode *inode = json_object_get_member(e, "inverted");
+        if(!JSON_NODE_HOLDS_VALUE(inode) || json_node_get_value_type(inode) != G_TYPE_BOOLEAN)
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "wrong_type",
+                                          _("'inverted' must be a boolean"));
+          g_list_free(names);
+          return FALSE;
+        }
+        inverted = json_node_get_boolean(inode);
+        has_inverted = TRUE;
+      }
+      // H4 guard: inverted change together with a combine change
+      if(has_inverted && combine_changed && !allow_inv_combine)
+      {
+        if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric",
+                                        "inverted_and_combine_conflict",
+                                        _("changing 'inverted' and 'combine' together is "
+                                          "error-prone; pass allow_inverted_combine:true to confirm"));
+        g_list_free(names);
+        return FALSE;
+      }
+      // boost (optional; default = channel offset i.e. GUI zero)
+      float boost = ch->boost_offset;
+      if(json_object_has_member(e, "boost"))
+      {
+        if(!ch->boost_supported)
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "boost",
+                                          _("this channel does not support boost"));
+          g_list_free(names);
+          return FALSE;
+        }
+        double bv = 0.0;
+        JsonNode *bnode = json_object_get_member(e, "boost");
+        if(!JSON_NODE_HOLDS_VALUE(bnode)
+           || (json_node_get_value_type(bnode) != G_TYPE_DOUBLE
+               && json_node_get_value_type(bnode) != G_TYPE_INT64))
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "boost",
+                                          _("'boost' must be a number"));
+          g_list_free(names);
+          return FALSE;
+        }
+        bv = json_node_get_double(bnode);
+        if(!isfinite(bv) || bv < (double)ch->boost_offset || bv > (double)ch->boost_offset + 18.0)
+        {
+          if(error) *error = _blend_error(DT_REMOTE_ERR_INVALID_VALUE, "parametric", "boost",
+                                          _("'boost' out of range for this channel"));
+          g_list_free(names);
+          return FALSE;
+        }
+        boost = (float)bv;
+      }
+      // write verbatim; derive enable from markers (never rescale markers)
+      for(int k = 0; k < 4; k++) p[k] = m[k];
+      dst->blendif = dt_remote_blendif_slot_pack(dst->blendif, slot,
+                                                 dt_remote_blendif_markers_enable(m), inverted);
+      dst->blendif_boost_factors[slot] = boost;
+    }
+    g_list_free(names);
+  }
+
+  // 3. mode -- validated against the PROJECTED effective colorspace `eff`.
   if(json_object_has_member(patch, "mode"))
   {
     const char *mode_string = _json_member_string(patch, "mode");

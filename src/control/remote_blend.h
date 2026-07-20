@@ -46,9 +46,14 @@ struct dt_iop_module_t;
  * (raster wins whenever the RASTER bit is set). Returns a static string. */
 const char *dt_remote_blend_mask_mode_string(uint32_t mask_mode);
 
-/** Tier-1 writable vocabulary only: "off" -> DEVELOP_MASK_DISABLED,
- * "uniform" -> DEVELOP_MASK_ENABLED. Anything else (including the
- * read-only compound strings) returns FALSE with *out untouched. */
+/** Parse any of the five non-raster transition targets to its bitfield:
+ * "off" -> DEVELOP_MASK_DISABLED, "uniform" -> DEVELOP_MASK_ENABLED,
+ * "parametric" -> ENABLED|CONDITIONAL, "drawn" -> ENABLED|MASK,
+ * "drawn+parametric" -> ENABLED|MASK_CONDITIONAL. "raster", unknown
+ * strings, NULL input, or NULL output return FALSE without writing *out.
+ * This is a pure lexical parser; the state-preserving transition rules
+ * (MASK ownership, raster rejection) live in
+ * dt_remote_blend_mask_mode_transition. */
 gboolean dt_remote_blend_mask_mode_from_string(const char *s, uint32_t *out);
 
 /** resolves a stored blend_cst to the effective blending colorspace:

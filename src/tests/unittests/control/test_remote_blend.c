@@ -184,12 +184,16 @@ static void test_mask_mode_from_string(void **state)
   assert_int_equal(v, DEVELOP_MASK_DISABLED);
   assert_true(dt_remote_blend_mask_mode_from_string("uniform", &v));
   assert_int_equal(v, DEVELOP_MASK_ENABLED);
-  // read-only compounds and junk are rejected
-  assert_false(dt_remote_blend_mask_mode_from_string("drawn", &v));
-  assert_false(dt_remote_blend_mask_mode_from_string("parametric", &v));
+  assert_true(dt_remote_blend_mask_mode_from_string("parametric", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  assert_true(dt_remote_blend_mask_mode_from_string("drawn", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_true(dt_remote_blend_mask_mode_from_string("drawn+parametric", &v));
+  assert_int_equal(v, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL);
   assert_false(dt_remote_blend_mask_mode_from_string("raster", &v));
   assert_false(dt_remote_blend_mask_mode_from_string("", &v));
   assert_false(dt_remote_blend_mask_mode_from_string(NULL, &v));
+  assert_false(dt_remote_blend_mask_mode_from_string("off", NULL));
 }
 
 static void test_mode_names_for_colorspace_matches_sections(void **state)
@@ -957,48 +961,6 @@ static void test_patch_unknown_member_and_empty(void **state)
   blend_fixture_free(fx);
 }
 
-// Mechanical M-A projection of the transition appendix: stored state x
-// target in {"off","uniform"}. Rows off/uniform succeed (including the
-// no-op diagonal); every masked row refuses with
-// mask_configuration_present.
-static void test_patch_mask_mode_transition_table(void **state)
-{
-  (void)state;
-  const struct { uint32_t stored; gboolean writable; } rows[] = {
-    { DEVELOP_MASK_DISABLED, TRUE },
-    { DEVELOP_MASK_ENABLED, TRUE },
-    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL, FALSE },
-    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK, FALSE },
-    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL, FALSE },
-    { DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER, FALSE },
-  };
-  const struct { const char *target; uint32_t bits; } targets[] = {
-    { "off", DEVELOP_MASK_DISABLED }, { "uniform", DEVELOP_MASK_ENABLED },
-  };
-  blend_fixture_t *fx = blend_fixture_new("exposure");
-  for(guint r = 0; r < G_N_ELEMENTS(rows); r++)
-    for(guint t = 0; t < G_N_ELEMENTS(targets); t++)
-    {
-      fx->module->blend_params->mask_mode = rows[r].stored;
-      gchar *json = g_strdup_printf("{\"mask_mode\":\"%s\"}", targets[t].target);
-      if(rows[r].writable)
-      {
-        JsonObject *patch = _patch_from_string(json);
-        dt_develop_blend_params_t dst = *fx->module->blend_params;
-        dt_remote_error_t *error = NULL;
-        assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
-        assert_int_equal(dst.mask_mode, targets[t].bits);
-        json_object_unref(patch);
-      }
-      else
-        _assert_patch_fails(fx, json, DT_REMOTE_ERR_INVALID_VALUE, "mask_configuration_present");
-      g_free(json);
-    }
-  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
-  _assert_patch_fails(fx, "{\"mask_mode\":\"drawn\"}", DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
-  blend_fixture_free(fx);
-}
-
 static void test_patch_colorspace_reset_then_overrides(void **state)
 {
   (void)state;
@@ -1145,6 +1107,340 @@ static void test_patch_details_requires_raw_image(void **state)
   blend_fixture_free(fx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Task 4: parametric + combine patch apply                            */
+/* ------------------------------------------------------------------ */
+
+static void test_patch_parametric_sets_and_derives_enable(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  JsonObject *patch = _patch_from_string(
+    "{\"mask_mode\":\"parametric\","
+    " \"parametric\":{\"Jz_in\":{\"markers\":[0.0,0.0,0.5,0.6],\"inverted\":true}}}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_null(error);
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  const int slot = DEVELOP_BLENDIF_Jz_in;
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, slot));   // non-identity -> enabled
+  assert_true(dt_remote_blendif_slot_inverted(dst.blendif, slot));
+  assert_float_equal(dst.blendif_parameters[4 * slot + 2], 0.5f, 1e-6);
+  // boost defaults to the channel offset (GUI zero) = -6.64385619
+  assert_float_equal(dst.blendif_boost_factors[slot], -6.64385619f, 1e-5);
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_parametric_null_resets_and_disables(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _set_slot(bp, DEVELOP_BLENDIF_Jz_in, 0.1f, 0.2f, 0.6f, 0.7f, TRUE, -6.0f);
+  JsonObject *patch = _patch_from_string("{\"parametric\":{\"Jz_in\":null}}");
+  dt_develop_blend_params_t dst = *bp;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  const int slot = DEVELOP_BLENDIF_Jz_in;
+  assert_false(dt_remote_blendif_slot_enabled(dst.blendif, slot));     // reset -> disabled
+  assert_false(dt_remote_blendif_slot_inverted(dst.blendif, slot));
+  assert_float_equal(dst.blendif_parameters[4 * slot + 0], 0.0f, 1e-6);
+  assert_float_equal(dst.blendif_parameters[4 * slot + 3], 1.0f, 1e-6);
+  assert_float_equal(dst.blendif_boost_factors[slot], -6.64385619f, 1e-5); // channel offset
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_parametric_preserves_foreign_and_unlisted(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _set_slot(bp, 11, 0.1f, 0.2f, 0.6f, 0.7f, FALSE, 0.0f);  // foreign slot
+  _set_slot(bp, DEVELOP_BLENDIF_RED_in, 0.2f, 0.3f, 0.7f, 0.8f, FALSE, 0.0f); // unlisted
+  JsonObject *patch = _patch_from_string(
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.0,0.0,0.5,0.6]}}}");
+  dt_develop_blend_params_t dst = *bp;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, 11));               // foreign survives
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, DEVELOP_BLENDIF_RED_in)); // unlisted survives
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_combine_and_colorspace_layering(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  // combine writes the INV|INCL bits, preserving MASKS_POS
+  fx->module->blend_params->mask_combine = DEVELOP_COMBINE_MASKS_POS;
+  JsonObject *patch = _patch_from_string("{\"combine\":\"inclusive\"}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_combine & (DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL),
+                   DEVELOP_COMBINE_NORM_INCL);
+  assert_true((dst.mask_combine & DEVELOP_COMBINE_MASKS_POS) != 0);  // preserved
+  json_object_unref(patch);
+
+  // colorspace switch wipes blendif; a same-call parametric member then
+  // validates against the NEW family and applies on top
+  patch = _patch_from_string(
+    "{\"colorspace\":\"DEVELOP_BLEND_CS_RGB_DISPLAY\","
+    " \"mask_mode\":\"parametric\","
+    " \"parametric\":{\"H_in\":{\"markers\":[0.1,0.2,0.6,0.7]}}}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_cst, DEVELOP_BLEND_CS_RGB_DISPLAY);
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, DEVELOP_BLENDIF_H_in));
+  json_object_unref(patch);
+
+  // Availability is checked against the FINAL projected family, not the
+  // forced legacy RAW value present before this same-call colorspace switch.
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  patch = _patch_from_string(
+    "{\"mask_mode\":\"parametric\","
+    " \"colorspace\":\"DEVELOP_BLEND_CS_RGB_SCENE\","
+    " \"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7]}}}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.blend_cst, DEVELOP_BLEND_CS_RGB_SCENE);
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  assert_true(dt_remote_blendif_slot_enabled(dst.blendif, DEVELOP_BLENDIF_Jz_in));
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_parametric_rejections(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  // Lab channel name against an RGB-scene module
+  _assert_patch_fails(fx, "{\"parametric\":{\"L_in\":{\"markers\":[0.1,0.2,0.6,0.7]}}}",
+                      DT_REMOTE_ERR_UNSUPPORTED_FIELD, "blend.parametric.L_in");
+  // wrong marker count / order / domain
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6]}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{\"markers\":[0.5,0.2,0.6,0.7]}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{\"markers\":[0.0,0.0,0.6,1.5]}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  // boost on a hue channel
+  _assert_patch_fails(fx, "{\"parametric\":{\"hz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":1.0}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  // boost out of range for Jz (offset -6.64.. => max 11.356..)
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":20.0}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  // combine unknown value
+  _assert_patch_fails(fx, "{\"combine\":\"weird\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "unknown_value");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_parametric_strict_validation_and_edges(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+
+  _assert_patch_fails(fx, "{\"parametric\":[]}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":1}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx, "{\"allow_inverted_combine\":1}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"invert\":true}}}",
+    DT_REMOTE_ERR_UNSUPPORTED_FIELD, "blend.parametric.Jz_in.invert");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,true,0.6,0.7]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.0,0.1,0.6,1e400]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  // These two doubles are outside the domain before float narrowing and
+  // must not round to legal 0/1 float endpoints.
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[-1e-50,0.1,0.6,0.7]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,1.0000000001]}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "markers");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":1}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "wrong_type");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":1e400}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  _assert_patch_fails(fx,
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":\"high\"}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  const double min_boost =
+    (double)_find_channel(DEVELOP_BLEND_CS_RGB_SCENE, "Jz")->boost_offset;
+  const double max_boost = min_boost + 18.0;
+  gchar *below = g_strdup_printf(
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":%.17g}}}",
+    min_boost - 1e-6);
+  gchar *above = g_strdup_printf(
+    "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"boost\":%.17g}}}",
+    max_boost + 1e-6);
+  _assert_patch_fails(fx, below, DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  _assert_patch_fails(fx, above, DT_REMOTE_ERR_INVALID_VALUE, "boost");
+  g_free(below);
+  g_free(above);
+
+  // Degenerate markers and both inclusive boost endpoints are legal.
+  const double legal_boosts[] = { min_boost, max_boost };
+  for(guint i = 0; i < G_N_ELEMENTS(legal_boosts); i++)
+  {
+    gchar *json = g_strdup_printf(
+      "{\"parametric\":{\"Jz_in\":{\"markers\":[0.3,0.3,0.3,0.3],\"boost\":%.17g}}}",
+      legal_boosts[i]);
+    JsonObject *patch = _patch_from_string(json);
+    g_free(json);
+    dt_develop_blend_params_t dst = *fx->module->blend_params;
+    dt_remote_error_t *error = NULL;
+    assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+    assert_null(error);
+    json_object_unref(patch);
+  }
+  JsonObject *empty = _patch_from_string("{\"parametric\":{}}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, empty, &dst, &error));
+  assert_null(error); // empty object is a legal no-op channel patch
+  json_object_unref(empty);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_parametric_requires_parametric_mask_mode(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED;  // uniform, no CONDITIONAL
+  _assert_patch_fails(fx, "{\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7]}}}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "requires_parametric_mask_mode");
+  blend_fixture_free(fx);
+}
+
+static void test_patch_inverted_combine_conflict_and_override(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  bp->mask_combine = DEVELOP_COMBINE_NORM_EXCL;
+  // changing combine AND setting inverted in one call, no override -> refused
+  _assert_patch_fails(fx,
+    "{\"combine\":\"inclusive\",\"parametric\":{\"Jz_in\":"
+    "{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}",
+    DT_REMOTE_ERR_INVALID_VALUE, "inverted_and_combine_conflict");
+  // Explicit inverted is safe when combine is present but unchanged.
+  JsonObject *patch = _patch_from_string(
+    "{\"combine\":\"exclusive\",\"parametric\":{\"Jz_in\":"
+    "{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}");
+  dt_develop_blend_params_t dst = *bp;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_null(error);
+  json_object_unref(patch);
+  // with the override flag it succeeds
+  patch = _patch_from_string(
+    "{\"allow_inverted_combine\":true,\"combine\":\"inclusive\","
+    "\"parametric\":{\"Jz_in\":{\"markers\":[0.1,0.2,0.6,0.7],\"inverted\":true}}}");
+  dst = *bp;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
+static void test_patch_mask_mode_parametric_transitions(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  // off -> parametric: legal
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  JsonObject *patch = _patch_from_string("{\"mask_mode\":\"parametric\"}");
+  dt_develop_blend_params_t dst = *fx->module->blend_params;
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  json_object_unref(patch);
+
+  // drawn -> drawn+parametric adds only CONDITIONAL and preserves MASK.
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  patch = _patch_from_string("{\"mask_mode\":\"drawn+parametric\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL);
+  json_object_unref(patch);
+
+  // drawn+parametric -> drawn drops only CONDITIONAL; channel storage survives.
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL;
+  _set_slot(fx->module->blend_params, DEVELOP_BLENDIF_Jz_in,
+            0.1f, 0.2f, 0.6f, 0.7f, FALSE, -6.64385619f);
+  const float before = fx->module->blend_params
+                         ->blendif_parameters[4 * DEVELOP_BLENDIF_Jz_in + 1];
+  patch = _patch_from_string("{\"mask_mode\":\"drawn\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_float_equal(dst.blendif_parameters[4 * DEVELOP_BLENDIF_Jz_in + 1], before, 1e-6);
+  json_object_unref(patch);
+
+  // Crossing MASK ownership remains forbidden in both directions.
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"parametric\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "drawn_via_attach_only");
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"drawn+parametric\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "drawn_via_attach_only");
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"off\"}",
+                      DT_REMOTE_ERR_INVALID_VALUE, "raster_unsupported");
+
+  // A conditional bit cannot be newly introduced while the final family
+  // remains RAW. A legacy RAW conditional value is nevertheless a legal
+  // no-op target and can be removed, matching the state-aware schema.
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  _assert_patch_fails(fx, "{\"mask_mode\":\"parametric\"}",
+                      DT_REMOTE_ERR_UNSUPPORTED_FIELD, "blend.mask_mode");
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  patch = _patch_from_string("{\"mask_mode\":\"parametric\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL);
+  json_object_unref(patch);
+  patch = _patch_from_string("{\"mask_mode\":\"uniform\"}");
+  dst = *fx->module->blend_params;
+  assert_true(dt_remote_blend_patch_apply(fx->module, patch, &dst, &error));
+  assert_int_equal(dst.mask_mode, DEVELOP_MASK_ENABLED);
+  json_object_unref(patch);
+  blend_fixture_free(fx);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1180,7 +1476,6 @@ int main(void)
     cmocka_unit_test(test_read_non_finite_parametric_storage_serializes_null),
     cmocka_unit_test(test_patch_opacity_and_mask_mode),
     cmocka_unit_test(test_patch_unknown_member_and_empty),
-    cmocka_unit_test(test_patch_mask_mode_transition_table),
     cmocka_unit_test(test_patch_colorspace_reset_then_overrides),
     cmocka_unit_test(test_patch_colorspace_rejections),
     cmocka_unit_test(test_patch_mode_validated_against_projected_colorspace),
@@ -1188,6 +1483,15 @@ int main(void)
     cmocka_unit_test(test_patch_numeric_edges),
     cmocka_unit_test(test_patch_feathering_guide),
     cmocka_unit_test(test_patch_details_requires_raw_image),
+    cmocka_unit_test(test_patch_parametric_sets_and_derives_enable),
+    cmocka_unit_test(test_patch_parametric_null_resets_and_disables),
+    cmocka_unit_test(test_patch_parametric_preserves_foreign_and_unlisted),
+    cmocka_unit_test(test_patch_combine_and_colorspace_layering),
+    cmocka_unit_test(test_patch_parametric_rejections),
+    cmocka_unit_test(test_patch_parametric_strict_validation_and_edges),
+    cmocka_unit_test(test_patch_parametric_requires_parametric_mask_mode),
+    cmocka_unit_test(test_patch_inverted_combine_conflict_and_override),
+    cmocka_unit_test(test_patch_mask_mode_parametric_transitions),
   };
   return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }
