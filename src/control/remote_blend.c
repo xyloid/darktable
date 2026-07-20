@@ -391,6 +391,12 @@ JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
   const dt_develop_blend_params_t *bp = module->blend_params;
   const gboolean extra_bits =
     (bp->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER)) != 0;
+  const dt_develop_blend_colorspace_t eff_mm =
+    dt_remote_blend_effective_colorspace(module, module->blend_params->blend_cst);
+  const gboolean parametric_supported = dt_remote_blendif_channels(eff_mm) != NULL;
+  const gboolean raster = (bp->mask_mode & DEVELOP_MASK_RASTER) != 0;
+  const gboolean drawn = (bp->mask_mode & DEVELOP_MASK_MASK) != 0;
+  const gboolean conditional = (bp->mask_mode & DEVELOP_MASK_CONDITIONAL) != 0;
 
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
@@ -401,11 +407,27 @@ JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
   json_builder_add_string_value(b, "enum");
   json_builder_set_member_name(b, "values");
   json_builder_begin_array(b);
-  json_builder_add_string_value(b, "off");
-  json_builder_add_string_value(b, "uniform");
+  if(raster)
+    json_builder_add_string_value(b, "raster");
+  else if(drawn)
+  {
+    json_builder_add_string_value(b, "drawn");
+    // Keep a legacy unsupported current value representable so it can be
+    // removed, even though it cannot be newly added in this family.
+    if(parametric_supported || conditional)
+      json_builder_add_string_value(b, "drawn+parametric");
+  }
+  else
+  {
+    json_builder_add_string_value(b, "off");
+    json_builder_add_string_value(b, "uniform");
+    if(parametric_supported || conditional)
+      json_builder_add_string_value(b, "parametric");
+  }
   json_builder_end_array(b);
   json_builder_set_member_name(b, "writable");
-  json_builder_add_boolean_value(b, !extra_bits);
+  json_builder_add_boolean_value(
+    b, !raster && (!drawn || parametric_supported || conditional));
   json_builder_set_member_name(b, "current_extra_bits");
   json_builder_add_boolean_value(b, extra_bits);
   json_builder_end_object(b);
@@ -430,9 +452,7 @@ JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
   json_builder_add_boolean_value(b, cs_writable);
   json_builder_end_object(b);
 
-  const dt_develop_blend_colorspace_t eff =
-    dt_remote_blend_effective_colorspace(module, bp->blend_cst);
-  GPtrArray *mode_names = dt_remote_blend_mode_names_for_colorspace(eff);
+  GPtrArray *mode_names = dt_remote_blend_mode_names_for_colorspace(eff_mm);
   json_builder_set_member_name(b, "mode");
   json_builder_begin_object(b);
   json_builder_set_member_name(b, "type");
@@ -496,6 +516,91 @@ JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
     json_builder_add_boolean_value(b,
       strcmp(f->name, "details") ? TRUE : _details_writable(module));
     json_builder_end_object(b);
+  }
+
+  // Tier 2: combine + parametric (Lab / RGB families only; absent for RAW)
+  if(parametric_supported)
+  {
+    json_builder_set_member_name(b, "allow_inverted_combine");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, "bool");
+    json_builder_set_member_name(b, "writable");
+    json_builder_add_boolean_value(b, TRUE);
+    json_builder_set_member_name(b, "write_only");
+    json_builder_add_boolean_value(b, TRUE);
+    json_builder_end_object(b);
+
+    json_builder_set_member_name(b, "combine");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, "enum");
+    json_builder_set_member_name(b, "values");
+    json_builder_begin_array(b);
+    json_builder_add_string_value(b, "exclusive");
+    json_builder_add_string_value(b, "inclusive");
+    json_builder_add_string_value(b, "exclusive_inverted");
+    json_builder_add_string_value(b, "inclusive_inverted");
+    json_builder_end_array(b);
+    json_builder_set_member_name(b, "writable");
+    json_builder_add_boolean_value(b, TRUE);
+    json_builder_end_object(b);
+
+    json_builder_set_member_name(b, "parametric");
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "channels");
+    json_builder_begin_object(b);
+    for(const dt_remote_blendif_channel_t *c = dt_remote_blendif_channels(eff_mm);
+        c && c->name; c++)
+    {
+      for(int io = 0; io < 2; io++)
+      {
+        gchar *slot_name = g_strdup_printf("%s_%s", c->name, io ? "out" : "in");
+        json_builder_set_member_name(b, slot_name);
+        g_free(slot_name);
+        json_builder_begin_object(b);
+
+        json_builder_set_member_name(b, "markers_domain");
+        json_builder_begin_array(b);
+        json_builder_add_double_value(b, 0.0);
+        json_builder_add_double_value(b, 1.0);
+        json_builder_end_array(b);
+
+        json_builder_set_member_name(b, "boost");
+        if(c->boost_supported)
+        {
+          json_builder_begin_object(b);
+          json_builder_set_member_name(b, "writable");
+          json_builder_add_boolean_value(b, TRUE);
+          json_builder_set_member_name(b, "offset");
+          json_builder_add_double_value(b, (double)c->boost_offset);
+          json_builder_set_member_name(b, "range");
+          json_builder_begin_array(b);
+          json_builder_add_double_value(b, (double)c->boost_offset);
+          json_builder_add_double_value(b, (double)c->boost_offset + 18.0);
+          json_builder_end_array(b);
+          json_builder_end_object(b);
+        }
+        else
+          json_builder_add_null_value(b);
+
+        json_builder_set_member_name(b, "display_hint");
+        json_builder_begin_object(b);
+        json_builder_set_member_name(b, "factor");
+        json_builder_add_double_value(b, (double)c->display_factor);
+        json_builder_set_member_name(b, "offset");
+        json_builder_add_double_value(b, (double)c->marker_offset);
+        json_builder_set_member_name(b, "unit");
+        json_builder_add_string_value(b, c->display_unit);
+        json_builder_set_member_name(b, "boost_scales");
+        json_builder_add_boolean_value(b, c->boost_supported);
+        json_builder_end_object(b);
+
+        json_builder_end_object(b);
+      }
+    }
+    json_builder_end_object(b);  // channels
+    json_builder_end_object(b);  // parametric
   }
 
   json_builder_end_object(b);

@@ -514,9 +514,10 @@ static void test_schema_shape_for_rgb_module(void **state)
   assert_true(json_object_get_boolean_member(mm, "writable"));
   assert_false(json_object_get_boolean_member(mm, "current_extra_bits"));
   JsonArray *mm_values = json_object_get_array_member(mm, "values");
-  assert_int_equal(json_array_get_length(mm_values), 2);
+  assert_int_equal(json_array_get_length(mm_values), 3);
   assert_string_equal(json_array_get_string_element(mm_values, 0), "off");
   assert_string_equal(json_array_get_string_element(mm_values, 1), "uniform");
+  assert_string_equal(json_array_get_string_element(mm_values, 2), "parametric");
 
   JsonObject *cs = json_object_get_object_member(schema, "colorspace");
   assert_true(json_object_get_boolean_member(cs, "writable"));
@@ -557,15 +558,203 @@ static void test_schema_shape_for_rgb_module(void **state)
   blend_fixture_free(fx);
 }
 
-static void test_schema_mask_mode_not_writable_with_extra_bits(void **state)
+static void test_schema_mask_mode_extra_bits_metadata(void **state)
 {
   (void)state;
   blend_fixture_t *fx = blend_fixture_new("exposure");
   fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
   JsonNode *node = dt_remote_blend_schema(fx->module);
   JsonObject *mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  assert_true(json_object_get_boolean_member(mm, "writable"));
+  assert_true(json_object_get_boolean_member(mm, "current_extra_bits"));
+  json_node_unref(node);
+
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER;
+  node = dt_remote_blend_schema(fx->module);
+  mm = json_object_get_object_member(_node_object(node), "mask_mode");
   assert_false(json_object_get_boolean_member(mm, "writable"));
   assert_true(json_object_get_boolean_member(mm, "current_extra_bits"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 2: parametric + combine schema                                 */
+/* ------------------------------------------------------------------ */
+
+static void _assert_channel_vocabulary(JsonObject *channels,
+                                       const char *const *names,
+                                       guint names_len)
+{
+  assert_int_equal((guint)json_object_get_size(channels), names_len * 2);
+  for(guint i = 0; i < names_len; i++)
+  {
+    gchar *slot = g_strdup_printf("%s_in", names[i]);
+    assert_true(json_object_has_member(channels, slot));
+    g_free(slot);
+    slot = g_strdup_printf("%s_out", names[i]);
+    assert_true(json_object_has_member(channels, slot));
+    g_free(slot);
+  }
+}
+
+static void _assert_shifted_boost_range(JsonObject *channels, const char *slot_name)
+{
+  JsonObject *slot = json_object_get_object_member(channels, slot_name);
+  JsonObject *boost = json_object_get_object_member(slot, "boost");
+  JsonArray *range = json_object_get_array_member(boost, "range");
+  assert_float_equal(json_array_get_double_element(range, 0), -6.64385619, 1e-5);
+  assert_float_equal(json_array_get_double_element(range, 1), 11.35614381, 1e-5);
+}
+
+static void test_schema_parametric_for_rgb_scene(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *schema = _node_object(node);
+
+  // Non-drawn state: the exact writable vocabulary is off/uniform/parametric.
+  JsonObject *mm_schema = json_object_get_object_member(schema, "mask_mode");
+  JsonArray *mm = json_object_get_array_member(mm_schema, "values");
+  assert_int_equal(json_array_get_length(mm), 3);
+  assert_string_equal(json_array_get_string_element(mm, 0), "off");
+  assert_string_equal(json_array_get_string_element(mm, 1), "uniform");
+  assert_string_equal(json_array_get_string_element(mm, 2), "parametric");
+  assert_true(json_object_get_boolean_member(mm_schema, "writable"));
+
+  // combine enum, four values, writable
+  JsonObject *combine = json_object_get_object_member(schema, "combine");
+  assert_true(json_object_get_boolean_member(combine, "writable"));
+  JsonArray *cv = json_object_get_array_member(combine, "values");
+  assert_int_equal(json_array_get_length(cv), 4);
+  assert_string_equal(json_array_get_string_element(cv, 0), "exclusive");
+  assert_string_equal(json_array_get_string_element(cv, 1), "inclusive");
+  assert_string_equal(json_array_get_string_element(cv, 2), "exclusive_inverted");
+  assert_string_equal(json_array_get_string_element(cv, 3), "inclusive_inverted");
+
+  JsonObject *override = json_object_get_object_member(schema, "allow_inverted_combine");
+  assert_string_equal(json_object_get_string_member(override, "type"), "bool");
+  assert_true(json_object_get_boolean_member(override, "writable"));
+  assert_true(json_object_get_boolean_member(override, "write_only"));
+
+  // RGB scene is forced: validate its exact vocabulary and shifted boosts
+  // without a runtime family conditional that could skip this coverage.
+  JsonObject *channels = json_object_get_object_member(
+    json_object_get_object_member(schema, "parametric"), "channels");
+  static const char *const names[] = { "g", "R", "G", "B", "Jz", "Cz", "hz" };
+  _assert_channel_vocabulary(channels, names, G_N_ELEMENTS(names));
+  _assert_shifted_boost_range(channels, "Jz_in");
+  _assert_shifted_boost_range(channels, "Jz_out");
+  _assert_shifted_boost_range(channels, "Cz_in");
+  _assert_shifted_boost_range(channels, "Cz_out");
+  assert_true(json_object_get_null_member(
+    json_object_get_object_member(channels, "hz_in"), "boost"));
+  assert_true(json_object_get_null_member(
+    json_object_get_object_member(channels, "hz_out"), "boost"));
+
+  JsonArray *md = json_object_get_array_member(
+    json_object_get_object_member(channels, "g_in"), "markers_domain");
+  assert_float_equal(json_array_get_double_element(md, 0), 0.0, 1e-6);
+  assert_float_equal(json_array_get_double_element(md, 1), 1.0, 1e-6);
+
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_schema_parametric_for_rgb_display(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_DISPLAY;
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *schema = _node_object(node);
+  assert_true(json_object_has_member(schema, "parametric"));
+  JsonObject *channels = json_object_get_object_member(
+    json_object_get_object_member(schema, "parametric"), "channels");
+
+  static const char *const names[] = { "g", "R", "G", "B", "H", "S", "l" };
+  _assert_channel_vocabulary(channels, names, G_N_ELEMENTS(names));
+  static const char *const non_boost_slots[] = {
+    "H_in", "H_out", "S_in", "S_out", "l_in", "l_out"
+  };
+  for(guint i = 0; i < G_N_ELEMENTS(non_boost_slots); i++)
+    assert_true(json_object_get_null_member(
+      json_object_get_object_member(channels, non_boost_slots[i]), "boost"));
+
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void _assert_mask_mode_schema(dt_iop_module_t *module,
+                                     uint32_t stored,
+                                     const char *const *expected,
+                                     guint expected_len,
+                                     gboolean writable)
+{
+  module->blend_params->mask_mode = stored;
+  JsonNode *node = dt_remote_blend_schema(module);
+  JsonObject *mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  JsonArray *values = json_object_get_array_member(mm, "values");
+  assert_int_equal(json_array_get_length(values), expected_len);
+  for(guint i = 0; i < expected_len; i++)
+    assert_string_equal(json_array_get_string_element(values, i), expected[i]);
+  assert_int_equal(json_object_get_boolean_member(mm, "writable"), writable);
+  json_node_unref(node);
+}
+
+static void test_schema_mask_mode_state_aware(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  static const char *const plain[] = { "off", "uniform", "parametric" };
+  static const char *const drawn[] = { "drawn", "drawn+parametric" };
+  static const char *const raster[] = { "raster" };
+
+  _assert_mask_mode_schema(fx->module, DEVELOP_MASK_DISABLED, plain, 3, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL,
+                           plain, 3, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK,
+                           drawn, 2, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK_CONDITIONAL,
+                           drawn, 2, TRUE);
+  _assert_mask_mode_schema(fx->module,
+                           DEVELOP_MASK_ENABLED | DEVELOP_MASK_RASTER,
+                           raster, 1, FALSE);
+  blend_fixture_free(fx);
+}
+
+static void test_schema_no_parametric_for_raw_module(void **state)
+{
+  (void)state;
+  // Force the blending exposure fixture into RAW to exercise the family
+  // gate without depending on a non-blending module's NULL schema.
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_cst = DEVELOP_BLEND_CS_RAW;
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *schema = _node_object(node);
+  assert_false(json_object_has_member(schema, "parametric"));
+  assert_false(json_object_has_member(schema, "combine"));
+  json_node_unref(node);
+
+  // A legacy conditional bit remains representable/removable, but RAW
+  // still does not expose writable channel/combine members.
+  fx->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  node = dt_remote_blend_schema(fx->module);
+  schema = _node_object(node);
+  JsonObject *mm = json_object_get_object_member(schema, "mask_mode");
+  JsonArray *values = json_object_get_array_member(mm, "values");
+  assert_int_equal(json_array_get_length(values), 3);
+  assert_string_equal(json_array_get_string_element(values, 2), "parametric");
+  assert_true(json_object_get_boolean_member(mm, "writable"));
+  assert_false(json_object_has_member(schema, "parametric"));
+  assert_false(json_object_has_member(schema, "combine"));
   json_node_unref(node);
   blend_fixture_free(fx);
 }
@@ -882,7 +1071,11 @@ int main(void)
     cmocka_unit_test(test_mask_mode_targets_and_transition_matrix),
     cmocka_unit_test(test_schema_null_for_non_blending_module),
     cmocka_unit_test(test_schema_shape_for_rgb_module),
-    cmocka_unit_test(test_schema_mask_mode_not_writable_with_extra_bits),
+    cmocka_unit_test(test_schema_mask_mode_extra_bits_metadata),
+    cmocka_unit_test(test_schema_parametric_for_rgb_scene),
+    cmocka_unit_test(test_schema_parametric_for_rgb_display),
+    cmocka_unit_test(test_schema_mask_mode_state_aware),
+    cmocka_unit_test(test_schema_no_parametric_for_raw_module),
     cmocka_unit_test(test_read_defaults),
     cmocka_unit_test(test_read_reverse_and_deprecated_mode),
     cmocka_unit_test(test_read_non_finite_serializes_null),
