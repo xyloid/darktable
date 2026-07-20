@@ -27,9 +27,13 @@
 #include <cmocka.h>
 
 #include "control/remote_blend.h"
+#include "common/darktable.h"
+#include "develop/develop.h"
 #include "develop/blend.h"
+#include "develop/imageop.h"
 
 #include <glib.h>
+#include <math.h>
 
 // Flattens dt_develop_blend_mode_sections(csp) exactly the way
 // dt_bauhaus_combobox_add_introspection() walks dt_develop_blend_mode_names:
@@ -204,6 +208,206 @@ static void test_mode_names_for_colorspace_matches_sections(void **state)
   g_ptr_array_unref(none);
 }
 
+#ifndef DT_TEST_MODULEDIR
+#error "DT_TEST_MODULEDIR must be defined by the build (see CMakeLists.txt)"
+#endif
+
+static char *s_blend_confdir = NULL;
+
+static int harness_group_setup(void **state)
+{
+  (void)state;
+  GError *gerror = NULL;
+  s_blend_confdir = g_dir_make_tmp("test_remote_blend-XXXXXX", &gerror);
+  if(!s_blend_confdir)
+  {
+    fprintf(stderr, "test_remote_blend: scratch confdir failed: %s\n", gerror->message);
+    g_error_free(gerror);
+    return -1;
+  }
+  char *argv_override[] = {
+    "test_remote_blend",
+    "--configdir", s_blend_confdir,
+    "--library", ":memory:",
+    "--moduledir", DT_TEST_MODULEDIR,
+    "--conf", "write_sidecar_files=never",
+    NULL
+  };
+  int argc_override = G_N_ELEMENTS(argv_override) - 1;
+  return dt_init(argc_override, argv_override, FALSE, FALSE, NULL) ? -1 : 0;
+}
+
+static int harness_group_teardown(void **state)
+{
+  (void)state;
+  dt_cleanup();
+  if(s_blend_confdir)
+  {
+    gchar *cmd = g_strdup_printf("rm -rf '%s'", s_blend_confdir);
+    if(system(cmd) != 0)
+      fprintf(stderr, "test_remote_blend: could not remove %s\n", s_blend_confdir);
+    g_free(cmd);
+    g_clear_pointer(&s_blend_confdir, g_free);
+  }
+  return 0;
+}
+
+typedef struct blend_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+} blend_fixture_t;
+
+static blend_fixture_t *blend_fixture_new(const char *op)
+{
+  blend_fixture_t *fixture = g_new0(blend_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+  fixture->dev.gui_attached = FALSE;
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params, fixture->module->params_size);
+  fixture->dev.iop = g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void blend_fixture_free(blend_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static JsonObject *_node_object(JsonNode *node)
+{
+  assert_non_null(node);
+  assert_true(JSON_NODE_HOLDS_OBJECT(node));
+  return json_node_get_object(node);
+}
+
+// "exposure" supports blending (RGB module); "rawprepare" does not.
+static void test_schema_null_for_non_blending_module(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("rawprepare");
+  assert_null(dt_remote_blend_schema(fx->module));
+  assert_null(dt_remote_blend_read(fx->module));
+  blend_fixture_free(fx);
+}
+
+static void test_schema_shape_for_rgb_module(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *schema = _node_object(node);
+
+  JsonObject *mm = json_object_get_object_member(schema, "mask_mode");
+  assert_true(json_object_get_boolean_member(mm, "writable"));
+  assert_false(json_object_get_boolean_member(mm, "current_extra_bits"));
+  JsonArray *mm_values = json_object_get_array_member(mm, "values");
+  assert_int_equal(json_array_get_length(mm_values), 2);
+  assert_string_equal(json_array_get_string_element(mm_values, 0), "off");
+  assert_string_equal(json_array_get_string_element(mm_values, 1), "uniform");
+
+  JsonObject *cs = json_object_get_object_member(schema, "colorspace");
+  assert_true(json_object_get_boolean_member(cs, "writable"));
+  JsonArray *cs_values = json_object_get_array_member(cs, "values");
+  assert_int_equal(json_array_get_length(cs_values), 2);
+  assert_string_equal(json_array_get_string_element(cs_values, 0), "DEVELOP_BLEND_CS_RGB_DISPLAY");
+  assert_string_equal(json_array_get_string_element(cs_values, 1), "DEVELOP_BLEND_CS_RGB_SCENE");
+  const char *cs_default = json_object_get_string_member(cs, "default");
+  assert_true(!strcmp(cs_default, "DEVELOP_BLEND_CS_RGB_DISPLAY")
+              || !strcmp(cs_default, "DEVELOP_BLEND_CS_RGB_SCENE"));
+
+  JsonObject *mode = json_object_get_object_member(schema, "mode");
+  const dt_develop_blend_colorspace_t eff =
+    dt_remote_blend_effective_colorspace(fx->module, fx->module->blend_params->blend_cst);
+  GPtrArray *expected = dt_remote_blend_mode_names_for_colorspace(eff);
+  JsonArray *mode_values = json_object_get_array_member(mode, "values");
+  assert_int_equal(json_array_get_length(mode_values), expected->len);
+  for(guint i = 0; i < expected->len; i++)
+    assert_string_equal(json_array_get_string_element(mode_values, i),
+                        g_ptr_array_index(expected, i));
+  g_ptr_array_unref(expected);
+
+  JsonObject *fulcrum = json_object_get_object_member(schema, "fulcrum");
+  JsonArray *range = json_object_get_array_member(fulcrum, "range");
+  assert_int_equal((int)json_array_get_double_element(range, 0), -18);
+  assert_int_equal((int)json_array_get_double_element(range, 1), 18);
+  JsonArray *soft = json_object_get_array_member(fulcrum, "soft_range");
+  assert_int_equal((int)json_array_get_double_element(soft, 0), -3);
+  assert_string_equal(json_object_get_string_member(fulcrum, "unit"), "EV");
+
+  JsonObject *details = json_object_get_object_member(schema, "details");
+  assert_false(json_object_get_boolean_member(details, "writable"));
+
+  JsonObject *fg = json_object_get_object_member(schema, "feathering_guide");
+  assert_int_equal(json_array_get_length(json_object_get_array_member(fg, "values")), 4);
+
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_schema_mask_mode_not_writable_with_extra_bits(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  JsonNode *node = dt_remote_blend_schema(fx->module);
+  JsonObject *mm = json_object_get_object_member(_node_object(node), "mask_mode");
+  assert_false(json_object_get_boolean_member(mm, "writable"));
+  assert_true(json_object_get_boolean_member(mm, "current_extra_bits"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_defaults(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *o = _node_object(node);
+  assert_string_equal(json_object_get_string_member(o, "mask_mode"), "off");
+  assert_string_equal(json_object_get_string_member(o, "colorspace"), "DEVELOP_BLEND_CS_NONE");
+  const char *eff = json_object_get_string_member(o, "effective_colorspace");
+  assert_true(!strcmp(eff, "DEVELOP_BLEND_CS_RGB_DISPLAY") || !strcmp(eff, "DEVELOP_BLEND_CS_RGB_SCENE"));
+  assert_string_equal(json_object_get_string_member(o, "mode"), "DEVELOP_BLEND_NORMAL2");
+  assert_false(json_object_get_boolean_member(o, "reverse"));
+  assert_float_equal(json_object_get_double_member(o, "opacity"), 100.0, 1e-6);
+  assert_float_equal(json_object_get_double_member(o, "fulcrum"), 0.0, 1e-6);
+  assert_string_equal(json_object_get_string_member(o, "feathering_guide"),
+                      "DEVELOP_MASK_GUIDE_IN_AFTER_BLUR");
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_reverse_and_deprecated_mode(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->blend_mode = DEVELOP_BLEND_LAB_L | DEVELOP_BLEND_REVERSE;
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *o = _node_object(node);
+  assert_string_equal(json_object_get_string_member(o, "mode"), "DEVELOP_BLEND_LAB_L");
+  assert_true(json_object_get_boolean_member(o, "reverse"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_non_finite_serializes_null(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  fx->module->blend_params->opacity = NAN;
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *o = _node_object(node);
+  assert_true(json_object_get_null_member(o, "opacity"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -216,6 +420,12 @@ int main(void)
     cmocka_unit_test(test_mask_mode_string_mapping),
     cmocka_unit_test(test_mask_mode_from_string),
     cmocka_unit_test(test_mode_names_for_colorspace_matches_sections),
+    cmocka_unit_test(test_schema_null_for_non_blending_module),
+    cmocka_unit_test(test_schema_shape_for_rgb_module),
+    cmocka_unit_test(test_schema_mask_mode_not_writable_with_extra_bits),
+    cmocka_unit_test(test_read_defaults),
+    cmocka_unit_test(test_read_reverse_and_deprecated_mode),
+    cmocka_unit_test(test_read_non_finite_serializes_null),
   };
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return cmocka_run_group_tests(tests, harness_group_setup, harness_group_teardown);
 }

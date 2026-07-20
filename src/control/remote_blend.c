@@ -206,3 +206,211 @@ GPtrArray *dt_remote_blend_mode_names_for_colorspace(dt_develop_blend_colorspace
   }
   return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* schema + read                                                       */
+/* ------------------------------------------------------------------ */
+
+// Choice set per the GUI colorspace menu: modules whose default space is
+// Lab/RGB may choose; RAW and CS_NONE defaults have no choice.
+static guint _colorspace_choices(dt_iop_module_t *module,
+                                 dt_develop_blend_colorspace_t *choices,
+                                 gboolean *writable)
+{
+  const dt_develop_blend_colorspace_t def =
+    dt_develop_blend_default_module_blend_colorspace(module);
+  guint n = 0;
+  if(def == DEVELOP_BLEND_CS_LAB
+     || def == DEVELOP_BLEND_CS_RGB_DISPLAY
+     || def == DEVELOP_BLEND_CS_RGB_SCENE)
+  {
+    *writable = TRUE;
+    if(def == DEVELOP_BLEND_CS_LAB) choices[n++] = DEVELOP_BLEND_CS_LAB;
+    choices[n++] = DEVELOP_BLEND_CS_RGB_DISPLAY;
+    choices[n++] = DEVELOP_BLEND_CS_RGB_SCENE;
+    return n;
+  }
+  *writable = FALSE;
+  choices[n++] = def;
+  return n;
+}
+
+static gboolean _details_writable(dt_iop_module_t *module)
+{
+  return module->dev
+         && dt_is_valid_imgid(module->dev->image_storage.id)
+         && dt_image_is_rawprepare_supported(&module->dev->image_storage);
+}
+
+static void _add_float_member(JsonBuilder *b, const char *name, float value)
+{
+  json_builder_set_member_name(b, name);
+  if(isfinite(value)) json_builder_add_double_value(b, (double)value);
+  else json_builder_add_null_value(b);
+}
+
+JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
+{
+  if(!module || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) return NULL;
+  const dt_develop_blend_params_t *bp = module->blend_params;
+  const gboolean extra_bits =
+    (bp->mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_RASTER)) != 0;
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "mask_mode");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "enum");
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  json_builder_add_string_value(b, "off");
+  json_builder_add_string_value(b, "uniform");
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, !extra_bits);
+  json_builder_set_member_name(b, "current_extra_bits");
+  json_builder_add_boolean_value(b, extra_bits);
+  json_builder_end_object(b);
+
+  dt_develop_blend_colorspace_t choices[3];
+  gboolean cs_writable = FALSE;
+  const guint n_choices = _colorspace_choices(module, choices, &cs_writable);
+  json_builder_set_member_name(b, "colorspace");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "enum");
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  for(guint i = 0; i < n_choices; i++)
+    json_builder_add_string_value(b, _enum_name_for_value(_colorspace_names, choices[i]));
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "default");
+  json_builder_add_string_value(b,
+    _enum_name_for_value(_colorspace_names,
+                         dt_develop_blend_default_module_blend_colorspace(module)));
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, cs_writable);
+  json_builder_end_object(b);
+
+  const dt_develop_blend_colorspace_t eff =
+    dt_remote_blend_effective_colorspace(module, bp->blend_cst);
+  GPtrArray *mode_names = dt_remote_blend_mode_names_for_colorspace(eff);
+  json_builder_set_member_name(b, "mode");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "enum");
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  for(guint i = 0; i < mode_names->len; i++)
+    json_builder_add_string_value(b, g_ptr_array_index(mode_names, i));
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, TRUE);
+  json_builder_end_object(b);
+  g_ptr_array_unref(mode_names);
+
+  json_builder_set_member_name(b, "reverse");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "bool");
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, TRUE);
+  json_builder_end_object(b);
+
+  json_builder_set_member_name(b, "feathering_guide");
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");
+  json_builder_add_string_value(b, "enum");
+  json_builder_set_member_name(b, "values");
+  json_builder_begin_array(b);
+  for(const _enum_name_t *e = _feathering_guide_names; e->name; e++)
+    json_builder_add_string_value(b, e->name);
+  json_builder_end_array(b);
+  json_builder_set_member_name(b, "writable");
+  json_builder_add_boolean_value(b, TRUE);
+  json_builder_end_object(b);
+
+  for(const _float_field_t *f = _float_fields; f->name; f++)
+  {
+    json_builder_set_member_name(b, f->name);
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "type");
+    json_builder_add_string_value(b, "float");
+    json_builder_set_member_name(b, "range");
+    json_builder_begin_array(b);
+    json_builder_add_double_value(b, (double)f->min);
+    json_builder_add_double_value(b, (double)f->max);
+    json_builder_end_array(b);
+    if(f->soft_min != f->soft_max)
+    {
+      json_builder_set_member_name(b, "soft_range");
+      json_builder_begin_array(b);
+      json_builder_add_double_value(b, (double)f->soft_min);
+      json_builder_add_double_value(b, (double)f->soft_max);
+      json_builder_end_array(b);
+    }
+    if(f->unit)
+    {
+      json_builder_set_member_name(b, "unit");
+      json_builder_add_string_value(b, f->unit);
+    }
+    json_builder_set_member_name(b, "writable");
+    json_builder_add_boolean_value(b,
+      strcmp(f->name, "details") ? TRUE : _details_writable(module));
+    json_builder_end_object(b);
+  }
+
+  json_builder_end_object(b);
+  JsonNode *root = json_builder_get_root(b);
+  g_object_unref(b);
+  return root;
+}
+
+JsonNode *dt_remote_blend_read(dt_iop_module_t *module)
+{
+  if(!module || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) return NULL;
+  const dt_develop_blend_params_t *bp = module->blend_params;
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+
+  json_builder_set_member_name(b, "mask_mode");
+  json_builder_add_string_value(b, dt_remote_blend_mask_mode_string(bp->mask_mode));
+
+  const dt_develop_blend_colorspace_t default_cst =
+    dt_develop_blend_default_module_blend_colorspace(module);
+  const int32_t stored_cst = bp->blend_cst == default_cst ? DEVELOP_BLEND_CS_NONE : bp->blend_cst;
+  const char *cs_name = _enum_name_for_value(_colorspace_names, (uint32_t)stored_cst);
+  json_builder_set_member_name(b, "colorspace");
+  if(cs_name) json_builder_add_string_value(b, cs_name);
+  else json_builder_add_int_value(b, stored_cst);
+
+  json_builder_set_member_name(b, "effective_colorspace");
+  json_builder_add_string_value(b,
+    _enum_name_for_value(_colorspace_names,
+                         dt_remote_blend_effective_colorspace(module, bp->blend_cst)));
+
+  const uint32_t mode_value = bp->blend_mode & DEVELOP_BLEND_MODE_MASK;
+  const char *mode_name = _enum_name_for_value(_mode_c_names, mode_value);
+  json_builder_set_member_name(b, "mode");
+  if(mode_name) json_builder_add_string_value(b, mode_name);
+  else json_builder_add_int_value(b, (gint64)mode_value);
+
+  json_builder_set_member_name(b, "reverse");
+  json_builder_add_boolean_value(b, (bp->blend_mode & DEVELOP_BLEND_REVERSE) != 0);
+
+  const char *fg_name = _enum_name_for_value(_feathering_guide_names, bp->feathering_guide);
+  json_builder_set_member_name(b, "feathering_guide");
+  if(fg_name) json_builder_add_string_value(b, fg_name);
+  else json_builder_add_int_value(b, (gint64)bp->feathering_guide);
+
+  for(const _float_field_t *f = _float_fields; f->name; f++)
+    _add_float_member(b, f->name, *(const float *)((const guint8 *)bp + f->offset));
+
+  json_builder_end_object(b);
+  JsonNode *root = json_builder_get_root(b);
+  g_object_unref(b);
+  return root;
+}
