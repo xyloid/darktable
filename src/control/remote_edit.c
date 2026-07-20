@@ -1622,6 +1622,37 @@ gboolean dt_remote_set_module_params(const dt_remote_module_ref_t *ref,
   const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
   dt_iop_gui_update(module);
   dt_dev_add_history_item(dev, module, FALSE);
+
+  // Blend race repair: unlike scalar params, the blend block also flows
+  // HISTORY -> MODULE -- every pixelpipe synch (dt_dev_pixelpipe_change,
+  // background pipe threads, under dev->history_mutex) re-commits each
+  // history item's blend_params into the live module via
+  // dt_iop_commit_params() -> dt_iop_commit_blend_params(), and synch_all
+  // first resets every module to default blend params. A synch that runs
+  // between the dt_iop_commit_blend_params() above and the history item
+  // landing can therefore clobber the freshly committed blend block in the
+  // live module -- and, because _dev_add_history_item_ext snapshots
+  // module->blend_params, even inside the new history item (observed live
+  // in the Tier-1 integration gates). Under the same mutex the synchs
+  // hold, re-assert the validated block on both, and re-invalidate the
+  // pipes if a clobber actually happened (a synch may already have
+  // consumed the changed flags with the stale block).
+  if(have_blend)
+  {
+    dt_pthread_mutex_lock(&dev->history_mutex);
+    const gboolean module_stale =
+      memcmp(module->blend_params, &temp_blend, sizeof(dt_develop_blend_params_t)) != 0;
+    GList *last = g_list_nth(dev->history, dev->history_end - 1);
+    dt_dev_history_item_t *hist = last ? last->data : NULL;
+    const gboolean hist_stale =
+      hist && hist->module == module && hist->blend_params
+      && memcmp(hist->blend_params, &temp_blend, sizeof(dt_develop_blend_params_t)) != 0;
+    if(module_stale) dt_iop_commit_blend_params(module, &temp_blend);
+    if(hist_stale) memcpy(hist->blend_params, &temp_blend, sizeof(dt_develop_blend_params_t));
+    dt_pthread_mutex_unlock(&dev->history_mutex);
+    if(module_stale || hist_stale) dt_dev_invalidate_all(dev);
+  }
+
   if(module->widget) gtk_widget_queue_draw(module->widget);
   _remote_reveal_module(module);
 
