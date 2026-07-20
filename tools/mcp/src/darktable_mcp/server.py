@@ -56,7 +56,9 @@ SERVER_INSTRUCTIONS = (
     "current image/view, live processing modules, and their parameter "
     "schemas and values; mutate the edit -- enable/disable and reset "
     "modules, create new module instances, read the history stack, and "
-    "undo; and render a bounded JPEG preview of the current edit state. "
+    "undo; and render a bounded JPEG preview of the current edit state -- "
+    "or, when the `mask_render` capability is available, an individual "
+    "module's blend mask via `render_preview`'s `show_mask`. "
     "All tools require a darktable instance running with remote control "
     "enabled and, for darkroom-scoped tools, an image open in the "
     "darkroom. Mutations accept an optional `expected_revision` for "
@@ -332,8 +334,12 @@ def build_server(
         `blend` edits the module's blend settings (opacity, blend mode,
         blending colorspace, mask refinement) and needs a darktable that
         advertises the `blend_params` capability. Members: `mask_mode`
-        ("off"/"uniform" -- drawn/parametric/raster configurations are
-        read-only here), `colorspace` and `mode` (C enumerator names; see
+        (the schema gives the state-aware choice set:
+        `off`/`uniform`/`parametric` are writable in non-drawn supported
+        families; `drawn` and `drawn+parametric` may toggle only the
+        parametric bit while a drawn mask stays attached; entering or
+        leaving drawn ownership is attach/detach-only; raster is read-only),
+        `colorspace` and `mode` (C enumerator names; see
         `get_module_schema`'s `blend` section for this instance's choice
         sets), `reverse` (bool), `fulcrum` (EV), `opacity` (0-100),
         `feathering_radius` (0-250 px), `feathering_guide`,
@@ -344,6 +350,19 @@ def build_server(
         defaults -- send replacement values in the same call if you want
         them. The response's `blend` member reads back the complete
         post-commit blend state.
+
+        `blend.parametric` (capability `parametric_mask_params`) maps
+        effective-colorspace channel names such as `Jz_in` to complete slot
+        replacements: `{markers:[m0,m1,m2,m3], inverted?, boost?}`. Markers
+        are ascending in [0,1]; [0,0,1,1] disables the slot, and null resets
+        it. To select bright sky/highlights deterministically, set
+        `colorspace:"DEVELOP_BLEND_CS_RGB_SCENE"`, `combine:"exclusive"`,
+        `mask_mode:"parametric"`, and `Jz_in:{markers:[0.55,0.65,1,1]}` with
+        omitted/false `inverted`. To select shadows, use
+        `Jz_in:{markers:[0,0,0.2,0.35]}`. Boost is an exp2 exponent and does
+        not rescale markers. Inclusive combine XORs effective polarity;
+        changing combine and explicit inverted together requires
+        `allow_inverted_combine:true`. Verify thresholds with `show_mask`.
 
         `curves`, `vectors`, `bands`, and `quantities` may be given
         together; a semantic ID given in more than one raises an error
@@ -413,6 +432,21 @@ def build_server(
                 raise TransportError(
                     "this darktable does not advertise blend_params; "
                     "upgrade darktable to edit blend settings"
+                )
+            # Tier 2 / M-B: the parametric/combine members and the three
+            # blendif-owning mask modes (parametric, drawn, drawn+parametric),
+            # plus the inverted+combine override, require the extra capability.
+            tier2_mask_mode = blend.get("mask_mode") in {
+                "parametric", "drawn", "drawn+parametric"
+            }
+            needs_parametric = tier2_mask_mode or any(
+                key in blend
+                for key in ("parametric", "combine", "allow_inverted_combine")
+            )
+            if needs_parametric and "parametric_mask_params" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise parametric_mask_params; "
+                    "upgrade darktable to edit parametric masks"
                 )
             params["blend"] = blend
         return await client.call("set_module_params", params)
@@ -506,27 +540,49 @@ def build_server(
         client = await _client()
         return await client.call("undo", {"expected_revision": expected_revision})
 
-    @app.tool()
-    async def render_preview(max_px: int = 1024, quality: int = 85) -> Image:
-        """Render the image currently open in the darkroom, with its full
-        current edit history and normal output color management (sRGB),
-        and return it as a JPEG image the model can look at directly.
-        `max_px` bounds the longest edge (clamped to [64, 2048], default
-        1024); `quality` is the JPEG quality (clamped to [50, 95], default
-        85). Rendering happens asynchronously in darktable and can take a
-        few seconds for large raws. If it fails with `request_too_large`,
-        retry with a smaller `max_px`. The wire response's `revision` says
-        which history state was rendered."""
-        # The server clamps too (its contract); clamping here as well keeps
-        # the request honest and self-describing on the wire.
+    # Mixed content for the mask branch, so structured output is off: an
+    # ordinary preview still returns a single native Image block; a mask
+    # render returns a JSON metadata block plus the native Image (the
+    # get_scopes mixed-content idiom, per design amendment 6).
+    @app.tool(structured_output=False)
+    async def render_preview(
+        max_px: int = 1024,
+        quality: int = 85,
+        show_mask: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Render the current darkroom image as a native JPEG content
+        block. `max_px` is clamped to [64, 2048] and `quality` to [50, 95].
+
+        `show_mask={"op": <module>, "instance": <n>}` instead renders that
+        module's blend mask (white = full effect), with identical framing.
+        It requires `mask_render`; off/uniform masks are solid white. Mask
+        renders return a JSON metadata block (`mime_type`, dimensions,
+        revision, `mask_of`) followed by the native JPEG block.
+        """
         max_px = max(64, min(2048, max_px))
         quality = max(50, min(95, quality))
+        params: dict[str, Any] = {"max_px": max_px, "quality": quality}
         client = await _client()
-        result = await client.call("render_preview", {"max_px": max_px, "quality": quality})
+        if show_mask is not None:
+            await client.ensure_connected()
+            if "mask_render" not in client.capabilities:
+                raise TransportError(
+                    "this darktable does not advertise mask_render; "
+                    "upgrade darktable to render masks"
+                )
+            params["show_mask"] = show_mask
+
+        result = await client.call("render_preview", params)
         # Native MCP image content, never a base64 text blob to the model
         # (a plan step 9 binding requirement): decode the wire base64 and
         # hand FastMCP an Image, which becomes an ImageContent block.
-        return Image(data=base64.b64decode(result["data"]), format="jpeg")
+        image = Image(data=base64.b64decode(result["data"]), format="jpeg")
+        if show_mask is None:
+            return [image]
+        if not isinstance(result.get("mask_of"), dict):
+            raise TransportError("darktable returned a mask image without mask_of metadata")
+        metadata = {key: value for key, value in result.items() if key != "data"}
+        return [json.dumps(metadata), image]
 
     # Mixed content (text + images), so structured output is explicitly off:
     # FastMCP converts each returned list element individually -- the JSON

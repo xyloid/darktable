@@ -45,6 +45,15 @@ async def _built_server(tmp_path, server):
     return build_server(config_dir=str(tmp_path), connect_timeout=1.0, request_timeout=1.0)
 
 
+def _advertise_capabilities(server, capabilities: list[str]) -> None:
+    fixture = load_fixture("hello_response.json")
+    server.hello_override = lambda params, req_id: {
+        **fixture,
+        "id": req_id,
+        "result": {**fixture["result"], "capabilities": capabilities},
+    }
+
+
 async def call_tool_json(app, name: str, arguments: dict) -> object:
     """Calls a tool and returns its structured result.
 
@@ -1568,3 +1577,99 @@ async def test_set_module_params_blend_passes_through_when_advertised(
 
     assert len(seen) == 1
     assert seen[0]["blend"] == {"opacity": 50.0}
+
+
+# -- Tier 2 / M-B: parametric-mask + mask-render capability gates -----------
+
+
+@pytest.mark.parametrize(
+    "blend",
+    [
+        {"parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}}},
+        {"combine": "inclusive"},
+        {"allow_inverted_combine": True},
+        {"mask_mode": "parametric"},
+        {"mask_mode": "drawn"},
+        {"mask_mode": "drawn+parametric"},
+    ],
+)
+async def test_tier2_blend_members_require_parametric_capability(
+    tmp_path, fake_server_factory, blend
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "blend_params"])
+    calls: list[dict] = []
+    server.handle("set_module_params", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_module_params",
+            {"module": "exposure", "values": {}, "blend": blend},
+        )
+    assert "parametric_mask_params" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_parametric_blend_passes_when_advertised(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(
+        server, ["params", "blend_params", "parametric_mask_params"]
+    )
+    seen: list[dict] = []
+    server.handle(
+        "set_module_params",
+        lambda params: seen.append(params)
+        or {"module": "exposure", "instance": 0, "enabled": True,
+            "values": {}, "revision": 5},
+    )
+    app = await _built_server(tmp_path, server)
+    blend = {
+        "mask_mode": "parametric",
+        "combine": "exclusive",
+        "parametric": {"Jz_in": {"markers": [0.55, 0.65, 1.0, 1.0]}},
+    }
+    await app.call_tool(
+        "set_module_params",
+        {"module": "exposure", "values": {}, "blend": blend},
+    )
+    assert seen[0]["blend"] == blend
+
+
+async def test_show_mask_requires_mask_render_capability(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "preview"])
+    calls: list[dict] = []
+    server.handle("render_preview", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("render_preview", {"show_mask": {"op": "exposure"}})
+    assert "mask_render" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_show_mask_returns_metadata_then_native_image(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["params", "preview", "mask_render"])
+    fixture = load_fixture("render_preview_show_mask_response.json")
+    seen: list[dict] = []
+    server.handle(
+        "render_preview", lambda params: seen.append(params) or fixture["result"]
+    )
+    app = await _built_server(tmp_path, server)
+    result = await app.call_tool(
+        "render_preview", {"show_mask": {"op": "exposure", "instance": 1}}
+    )
+    assert seen[0]["show_mask"] == {"op": "exposure", "instance": 1}
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert isinstance(result[0], TextContent)
+    metadata = json.loads(result[0].text)
+    assert metadata["mask_of"] == {
+        "op": "exposure", "instance": 1, "mask_mode": "parametric"
+    }
+    assert metadata["revision"] == 35
+    assert "data" not in metadata
+    assert isinstance(result[1], ImageContent)
+    assert base64.b64decode(result[1].data) == base64.b64decode(
+        fixture["result"]["data"]
+    )
