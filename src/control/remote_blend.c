@@ -609,6 +609,18 @@ JsonNode *dt_remote_blend_schema(dt_iop_module_t *module)
   return root;
 }
 
+static const char *_combine_to_string(uint32_t mask_combine)
+{
+  switch(mask_combine & (DEVELOP_COMBINE_INV | DEVELOP_COMBINE_INCL))
+  {
+    case DEVELOP_COMBINE_NORM_EXCL: return "exclusive";
+    case DEVELOP_COMBINE_NORM_INCL: return "inclusive";
+    case DEVELOP_COMBINE_INV_EXCL:  return "exclusive_inverted";
+    case DEVELOP_COMBINE_INV_INCL:  return "inclusive_inverted";
+    default:                        return "exclusive";
+  }
+}
+
 JsonNode *dt_remote_blend_read(dt_iop_module_t *module)
 {
   if(!module || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) return NULL;
@@ -649,6 +661,53 @@ JsonNode *dt_remote_blend_read(dt_iop_module_t *module)
 
   for(const _float_field_t *f = _float_fields; f->name; f++)
     _add_float_member(b, f->name, *(const float *)((const guint8 *)bp + f->offset));
+
+  const dt_develop_blend_colorspace_t eff_r =
+    dt_remote_blend_effective_colorspace(module, bp->blend_cst);
+  const dt_remote_blendif_channel_t *table = dt_remote_blendif_channels(eff_r);
+  if(table)
+  {
+    json_builder_set_member_name(b, "combine");
+    json_builder_add_string_value(b, _combine_to_string(bp->mask_combine));
+
+    json_builder_set_member_name(b, "parametric");
+    json_builder_begin_object(b);
+    uint32_t in_family = 0u;
+    for(const dt_remote_blendif_channel_t *c = table; c->name; c++)
+    {
+      const int slots[2] = { (int)c->slot_in, (int)c->slot_out };
+      for(int io = 0; io < 2; io++)
+      {
+        const int slot = slots[io];
+        in_family |= (1u << slot);
+        if(!dt_remote_blendif_slot_enabled(bp->blendif, slot)) continue;
+        gchar *slot_name = g_strdup_printf("%s_%s", c->name, io ? "out" : "in");
+        json_builder_set_member_name(b, slot_name);
+        g_free(slot_name);
+        json_builder_begin_object(b);
+        const float *p = &bp->blendif_parameters[4 * slot];
+        json_builder_set_member_name(b, "markers");
+        json_builder_begin_array(b);
+        for(int k = 0; k < 4; k++)
+        {
+          if(isfinite(p[k])) json_builder_add_double_value(b, (double)p[k]);
+          else json_builder_add_null_value(b); // corrupt legacy storage: keep JSON strict
+        }
+        json_builder_end_array(b);
+        json_builder_set_member_name(b, "inverted");
+        json_builder_add_boolean_value(b, dt_remote_blendif_slot_inverted(bp->blendif, slot));
+        _add_float_member(b, "boost", bp->blendif_boost_factors[slot]);
+        json_builder_end_object(b);
+      }
+    }
+    json_builder_end_object(b);
+
+    // foreign: any enabled slot outside the effective family (legacy edits)
+    const uint32_t usable_slot_mask = (1u << DEVELOP_BLENDIF_unused) - 1u;
+    const uint32_t enabled_slots = bp->blendif & usable_slot_mask;
+    json_builder_set_member_name(b, "foreign_channels");
+    json_builder_add_boolean_value(b, (enabled_slots & ~in_family) != 0);
+  }
 
   json_builder_end_object(b);
   JsonNode *root = json_builder_get_root(b);

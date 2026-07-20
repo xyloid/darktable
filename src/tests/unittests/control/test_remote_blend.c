@@ -805,6 +805,102 @@ static void test_read_non_finite_serializes_null(void **state)
 }
 
 /* ------------------------------------------------------------------ */
+/* Task 3: parametric + combine read                                   */
+/* ------------------------------------------------------------------ */
+
+// helper: set a slot's markers + enable + polarity + boost directly
+static void _set_slot(dt_develop_blend_params_t *bp, int slot,
+                      float m0, float m1, float m2, float m3,
+                      gboolean inverted, float boost)
+{
+  float *p = &bp->blendif_parameters[4 * slot];
+  p[0] = m0; p[1] = m1; p[2] = m2; p[3] = m3;
+  bp->blendif = dt_remote_blendif_slot_pack(bp->blendif, slot,
+                                            dt_remote_blendif_markers_enable(p), inverted);
+  bp->blendif_boost_factors[slot] = boost;
+}
+
+static void test_read_parametric_enabled_only(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  bp->mask_combine = DEVELOP_COMBINE_NORM_EXCL;
+  // g_in enabled (non-identity), inverted; R_in left full-span => disabled
+  _set_slot(bp, DEVELOP_BLENDIF_GRAY_in, 0.1f, 0.2f, 0.6f, 0.7f, TRUE, 0.0f);
+  _set_slot(bp, DEVELOP_BLENDIF_RED_in, 0.0f, 0.0f, 1.0f, 1.0f, FALSE, 0.0f);
+
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *o = _node_object(node);
+  assert_string_equal(json_object_get_string_member(o, "mask_mode"), "parametric");
+  assert_string_equal(json_object_get_string_member(o, "combine"), "exclusive");
+  assert_false(json_object_has_member(o, "allow_inverted_combine")); // write-only
+
+  JsonObject *param = json_object_get_object_member(o, "parametric");
+  assert_true(json_object_has_member(param, "g_in"));
+  assert_false(json_object_has_member(param, "R_in"));   // full-span -> disabled -> absent
+  JsonObject *g = json_object_get_object_member(param, "g_in");
+  JsonArray *markers = json_object_get_array_member(g, "markers");
+  assert_float_equal(json_array_get_double_element(markers, 0), 0.1, 1e-6);
+  assert_true(json_object_get_boolean_member(g, "inverted"));
+  assert_float_equal(json_object_get_double_member(g, "boost"), 0.0, 1e-6);
+  assert_false(json_object_get_boolean_member(o, "foreign_channels"));
+
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_foreign_channels_flag(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;   // family = 0x77FF
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  // enable a Lab-only slot (bit 8 = C_in, in 0x3377 but the scene family
+  // mask 0x77FF also includes bit 8; choose an out-of-0x77FF slot instead:
+  // bit 15 DEVELOP_BLENDIF_unused is outside both). Use raw bit 11, which
+  // is set in neither Lab_MASK (0x3377) nor RGB_MASK (0x77FF).
+  _set_slot(bp, 11, 0.1f, 0.2f, 0.6f, 0.7f, FALSE, 0.0f);
+
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *o = _node_object(node);
+  assert_true(json_object_get_boolean_member(o, "foreign_channels"));
+  json_node_unref(node);
+
+  // Reserved slot 15 is not a foreign channel. Its polarity twin is the
+  // legacy active bit 31; neither half may make the read flag true.
+  bp->blendif = (1u << DEVELOP_BLENDIF_unused) | (1u << DEVELOP_BLENDIF_active);
+  node = dt_remote_blend_read(fx->module);
+  o = _node_object(node);
+  assert_false(json_object_get_boolean_member(o, "foreign_channels"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+static void test_read_non_finite_parametric_storage_serializes_null(void **state)
+{
+  (void)state;
+  blend_fixture_t *fx = blend_fixture_new("exposure");
+  dt_develop_blend_params_t *bp = fx->module->blend_params;
+  bp->blend_cst = DEVELOP_BLEND_CS_RGB_SCENE;
+  bp->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  _set_slot(bp, DEVELOP_BLENDIF_Jz_in, NAN, 0.2f, 0.6f, 0.7f,
+            FALSE, INFINITY);
+
+  JsonNode *node = dt_remote_blend_read(fx->module);
+  JsonObject *entry = json_object_get_object_member(
+    json_object_get_object_member(_node_object(node), "parametric"), "Jz_in");
+  JsonArray *markers = json_object_get_array_member(entry, "markers");
+  assert_true(json_node_is_null(json_array_get_element(markers, 0)));
+  assert_true(json_object_get_null_member(entry, "boost"));
+  json_node_unref(node);
+  blend_fixture_free(fx);
+}
+
+/* ------------------------------------------------------------------ */
 /* Task 4: patch apply                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -1079,6 +1175,9 @@ int main(void)
     cmocka_unit_test(test_read_defaults),
     cmocka_unit_test(test_read_reverse_and_deprecated_mode),
     cmocka_unit_test(test_read_non_finite_serializes_null),
+    cmocka_unit_test(test_read_parametric_enabled_only),
+    cmocka_unit_test(test_read_foreign_channels_flag),
+    cmocka_unit_test(test_read_non_finite_parametric_storage_serializes_null),
     cmocka_unit_test(test_patch_opacity_and_mask_mode),
     cmocka_unit_test(test_patch_unknown_member_and_empty),
     cmocka_unit_test(test_patch_mask_mode_transition_table),
