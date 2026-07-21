@@ -1,13 +1,15 @@
 # darktable MCP — drawn masks (mask Tier 3) low-level design
 
 Date: 2026-07-19
-Status: draft design (not yet planned; awaiting review; depends on Tier 1).
-Two contracts are prerequisites to *planning*, per the 2026-07-19 scope
-reorg: the pipe-freshness contract for coordinate transforms (shared with
-`sample_region` — whichever effort plans first writes it) and the
-GUI-edit-session guard (resolved below, decision 8). The cross-tier
-`mask_mode` transition appendix in the candidates doc is authoritative
-over this document's per-operation mode effects.
+Status: **planned** (see `docs/superpowers/plans/2026-07-19-darktable-mcp-drawn-masks-tier3.md`; depends on Tier 1 / M-A and Tier 2 / M-B).
+The two planning-prerequisite contracts are now resolved and written into
+the plan as normative amendments: the pipe-freshness contract for
+coordinate transforms (Amendment 1, shared verbatim with `sample_region`)
+and the GUI-edit-session guard (Amendment 2 / decision 8). All items in
+"Explicitly unresolved" below are closed — see the **Amendments
+(planning)** section for the resolutions. The cross-tier `mask_mode`
+transition appendix in the candidates doc is authoritative over this
+document's per-operation mode effects.
 Companions: `2026-07-19-darktable-mcp-blend-settings-design.md` (Tier 1),
 `2026-07-19-darktable-mcp-parametric-masks-design.md` (Tier 2),
 `2026-07-18-darktable-mcp-picker-and-sampling-candidates.md` (the
@@ -221,6 +223,13 @@ affected instances + revision.
 
 ### `attach_mask` / `detach_mask`
 
+> **Superseded by Amendment 3:** these two are merged into a single
+> `set_mask_attachment { …, attached: true|false }` method. The payload
+> below is unchanged for the attach case (`attached: true`); `attached:
+> false` detaches and reads none of `state`/`inverted`/`opacity`. Per
+> Amendment 6, `state` is ignored when the shape lands as the group's
+> first member.
+
 ```json
 { "op": "exposure", "instance": 1, "shape_id": 12,
   "state": "union", "inverted": false, "opacity": 0.8,
@@ -277,14 +286,15 @@ all mutating ones take `expected_revision` CAS like every mutation.
 - `used_by` walk, state-bit ↔ string mapping, membership upsert.
 - Coordinate conversion (`remote_transform.c` helper): point mapping via
   `dt_dev_distort_transform/backtransform` on the full pipe + the probe
-  algorithm for sizes/angles. Locking follows the GUI handlers (GTK
-  thread against `darktable.develop`). **Freshness is a separate,
-  unresolved contract** (hard-challenge H3): locking prevents races, not
-  staleness — a transform issued between a distortion mutation and pipe
-  reprocess can be deterministically wrong with no redraw to self-correct.
-  The freshness contract (block-until-clean vs `retry_later` vs both,
-  with timeout) must be designed before this milestone is planned and is
-  shared verbatim with `sample_region`.
+    algorithm for sizes/angles. Locking follows the GUI handlers (GTK
+  thread against `darktable.develop`). **Freshness is a separate
+  contract** (hard-challenge H3): locking prevents races, not staleness —
+  a transform issued between a distortion mutation and pipe reprocess can
+  be deterministically wrong with no redraw to self-correct. **Resolved as
+  Amendment 1** (block-until-clean, then `retry_later` on timeout;
+  `dt_remote_transform_ensure_fresh`), shared verbatim with
+  `sample_region`. Note the angle probe works in isotropic pixels, not
+  normalized space (Amendment 5).
 - **GUI-edit-session guard** (hard-challenge H2, decision 8): before
   mutating or deleting any form, the engine checks whether that form (or
   its group) is the live edit target (`dev->form_visible` /
@@ -413,19 +423,106 @@ end-to-end confirmation):
    alternative (refusing with a retryable error) was rejected as worse
    for unattended agent operation but is cheap to revisit.
 
-## Explicitly unresolved (to close during planning/brainstorming)
+## Amendments (planning — 2026-07-20)
 
-- **The pipe-freshness contract** (prerequisite to planning; see Engine
-  design and hard-challenge H3) — shared with `sample_region`.
-- Final numeric ranges per geometry member (pin from GUI interaction
-  clamps; the validation *policy* above is fixed).
-- Probe algorithm details: probe arm length for angle mapping, the
-  exact/approximate spread threshold (1% is a placeholder).
-- Whether `update_mask_shape` on a shape whose only user is a *disabled*
-  module should still reveal that module.
-- Interaction with `dt_masks_form_duplicate` (GUI shape duplication) —
-  a possible cheap `duplicate_mask_shape` method, deferred unless a
-  workflow needs it.
-- Whether creation should honor the GUI's per-shape conf defaults for
-  omitted optional members (`border` etc.) or require every member
-  explicitly (current design: require explicitly; challenge welcome).
+Recorded when the implementation plan
+(`2026-07-19-darktable-mcp-drawn-masks-tier3.md`) was written and
+source-verified. These are binding contracts; the plan header carries the
+full normative text.
+
+1. **Pipe-freshness contract (H3).** Any wire call that back-transforms
+   coordinates between a mutation and pipe reprocess (and any such call on
+   a freshly-loaded image) blocks until `dev->preview_pipe->status ==
+   DT_DEV_PIXELPIPE_VALID`: if not already valid, enqueue one
+   `dt_dev_process_preview` and poll every 5 ms up to
+   `pixelpipe_synchronization_timeout` iterations (hard cap 2000 ≈ 10 s
+   when the conf is non-positive), else fail `retry_later`
+   (`DT_REMOTE_ERR_PIPE_NOT_READY`, retryable). Every mutation marks the
+   preview pipe `DIRTY` synchronously before returning, so a
+   mutate-then-transform in one client breath never reads stale-`VALID`
+   geometry. Implemented once as `dt_remote_transform_ensure_fresh` in
+   `remote_transform.c` and **shared verbatim with `sample_region`**.
+   *Interactive cost (accepted):* the poll runs on the GTK main thread, so
+   a co-located user's UI stalls for the wait window on the first
+   coordinate call after a distortion-changing edit; the common
+   already-`VALID` path returns immediately. Documented in the protocol
+   reference.
+
+2. **GUI-edit-session guard (H2 / decision 8).** Before mutating or
+   deleting any form (or a group referencing it), the engine cancels a
+   live GUI edit of that target via `dt_masks_change_form_gui(NULL)`,
+   which clears `form_gui->points` and nulls `form_visible` before the
+   free — so a user mid-drag on the deleted form has their gesture
+   discarded cleanly (no use-after-free). Implemented as
+   `dt_remote_masks_cancel_gui_edit_if_targeting`.
+
+3. **H7 tool merge.** `attach_mask` + `detach_mask` merged into one
+   `set_mask_attachment { op, instance, shape_id, attached, state?,
+   inverted?, opacity?, expected_revision }` (18→17 tools);
+   `create`/`update`/`delete`/`list` stay separate. Docstring token
+   budgets enforced by a sidecar test.
+
+4. **Omitted optional geometry members are rejected.** Create/update
+   require **every** member of the type's geometry; a missing member is
+   `invalid_value` / `missing_member`. No per-shape conf defaults. (Closes
+   the omitted-member open question in favor of a deterministic wire.)
+
+5. **Probe constants pinned + angle space corrected.** `size_mapping`
+   spread threshold = **1 % relative** across the 4 probe-arm distances;
+   angle-probe arm = **0.05 of the shorter image edge, applied as an
+   isotropic pixel offset**. The angle handling is isotropic-pixel, **not
+   normalized**, because darktable stores mask rotation as a geometric
+   angle in square-pixel space (`ellipse.c:233-286` scales radii by
+   `MIN(w,h)`); a normalized-space probe would skew rotations on
+   non-square images (diverges only under *anisotropic* distortion —
+   perspective/keystone; a plain rotation is conformal and round-trips
+   either way).
+
+6. **First-member combine-op rule.** The bottom-most (first) member of a
+   module's group carries **no** combine op — nothing beneath it to
+   combine with — mirroring `dt_masks_gui_form_save_creation`
+   (`masks.c:401-406`) and the GUI. A `state` supplied on a
+   `set_mask_attachment` that lands as the first member is accepted and
+   **ignored**; `inverted` and `opacity` still apply to every member. This
+   holds on re-attach too (the bottom member never gains an op).
+
+7. **Numeric ranges pinned to GUI storage clamps.** Circle/ellipse
+   `radius`/`border ∈ [0.0005, 1.0]`, ellipse `radius_limit = 1.0`
+   (non-clone), gradient `compression ∈ (0, 1.0]`, `curvature ∈ [-2, 2]`
+   (verified `circle.c`/`ellipse.c`/`gradient.c`). Wire-space center/anchor
+   allowed in `[-0.5, 1.5]` (moderately off-canvas, mirroring the GUI).
+
+8. **`dt_masks_form_remove` semantics verified (`masks.c:1793-1892`).**
+   `(NULL, NULL, form)` = full permanent delete; `(module, grp, form)` =
+   membership-only detach (drawn shapes lack the `CLONE|NON_CLONE` bit, so
+   the detach early-return applies). The function is **hardwired to
+   `darktable.develop`** internally, not the passed dev — correct on the
+   wire (darkroom dev *is* `darktable.develop`); unit tests on a standalone
+   fixture dev repoint `darktable.develop` around those calls.
+
+9. **JSON numeric coercion.** Wire scalars are read through a helper that
+   accepts both `G_TYPE_DOUBLE` and `G_TYPE_INT64` (mirroring
+   `remote_blend.c:760-761`); integer JSON (e.g. `"radius": 1`) is never
+   misread as `0.0`. Regression-tested.
+
+10. **Disabled-module reveal answered.** Mutations reveal the affected
+    module iff **exactly one** module references the shape, **regardless of
+    its enabled state**; `list_mask_shapes` reveals nothing.
+    `duplicate_mask_shape` remains **deferred** (no workflow needs it yet).
+
+## Explicitly unresolved (all closed — see Amendments above)
+
+Every item below was resolved during planning; kept for traceability.
+
+- ~~**The pipe-freshness contract**~~ → Amendment 1 (shared with
+  `sample_region`).
+- ~~Final numeric ranges per geometry member~~ → Amendment 7.
+- ~~Probe algorithm details (arm length, 1 % spread placeholder)~~ →
+  Amendment 5.
+- ~~Reveal on a shape whose only user is a *disabled* module~~ →
+  Amendment 10 (reveal iff exactly one referencing module, any enabled
+  state).
+- ~~`dt_masks_form_duplicate` / `duplicate_mask_shape`~~ → Amendment 10
+  (deferred).
+- ~~Honor conf defaults vs require every member~~ → Amendment 4 (require
+  explicitly).

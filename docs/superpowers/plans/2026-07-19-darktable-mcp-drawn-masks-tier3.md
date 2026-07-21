@@ -22,7 +22,7 @@
   - `gradient`: `anchor [x,y]`, `rotation` (degrees), `compression`, `steepness`, `curvature`
 - **Validation policy (finite first, then range).** All geometry floats must be finite. Wire-space pre-checks: `radius > 0`, ellipse `radius[a] > 0` and `radius[b] > 0`, `border ≥ 0`, `compression > 0`, `|curvature| ≤ 2`, `rotation` finite, `steepness` finite, `center`/`anchor` finite and within `[-0.5, 1.5]` (the "moderately off-canvas" allowance mirroring the GUI). After back-transform, the raw-normalized stored values must fall in the GUI storage clamps or the write is rejected `invalid_value`: circle/ellipse `radius ∈ [0.0005, 1.0]` (`MIN_CIRCLE_RADIUS`/`MIN_CIRCLE_BORDER` = `0.0005f`, `max_mask_size`/`max_mask_border` = `1.0f` for non-clone; `src/develop/masks/circle.c:29-30,120-121`; ellipse `radius_limit = 1.0f` for non-clone, `ellipse.c:433-434`), circle/ellipse `border ∈ [0.0005, 1.0]`, gradient `compression ∈ (0.0, 1.0]`, gradient `curvature ∈ [-2.0, 2.0]` (`gradient.c:166-183`).
 - **Adversarial-input caps:** at most one shape per `create_mask_shape`; reject unknown geometry members; `name` length `< sizeof(form->name)` = 128; nothing invalid ever reaches `dev->forms`.
-- **Group member states (storage `int state`, `masks.h:54-67`):** `USE`/`SHOW` always set; combine op is exactly one of `UNION`/`INTERSECTION`/`DIFFERENCE`/`EXCLUSION`; `INVERSE` toggled from `inverted`; `SUM` is brush-only (refused in v1). Wire `state` vocabulary: `"union" | "intersection" | "difference" | "exclusion"`. `opacity` clamped to `[0,1]`.
+- **Group member states (storage `int state`, `masks.h:54-67`):** `USE`/`SHOW` always set; combine op is exactly one of `UNION`/`INTERSECTION`/`DIFFERENCE`/`EXCLUSION`; `INVERSE` toggled from `inverted`; `SUM` is brush-only (refused in v1). Wire `state` vocabulary: `"union" | "intersection" | "difference" | "exclusion"`. `opacity` clamped to `[0,1]`. **First-member rule:** the bottom-most (first) member of a group carries **no** combine op — there is nothing beneath it to combine with — mirroring `dt_masks_gui_form_save_creation` (`masks.c:401-406`) and the GUI, which hides the combine dropdown for it. A `state` supplied on an attach that lands as the first member is accepted and ignored (documented in the `set_mask_attachment` docstring, Task 9). `inverted` and `opacity` are honored on every member including the first.
 - **mask_mode (authoritative appendix):** the `MASK` bit changes ONLY via `create_mask_shape`(+attach)/`set_mask_attachment`/`delete_mask_shape`. `drawn ↔ drawn+parametric` transitions are handled by M-B's blend surface, never here. `raster` is never writable. On attach (any non-raster row), OR `DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK` into `mask_mode` (preserving `CONDITIONAL`); on an R-bit row, fail `invalid_value`, `constraint: "raster_unsupported"`. On detach/delete emptying a module's group, clear `DEVELOP_MASK_MASK` from that module's `mask_mode`.
 - **Error slugs (exact):** `not_found` (unknown shape id — NEW code, see Task 7), `unsupported_field` (unsupported/non-editable type, or attach to a module without blending), `invalid_value` (non-finite/out-of-policy geometry, `sum_is_brush_only`, `raster_unsupported`), `revision_conflict` (CAS), `retry_later` (pipe not fresh — NEW code, see Task 2/7). `details_json` = `{"parameter": "...", "constraint": "..."}`.
 - All five methods run on the GTK main thread via the existing dispatch; all mutating ones take `expected_revision` CAS. Mask history commits through `dt_dev_add_masks_history_item`; undo covered by existing `DT_UNDO_DEVELOP` scope; per-method history-item counts are documented (Task 11).
@@ -51,6 +51,8 @@ These are contracts, not implementation details. Amendments 1 and 2 are the two 
 1. If `dev->preview_pipe->status == DT_DEV_PIXELPIPE_VALID`, proceed immediately.
 2. Otherwise enqueue one `dt_dev_process_preview(dev)` and poll `dev->preview_pipe->status` every `5000` µs (`dt_iop_nap(5000)`), for at most `dt_conf_get_int("pixelpipe_synchronization_timeout")` iterations (the same budget `_dev_wait_hash` uses; `develop.c:3790-3803`), capped at 2000 iterations (≈10 s) when the conf is non-positive.
 3. On reaching `VALID`, proceed. On `INVALID` or timeout, fail with the new error code `DT_REMOTE_ERR_PIPE_NOT_READY` (wire slug `retry_later`, retryable), message `"preview pipe not ready; retry"`, no state changed.
+
+**Interactive cost (accepted).** Because the poll loop runs on the GTK main thread, a co-located user's UI is unresponsive for the duration of the wait (worst case ≈ the `pixelpipe_synchronization_timeout` budget; the 2000-iteration ≈10 s hard cap applies only when that conf is non-positive/misconfigured). This is the deliberate trade for deterministic placement over a one-shot wire call — the alternative (returning `retry_later` immediately whenever the pipe is not already `VALID`) would make coordinate calls flaky right after any edit. The common case is fast: an unchanged, already-`VALID` pipe returns at step 1 with no wait. This freeze window MUST be documented in the protocol reference (Task 11, Step 1) so integrators expect a bounded stall on the first coordinate call after a distortion-changing edit.
 
 This is implemented once as `dt_remote_transform_ensure_fresh(dev, error)` in `remote_transform.c` (Task 2) and called by every coordinate-touching engine path. **It is shared verbatim with `sample_region`** (`docs/superpowers/specs/2026-07-18-darktable-mcp-picker-and-sampling-candidates.md`); Task 11 records it there as "answered here". The exercising test is the "mutate-distortion-then-create-shape in one breath" integration gate (Task 10, gate 4) plus a unit test that a DIRTY-then-timeout path returns `retry_later` (Task 2).
 
@@ -82,7 +84,7 @@ Following the design's stated preference: `create_mask_shape`/`update_mask_shape
 
 ### Amendment 5 — Probe algorithm constants pinned
 
-`size_mapping` spread threshold: `1%` relative — with 4 probe-arm raw distances `d[0..3]`, `size_mapping = "approximate"` iff `(max(d) - min(d)) / mean(d) > 0.01`, else `"exact"`. Angle probe arm length (for `rotation` read/write where no radius exists, e.g. gradient): a fixed preview-space length of `0.05`. Size probe arms: the requested preview-space `radius` (circle/ellipse `radius[0]`). Recorded here because the design flagged these as unresolved placeholders.
+`size_mapping` spread threshold: `1%` relative — with 4 probe-arm raw distances `d[0..3]`, `size_mapping = "approximate"` iff `(max(d) - min(d)) / mean(d) > 0.01`, else `"exact"`. Angle probe arm length (for `rotation` read/write where no radius exists, e.g. gradient): `0.05` of the **shorter image edge**, applied as an **isotropic pixel** offset (not a normalized offset), because darktable stores mask rotation as a geometric angle in square-pixel space (`ellipse.c:233-286` scales radii by `MIN(w,h)`). Measuring in normalized space would skew rotations on non-square images. Size probe arms: the requested preview-space `radius` (circle/ellipse `radius[0]`). Recorded here because the design flagged these as unresolved placeholders.
 
 ### Verified engine facts that shape the implementation (not contradictions, but load-bearing)
 
@@ -114,7 +116,7 @@ Following the design's stated preference: `create_mask_shape`/`update_mask_shape
 
 **Files:**
 - Modify: `src/develop/masks.h` (declare in the masks API block near `dt_masks_gui_form_save_creation`, masks.h:627)
-- Modify: `src/develop/masks/masks.c:304-314` (drop `static`, rename) and its two call sites at `masks.c:392,394`
+- Modify: `src/develop/masks/masks.c:304-314` (drop `static`, rename) and its **four** call sites: `masks.c:392,394` (pass `dev`) and `masks.c:1551,1587` (pass `darktable.develop`)
 - Test: `src/tests/unittests/control/test_remote_masks.c` (created in Task 3 uses it; Task 1 adds a minimal linkage test here)
 
 **Interfaces:**
@@ -211,13 +213,21 @@ dt_masks_form_t *dt_masks_group_create_for_module(dt_develop_t *dev,
                                                   const dt_masks_type_t type)
 ```
 
-Update the two internal call sites (`masks.c:392` and `masks.c:394`):
+Update **all four** internal call sites. The two in `dt_masks_gui_form_save_creation` (`masks.c:392,394`) pass `dev`:
 
 ```c
         grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP | DT_MASKS_CLONE);
       else
         grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP);
 ```
+
+The two remaining sites (`masks.c:1551` and `masks.c:1587`) pass `darktable.develop` — update both:
+
+```c
+    grp = dt_masks_group_create_for_module(darktable.develop, module, DT_MASKS_GROUP);
+```
+
+Then confirm nothing references the old name: `grep -n '_group_create' src/develop/masks/masks.c` must show only the (now-renamed) definition.
 
 - [ ] **Step 5: Build and run**
 
@@ -411,7 +421,7 @@ G_BEGIN_DECLS
 struct dt_develop_t;
 
 #define DT_REMOTE_TRANSFORM_SPREAD 0.01     // size_mapping "approximate" threshold (amendment 5)
-#define DT_REMOTE_TRANSFORM_ANGLE_ARM 0.05  // preview-space arm for angle probes (amendment 5)
+#define DT_REMOTE_TRANSFORM_ANGLE_ARM 0.05  // angle-probe arm as a fraction of MIN(w,h), isotropic px (amendment 5)
 
 /** Block-until-clean freshness contract: TRUE when dev->preview_pipe->status
  * is DT_DEV_PIXELPIPE_VALID (waiting up to pixelpipe_synchronization_timeout
@@ -595,24 +605,30 @@ gboolean dt_remote_transform_raw_to_preview_size(dt_develop_t *dev,
   return TRUE;
 }
 
-// angle probe: transform a short arm from the center and take the delta angle.
+// angle probe: darktable stores mask rotation as a geometric angle in
+// SQUARE-PIXEL image space — ellipse/gradient scale their radii by MIN(w,h)
+// and apply the rotation matrix there (ellipse.c:233-286). The arm must
+// therefore be built in isotropic pixels and the result angle measured
+// directly in pixels; doing it in aspect-distorted normalized space would
+// skew every rotation on a non-square image.
 static gboolean _probe_angle(dt_develop_t *dev, gboolean forward,
                              double cx, double cy, double deg_in, double *deg_out)
 {
   float pw, ph, iw, ih;
   _sizes(&pw, &ph, &iw, &ih);
-  const double sx = forward ? iw : pw, sy = forward ? ih : ph;
+  const double sx = forward ? iw : pw, sy = forward ? ih : ph;   // source pixel dims
   const double rad = deg_in * M_PI / 180.0;
-  const double arm = DT_REMOTE_TRANSFORM_ANGLE_ARM;  // normalized in the source space
+  // arm length as a fraction of the shorter source edge, in pixels (isotropic)
+  const double arm = DT_REMOTE_TRANSFORM_ANGLE_ARM * fmin(sx, sy);
   float pts[4] = {
-    (float)(cx * sx),                          (float)(cy * sy),
-    (float)((cx + arm * cos(rad)) * sx),       (float)((cy - arm * sin(rad)) * sy),
+    (float)(cx * sx),                     (float)(cy * sy),
+    (float)(cx * sx + arm * cos(rad)),    (float)(cy * sy - arm * sin(rad)),
   };
   const gboolean ok = forward ? dt_dev_distort_transform(dev, pts, 2)
                               : dt_dev_distort_backtransform(dev, pts, 2);
   if(!ok) return FALSE;
-  const double dsx = forward ? pw : iw, dsy = forward ? ph : ih;
-  const double dx = (pts[2] - pts[0]) / dsx, dy = (pts[3] - pts[1]) / dsy;
+  // measure the angle directly in destination pixels (isotropic, no aspect skew)
+  const double dx = pts[2] - pts[0], dy = pts[3] - pts[1];
   *deg_out = atan2(-dy, dx) * 180.0 / M_PI;
   return TRUE;
 }
@@ -756,6 +772,27 @@ static void test_validate_gradient_curvature_bounds(void **state)
   json_object_unref(bad);
 }
 
+// integer JSON numbers (no decimal point, parsed as INT64) must coerce to
+// double, not be misread as 0.0 — regression guard for json_node_get_double.
+static void test_validate_accepts_integer_json(void **state)
+{
+  (void)state;
+  dt_remote_error_t *err = NULL;
+  // rotation/steepness/curvature arrive as JSON integers; center as int pair
+  JsonObject *g = _geom("{\"anchor\":[0,1],\"rotation\":0,\"compression\":0.5,"
+                        "\"steepness\":0,\"curvature\":0}");
+  assert_true(dt_remote_masks_geometry_validate(DT_MASKS_GRADIENT, g, &err));
+  assert_null(err);
+  json_object_unref(g);
+
+  // an integer radius must read as 1.0, not 0.0 — under the json_node_get_double
+  // bug it would be misread as 0 and rejected by the radius>0 check.
+  JsonObject *ci = _geom("{\"center\":[0.5,0.5],\"radius\":1,\"border\":0}"); // ints
+  assert_true(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, ci, &err));
+  assert_null(err);
+  json_object_unref(ci);
+}
+
 // Identity pipe: geometry -> points -> geometry round-trips within tolerance.
 static void test_circle_points_roundtrip_identity(void **state)
 {
@@ -800,6 +837,12 @@ Expected: FAIL — `control/remote_masks.h` not found.
 // and never reaches dev->forms unvalidated. Coordinate mapping is delegated
 // to remote_transform.h. Every function taking a dt_develop_t/dt_iop_module_t
 // runs on the GTK main thread.
+//
+// CAVEAT: the create/delete/detach paths reach dt_masks_gui_form_save_creation
+// (dev-parameterized, safe) and dt_masks_form_remove (HARDWIRED to
+// darktable.develop, ignores the passed dev). On the wire the darkroom dev IS
+// darktable.develop so this is correct; unit tests on a standalone fixture dev
+// must repoint darktable.develop at it around those calls (see Task 5/6 tests).
 
 #pragma once
 
@@ -917,14 +960,23 @@ static gboolean _err_iv(dt_remote_error_t **e, const char *param, const char *co
   return FALSE;
 }
 
+// coerce a JSON scalar node to double, accepting both real and integer JSON
+// numbers (json_node_get_double is NOT safe on an INT64 node — mirror the M-A
+// idiom at remote_blend.c:760-761). Returns FALSE if the node is not numeric.
+static gboolean _node_num(JsonNode *n, double *v)
+{
+  if(!n || json_node_get_node_type(n) != JSON_NODE_VALUE) return FALSE;
+  const GType t = json_node_get_value_type(n);
+  if(t == G_TYPE_DOUBLE) { *v = json_node_get_double(n); return TRUE; }
+  if(t == G_TYPE_INT64)  { *v = (double)json_node_get_int(n); return TRUE; }
+  return FALSE;
+}
+
 // finite scalar member fetch
 static gboolean _num(JsonObject *o, const char *k, double *v, dt_remote_error_t **e)
 {
   if(!json_object_has_member(o, k)) return _err_iv(e, k, "missing_member");
-  JsonNode *n = json_object_get_member(o, k);
-  if(json_node_get_value_type(n) != G_TYPE_DOUBLE && json_node_get_value_type(n) != G_TYPE_INT64)
-    return _err_iv(e, k, "not_a_number");
-  *v = json_node_get_double(n);
+  if(!_node_num(json_object_get_member(o, k), v)) return _err_iv(e, k, "not_a_number");
   if(!isfinite(*v)) return _err_iv(e, k, "not_finite");
   return TRUE;
 }
@@ -932,14 +984,32 @@ static gboolean _num(JsonObject *o, const char *k, double *v, dt_remote_error_t 
 static gboolean _point2(JsonObject *o, const char *k, double *x, double *y, dt_remote_error_t **e)
 {
   if(!json_object_has_member(o, k)) return _err_iv(e, k, "missing_member");
-  JsonArray *a = json_object_get_array_member(o, k);
+  JsonNode *an = json_object_get_member(o, k);
+  if(json_node_get_node_type(an) != JSON_NODE_ARRAY) return _err_iv(e, k, "expected_pair");
+  JsonArray *a = json_node_get_array(an);
   if(!a || json_array_get_length(a) != 2) return _err_iv(e, k, "expected_pair");
-  *x = json_array_get_double_element(a, 0);
-  *y = json_array_get_double_element(a, 1);
+  if(!_node_num(json_array_get_element(a, 0), x)
+     || !_node_num(json_array_get_element(a, 1), y))
+    return _err_iv(e, k, "not_a_number");
   if(!isfinite(*x) || !isfinite(*y)) return _err_iv(e, k, "not_finite");
   if(*x < DTRM_CENTER_LO || *x > DTRM_CENTER_HI || *y < DTRM_CENTER_LO || *y > DTRM_CENTER_HI)
     return _err_iv(e, k, "out_of_canvas");
   return TRUE;
+}
+
+// member accessors used by geometry_to_points — reuse the coercing fetch above
+// so integer JSON (e.g. "rotation": 0) is never silently read as 0.0 garbage.
+static double _memb(JsonObject *o, const char *k)   // caller guarantees validated+present
+{
+  double v = 0.0;
+  _node_num(json_object_get_member(o, k), &v);
+  return v;
+}
+static void _memb_pair(JsonObject *o, const char *k, double *a, double *b)
+{
+  JsonArray *arr = json_node_get_array(json_object_get_member(o, k));
+  _node_num(json_array_get_element(arr, 0), a);
+  _node_num(json_array_get_element(arr, 1), b);
 }
 
 // reject any member not in the allowed set for the type
@@ -981,9 +1051,13 @@ gboolean dt_remote_masks_geometry_validate(dt_masks_type_t type, JsonObject *geo
       if(!_reject_unknown(geom, allow, error)) return FALSE;
       if(!_point2(geom, "center", &x, &y, error)) return FALSE;
       if(!json_object_has_member(geom, "radius")) return _err_iv(error, "radius", "missing_member");
-      JsonArray *r = json_object_get_array_member(geom, "radius");
+      JsonNode *rn = json_object_get_member(geom, "radius");
+      if(json_node_get_node_type(rn) != JSON_NODE_ARRAY) return _err_iv(error, "radius", "expected_pair");
+      JsonArray *r = json_node_get_array(rn);
       if(!r || json_array_get_length(r) != 2) return _err_iv(error, "radius", "expected_pair");
-      const double ra = json_array_get_double_element(r, 0), rb = json_array_get_double_element(r, 1);
+      double ra = 0, rb = 0;
+      if(!_node_num(json_array_get_element(r, 0), &ra) || !_node_num(json_array_get_element(r, 1), &rb))
+        return _err_iv(error, "radius", "not_a_number");
       if(!isfinite(ra) || !isfinite(rb)) return _err_iv(error, "radius", "not_finite");
       if(ra <= 0.0 || rb <= 0.0) return _err_iv(error, "radius", "must_be_positive");
       if(!_num(geom, "rotation", &v, error)) return FALSE;
@@ -1035,10 +1109,8 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev, dt_masks_type_t t
       _point2(geom, "center", &cx, &cy, error);
       dt_remote_transform_preview_to_raw_point(dev, cx, cy, &rx, &ry);
       c->center[0] = (float)rx; c->center[1] = (float)ry;
-      dt_remote_transform_preview_to_raw_size(dev, cx, cy,
-        json_object_get_double_member(geom, "radius"), &r_raw, &ex);
-      dt_remote_transform_preview_to_raw_size(dev, cx, cy,
-        json_object_get_double_member(geom, "border"), &b_raw, &ex);
+      dt_remote_transform_preview_to_raw_size(dev, cx, cy, _memb(geom, "radius"), &r_raw, &ex);
+      dt_remote_transform_preview_to_raw_size(dev, cx, cy, _memb(geom, "border"), &b_raw, &ex);
       if(!_clamp_ok(r_raw, DTRM_SIZE_MIN, DTRM_SIZE_MAX)) return _err_iv(error, "radius", "out_of_range");
       if(!_clamp_ok(b_raw, 0.0, DTRM_SIZE_MAX)) return _err_iv(error, "border", "out_of_range");
       c->radius = (float)r_raw; c->border = (float)fmax(b_raw, DTRM_SIZE_MIN);
@@ -1051,23 +1123,21 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev, dt_masks_type_t t
       _point2(geom, "center", &cx, &cy, error);
       dt_remote_transform_preview_to_raw_point(dev, cx, cy, &rx, &ry);
       e->center[0] = (float)rx; e->center[1] = (float)ry;
-      JsonArray *r = json_object_get_array_member(geom, "radius");
-      dt_remote_transform_preview_to_raw_size(dev, cx, cy,
-        json_array_get_double_element(r, 0), &ra_raw, &ex);
-      dt_remote_transform_preview_to_raw_size(dev, cx, cy,
-        json_array_get_double_element(r, 1), &rb_raw, &ex);
+      double ra_prev = 0, rb_prev = 0;
+      _memb_pair(geom, "radius", &ra_prev, &rb_prev);
+      dt_remote_transform_preview_to_raw_size(dev, cx, cy, ra_prev, &ra_raw, &ex);
+      dt_remote_transform_preview_to_raw_size(dev, cx, cy, rb_prev, &rb_raw, &ex);
       if(!_clamp_ok(ra_raw, DTRM_SIZE_MIN, DTRM_SIZE_MAX)
          || !_clamp_ok(rb_raw, DTRM_SIZE_MIN, DTRM_SIZE_MAX))
         return _err_iv(error, "radius", "out_of_range");
       e->radius[0] = (float)ra_raw; e->radius[1] = (float)rb_raw;
-      dt_remote_transform_preview_to_raw_angle(dev, cx, cy,
-        json_object_get_double_member(geom, "rotation"), &rot_raw);
+      dt_remote_transform_preview_to_raw_angle(dev, cx, cy, _memb(geom, "rotation"), &rot_raw);
       e->rotation = (float)rot_raw;
       const gboolean prop =
         !g_strcmp0(json_object_get_string_member(geom, "border_mode"), "proportional");
       e->flags = prop ? DT_MASKS_ELLIPSE_PROPORTIONAL : DT_MASKS_ELLIPSE_EQUIDISTANT;
       // border is proportional (fraction) or a raw length depending on mode.
-      const double bw = json_object_get_double_member(geom, "border");
+      const double bw = _memb(geom, "border");
       if(prop) { if(bw < 0.0) return _err_iv(error, "border", "out_of_range"); e->border = (float)bw; }
       else {
         dt_remote_transform_preview_to_raw_size(dev, cx, cy, bw, &b_raw, &ex);
@@ -1082,14 +1152,13 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev, dt_masks_type_t t
       _point2(geom, "anchor", &ax, &ay, error);
       dt_remote_transform_preview_to_raw_point(dev, ax, ay, &rx, &ry);
       g->anchor[0] = (float)rx; g->anchor[1] = (float)ry;
-      dt_remote_transform_preview_to_raw_angle(dev, ax, ay,
-        json_object_get_double_member(geom, "rotation"), &rot_raw);
+      dt_remote_transform_preview_to_raw_angle(dev, ax, ay, _memb(geom, "rotation"), &rot_raw);
       g->rotation = (float)rot_raw;
-      const double comp = json_object_get_double_member(geom, "compression");
+      const double comp = _memb(geom, "compression");
       if(!_clamp_ok(comp, DTRM_SIZE_MIN, DTRM_COMPRESSION_MAX)) return _err_iv(error, "compression", "out_of_range");
       g->compression = (float)comp;
-      g->steepness = (float)json_object_get_double_member(geom, "steepness");
-      g->curvature = (float)json_object_get_double_member(geom, "curvature");
+      g->steepness = (float)_memb(geom, "steepness");
+      g->curvature = (float)_memb(geom, "curvature");
       g->state = DT_MASKS_GRADIENT_STATE_SIGMOIDAL;  // GUI default for new gradients
       return TRUE;
     }
@@ -1658,11 +1727,16 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev, dt_mask_id_t id,
       if(((dt_masks_point_group_t *)p->data)->formid == id) { g_ptr_array_add(refs, m); break; }
   }
 
-  // dt_masks_form_remove drops membership from every module, empties groups,
-  // and removes the form itself; it does NOT clear the MASK bit.
-  dt_masks_form_remove(NULL, dt_masks_get_from_id(dev, form->formid) ? form : form, form);
-  // (grp is looked up per-module inside; passing (NULL, form, form) triggers
-  //  the full-form removal branch. See masks.c:1793 — full removal path.)
+  // Full-deletion path: with grp==NULL, dt_masks_form_remove skips the
+  // membership-only early-return (verified masks.c:1801-1824; that branch also
+  // requires a CLONE/NON_CLONE-free form, which drawn shapes are) and walks
+  // every blending module — dropping the shape's membership, emptying/removing
+  // groups, clearing mask_id where the shape WAS a module's base group, and
+  // removing the form from the forms list. It does NOT clear DEVELOP_MASK_MASK.
+  // CAVEAT: it operates on darktable.develop internally, NOT on `dev`; on the
+  // wire dev == darktable.develop (see the header caveat), and the unit tests
+  // must point darktable.develop at the fixture dev for the duration.
+  dt_masks_form_remove(NULL, NULL, form);
 
   for(guint i = 0; i < refs->len; i++)
   {
@@ -1683,7 +1757,10 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev, dt_mask_id_t id,
 }
 ```
 
-**Implementation note on `dt_masks_form_remove` args:** verify at `masks.c:1793` which `(module, grp, form)` triple triggers the full-form-removal branch. From the source, passing `grp == NULL` (or a non-group) skips the membership-only branch and falls through to "permanently delete this form" which walks every module, drops membership, empties groups, and removes from `dev->forms`, committing one masks-history item at the end. Call it as `dt_masks_form_remove(NULL, NULL, form);` — simplify the code above to that single call and drop the confusing ternary. The MASK-bit clear + `removed_from` collection happen around it as shown.
+**Implementation note on `dt_masks_form_remove` args (verified `masks.c:1793-1892`):**
+- **Detach (membership-only):** `dt_masks_form_remove(module, grp, form)` with `grp != NULL` and `form` lacking `CLONE|NON_CLONE` bits (all drawn shapes qualify) removes only the group membership; if the group then empties it recurses to remove the empty group. Used by `set_mask_attachment(attached:false)` (Task 6).
+- **Full delete:** `dt_masks_form_remove(NULL, NULL, form)` skips that early-return and permanently deletes the form across all modules, committing one masks-history item at the end. Used by `delete_mask_shape` (this task).
+- **`darktable.develop` hardwiring:** both branches read/write `darktable.develop->iop`/`->forms` and commit history to `darktable.develop`, ignoring any other dev. On the wire `dev == darktable.develop`, so this is correct. In unit tests that build a standalone `fx->dev`, save and repoint `darktable.develop = &fx->dev` around any call that reaches `dt_masks_form_remove`, then restore — otherwise the empty-group cleanup and `mask_id` clear land on the wrong dev and the `mask_mode`/`removed_from` assertions will not hold. The MASK-bit clear + `removed_from` collection happen around it as shown.
 
 - [ ] **Step 4: Build and run**
 
@@ -1726,6 +1803,16 @@ static void test_attach_upsert_sets_mask_mode_and_member(void **state)
   (void)state;
   blend_fixture_t *fx = blend_fixture_new("exposure");
   darktable.develop->preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+
+  // a first (bottom) shape — carries no combine op by the first-member rule
+  dt_masks_form_t *base = dt_masks_create(DT_MASKS_CIRCLE);
+  dt_masks_point_circle_t *bc = malloc(sizeof(*bc));
+  *bc = (dt_masks_point_circle_t){ .center = {0.4f,0.4f}, .radius = 0.1f, .border = 0.03f };
+  base->points = g_list_append(base->points, bc);
+  base->formid = 302;
+  fx->dev.forms = g_list_append(fx->dev.forms, base);
+
+  // a second shape whose combine op / inverted / opacity we assert
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
   dt_masks_point_circle_t *c = malloc(sizeof(*c));
   *c = (dt_masks_point_circle_t){ .center = {0.5f,0.5f}, .radius = 0.1f, .border = 0.03f };
@@ -1733,22 +1820,33 @@ static void test_attach_upsert_sets_mask_mode_and_member(void **state)
   form->formid = 303;
   fx->dev.forms = g_list_append(fx->dev.forms, form);
 
-  const double op = 0.8;
   dt_remote_error_t *err = NULL;
+  // attach the base first so 303 lands as a non-first member
+  assert_true(dt_remote_masks_set_attachment(&fx->dev, fx->module, 302, TRUE,
+                                             "union", 0, NULL, &err));
+  assert_null(err);
+  const double op = 0.8;
   assert_true(dt_remote_masks_set_attachment(&fx->dev, fx->module, 303, TRUE,
                                              "intersection", 1, &op, &err));
   assert_null(err);
   // mask_mode gained ENABLED|MASK
   assert_true(fx->module->blend_params->mask_mode & DEVELOP_MASK_ENABLED);
   assert_true(fx->module->blend_params->mask_mode & DEVELOP_MASK_MASK);
-  // group exists with the member
+  // group holds both members
   dt_masks_form_t *grp = dt_masks_get_from_id(&fx->dev, fx->module->blend_params->mask_id);
   assert_non_null(grp);
-  dt_masks_point_group_t *m = grp->points->data;
-  assert_int_equal(m->formid, 303);
-  assert_true(m->state & DT_MASKS_STATE_INTERSECTION);
-  assert_true(m->state & DT_MASKS_STATE_INVERSE);
-  assert_float_equal(m->opacity, 0.8, 1e-4);
+  // the bottom member (302) carries NO combine op (first-member rule)
+  dt_masks_point_group_t *m302 = grp->points->data;
+  assert_int_equal(m302->formid, 302);
+  assert_int_equal(m302->state & DT_MASKS_STATE_OP, 0);
+  // 303 carries the requested combine state / inverted / opacity
+  dt_masks_point_group_t *m303 = NULL;
+  for(GList *p = grp->points; p; p = g_list_next(p))
+    if(((dt_masks_point_group_t *)p->data)->formid == 303) { m303 = p->data; break; }
+  assert_non_null(m303);
+  assert_true(m303->state & DT_MASKS_STATE_INTERSECTION);
+  assert_true(m303->state & DT_MASKS_STATE_INVERSE);
+  assert_float_equal(m303->opacity, 0.8, 1e-4);
   blend_fixture_free(fx);
 }
 
@@ -1771,6 +1869,11 @@ static void test_detach_empties_group_clears_mask_bit(void **state)
 {
   (void)state;
   blend_fixture_t *fx = blend_fixture_new("exposure");
+  // dt_masks_form_remove (reached by the detach path) is hardwired to
+  // darktable.develop; point it at the fixture dev so the empty-group cleanup
+  // and mask_id clear land on fx->dev, then restore before freeing.
+  dt_develop_t *saved_dev = darktable.develop;
+  darktable.develop = &fx->dev;
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE); form->formid = 305;
   dt_masks_point_circle_t *c = calloc(1, sizeof(*c)); c->radius = 0.1f;
   form->points = g_list_append(form->points, c);
@@ -1781,6 +1884,7 @@ static void test_detach_empties_group_clears_mask_bit(void **state)
   assert_true(fx->module->blend_params->mask_mode & DEVELOP_MASK_MASK);
   assert_true(dt_remote_masks_set_attachment(&fx->dev, fx->module, 305, FALSE, NULL, -1, NULL, &err));
   assert_false(fx->module->blend_params->mask_mode & DEVELOP_MASK_MASK);  // cleared
+  darktable.develop = saved_dev;
   blend_fixture_free(fx);
 }
 ```
@@ -1863,21 +1967,27 @@ gboolean dt_remote_masks_set_attachment(dt_develop_t *dev, dt_iop_module_t *modu
   for(GList *p = grp->points; p; p = g_list_next(p))
     if(((dt_masks_point_group_t *)p->data)->formid == shape_id) { member = p->data; break; }
   const gboolean is_new = (member == NULL);
+  // The bottom-most (first) member of a group carries NO combine op — there is
+  // nothing beneath it to combine with. Mirrors save_creation (masks.c:401-406)
+  // and the GUI (which hides the combine dropdown for it). A `state` that lands
+  // on the first member is ignored (First-member rule, Global Constraints).
   if(is_new)
   {
     member = malloc(sizeof(dt_masks_point_group_t));
     member->formid = shape_id;
     member->parentid = grp->formid;
     member->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
-    // first member has no combine op; subsequent get one (mirror save_creation)
     member->state = DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW;
-    if(grp->points) member->state |= op_bit;
+    if(grp->points) member->state |= op_bit;   // has a member beneath -> not first
     grp->points = g_list_append(grp->points, member);
   }
   else
   {
-    member->state = (member->state & ~DT_MASKS_STATE_OP) | op_bit
+    // re-attach of an existing member: keep the first member op-less too
+    const gboolean is_first = (grp->points && grp->points->data == member);
+    member->state = (member->state & ~DT_MASKS_STATE_OP)
                     | DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW;
+    if(!is_first) member->state |= op_bit;
   }
   if(inverted == 1) member->state |= DT_MASKS_STATE_INVERSE;
   else if(inverted == 0) member->state &= ~DT_MASKS_STATE_INVERSE;
@@ -1889,7 +1999,7 @@ gboolean dt_remote_masks_set_attachment(dt_develop_t *dev, dt_iop_module_t *modu
 }
 ```
 
-**Note:** `DT_MASKS_STATE_OP` is the union of the five op bits (`masks.h:63-67`); masking it off before OR-ing the new op keeps the state clean on re-attach.
+**Note:** `DT_MASKS_STATE_OP` is the union of the five op bits (`masks.h:63-67`); masking it off before re-applying keeps the state clean on re-attach. `op_bit` is applied only to non-first members, matching darktable's rule that the bottom member of a group has no combine op (see First-member rule in Global Constraints).
 
 - [ ] **Step 4: Build and run**
 
@@ -2174,7 +2284,7 @@ Expected: FAIL — tools not defined.
 
 Add five FastMCP tools to `server.py`, each gated client-side on `mask_shapes` exactly like the quantity/blend gate (`await client.ensure_connected(); if "mask_shapes" not in client.capabilities: raise TransportError(...)`). Docstrings within the H7 budget:
 - `create_mask_shape(type, geometry, name=None, attach=None, space="preview", expected_revision=None)` and `update_mask_shape(id, geometry, name=None, space="preview", expected_revision=None)` — carry the full coordinate contract ONCE (in `create_mask_shape`), and `update_mask_shape` cross-references it ("coordinates as in create_mask_shape"). Both note: coordinates are preview-normalized `[0,1]`; sizes/angles may be reported `approximate` under perspective (`size_mapping`); editing a shared shape edits every module using it (`affects_instances`).
-- `list_mask_shapes()`, `delete_mask_shape(id, expected_revision=None)`, `set_mask_attachment(op, shape_id, attached, instance=0, state=None, inverted=None, opacity=None, expected_revision=None)` — terse; `set_mask_attachment` notes `attached=true` upserts (state/inverted/opacity apply) and `attached=false` detaches (shape survives if used elsewhere).
+- `list_mask_shapes()`, `delete_mask_shape(id, expected_revision=None)`, `set_mask_attachment(op, shape_id, attached, instance=0, state=None, inverted=None, opacity=None, expected_revision=None)` — terse; `set_mask_attachment` notes `attached=true` upserts (state/inverted/opacity apply) and `attached=false` detaches (shape survives if used elsewhere). One sentence records the first-member rule: `state` is ignored when the shape becomes the bottom member of a module's group (that member has no combine op); `inverted`/`opacity` still apply.
 
 - [ ] **Step 4: Run tests**
 
@@ -2206,7 +2316,7 @@ Model on `test_quantity_milestone6.py`: module docstring, `from . import harness
 1. `test_hello_advertises_mask_shapes` — `client.capabilities` contains `"mask_shapes"`.
 2. `test_create_circle_confines_effect` — enable exposure with a visible delta; `create_mask_shape {type:"circle", geometry:{center:[0.5,0.5],radius:0.15,border:0.02}, attach:{op:"exposure",instance:0}}`; render `show_mask {op:"exposure",instance:0}`; assert the mask is bright inside the circle centroid and dark in a far corner (ratio of mean luminance inside vs outside > 3×). Assert the response `used_by` shows exposure and `mask_mode` reads `drawn` via `get_module_params`' blend section.
 3. `test_update_moves_region` — `update_mask_shape` moving the center to `[0.25,0.25]`; re-render `show_mask`; assert the bright centroid moved toward the new position (bright-mass centroid within tolerance of `[0.25,0.25]` in preview coords — the placement gate comparing requested preview coords to rendered mask centroid).
-4. `test_distortion_roundtrip_and_freshness` — enable `crop` with a rotation in the SAME client breath as a `create_mask_shape` at preview position `P` (issue the crop mutation then immediately the create, relying on the freshness contract to block until the pipe reflects the rotation); then `list_mask_shapes` returns the shape's `geometry.center` within tolerance of `P` (the back-transform gate — the milestone's highest-value test). Also assert that if the pipe is forced busy the create returns a `retry_later` error rather than a mis-placed shape (best-effort; skip if the harness cannot force a dirty pipe deterministically).
+4. `test_distortion_roundtrip_and_freshness` — enable `crop` with a rotation in the SAME client breath as a `create_mask_shape` at preview position `P` (issue the crop mutation then immediately the create, relying on the freshness contract to block until the pipe reflects the rotation); then `list_mask_shapes` returns the shape's `geometry.center` within tolerance of `P` (the back-transform gate — the milestone's highest-value test). Also assert that if the pipe is forced busy the create returns a `retry_later` error rather than a mis-placed shape (best-effort; skip if the harness cannot force a dirty pipe deterministically). **Angle-space coverage note:** a *conformal* distortion (plain rotation) does not distinguish the isotropic-pixel angle probe (Amendment 5) from a normalized-space one — both round-trip. The isotropic handling only diverges under an **anisotropic** distortion (perspective/keystone). If a perspective-correction fixture is available, add an ellipse `rotation` round-trip under it asserting the reported wire angle matches the geometric major-axis angle in the rendered `show_mask`; otherwise record this as a known coverage gap (the implementation is still correct-by-construction per Amendment 5, but untested end-to-end).
 5. `test_detach_makes_effect_uniform_then_delete_noops` — `set_mask_attachment {attached:false}`; render normal preview; assert the exposure effect is now spatially uniform (inside/outside ratio ≈ 1); `delete_mask_shape`; assert a re-render is unchanged and `list_mask_shapes` no longer contains the id.
 6. `test_deferred_type_listed_non_editable` — using a fixture edit that already contains a brush (or skip with a clear reason if no such fixture exists), assert `list_mask_shapes` lists it with `editable == false` and no `geometry`, and that `set_mask_attachment` on it succeeds.
 7. `test_undo_twice_restores_create_attach` — capture revision; `create_mask_shape`+attach (2 history items); `undo` twice with the tracked revisions; assert `list_mask_shapes` and the module's `mask_mode` return to the pre-call state.
@@ -2242,7 +2352,7 @@ git commit -m "test: Tier-3 drawn-mask integration gates (show_mask observable, 
 - Modify: `tools/mcp/README.md`
 - Modify: `.superpowers/sdd/progress.md` (ledger)
 
-- [ ] **Step 1: Protocol reference** — add a top-level "Drawn masks (`mask_shapes` capability)" section covering: the coordinate contract (preview-normalized, `space` field, `raw_geometry`, the probe algorithm and `size_mapping` with the 1% spread threshold and 0.05 angle arm from Amendment 5); all five method shapes (`list_mask_shapes`, `create_mask_shape`, `update_mask_shape`, `delete_mask_shape`, `set_mask_attachment`); the state vocabulary (`union/intersection/difference/exclusion`, sum brush-only); per-method history-item counts (create-unattached = 1; create+attach = 2; update = 1; delete = 1 + the emptied-group items; set_mask_attachment = 1); the deferred-type visibility rules; the full error table incl. `not_found`, `retry_later`, `raster_unsupported`, `sum_is_brush_only`; the **pipe-freshness contract** (Amendment 1, verbatim); and the **GUI-edit-session guard** (Amendment 2, incl. the mid-drag-on-deleted-form behavior). Note the undo-granularity wart (N calls to revert an N-item op).
+- [ ] **Step 1: Protocol reference** — add a top-level "Drawn masks (`mask_shapes` capability)" section covering: the coordinate contract (preview-normalized, `space` field, `raw_geometry`, the probe algorithm and `size_mapping` with the 1% spread threshold and 0.05 angle arm from Amendment 5); all five method shapes (`list_mask_shapes`, `create_mask_shape`, `update_mask_shape`, `delete_mask_shape`, `set_mask_attachment`); the state vocabulary (`union/intersection/difference/exclusion`, sum brush-only); per-method history-item counts (create-unattached = 1; create+attach = 2; update = 1; delete = 1 + the emptied-group items; set_mask_attachment = 1); the deferred-type visibility rules; the full error table incl. `not_found`, `retry_later`, `raster_unsupported`, `sum_is_brush_only`; the **pipe-freshness contract** (Amendment 1, verbatim) **including the interactive-cost note** — the first coordinate call after a distortion-changing edit blocks the GTK main thread (and thus a co-located user's UI) until the preview pipe reprocesses, bounded by `pixelpipe_synchronization_timeout`, else `retry_later`; and the **GUI-edit-session guard** (Amendment 2, incl. the mid-drag-on-deleted-form behavior). Note the undo-granularity wart (N calls to revert an N-item op).
 
 - [ ] **Step 2: Supported operations** — add: "Drawn masks (circle, ellipse, gradient create/edit/attach) are supported via the `mask_shapes` capability; path/brush/clone/AI forms are visible and attachable but not editable; raster masks remain out of scope. `mask_manager` stays unsupported as a *module* — the drawn-mask methods replace it."
 
@@ -2296,4 +2406,4 @@ five-tool merge, and the divergence-manifest rows."
 - **Verified source facts, not contradictions:** `dt_masks_gui_form_save_creation` does not set `mask_mode` (engine sets bits before calling it); `dt_masks_form_remove` does not clear `MASK` (engine clears it). Both documented in "Verified engine facts" and implemented accordingly. No hard contradiction between source and design was found.
 - **Type consistency:** `dt_remote_masks_geometry_to_points(dev, type, JsonObject*, void*, error**)`, `dt_remote_masks_list(dev)`, `dt_remote_masks_set_attachment(...)`, and the `dt_remote_masks_*_call` entry points keep identical signatures across the task where they are declared (header), implemented, and consumed (Tasks 7–8). Error codes `DT_REMOTE_ERR_NOT_FOUND`/`DT_REMOTE_ERR_PIPE_NOT_READY` are declared once (Task 2) and mapped once (Task 7). Wire slugs `not_found`/`retry_later` match the Global Constraints table.
 - **Placeholder scan:** two deliberate "reminder" fragments in the plan text (the `ensure_fresh` null-branch and the guard's `dt_masks_group_get_hash` leftover) are immediately followed by their corrected final form with an explicit instruction to use the corrected version — implementers must apply the corrected code. All other steps carry complete code or the M-A-style "mirror the neighbouring test's plumbing" instruction (same precedent as the M-A plan's protocol/sidecar tasks).
-- **Implementer guidance:** stub-table/test-helper names in Tasks 8–9 must match the existing local idioms (`_assert_dispatch_matches`, `dt_remote_protocol_set_calls`, `fake_server_factory`); confirm `dt_remote_error_t`'s details field name (`details_json`) against M-A's actual struct before relying on it. Confirm `dt_masks_form_remove`'s exact `(module, grp, form)` branch selection at masks.c:1793 (use `(NULL, NULL, form)` for full delete; `(module, grp, form)` for detach) as noted in Tasks 5–6.
+- **Implementer guidance:** stub-table/test-helper names in Tasks 8–9 must match the existing local idioms (`_assert_dispatch_matches`, `dt_remote_protocol_set_calls`, `fake_server_factory`); confirm `dt_remote_error_t`'s details field name (`details_json`) against M-A's actual struct before relying on it. `dt_masks_form_remove`'s branch selection is **verified** (`masks.c:1793-1892`): `(NULL, NULL, form)` = full delete, `(module, grp, form)` = detach; it is hardwired to `darktable.develop`, so unit tests on a fixture dev repoint `darktable.develop` around those calls (Tasks 5–6).
