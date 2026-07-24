@@ -2013,6 +2013,72 @@ static int _find_in_group(const dt_masks_form_t *grp,
   return nb;
 }
 
+static gboolean _group_contains_form(const dt_develop_t *dev,
+                                     const dt_masks_form_t *group,
+                                     const dt_mask_id_t formid,
+                                     GHashTable *visited)
+{
+  if(!dev || !group || !(group->type & DT_MASKS_GROUP)) return FALSE;
+  if(group->formid == formid) return TRUE;
+
+  const gpointer key = GINT_TO_POINTER((gint)group->formid);
+  if(g_hash_table_contains(visited, key)) return FALSE;
+  g_hash_table_add(visited, key);
+
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    if(!member) continue;
+    if(member->formid == formid) return TRUE;
+
+    const dt_masks_form_t *child =
+      dt_masks_get_from_id(dev, member->formid);
+    if(child && (child->type & DT_MASKS_GROUP)
+       && _group_contains_form(dev, child, formid, visited))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+gboolean dt_masks_group_contains_form(const dt_develop_t *dev,
+                                      const dt_masks_form_t *group,
+                                      const dt_mask_id_t formid)
+{
+  if(!dev || !group || !(group->type & DT_MASKS_GROUP)) return FALSE;
+  GHashTable *visited =
+    g_hash_table_new(g_direct_hash, g_direct_equal);
+  const gboolean found =
+    _group_contains_form(dev, group, formid, visited);
+  g_hash_table_unref(visited);
+  return found;
+}
+
+GPtrArray *dt_masks_form_get_referencing_modules(
+  const dt_develop_t *dev,
+  const dt_mask_id_t formid)
+{
+  GPtrArray *owners = g_ptr_array_new();
+  if(!dev) return owners;
+
+  for(GList *modules = dev->iop;
+      modules;
+      modules = g_list_next(modules))
+  {
+    dt_iop_module_t *module = modules->data;
+    if(!module || !module->flags || !module->blend_params
+       || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+      continue;
+
+    const dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(group && dt_masks_group_contains_form(dev, group, formid))
+      g_ptr_array_add(owners, module);
+  }
+  return owners;
+}
+
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form)
 {

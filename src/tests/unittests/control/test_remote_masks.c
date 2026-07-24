@@ -318,6 +318,111 @@ static JsonObject *_find_shape(JsonArray *shapes, const dt_mask_id_t id)
   return NULL;
 }
 
+static dt_masks_form_t *_fixture_add_form(blend_fixture_t *fixture,
+                                          const dt_masks_type_t type,
+                                          const dt_mask_id_t id)
+{
+  dt_masks_form_t *form = dt_masks_create(type);
+  assert_non_null(form);
+  form->formid = id;
+  fixture->dev.forms = g_list_append(fixture->dev.forms, form);
+  return form;
+}
+
+static dt_masks_point_group_t *_fixture_add_member(
+  dt_masks_form_t *group,
+  const dt_mask_id_t child_id,
+  const int state,
+  const float opacity)
+{
+  dt_masks_point_group_t *member =
+    g_malloc0(sizeof(dt_masks_point_group_t));
+  member->formid = child_id;
+  member->parentid = group->formid;
+  member->state = state;
+  member->opacity = opacity;
+  group->points = g_list_append(group->points, member);
+  return member;
+}
+
+static guint _list_pointer_count(const GList *list, const gpointer value)
+{
+  guint count = 0;
+  for(const GList *item = list; item; item = g_list_next(item))
+    if(item->data == value) count++;
+  return count;
+}
+
+static void test_core_group_contains_form_is_transitive_and_cycle_safe(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7201);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7202);
+  dt_masks_form_t *outer =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7203);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.4f);
+  _fixture_add_member(outer, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.8f);
+
+  assert_true(dt_masks_group_contains_form(&fixture->dev, outer,
+                                           leaf->formid));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, outer,
+                                           inner->formid));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, outer, 7999));
+  assert_false(dt_masks_group_contains_form(NULL, outer, leaf->formid));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, NULL,
+                                            leaf->formid));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, leaf,
+                                            leaf->formid));
+
+  _fixture_add_member(inner, outer->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  assert_false(dt_masks_group_contains_form(&fixture->dev, outer, 7998));
+
+  _fixture_add_member(outer, 7997,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  assert_true(dt_masks_group_contains_form(&fixture->dev, outer, 7997));
+}
+
+static void test_core_referencing_modules_flattens_nested_and_shared_paths(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_iop_module_t *second =
+    _blend_fixture_add_module(fixture, "exposure", 2);
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7211);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7212);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.5f);
+
+  dt_masks_form_t *first_root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  dt_masks_form_t *second_root = dt_masks_group_create_for_module(
+    &fixture->dev, second, DT_MASKS_GROUP);
+  _fixture_add_member(first_root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(second_root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(first_root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+
+  assert_int_equal(_list_pointer_count(fixture->dev.iop, fixture->module), 1);
+  assert_int_equal(_list_pointer_count(fixture->dev.iop, second), 1);
+  GPtrArray *owners =
+    dt_masks_form_get_referencing_modules(&fixture->dev, leaf->formid);
+  assert_non_null(owners);
+  assert_int_equal(owners->len, 2);
+  assert_ptr_equal(g_ptr_array_index(owners, 0), fixture->module);
+  assert_ptr_equal(g_ptr_array_index(owners, 1), second);
+  g_ptr_array_unref(owners);
+}
+
 // Task 1: the symbol must be linkable (public, non-static). We only assert
 // the declaration compiles and the pointer is non-NULL; behavioral tests
 // that need a live dev/module arrive in Task 3 with the dt_init harness.
@@ -1616,6 +1721,12 @@ int main(void)
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_group_create_symbol_is_public),
+    cmocka_unit_test_setup_teardown(
+      test_core_group_contains_form_is_transitive_and_cycle_safe,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_core_referencing_modules_flattens_nested_and_shared_paths,
+      blend_test_setup, blend_test_teardown),
     cmocka_unit_test(test_type_mapping_and_composite_precedence),
     cmocka_unit_test(test_validate_circle_policy),
     cmocka_unit_test(test_validate_ellipse_policy),

@@ -640,6 +640,11 @@ void dt_masks_group_ungroup(dt_masks_form_t *dest_grp, dt_masks_form_t *grp);
 void dt_masks_group_update_name(dt_iop_module_t *module);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form);
+gboolean dt_masks_group_contains_form(const dt_develop_t *dev,
+                                      const dt_masks_form_t *group,
+                                      dt_mask_id_t formid);
+GPtrArray *dt_masks_form_get_referencing_modules(const dt_develop_t *dev,
+                                                 dt_mask_id_t formid);
 
 void dt_masks_iop_edit_toggle_callback(GtkToggleButton *togglebutton,
                                        struct dt_iop_module_t *module);
