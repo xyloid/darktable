@@ -455,6 +455,54 @@ static void test_circle_conversion_storage_bounds_and_atomic_output(void **state
   json_object_unref(too_large);
 }
 
+static void test_transformed_center_may_leave_wire_range(void **state)
+{
+  masks_fixture_t *fixture = *state;
+  fixture->preview_pipe->processed_width = 2000;
+
+  dt_remote_error_t *error = NULL;
+  dt_masks_point_circle_t point = { 0 };
+  JsonObject *geometry =
+    _geom("{\"center\":[1,0.5],\"radius\":0.1,\"border\":0.03}");
+
+  // The wire center is valid. With preview width twice raw width, the
+  // transformed raw x coordinate is 2.0; raw points have no wire-space
+  // [-0.5, 1.5] policy and remain valid when finite/float-storable.
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, geometry, &point, &error));
+  assert_null(error);
+  assert_float_equal(point.center[0], 2.0, 1e-4);
+  assert_float_equal(point.center[1], 0.5, 1e-4);
+
+  json_object_unref(geometry);
+}
+
+static void test_successful_nonstorable_size_is_invalid_value(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  dt_masks_point_circle_t point;
+  memset(&point, 0x6b, sizeof(point));
+  const dt_masks_point_circle_t before = point;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.03}");
+  json_object_set_double_member(geometry, "radius", FLT_MAX);
+
+  // FLT_MAX is accepted and float-storable on the wire. Scaling the probe
+  // arms by the deterministic 1000px fixture overflows the transformed size,
+  // while the transform helper itself returns TRUE. This is a storage-range
+  // failure, not a transform-helper failure.
+  assert_true(
+    dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, geometry, &error));
+  assert_null(error);
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, geometry, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius", "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+
+  json_object_unref(geometry);
+}
+
 static void test_ellipse_conversion_storage_bounds_and_atomic_output(void **state)
 {
   (void)state;
@@ -756,6 +804,11 @@ int main(void)
       test_validate_rejects_nonfinite_overflow_unknown_and_unsupported),
     cmocka_unit_test_setup_teardown(
       test_circle_conversion_storage_bounds_and_atomic_output,
+      masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(test_transformed_center_may_leave_wire_range,
+                                    masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_successful_nonstorable_size_is_invalid_value,
       masks_test_setup, masks_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_ellipse_conversion_storage_bounds_and_atomic_output,

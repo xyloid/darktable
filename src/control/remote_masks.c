@@ -404,12 +404,6 @@ static gboolean _in_storage_range(const double value,
          && _float_representable(value);
 }
 
-static gboolean _raw_center_ok(const double x, const double y)
-{
-  return _in_storage_range(x, DTRM_CENTER_LO, DTRM_CENTER_HI)
-         && _in_storage_range(y, DTRM_CENTER_LO, DTRM_CENTER_HI);
-}
-
 gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev,
                                             const dt_masks_type_t type,
                                             JsonObject *geom,
@@ -445,21 +439,15 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev,
       if(!isfinite(raw_x) || !isfinite(raw_y)
          || !_float_representable(raw_x) || !_float_representable(raw_y))
         return _err_transform(error, "center");
-      if(!_raw_center_ok(raw_x, raw_y))
-        return _err_invalid(error, "center", "out_of_range");
       if(!dt_remote_transform_preview_to_raw_size(
            dev, center_x, center_y, _member_num(geom, "radius"),
            &raw_radius, &exact))
-        return _err_transform(error, "radius");
-      if(!isfinite(raw_radius) || !_float_representable(raw_radius))
         return _err_transform(error, "radius");
       if(!_in_storage_range(raw_radius, DTRM_SIZE_MIN, DTRM_SIZE_MAX))
         return _err_invalid(error, "radius", "out_of_range");
       if(!dt_remote_transform_preview_to_raw_size(
            dev, center_x, center_y, _member_num(geom, "border"),
            &raw_border, &exact))
-        return _err_transform(error, "border");
-      if(!isfinite(raw_border) || !_float_representable(raw_border))
         return _err_transform(error, "border");
       if(!_in_storage_range(raw_border, DTRM_SIZE_MIN, DTRM_SIZE_MAX))
         return _err_invalid(error, "border", "out_of_range");
@@ -493,16 +481,10 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev,
       if(!isfinite(raw_x) || !isfinite(raw_y)
          || !_float_representable(raw_x) || !_float_representable(raw_y))
         return _err_transform(error, "center");
-      if(!_raw_center_ok(raw_x, raw_y))
-        return _err_invalid(error, "center", "out_of_range");
       if(!dt_remote_transform_preview_to_raw_size(
            dev, center_x, center_y, preview_radius_a, &raw_radius_a, &exact)
          || !dt_remote_transform_preview_to_raw_size(
            dev, center_x, center_y, preview_radius_b, &raw_radius_b, &exact))
-        return _err_transform(error, "radius");
-      if(!isfinite(raw_radius_a) || !isfinite(raw_radius_b)
-         || !_float_representable(raw_radius_a)
-         || !_float_representable(raw_radius_b))
         return _err_transform(error, "radius");
       if(!_in_storage_range(raw_radius_a, DTRM_SIZE_MIN, DTRM_SIZE_MAX)
          || !_in_storage_range(raw_radius_b, DTRM_SIZE_MIN, DTRM_SIZE_MAX))
@@ -528,8 +510,6 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev,
       {
         return _err_transform(error, "border");
       }
-      if(!isfinite(raw_border) || !_float_representable(raw_border))
-        return _err_transform(error, "border");
       if(!_in_storage_range(raw_border, DTRM_SIZE_MIN, DTRM_SIZE_MAX))
         return _err_invalid(error, "border", "out_of_range");
 
@@ -559,8 +539,6 @@ gboolean dt_remote_masks_geometry_to_points(dt_develop_t *dev,
       if(!isfinite(raw_x) || !isfinite(raw_y)
          || !_float_representable(raw_x) || !_float_representable(raw_y))
         return _err_transform(error, "anchor");
-      if(!_raw_center_ok(raw_x, raw_y))
-        return _err_invalid(error, "anchor", "out_of_range");
       if(!dt_remote_transform_preview_to_raw_angle(
            dev, anchor_x, anchor_y, _member_num(geom, "rotation"),
            &raw_rotation))
