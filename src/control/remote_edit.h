@@ -61,6 +61,8 @@ typedef enum dt_remote_error_code_t
   DT_REMOTE_ERR_REVISION_CONFLICT,
   DT_REMOTE_ERR_PREVIEW_FAILED,
   DT_REMOTE_ERR_SCOPE_FAILED,
+  DT_REMOTE_ERR_NOT_FOUND,       // M-C: unknown mask shape id (wire "not_found")
+  DT_REMOTE_ERR_PIPE_NOT_READY,  // M-C: preview pipe not clean (wire "retry_later", retryable)
   DT_REMOTE_ERR_INTERNAL,
 } dt_remote_error_code_t;
 // transport-only codes (unauthorized, request_too_large, busy) live in
@@ -72,6 +74,11 @@ typedef struct dt_remote_error_t
   char *message;        // owned; human-readable
   char *details_json;   // owned, nullable; pre-serialized details object
 } dt_remote_error_t;
+
+/** allocates an error with a printf-formatted owned message. */
+dt_remote_error_t *dt_remote_error_new(dt_remote_error_code_t code,
+                                       const char *format, ...)
+  G_GNUC_PRINTF(2, 3);
 
 /** frees an error allocated by any dt_remote_* function. NULL-safe. */
 void dt_remote_error_free(dt_remote_error_t *error);

@@ -45,12 +45,12 @@
 /* error helper                                                            */
 /* ---------------------------------------------------------------------- */
 
-static dt_remote_error_t *dt_remote_error_new(dt_remote_error_code_t code,
-                                              const char *format, ...)
+dt_remote_error_t *dt_remote_error_new(dt_remote_error_code_t code,
+                                       const char *format, ...)
   G_GNUC_PRINTF(2, 3);
 
-static dt_remote_error_t *dt_remote_error_new(dt_remote_error_code_t code,
-                                              const char *format, ...)
+dt_remote_error_t *dt_remote_error_new(dt_remote_error_code_t code,
+                                       const char *format, ...)
 {
   dt_remote_error_t *error = g_malloc0(sizeof(dt_remote_error_t));
   error->code = code;

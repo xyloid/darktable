@@ -124,6 +124,7 @@ FILE(GLOB SOURCE_FILES
   "control/remote_revision.c"
   "control/remote_scopes.c"
   "control/remote_server.c"
+  "control/remote_transform.c"
   "control/remote_vector.c"
   "control/remote_vector_registry.c"
   "control/signal.c"
