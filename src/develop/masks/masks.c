@@ -1967,6 +1967,9 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
   return TRUE;
 }
 
+// MASKS_REMOVE_CALLER_AUDIT: legacy semantics are intentional; review
+// docs/superpowers/specs/2026-07-24-darktable-mask-removal-caller-audit.md
+// before changing this API or migrating one of its callers.
 void dt_masks_form_remove(dt_iop_module_t *module,
                           dt_masks_form_t *grp,
                           dt_masks_form_t *form)

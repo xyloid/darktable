@@ -680,6 +680,9 @@ void dt_masks_iop_use_same_as(struct dt_iop_module_t *module,
                               struct dt_iop_module_t *src);
 dt_hash_t dt_masks_group_hash(dt_hash_t hash, dt_masks_form_t *form);
 
+// MASKS_REMOVE_CALLER_AUDIT: legacy semantics are intentional; review
+// docs/superpowers/specs/2026-07-24-darktable-mask-removal-caller-audit.md
+// before changing this API or migrating one of its callers.
 void dt_masks_form_remove(struct dt_iop_module_t *module,
                           dt_masks_form_t *grp,
                           dt_masks_form_t *form);

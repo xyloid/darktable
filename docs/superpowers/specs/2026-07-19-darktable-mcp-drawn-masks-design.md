@@ -44,22 +44,15 @@ masks (`raster_mask_*`, `DEVELOP_COMBINE_MASKS_POS`).
 
 All verified 2026-07-19:
 
-- **Creation is already headless-capable.**
-  `dt_masks_gui_form_save_creation(dev, module, form, gui)`
-  (`src/develop/masks/masks.c:336`) accepts `gui == NULL`: it assigns a
-  unique id (`_check_id`), derives a unique name via the shape's
-  `set_form_name`, appends to `dev->forms`, commits a masks history item,
-  then — given a module — finds or creates the module's group form
-  (`_group_create` sets `blend_params->mask_id`), appends a
-  `dt_masks_point_group_t` member with
-  `state = SHOW|USE` (`|UNION` when the group already has members),
-  `opacity = conf "plugins/darkroom/masks/opacity"`, and commits a second
-  masks history item. All GUI touches are behind `if(gui)`. **The engine
-  calls this function directly; no re-derived sequence.**
-- **Deletion is engine-ready.** `dt_masks_form_remove(module, grp, form)`
-  (`masks.c:1793`) removes group membership, commits masks history,
-  auto-deletes an emptied group, and handles full-form removal.
-  `dt_remote_reset_module` already calls it headless today.
+- Legacy `dt_masks_form_remove(NULL, NULL, form)` scans only immediate
+  members of module base groups and does not retain unlinked objects.
+  Remote full shape deletion therefore uses
+  `dt_masks_form_remove_shape_full`, which removes incoming references at
+  every nesting depth and retires objects into `dev->allforms`.
+- Remote creation uses `dt_masks_gui_form_save_creation_ext`. The first
+  forced-new masks snapshot contains the unattached form and unchanged
+  module state; the second contains the membership and the
+  `ENABLED|MASK` mode addition. Both preserve `module->enabled`.
 - **Storage coordinates.** Shape points are normalized to the raw input
   image: `center = dt_dev_distort_backtransform(screen_pts)/iwidth`
   (`masks/circle.c:281`); scalar sizes (radius, border) are normalized by
@@ -148,10 +141,10 @@ Response:
   "revision": 41 }
 ```
 
-- `used_by` is derived by walking every module's group form; `state`
-  lists the combine op, `inverted` maps `DT_MASKS_STATE_INVERSE`,
-  `opacity` is the group-member opacity (not the module's blend
-  opacity).
+- Nested `used_by` is flattened to one entry per referencing module.
+  State, inversion, and opacity come from the target form's nearest
+  membership edge on the first depth-first path from that module's base
+  group.
 - Group forms themselves are **not** listed as shapes; they are
   represented through `used_by`. (Decision 4 below.)
 - Deferred-type forms present in the edit (paths, brushes, clones) are
@@ -170,12 +163,12 @@ Response:
   "expected_revision": 41 }
 ```
 
-- `attach` is optional. With it, the engine passes the module to
-  `dt_masks_gui_form_save_creation` (group + membership + `mask_id`
-  handled by darktable) and then ORs
-  `ENABLED|MASK` into `mask_mode` before the same call's final commit;
-  without it, the form is created unattached (`module = NULL`), for
-  later `attach_mask`.
+- `attach` is optional. The engine calls
+  `dt_masks_gui_form_save_creation_ext` with explicit creation options:
+  attached creation adds `ENABLED|MASK` only in the second forced-new
+  snapshot, while unattached creation adds no mode bits. Both paths
+  preserve `module->enabled`; group + membership + `mask_id` remain
+  handled by darktable.
 - `name: null` → darktable's auto-numbering; a string requests that
   name (uniquified with a suffix if taken, actual name returned).
 - Result: the new shape's `list_mask_shapes` entry + new revision.
@@ -214,12 +207,11 @@ allows placing shapes partly off-canvas, everything else rejected):
 { "id": 12, "expected_revision": 43 }
 ```
 
-Engine: for each referencing module, `dt_masks_form_remove(module, grp,
-form)` (which also drops emptied groups); if unreferenced, remove from
-`dev->forms` with a masks history item. When a module's group empties,
-the engine also clears `MASK` from its `mask_mode` (mirroring GUI
-behavior when the last shape goes). Response: `removed_from` list of
-affected instances + revision.
+Engine: `dt_masks_form_remove_shape_full(dev, form, &references)` removes
+incoming references at every nesting depth, retires the shape and any
+newly unowned groups into `dev->allforms`, and clears `MASK` when a
+module's base group empties. Response: `removed_from` list of affected
+instances + revision.
 
 ### `attach_mask` / `detach_mask`
 
@@ -282,7 +274,8 @@ all mutating ones take `expected_revision` CAS like every mutation.
   unknown members.
 - Form construction: `dt_masks_create(type)` + one malloc'd point struct
   + `g_list_append` — then hand off to
-  `dt_masks_gui_form_save_creation(dev, module_or_NULL, form, NULL)`.
+  `dt_masks_gui_form_save_creation_ext(dev, module_or_NULL, form, NULL,
+  &options)`.
 - `used_by` walk, state-bit ↔ string mapping, membership upsert.
 - Coordinate conversion (`remote_transform.c` helper): point mapping via
   `dt_dev_distort_transform/backtransform` on the full pipe + the probe
@@ -317,10 +310,11 @@ already-public masks API.
 
 ### History, revision, undo
 
-- Creation with attach commits **two** masks history items (darktable's
-  own sequence: form, then group) plus the `mask_mode` OR folded into
-  the second; the revision tracker counts each synchronous delivery and
-  the mutation result reports the final revision — the
+- Creation with attach commits **two** forced-new masks history items.
+  The first contains the unattached form and unchanged module state; the
+  second contains the membership and the `ENABLED|MASK` mode addition.
+  Both preserve `module->enabled`. The revision tracker counts each
+  synchronous delivery and the mutation result reports the final revision — the
   `create_module_instance` precedent (also 2 items) applies verbatim,
   including the force-bump fallback.
 - **Undo granularity wart (accepted, documented):** remote `undo`
@@ -391,9 +385,10 @@ end-to-end confirmation):
 
 ## Decisions recorded (and what review should challenge)
 
-1. **Reuse `dt_masks_gui_form_save_creation` headless** rather than
-   re-deriving the sequence — it is already NULL-gui-safe; the one core
-   export needed is `_group_create` (behavior-identical refactor).
+1. **Reuse `dt_masks_gui_form_save_creation_ext` headless** rather than
+   re-deriving the sequence — explicit creation options provide distinct
+   snapshots, preserve module enablement, and add `mask_mode` only with
+   membership.
 2. **Preview-normalized wire coordinates with engine-side transform**;
    raw geometry reported alongside; explicit `space` field. Points
    exact, sizes/angles via the probe algorithm with honest
@@ -492,13 +487,11 @@ full normative text.
    (verified `circle.c`/`ellipse.c`/`gradient.c`). Wire-space center/anchor
    allowed in `[-0.5, 1.5]` (moderately off-canvas, mirroring the GUI).
 
-8. **`dt_masks_form_remove` semantics verified (`masks.c:1793-1892`).**
-   `(NULL, NULL, form)` = full permanent delete; `(module, grp, form)` =
-   membership-only detach (drawn shapes lack the `CLONE|NON_CLONE` bit, so
-   the detach early-return applies). The function is **hardwired to
-   `darktable.develop`** internally, not the passed dev — correct on the
-   wire (darkroom dev *is* `darktable.develop`); unit tests on a standalone
-   fixture dev repoint `darktable.develop` around those calls.
+8. **Legacy `dt_masks_form_remove` remains for detach and reset paths.**
+   `(module, grp, form)` is membership-only detach for drawn shapes.
+   `(NULL, NULL, form)` scans only immediate base-group members and does
+   not retain unlinked objects, so remote full deletion instead uses
+   `dt_masks_form_remove_shape_full`.
 
 9. **JSON numeric coercion.** Wire scalars are read through a helper that
    accepts both `G_TYPE_DOUBLE` and `G_TYPE_INT64` (mirroring

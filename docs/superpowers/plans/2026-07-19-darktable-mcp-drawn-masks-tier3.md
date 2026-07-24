@@ -4,7 +4,7 @@
 
 **Goal:** List, create, edit, delete drawn mask shapes (circle, ellipse, gradient) and attach/detach them to module instances with combine state and per-member opacity, behind a new `mask_shapes` hello capability, using new wire methods that speak preview-normalized coordinates and back-transform to raw-normalized storage.
 
-**Architecture:** A new shared pure helper `src/control/remote_transform.c` performs the preview↔raw point mapping (via `dt_dev_distort_transform/backtransform` on the live preview pipe) plus the scalar-size/angle probe algorithm, and owns the **pipe-freshness contract** (block-until-clean on `dev->preview_pipe->status`). A new engine file `src/control/remote_masks.c` holds per-type geometry (de)serializers, adversarial-input validation, the `used_by` walk, state-bit↔string mapping, membership upsert, the mask_mode bit management, and the **GUI-edit-session guard** (`dt_masks_change_form_gui(NULL)`). Shape creation reuses darktable's NULL-gui-safe `dt_masks_gui_form_save_creation`; the one core export is `_group_create` → `dt_masks_group_create_for_module`. `remote_edit.c` gains the ref-resolving/CAS/revision/reveal entry points; `remote_protocol.c` adds the capability, five handlers, and fixtures.
+**Architecture:** A new shared pure helper `src/control/remote_transform.c` performs the preview↔raw point mapping (via `dt_dev_distort_transform/backtransform` on the live preview pipe) plus the scalar-size/angle probe algorithm, and owns the **pipe-freshness contract** (block-until-clean on `dev->preview_pipe->status`). A new engine file `src/control/remote_masks.c` holds per-type geometry (de)serializers, adversarial-input validation, the `used_by` walk, state-bit↔string mapping, membership upsert, the mask_mode bit management, and the **GUI-edit-session guard** (`dt_masks_change_form_gui(NULL)`). Shape creation uses `dt_masks_gui_form_save_creation_ext`; core exports provide cycle-safe ownership queries, ownership-aware full deletion, and group creation. `remote_edit.c` gains the ref-resolving/CAS/revision/reveal entry points; `remote_protocol.c` adds the capability, five handlers, and fixtures.
 
 **Tech Stack:** C (GLib, json-glib, cmocka), Python (FastMCP sidecar, pytest). Builds on M-A (`blend_params`, `remote_blend.c`, the divergence manifest, `get_module_schema`'s `instance` arg) and M-B (`parametric_mask_params` + `mask_render`'s `show_mask` on `render_preview`) as if fully implemented.
 
@@ -88,8 +88,13 @@ Following the design's stated preference: `create_mask_shape`/`update_mask_shape
 
 ### Verified engine facts that shape the implementation (not contradictions, but load-bearing)
 
-- `dt_masks_gui_form_save_creation(dev, module, form, NULL)` does **not** set `mask_mode`; it appends the form, commits a masks-history item, and (given a module) creates/extends the group + membership and commits a **second** masks-history item (`masks.c:336-418`). The GUI sets `mask_mode` separately (`_blendop_masks_modes_toggle(..., DEVELOP_MASK_MASK)`, `blend_gui.c:1637`). **Therefore the engine sets `module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK` BEFORE calling `save_creation`**, so both internal masks-history snapshots capture it (item count stays 2, mask_mode folded in — matching the design).
-- `dt_masks_form_remove` does **not** clear `DEVELOP_MASK_MASK`; it sets `blend_params->mask_id = NO_MASKID` when the base group is removed (`masks.c:1843-1852`) but leaves `mask_mode` untouched. **Therefore the engine clears the `MASK` bit itself** after a detach/delete empties a module's group (checking `_group_from_module(dev, module) == NULL` or the module's `mask_id == NO_MASKID` post-remove).
+- Remote creation uses `dt_masks_gui_form_save_creation_ext` with explicit
+  options. The first forced-new snapshot contains the unattached form and
+  unchanged module state; the second contains membership and the
+  `ENABLED|MASK` addition. Both preserve `module->enabled`.
+- Legacy `dt_masks_form_remove` remains unchanged for detach/reset paths.
+  Remote full deletion uses `dt_masks_form_remove_shape_full` so incoming
+  references are removed transitively and retired objects remain owned.
 
 ---
 
@@ -838,11 +843,10 @@ Expected: FAIL — `control/remote_masks.h` not found.
 // to remote_transform.h. Every function taking a dt_develop_t/dt_iop_module_t
 // runs on the GTK main thread.
 //
-// CAVEAT: the create/delete/detach paths reach dt_masks_gui_form_save_creation
-// (dev-parameterized, safe) and dt_masks_form_remove (HARDWIRED to
-// darktable.develop, ignores the passed dev). On the wire the darkroom dev IS
-// darktable.develop so this is correct; unit tests on a standalone fixture dev
-// must repoint darktable.develop at it around those calls (see Task 5/6 tests).
+// CAVEAT: create and full delete use the dev-parameterized extended APIs.
+// Detach retains legacy dt_masks_form_remove behavior, which is hardwired to
+// darktable.develop; unit tests on a standalone fixture dev must repoint the
+// global around that Task 6 path.
 
 #pragma once
 
@@ -1411,8 +1415,40 @@ gboolean dt_remote_masks_state_op_from_string(const char *s, int *op_bit_out)
   return FALSE;  // "sum" (brush-only) and junk rejected
 }
 
-// walk every blending module's group form; append a used_by entry per member
-// whose formid == id.
+static const dt_masks_point_group_t *_find_membership(
+  const dt_develop_t *dev,
+  const dt_masks_form_t *group,
+  const dt_mask_id_t id,
+  GHashTable *visited)
+{
+  if(!dev || !group || !(group->type & DT_MASKS_GROUP)) return NULL;
+  if(g_hash_table_contains(visited, group)) return NULL;
+  g_hash_table_add(visited, (gpointer)group);
+
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    if(member && member->formid == id) return member;
+  }
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    const dt_masks_form_t *child =
+      member ? dt_masks_get_from_id(dev, member->formid) : NULL;
+    const dt_masks_point_group_t *found =
+      child ? _find_membership(dev, child, id, visited) : NULL;
+    if(found) return found;
+  }
+  return NULL;
+}
+
+// Walk every blending module whose base group transitively contains id.
+// _find_membership is cycle-safe and returns the target's nearest edge
+// on the first depth-first path.
 static void _append_used_by(dt_develop_t *dev, dt_mask_id_t id, JsonArray *out)
 {
   for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
@@ -1420,21 +1456,22 @@ static void _append_used_by(dt_develop_t *dev, dt_mask_id_t id, JsonArray *out)
     dt_iop_module_t *m = iops->data;
     if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) continue;
     dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
-    if(!grp || !(grp->type & DT_MASKS_GROUP)) continue;
-    for(GList *pts = grp->points; pts; pts = g_list_next(pts))
-    {
-      const dt_masks_point_group_t *gp = pts->data;
-      if(gp->formid != id) continue;
-      JsonObject *u = json_object_new();
-      json_object_set_string_member(u, "op", m->op);
-      json_object_set_int_member(u, "instance", m->multi_priority);
-      JsonArray *st = json_array_new();
-      json_array_add_string_element(st, dt_remote_masks_state_op_string(gp->state));
-      json_object_set_array_member(u, "state", st);
-      json_object_set_boolean_member(u, "inverted", (gp->state & DT_MASKS_STATE_INVERSE) != 0);
-      json_object_set_double_member(u, "opacity", gp->opacity);
-      json_array_add_object_element(out, u);
-    }
+    if(!grp || !dt_masks_group_contains_form(dev, grp, id)) continue;
+    GHashTable *visited =
+      g_hash_table_new(g_direct_hash, g_direct_equal);
+    const dt_masks_point_group_t *gp =
+      _find_membership(dev, grp, id, visited);
+    g_hash_table_unref(visited);
+    if(!gp) continue;
+    JsonObject *u = json_object_new();
+    json_object_set_string_member(u, "op", m->op);
+    json_object_set_int_member(u, "instance", m->multi_priority);
+    JsonArray *st = json_array_new();
+    json_array_add_string_element(st, dt_remote_masks_state_op_string(gp->state));
+    json_object_set_array_member(u, "state", st);
+    json_object_set_boolean_member(u, "inverted", (gp->state & DT_MASKS_STATE_INVERSE) != 0);
+    json_object_set_double_member(u, "opacity", gp->opacity);
+    json_array_add_object_element(out, u);
   }
 }
 
@@ -1496,6 +1533,14 @@ deferred types listed non-editable with no geometry."
 
 ### Task 5: `remote_masks.c` — create/update/delete shape + GUI-edit guard
 
+> **Task 5 remediation (2026-07-24):** The original snippets below assumed
+> flat module groups and set `mask_mode` before both creation snapshots.
+> Those details are superseded by
+> `2026-07-24-darktable-drawn-mask-task5-remediation.md`: use the
+> cycle-safe core ownership queries, ownership-aware full deletion,
+> transitive H2 guard, and extended creation helper. Binding Amendment 2
+> remains transitive.
+
 **Files:**
 - Modify: `src/control/remote_masks.c` (append), `src/control/remote_masks.h`
 - Test: `src/tests/unittests/control/test_remote_masks.c` (append)
@@ -1510,7 +1555,10 @@ deferred types listed non-editable with no geometry."
 
 - [ ] **Step 1: Write the failing tests**
 
-Append (using `blend_fixture_new` on `fx->dev`; note the guard tests manipulate `darktable.develop->form_visible`). Because `dt_masks_gui_form_save_creation` and `dt_masks_form_remove` operate on `darktable.develop` internally, the create/update/delete engine functions take an explicit `dev` but the underlying darktable calls use `darktable.develop`; in the unit harness set `darktable.develop` to the fixture dev for the duration (the M-A blend fixture already runs headless with `darktable.develop` initialized by `dt_dev_init` inside `dt_init`; to exercise the masks path deterministically the test points `darktable.develop`'s `forms`/`iop` at the fixture — OR, simpler, the test drives the pure guard + validation and defers full create/delete to the integration gates). Concretely:
+Append (using `blend_fixture_new` on `fx->dev`; note the guard tests
+manipulate `darktable.develop->form_visible`). The H2 guard follows the
+live GUI state on `darktable.develop`; in the unit harness, point that
+global at the fixture dev for the duration. Concretely:
 
 ```c
 static void test_guard_cancels_when_targeting(void **state)
@@ -1569,36 +1617,15 @@ Expected: FAIL — undeclared functions.
 // state. dt_masks_change_form_gui uses darktable.develop internally.
 void dt_remote_masks_cancel_gui_edit_if_targeting(dt_develop_t *dev, dt_masks_form_t *form)
 {
-  if(!form || dev != darktable.develop) return;
+  if(!dev || !form || dev != darktable.develop) return;
   const dt_masks_form_t *visible = dev->form_visible;
   if(!visible) return;
   const gboolean hit =
        visible->formid == form->formid
     || (dev->form_gui && dev->form_gui->formid == form->formid)
-    || ((visible->type & DT_MASKS_GROUP)
-        && dt_masks_group_get_hash /* any member? */ , FALSE);  // see note
-  // A group edit targets its members: if the visible form is a group that
-  // references `form`, treat it as a hit. Check membership explicitly:
-  gboolean group_hit = FALSE;
-  if(!hit && (visible->type & DT_MASKS_GROUP))
-    for(GList *p = visible->points; p; p = g_list_next(p))
-      if(((dt_masks_point_group_t *)p->data)->formid == form->formid) { group_hit = TRUE; break; }
-  if(hit || group_hit)
-    dt_masks_change_form_gui(NULL);
+    || dt_masks_group_contains_form(dev, visible, form->formid);
+  if(hit) dt_masks_change_form_gui(NULL);
 }
-```
-
-**Implementation note:** delete the bogus `dt_masks_group_get_hash , FALSE` term above — it is a leftover; the correct condition is:
-
-```c
-  const gboolean hit =
-       visible->formid == form->formid
-    || (dev->form_gui && dev->form_gui->formid == form->formid);
-  gboolean group_hit = FALSE;
-  if(!hit && (visible->type & DT_MASKS_GROUP))
-    for(GList *p = visible->points; p; p = g_list_next(p))
-      if(((dt_masks_point_group_t *)p->data)->formid == form->formid) { group_hit = TRUE; break; }
-  if(hit || group_hit) dt_masks_change_form_gui(NULL);
 ```
 
 ```c
@@ -1633,15 +1660,14 @@ gboolean dt_remote_masks_create(dt_develop_t *dev, dt_masks_type_t type, JsonObj
     return FALSE;
   }
   form->points = g_list_append(form->points, pt);
-  if(name_or_null && *name_or_null)
-    g_strlcpy(form->name, name_or_null, sizeof(form->name));
-
-  // set mask_mode BEFORE save_creation so both internal masks-history items
-  // snapshot it (verified: save_creation does not touch mask_mode).
-  if(attach_module)
-    attach_module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
-
-  dt_masks_gui_form_save_creation(dev, attach_module, form, NULL);
+  const dt_masks_form_creation_options_t options = {
+    .requested_name = name_or_null,
+    .preserve_module_enabled = TRUE,
+    .mask_mode_to_add =
+      attach_module ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK : 0,
+  };
+  dt_masks_gui_form_save_creation_ext(dev, attach_module, form, NULL,
+                                      &options);
   if(new_id_out) *new_id_out = form->formid;
   return TRUE;
 }
@@ -1684,19 +1710,11 @@ gboolean dt_remote_masks_update(dt_develop_t *dev, dt_mask_id_t id, JsonObject *
   free(scratch);
   if(name_or_null && *name_or_null) g_strlcpy(form->name, name_or_null, sizeof(form->name));
 
-  // count referencing modules (for affects_instances) and reveal iff exactly one
-  int affects = 0;
-  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
-  {
-    dt_iop_module_t *m = iops->data;
-    if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) continue;
-    dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
-    if(!grp) continue;
-    for(GList *p = grp->points; p; p = g_list_next(p))
-      if(((dt_masks_point_group_t *)p->data)->formid == id) { affects++; break; }
-  }
-  if(affects_out) *affects_out = affects;
-  dt_dev_add_masks_history_item(dev, NULL, TRUE);
+  GPtrArray *owners =
+    dt_masks_form_get_referencing_modules(dev, id);
+  if(affects_out) *affects_out = owners->len;
+  g_ptr_array_unref(owners);
+  dt_dev_add_new_masks_history_item(dev, NULL, FALSE);
   return TRUE;
 }
 
@@ -1715,28 +1733,10 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev, dt_mask_id_t id,
   }
   dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
 
-  // collect referencing modules before removal (for removed_from + mask_mode clear)
-  GPtrArray *refs = g_ptr_array_new();
-  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
-  {
-    dt_iop_module_t *m = iops->data;
-    if(!(m->flags() & IOP_FLAGS_SUPPORTS_BLENDING)) continue;
-    dt_masks_form_t *grp = dt_masks_get_from_id(dev, m->blend_params->mask_id);
-    if(!grp) continue;
-    for(GList *p = grp->points; p; p = g_list_next(p))
-      if(((dt_masks_point_group_t *)p->data)->formid == id) { g_ptr_array_add(refs, m); break; }
-  }
-
-  // Full-deletion path: with grp==NULL, dt_masks_form_remove skips the
-  // membership-only early-return (verified masks.c:1801-1824; that branch also
-  // requires a CLONE/NON_CLONE-free form, which drawn shapes are) and walks
-  // every blending module — dropping the shape's membership, emptying/removing
-  // groups, clearing mask_id where the shape WAS a module's base group, and
-  // removing the form from the forms list. It does NOT clear DEVELOP_MASK_MASK.
-  // CAVEAT: it operates on darktable.develop internally, NOT on `dev`; on the
-  // wire dev == darktable.develop (see the header caveat), and the unit tests
-  // must point darktable.develop at the fixture dev for the duration.
-  dt_masks_form_remove(NULL, NULL, form);
+  GPtrArray *refs = NULL;
+  if(!dt_masks_form_remove_shape_full(dev, form, &refs))
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "failed to delete mask shape", NULL, NULL);
 
   for(guint i = 0; i < refs->len; i++)
   {
@@ -1748,9 +1748,6 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev, dt_mask_id_t id,
       json_object_set_int_member(r, "instance", m->multi_priority);
       json_array_add_object_element(removed_from_out, r);
     }
-    // clear MASK when the module's group is now gone/empty (engine's job)
-    if(dt_masks_get_from_id(dev, m->blend_params->mask_id) == NULL)
-      m->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
   }
   g_ptr_array_unref(refs);
   return TRUE;
@@ -1759,8 +1756,11 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev, dt_mask_id_t id,
 
 **Implementation note on `dt_masks_form_remove` args (verified `masks.c:1793-1892`):**
 - **Detach (membership-only):** `dt_masks_form_remove(module, grp, form)` with `grp != NULL` and `form` lacking `CLONE|NON_CLONE` bits (all drawn shapes qualify) removes only the group membership; if the group then empties it recurses to remove the empty group. Used by `set_mask_attachment(attached:false)` (Task 6).
-- **Full delete:** `dt_masks_form_remove(NULL, NULL, form)` skips that early-return and permanently deletes the form across all modules, committing one masks-history item at the end. Used by `delete_mask_shape` (this task).
-- **`darktable.develop` hardwiring:** both branches read/write `darktable.develop->iop`/`->forms` and commit history to `darktable.develop`, ignoring any other dev. On the wire `dev == darktable.develop`, so this is correct. In unit tests that build a standalone `fx->dev`, save and repoint `darktable.develop = &fx->dev` around any call that reaches `dt_masks_form_remove`, then restore — otherwise the empty-group cleanup and `mask_id` clear land on the wrong dev and the `mask_mode`/`removed_from` assertions will not hold. The MASK-bit clear + `removed_from` collection happen around it as shown.
+- **Full delete:** legacy `dt_masks_form_remove(NULL, NULL, form)` scans
+  only immediate members of module base groups and does not retain
+  unlinked objects. `delete_mask_shape` uses
+  `dt_masks_form_remove_shape_full(dev, form, &references)` for
+  transitive incoming-reference removal and ownership-safe retirement.
 
 - [ ] **Step 4: Build and run**
 
@@ -1773,11 +1773,11 @@ Expected: PASS.
 git add src/control/remote_masks.c src/control/remote_masks.h src/tests/unittests/control/test_remote_masks.c
 git commit -m "feat: create/update/delete mask shape + GUI-edit-session guard (H2)
 
-create reuses dt_masks_gui_form_save_creation (setting mask_mode bits
-before it so both masks-history items capture them); update validates
-into a scratch struct before mutating and reports affects_instances;
-delete clears the MASK bit itself where a group empties. Every mutation
-first cancels a live GUI edit of the target via dt_masks_change_form_gui."
+create uses dt_masks_gui_form_save_creation_ext for ordered snapshots
+without enabling disabled modules; update validates into a scratch struct
+and uses transitive ownership for affects_instances; delete uses
+ownership-aware full removal. Every mutation first cancels a transitive
+live GUI edit target via dt_masks_change_form_gui."
 ```
 (plus trailers)
 
@@ -2403,7 +2403,13 @@ five-tool merge, and the divergence-manifest rows."
 
 - **Spec coverage:** coordinate contract → Task 2 (transform) + Task 3 (serializers); `list_mask_shapes` → Task 4; create/update/delete → Task 5; attach/detach (merged) → Task 6; engine CAS/reveal/revision → Task 7; wire + capability + fixtures → Task 8; sidecar + docstring budget → Task 9; integration (`show_mask`, placement, distortion round-trip, undo, deferred type) → Task 10; docs/manifest/design-status/picker-cross-ref → Task 11. The two PLANNING PREREQUISITES (freshness contract, GUI guard) are written as Design amendments 1–2 with full normative text and each has a test (Task 2 unit + Task 10 gate 4; Task 5 unit + Task 11 manual). H7 → Amendment 3 (five tools) + Task 9 budget test. H6 → Task 10 ratio assertions at pinned size. Design decisions 1–8 all land (decision 8 = Amendment 2; decision 4 = groups-not-listed in Task 4; decision 5 = affects_instances in Task 5/7; decision 7 = opacity/inverted on set_mask_attachment in Task 6).
 - **Design deviations recorded as amendments:** attach/detach merged into `set_mask_attachment` (H7); require-all-members (open question resolved); probe constants pinned; freshness = block-until-clean + retry_later. All in the amendments section and written back to the design doc in Task 11.
-- **Verified source facts, not contradictions:** `dt_masks_gui_form_save_creation` does not set `mask_mode` (engine sets bits before calling it); `dt_masks_form_remove` does not clear `MASK` (engine clears it). Both documented in "Verified engine facts" and implemented accordingly. No hard contradiction between source and design was found.
+- **Verified source facts, not contradictions:** remote creation uses
+  `dt_masks_gui_form_save_creation_ext` for ordered forced-new snapshots,
+  and remote full deletion uses `dt_masks_form_remove_shape_full`;
+  compatibility behavior remains unchanged for legacy callers.
 - **Type consistency:** `dt_remote_masks_geometry_to_points(dev, type, JsonObject*, void*, error**)`, `dt_remote_masks_list(dev)`, `dt_remote_masks_set_attachment(...)`, and the `dt_remote_masks_*_call` entry points keep identical signatures across the task where they are declared (header), implemented, and consumed (Tasks 7–8). Error codes `DT_REMOTE_ERR_NOT_FOUND`/`DT_REMOTE_ERR_PIPE_NOT_READY` are declared once (Task 2) and mapped once (Task 7). Wire slugs `not_found`/`retry_later` match the Global Constraints table.
-- **Placeholder scan:** two deliberate "reminder" fragments in the plan text (the `ensure_fresh` null-branch and the guard's `dt_masks_group_get_hash` leftover) are immediately followed by their corrected final form with an explicit instruction to use the corrected version — implementers must apply the corrected code. All other steps carry complete code or the M-A-style "mirror the neighbouring test's plumbing" instruction (same precedent as the M-A plan's protocol/sidecar tasks).
-- **Implementer guidance:** stub-table/test-helper names in Tasks 8–9 must match the existing local idioms (`_assert_dispatch_matches`, `dt_remote_protocol_set_calls`, `fake_server_factory`); confirm `dt_remote_error_t`'s details field name (`details_json`) against M-A's actual struct before relying on it. `dt_masks_form_remove`'s branch selection is **verified** (`masks.c:1793-1892`): `(NULL, NULL, form)` = full delete, `(module, grp, form)` = detach; it is hardwired to `darktable.develop`, so unit tests on a fixture dev repoint `darktable.develop` around those calls (Tasks 5–6).
+- **Placeholder scan:** the deliberate `ensure_fresh` reminder is
+  immediately followed by its corrected final form. All other steps carry
+  complete code or the M-A-style "mirror the neighbouring test's
+  plumbing" instruction.
+- **Implementer guidance:** stub-table/test-helper names in Tasks 8–9 must match the existing local idioms (`_assert_dispatch_matches`, `dt_remote_protocol_set_calls`, `fake_server_factory`); confirm `dt_remote_error_t`'s details field name (`details_json`) against M-A's actual struct before relying on it. Legacy `(module, grp, form)` detach remains hardwired to `darktable.develop`; Task 5 remote full deletion instead uses `dt_masks_form_remove_shape_full(dev, form, &references)`.
