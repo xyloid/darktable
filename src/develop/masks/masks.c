@@ -333,53 +333,36 @@ void dt_masks_register_forms(dt_develop_t *dev,
   dt_dev_add_masks_history_item(dev, NULL, TRUE);
 }
 
-void dt_masks_gui_form_save_creation(dt_develop_t *dev,
-                                     dt_iop_module_t *module,
-                                     dt_masks_form_t *form,
-                                     dt_masks_form_gui_t *gui)
+static void _set_unique_form_name(dt_develop_t *dev,
+                                  dt_masks_form_t *form,
+                                  const char *requested_name)
 {
-  // we check if the id is already registered
-  _check_id(form);
-
-  if(gui) gui->creation = FALSE;
-
-  // mask nb will be at least the length of the list
-  guint nb = 0;
-  const gboolean has_requested_name = form->name[0] != '\0';
-  char requested_name[sizeof(form->name)] = { 0 };
-  if(has_requested_name)
-    g_strlcpy(requested_name, form->name, sizeof(requested_name));
-  guint requested_name_suffix = 1;
-
-  // count only the same forms to have a clean numbering
-  for(GList *l = dev->forms; l; l = g_list_next(l))
+  guint same_type_count = 0;
+  for(GList *forms = dev->forms;
+      forms;
+      forms = g_list_next(forms))
   {
-    const dt_masks_form_t *f = l->data;
-    if(f->type == form->type)
-      nb++;
+    const dt_masks_form_t *existing = forms->data;
+    if(existing->type == form->type) same_type_count++;
   }
 
-  gboolean exist = FALSE;
-
-  // check that we do not have duplicate, in case some masks have been
-  // removed we can have hole and so nb could already exists.
+  guint suffix_number = 1;
+  gboolean exists = FALSE;
   do
   {
-    exist = FALSE;
-    if(has_requested_name)
+    exists = FALSE;
+    if(requested_name && *requested_name)
     {
-      if(requested_name_suffix == 1)
+      if(suffix_number == 1)
         g_strlcpy(form->name, requested_name, sizeof(form->name));
       else
       {
         char suffix[32];
-        g_snprintf(suffix, sizeof(suffix), " #%u",
-                   requested_name_suffix);
+        g_snprintf(suffix, sizeof(suffix), " #%u", suffix_number);
         int base_length =
-          MAX(0, (int)sizeof(form->name) - 1 - (int)strlen(suffix));
-        // `%.*s` truncates bytes, not UTF-8 characters. If the size limit
-        // lands inside a multibyte character, drop that whole character
-        // before appending the uniqueness suffix.
+          MIN((int)strlen(requested_name),
+              MAX(0, (int)sizeof(form->name) - 1
+                     - (int)strlen(suffix)));
         while(base_length > 0
               && (((unsigned char)requested_name[base_length] & 0xc0)
                   == 0x80))
@@ -387,64 +370,107 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
         g_snprintf(form->name, sizeof(form->name), "%.*s%s",
                    base_length, requested_name, suffix);
       }
-      requested_name_suffix++;
+      suffix_number++;
     }
     else
     {
-      nb++;
+      same_type_count++;
       if(form->functions && form->functions->set_form_name)
-        form->functions->set_form_name(form, nb);
+        form->functions->set_form_name(form, same_type_count);
     }
 
-    for(GList *l = dev->forms; l; l = g_list_next(l))
+    for(GList *forms = dev->forms;
+        forms;
+        forms = g_list_next(forms))
     {
-      const dt_masks_form_t *f = l->data;
-      if(!strcmp(f->name, form->name))
+      const dt_masks_form_t *existing = forms->data;
+      if(!strcmp(existing->name, form->name))
       {
-        exist = TRUE;
+        exists = TRUE;
         break;
       }
     }
-  } while(exist);
+  } while(exists);
+}
 
+static void _save_form_creation(
+  dt_develop_t *dev,
+  dt_iop_module_t *module,
+  dt_masks_form_t *form,
+  dt_masks_form_gui_t *gui,
+  const dt_masks_form_creation_options_t *options,
+  const gboolean force_new_history)
+{
+  _check_id(form);
+  if(gui) gui->creation = FALSE;
+
+  _set_unique_form_name(dev, form,
+                        options ? options->requested_name : NULL);
   dev->forms = g_list_append(dev->forms, form);
 
-  dt_dev_add_masks_history_item(dev, module, TRUE);
+  const gboolean history_enable =
+    module && options && options->preserve_module_enabled
+      ? module->enabled
+      : TRUE;
+  if(force_new_history)
+    dt_dev_add_new_masks_history_item(dev, module, history_enable);
+  else
+    dt_dev_add_masks_history_item(dev, module, history_enable);
 
   if(module)
   {
-    // is there already a masks group for this module ?
-    dt_masks_form_t *grp = _group_from_module(dev, module);
-    if(!grp)
+    dt_masks_form_t *group = _group_from_module(dev, module);
+    if(!group)
     {
-      // we create a new group
-      if(form->type & (DT_MASKS_CLONE|DT_MASKS_NON_CLONE))
-        grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP | DT_MASKS_CLONE);
-      else
-        grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP);
+      const dt_masks_type_t group_type =
+        form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE)
+          ? DT_MASKS_GROUP | DT_MASKS_CLONE
+          : DT_MASKS_GROUP;
+      group =
+        dt_masks_group_create_for_module(dev, module, group_type);
     }
-    // we add the form in this group
-    dt_masks_point_group_t *grpt = malloc(sizeof(dt_masks_point_group_t));
-    grpt->formid = form->formid;
-    grpt->parentid = grp->formid;
-    grpt->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
-    if(grp->points)
-    {
-      if(form->type == DT_MASKS_BRUSH)
-        grpt->state |= DT_MASKS_STATE_SUM;
-      else
-        grpt->state |= DT_MASKS_STATE_UNION;
-    }
-    grpt->opacity = dt_conf_get_float("plugins/darkroom/masks/opacity");
-    grp->points = g_list_append(grp->points, grpt);
-    // we save the group
-    dt_dev_add_masks_history_item(dev, module, TRUE);
-    // we update module gui
+
+    dt_masks_point_group_t *member =
+      malloc(sizeof(dt_masks_point_group_t));
+    member->formid = form->formid;
+    member->parentid = group->formid;
+    member->state = DT_MASKS_STATE_SHOW | DT_MASKS_STATE_USE;
+    if(group->points)
+      member->state |= form->type == DT_MASKS_BRUSH
+        ? DT_MASKS_STATE_SUM
+        : DT_MASKS_STATE_UNION;
+    member->opacity =
+      dt_conf_get_float("plugins/darkroom/masks/opacity");
+    group->points = g_list_append(group->points, member);
+
+    if(options)
+      module->blend_params->mask_mode |= options->mask_mode_to_add;
+    if(force_new_history)
+      dt_dev_add_new_masks_history_item(dev, module, history_enable);
+    else
+      dt_dev_add_masks_history_item(dev, module, history_enable);
     if(gui) dt_masks_iop_update(module);
-    //dt_dev_add_history_item(dev, module, TRUE);
   }
-  // show the form if needed
+
   if(gui) dev->form_gui->formid = form->formid;
+}
+
+void dt_masks_gui_form_save_creation(dt_develop_t *dev,
+                                     dt_iop_module_t *module,
+                                     dt_masks_form_t *form,
+                                     dt_masks_form_gui_t *gui)
+{
+  _save_form_creation(dev, module, form, gui, NULL, FALSE);
+}
+
+void dt_masks_gui_form_save_creation_ext(
+  dt_develop_t *dev,
+  dt_iop_module_t *module,
+  dt_masks_form_t *form,
+  dt_masks_form_gui_t *gui,
+  const dt_masks_form_creation_options_t *options)
+{
+  _save_form_creation(dev, module, form, gui, options, TRUE);
 }
 
 int dt_masks_form_duplicate(dt_develop_t *dev, const dt_mask_id_t formid)

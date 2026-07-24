@@ -1060,16 +1060,15 @@ gboolean dt_remote_masks_create(dt_develop_t *dev,
                             "failed to allocate mask shape", NULL, NULL);
   }
   form->points = g_list_append(form->points, point);
-  if(name_or_null && *name_or_null)
-    g_strlcpy(form->name, name_or_null, sizeof(form->name));
 
-  // save_creation snapshots blend_params twice for an attached creation.
-  // Set the mode first so both snapshots contain the same drawn-mask state.
-  if(attach_module)
-    attach_module->blend_params->mask_mode |=
-      DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
-
-  dt_masks_gui_form_save_creation(dev, attach_module, form, NULL);
+  const dt_masks_form_creation_options_t options = {
+    .requested_name = name_or_null,
+    .preserve_module_enabled = TRUE,
+    .mask_mode_to_add =
+      attach_module ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK : 0,
+  };
+  dt_masks_gui_form_save_creation_ext(dev, attach_module, form, NULL,
+                                      &options);
   if(new_id_out) *new_id_out = form->formid;
   return TRUE;
 }

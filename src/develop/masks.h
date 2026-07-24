@@ -624,10 +624,23 @@ void dt_masks_gui_form_remove(dt_masks_form_t *form,
 void dt_masks_gui_form_test_create(dt_masks_form_t *form,
                                    dt_masks_form_gui_t *gui,
                                    const struct dt_iop_module_t *module);
+typedef struct dt_masks_form_creation_options_t
+{
+  const char *requested_name;
+  gboolean preserve_module_enabled;
+  uint32_t mask_mode_to_add;
+} dt_masks_form_creation_options_t;
+
 void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      struct dt_iop_module_t *module,
                                      dt_masks_form_t *form,
                                      dt_masks_form_gui_t *gui);
+void dt_masks_gui_form_save_creation_ext(
+  dt_develop_t *dev,
+  struct dt_iop_module_t *module,
+  dt_masks_form_t *form,
+  dt_masks_form_gui_t *gui,
+  const dt_masks_form_creation_options_t *options);
 /** create a masks group form for `module` of `type`
  * (DT_MASKS_GROUP, optionally | DT_MASKS_CLONE), name it from the module,
  * append it to dev->forms, and set module->blend_params->mask_id to the new
