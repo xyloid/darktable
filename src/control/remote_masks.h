@@ -82,4 +82,17 @@ JsonNode *dt_remote_masks_points_to_geometry(struct dt_develop_t *dev,
  * unsupported types. Caller owns. */
 JsonNode *dt_remote_masks_points_to_raw_geometry(dt_masks_form_t *form);
 
+/** Stored member combine state -> wire operation. A member with no combine
+ * bit reads as "union"; the existing brush-only SUM bit reads as "sum". */
+const char *dt_remote_masks_state_op_string(int state);
+
+/** Writable wire operation -> stored combine bit. "sum" is output-only.
+ * FALSE leaves *op_bit_out unchanged. */
+gboolean dt_remote_masks_state_op_from_string(const char *s,
+                                              int *op_bit_out);
+
+/** Serialize all non-group forms and their module memberships. Requires a
+ * fresh pipe — the caller owns the ensure_fresh contract. Caller owns. */
+JsonNode *dt_remote_masks_list(struct dt_develop_t *dev);
+
 G_END_DECLS

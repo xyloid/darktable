@@ -19,6 +19,7 @@
 #include "control/remote_masks.h"
 
 #include "common/darktable.h"
+#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 
@@ -815,4 +816,117 @@ JsonNode *dt_remote_masks_points_to_raw_geometry(dt_masks_form_t *form)
 invalid_raw:
   json_object_unref(object);
   return NULL;
+}
+
+const char *dt_remote_masks_state_op_string(const int state)
+{
+  if(state & DT_MASKS_STATE_SUM) return "sum";
+  if(state & DT_MASKS_STATE_INTERSECTION) return "intersection";
+  if(state & DT_MASKS_STATE_DIFFERENCE) return "difference";
+  if(state & DT_MASKS_STATE_EXCLUSION) return "exclusion";
+  return "union";
+}
+
+gboolean dt_remote_masks_state_op_from_string(const char *s,
+                                              int *op_bit_out)
+{
+  if(!s || !op_bit_out) return FALSE;
+
+  int op_bit = 0;
+  if(!strcmp(s, "union"))
+    op_bit = DT_MASKS_STATE_UNION;
+  else if(!strcmp(s, "intersection"))
+    op_bit = DT_MASKS_STATE_INTERSECTION;
+  else if(!strcmp(s, "difference"))
+    op_bit = DT_MASKS_STATE_DIFFERENCE;
+  else if(!strcmp(s, "exclusion"))
+    op_bit = DT_MASKS_STATE_EXCLUSION;
+  else
+    return FALSE;
+
+  *op_bit_out = op_bit;
+  return TRUE;
+}
+
+static void _append_used_by(dt_develop_t *dev,
+                            const dt_mask_id_t id,
+                            JsonArray *out)
+{
+  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
+  {
+    dt_iop_module_t *module = iops->data;
+    if(!module || !module->flags || !module->blend_params
+       || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
+      continue;
+
+    dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
+
+    for(GList *points = group->points;
+        points;
+        points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *member = points->data;
+      if(!member || member->formid != id) continue;
+
+      JsonObject *usage = json_object_new();
+      json_object_set_string_member(usage, "op", module->op);
+      json_object_set_int_member(usage, "instance",
+                                 module->multi_priority);
+      JsonArray *state = json_array_new();
+      json_array_add_string_element(
+        state, dt_remote_masks_state_op_string(member->state));
+      json_object_set_array_member(usage, "state", state);
+      json_object_set_boolean_member(
+        usage, "inverted",
+        (member->state & DT_MASKS_STATE_INVERSE) != 0);
+      json_object_set_double_member(usage, "opacity", member->opacity);
+      json_array_add_object_element(out, usage);
+    }
+  }
+}
+
+JsonNode *dt_remote_masks_list(dt_develop_t *dev)
+{
+  if(!dev) return NULL;
+
+  JsonObject *root = json_object_new();
+  JsonArray *shapes = json_array_new();
+  for(GList *forms = dev->forms; forms; forms = g_list_next(forms))
+  {
+    dt_masks_form_t *form = forms->data;
+    if(!form || (form->type & DT_MASKS_GROUP)) continue;
+
+    JsonObject *shape = json_object_new();
+    json_object_set_int_member(shape, "id", form->formid);
+    json_object_set_string_member(
+      shape, "type", dt_remote_masks_type_string(form->type));
+    json_object_set_string_member(shape, "name", form->name);
+    json_object_set_string_member(shape, "space", "preview");
+
+    const gboolean editable =
+      dt_remote_masks_kind_from_type(form->type)
+      != DT_REMOTE_SHAPE_UNSUPPORTED;
+    json_object_set_boolean_member(shape, "editable", editable);
+    if(editable)
+    {
+      JsonNode *geometry =
+        dt_remote_masks_points_to_geometry(dev, form);
+      if(geometry)
+        json_object_set_member(shape, "geometry", geometry);
+      JsonNode *raw_geometry =
+        dt_remote_masks_points_to_raw_geometry(form);
+      if(raw_geometry)
+        json_object_set_member(shape, "raw_geometry", raw_geometry);
+    }
+
+    JsonArray *used_by = json_array_new();
+    _append_used_by(dev, form->formid, used_by);
+    json_object_set_array_member(shape, "used_by", used_by);
+    json_array_add_object_element(shapes, shape);
+  }
+
+  json_object_set_array_member(root, "shapes", shapes);
+  return _take_object(root);
 }

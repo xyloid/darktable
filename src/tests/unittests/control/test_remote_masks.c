@@ -28,6 +28,7 @@
 #include "common/darktable.h"
 #include "control/remote_masks.h"
 #include "develop/develop.h"
+#include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
 
@@ -185,6 +186,83 @@ static JsonObject *_node_object(JsonNode *node)
   assert_non_null(node);
   assert_int_equal(json_node_get_node_type(node), JSON_NODE_OBJECT);
   return json_node_get_object(node);
+}
+
+typedef struct blend_fixture_t
+{
+  dt_develop_t dev;
+  dt_iop_module_t *module;
+  dt_develop_t *saved_global_develop;
+} blend_fixture_t;
+
+static blend_fixture_t *blend_fixture_new(const char *op)
+{
+  blend_fixture_t *fixture = g_new0(blend_fixture_t, 1);
+  dt_dev_init(&fixture->dev, TRUE);
+  fixture->dev.gui_attached = FALSE;
+  assert_non_null(fixture->dev.preview_pipe);
+
+  // A square identity fixture makes preview and raw-normalized geometry
+  // deterministic. dt_masks_get_image_size() consults darktable.develop
+  // rather than the explicit dev passed to the remote serializer.
+  fixture->dev.preview_pipe->processed_width = 1000;
+  fixture->dev.preview_pipe->processed_height = 1000;
+  fixture->dev.preview_pipe->iwidth = 1000;
+  fixture->dev.preview_pipe->iheight = 1000;
+  fixture->dev.preview_pipe->iscale = 1.0f;
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  fixture->dev.image_storage.width = 1000;
+  fixture->dev.image_storage.height = 1000;
+
+  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
+  assert_non_null(so);
+  assert_false(
+    dt_iop_load_module(fixture->module, so, &fixture->dev));
+  memcpy(fixture->module->params, fixture->module->default_params,
+         fixture->module->params_size);
+  fixture->dev.iop =
+    g_list_append(fixture->dev.iop, fixture->module);
+  return fixture;
+}
+
+static void blend_fixture_free(blend_fixture_t *fixture)
+{
+  if(!fixture) return;
+  dt_dev_cleanup(&fixture->dev);
+  g_free(fixture);
+}
+
+static int blend_test_setup(void **state)
+{
+  blend_fixture_t *fixture = blend_fixture_new("exposure");
+  fixture->saved_global_develop = darktable.develop;
+  darktable.develop = &fixture->dev;
+  *state = fixture;
+  return 0;
+}
+
+static int blend_test_teardown(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  if(!fixture) return 0;
+
+  // Restore the global before cleaning up the standalone develop context,
+  // including when cmocka reaches teardown through a failed assertion.
+  darktable.develop = fixture->saved_global_develop;
+  blend_fixture_free(fixture);
+  *state = NULL;
+  return 0;
+}
+
+static JsonObject *_find_shape(JsonArray *shapes, const dt_mask_id_t id)
+{
+  for(guint i = 0; i < json_array_get_length(shapes); i++)
+  {
+    JsonObject *shape = json_array_get_object_element(shapes, i);
+    if(json_object_get_int_member(shape, "id") == id) return shape;
+  }
+  return NULL;
 }
 
 // Task 1: the symbol must be linkable (public, non-static). We only assert
@@ -792,6 +870,230 @@ static void test_unsupported_and_empty_serializers(void **state)
   assert_null(dt_remote_masks_points_to_raw_geometry(&form));
 }
 
+static void test_state_op_mapping_roundtrips_and_rejects_atomically(void **state)
+{
+  (void)state;
+  static const struct
+  {
+    const char *name;
+    int bit;
+  } writable[] = {
+    { "union", DT_MASKS_STATE_UNION },
+    { "intersection", DT_MASKS_STATE_INTERSECTION },
+    { "difference", DT_MASKS_STATE_DIFFERENCE },
+    { "exclusion", DT_MASKS_STATE_EXCLUSION },
+  };
+
+  for(guint i = 0; i < G_N_ELEMENTS(writable); i++)
+  {
+    assert_string_equal(
+      dt_remote_masks_state_op_string(
+        DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW | writable[i].bit),
+      writable[i].name);
+    int parsed = -1;
+    assert_true(
+      dt_remote_masks_state_op_from_string(writable[i].name, &parsed));
+    assert_int_equal(parsed, writable[i].bit);
+  }
+
+  assert_string_equal(
+    dt_remote_masks_state_op_string(DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW),
+    "union");
+  assert_string_equal(
+    dt_remote_masks_state_op_string(DT_MASKS_STATE_SUM), "sum");
+
+  int unchanged = 0x13579;
+  assert_false(dt_remote_masks_state_op_from_string("sum", &unchanged));
+  assert_int_equal(unchanged, 0x13579);
+  assert_false(dt_remote_masks_state_op_from_string("bogus", &unchanged));
+  assert_int_equal(unchanged, 0x13579);
+  assert_false(dt_remote_masks_state_op_from_string(NULL, &unchanged));
+  assert_int_equal(unchanged, 0x13579);
+  assert_false(dt_remote_masks_state_op_from_string("union", NULL));
+}
+
+static void test_list_reports_complete_shapes_and_membership(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->multi_priority = 3;
+
+  dt_masks_form_t *circle = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(circle);
+  circle->formid = 101;
+  g_strlcpy(circle->name, "attached circle", sizeof(circle->name));
+  dt_masks_point_circle_t *circle_point =
+    g_malloc0(sizeof(dt_masks_point_circle_t));
+  *circle_point = (dt_masks_point_circle_t){
+    .center = { 0.5f, 0.5f },
+    .radius = 0.1f,
+    .border = 0.03f,
+  };
+  circle->points = g_list_append(circle->points, circle_point);
+  fixture->dev.forms = g_list_append(fixture->dev.forms, circle);
+
+  dt_masks_form_t *clone =
+    dt_masks_create(DT_MASKS_CLONE | DT_MASKS_CIRCLE);
+  assert_non_null(clone);
+  clone->formid = 202;
+  g_strlcpy(clone->name, "deferred clone", sizeof(clone->name));
+  fixture->dev.forms = g_list_append(fixture->dev.forms, clone);
+
+  dt_masks_form_t *brush = dt_masks_create(DT_MASKS_BRUSH);
+  assert_non_null(brush);
+  brush->formid = 303;
+  g_strlcpy(brush->name, "deferred brush", sizeof(brush->name));
+  fixture->dev.forms = g_list_append(fixture->dev.forms, brush);
+
+  dt_masks_form_t *group = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  assert_non_null(group);
+  dt_masks_point_group_t *member =
+    g_malloc0(sizeof(dt_masks_point_group_t));
+  *member = (dt_masks_point_group_t){
+    .formid = circle->formid,
+    .parentid = group->formid,
+    // A bottom member has no combine bit. Listing uses the documented
+    // read default "union" while retaining inverse and opacity.
+    .state = DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+             | DT_MASKS_STATE_INVERSE,
+    .opacity = 0.85f,
+  };
+  group->points = g_list_append(group->points, member);
+  dt_masks_point_group_t *brush_member =
+    g_malloc0(sizeof(dt_masks_point_group_t));
+  *brush_member = (dt_masks_point_group_t){
+    .formid = brush->formid,
+    .parentid = group->formid,
+    .state = DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW | DT_MASKS_STATE_SUM,
+    .opacity = 0.55f,
+  };
+  group->points = g_list_append(group->points, brush_member);
+
+  JsonNode *node = dt_remote_masks_list(&fixture->dev);
+  JsonObject *root = _node_object(node);
+  assert_int_equal(json_object_get_size(root), 1);
+  JsonArray *shapes = json_object_get_array_member(root, "shapes");
+  assert_non_null(shapes);
+  assert_int_equal(json_array_get_length(shapes), 3);
+
+  JsonObject *listed_circle = _find_shape(shapes, circle->formid);
+  assert_non_null(listed_circle);
+  assert_int_equal(json_object_get_size(listed_circle), 8);
+  assert_int_equal(json_object_get_int_member(listed_circle, "id"), 101);
+  assert_string_equal(json_object_get_string_member(listed_circle, "type"),
+                      "circle");
+  assert_string_equal(json_object_get_string_member(listed_circle, "name"),
+                      "attached circle");
+  assert_string_equal(json_object_get_string_member(listed_circle, "space"),
+                      "preview");
+  assert_true(json_object_get_boolean_member(listed_circle, "editable"));
+
+  JsonObject *geometry =
+    json_object_get_object_member(listed_circle, "geometry");
+  assert_non_null(geometry);
+  assert_int_equal(json_object_get_size(geometry), 4);
+  _assert_no_space(geometry);
+  JsonArray *center = json_object_get_array_member(geometry, "center");
+  assert_int_equal(json_array_get_length(center), 2);
+  assert_float_equal(json_array_get_double_element(center, 0), 0.5, 1e-4);
+  assert_float_equal(json_array_get_double_element(center, 1), 0.5, 1e-4);
+  assert_float_equal(json_object_get_double_member(geometry, "radius"), 0.1,
+                     1e-4);
+  assert_float_equal(json_object_get_double_member(geometry, "border"), 0.03,
+                     1e-4);
+  assert_string_equal(json_object_get_string_member(geometry, "size_mapping"),
+                      "exact");
+
+  JsonObject *raw_geometry =
+    json_object_get_object_member(listed_circle, "raw_geometry");
+  assert_non_null(raw_geometry);
+  assert_int_equal(json_object_get_size(raw_geometry), 3);
+  _assert_no_space(raw_geometry);
+  JsonArray *raw_center =
+    json_object_get_array_member(raw_geometry, "center");
+  assert_int_equal(json_array_get_length(raw_center), 2);
+  assert_float_equal(json_array_get_double_element(raw_center, 0), 0.5, 1e-6);
+  assert_float_equal(json_array_get_double_element(raw_center, 1), 0.5, 1e-6);
+  assert_float_equal(
+    json_object_get_double_member(raw_geometry, "radius"), 0.1, 1e-6);
+  assert_float_equal(
+    json_object_get_double_member(raw_geometry, "border"), 0.03, 1e-6);
+
+  JsonArray *used_by =
+    json_object_get_array_member(listed_circle, "used_by");
+  assert_non_null(used_by);
+  assert_int_equal(json_array_get_length(used_by), 1);
+  JsonObject *usage = json_array_get_object_element(used_by, 0);
+  assert_int_equal(json_object_get_size(usage), 5);
+  assert_string_equal(json_object_get_string_member(usage, "op"), "exposure");
+  assert_int_equal(json_object_get_int_member(usage, "instance"), 3);
+  JsonArray *member_state = json_object_get_array_member(usage, "state");
+  assert_int_equal(json_array_get_length(member_state), 1);
+  assert_string_equal(json_array_get_string_element(member_state, 0),
+                      "union");
+  assert_true(json_object_get_boolean_member(usage, "inverted"));
+  assert_float_equal(json_object_get_double_member(usage, "opacity"), 0.85,
+                     1e-4);
+
+  JsonObject *listed_clone = _find_shape(shapes, clone->formid);
+  assert_non_null(listed_clone);
+  assert_int_equal(json_object_get_size(listed_clone), 6);
+  assert_int_equal(json_object_get_int_member(listed_clone, "id"), 202);
+  assert_string_equal(json_object_get_string_member(listed_clone, "type"),
+                      "clone");
+  assert_string_equal(json_object_get_string_member(listed_clone, "name"),
+                      "deferred clone");
+  assert_string_equal(json_object_get_string_member(listed_clone, "space"),
+                      "preview");
+  assert_false(json_object_get_boolean_member(listed_clone, "editable"));
+  assert_false(json_object_has_member(listed_clone, "geometry"));
+  assert_false(json_object_has_member(listed_clone, "raw_geometry"));
+  JsonArray *clone_used_by =
+    json_object_get_array_member(listed_clone, "used_by");
+  assert_non_null(clone_used_by);
+  assert_int_equal(json_array_get_length(clone_used_by), 0);
+
+  JsonObject *listed_brush = _find_shape(shapes, brush->formid);
+  assert_non_null(listed_brush);
+  assert_int_equal(json_object_get_size(listed_brush), 6);
+  assert_int_equal(json_object_get_int_member(listed_brush, "id"), 303);
+  assert_string_equal(json_object_get_string_member(listed_brush, "type"),
+                      "brush");
+  assert_string_equal(json_object_get_string_member(listed_brush, "name"),
+                      "deferred brush");
+  assert_string_equal(json_object_get_string_member(listed_brush, "space"),
+                      "preview");
+  assert_false(json_object_get_boolean_member(listed_brush, "editable"));
+  assert_false(json_object_has_member(listed_brush, "geometry"));
+  assert_false(json_object_has_member(listed_brush, "raw_geometry"));
+  JsonArray *brush_used_by =
+    json_object_get_array_member(listed_brush, "used_by");
+  assert_non_null(brush_used_by);
+  assert_int_equal(json_array_get_length(brush_used_by), 1);
+  JsonObject *brush_usage =
+    json_array_get_object_element(brush_used_by, 0);
+  assert_int_equal(json_object_get_size(brush_usage), 5);
+  assert_string_equal(json_object_get_string_member(brush_usage, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(brush_usage, "instance"), 3);
+  JsonArray *brush_state =
+    json_object_get_array_member(brush_usage, "state");
+  assert_int_equal(json_array_get_length(brush_state), 1);
+  assert_string_equal(json_array_get_string_element(brush_state, 0), "sum");
+  assert_false(json_object_get_boolean_member(brush_usage, "inverted"));
+  assert_float_equal(
+    json_object_get_double_member(brush_usage, "opacity"), 0.55, 1e-4);
+
+  assert_null(_find_shape(shapes, group->formid));
+  json_node_unref(node);
+}
+
+static void test_list_null_develop_contract(void **state)
+{
+  (void)state;
+  assert_null(dt_remote_masks_list(NULL));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -830,6 +1132,12 @@ int main(void)
       masks_test_setup, masks_test_teardown),
     cmocka_unit_test_setup_teardown(test_unsupported_and_empty_serializers,
                                     masks_test_setup, masks_test_teardown),
+    cmocka_unit_test(
+      test_state_op_mapping_roundtrips_and_rejects_atomically),
+    cmocka_unit_test_setup_teardown(
+      test_list_reports_complete_shapes_and_membership,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test(test_list_null_develop_contract),
   };
   return cmocka_run_group_tests(tests, harness_group_setup,
                                 harness_group_teardown);
