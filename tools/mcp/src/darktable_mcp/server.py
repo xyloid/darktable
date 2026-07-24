@@ -20,6 +20,11 @@ plus the scope analyzer (plan step 10):
 
     get_scopes
 
+plus drawn-mask shape tools:
+
+    list_mask_shapes, create_mask_shape, update_mask_shape,
+    delete_mask_shape, set_mask_attachment
+
 Each tool is a thin shape-conversion layer over one wire method call
 through `protocol.ProtocolClient`; wire results are already compact and
 model-oriented (per the protocol reference), so most tools return the wire
@@ -56,7 +61,8 @@ SERVER_INSTRUCTIONS = (
     "current image/view, live processing modules, and their parameter "
     "schemas and values; mutate the edit -- enable/disable and reset "
     "modules, create new module instances, read the history stack, and "
-    "undo; and render a bounded JPEG preview of the current edit state -- "
+    "undo; list, create, update, delete, and attach drawn-mask shapes; "
+    "and render a bounded JPEG preview of the current edit state -- "
     "or, when the `mask_render` capability is available, an individual "
     "module's blend mask via `render_preview`'s `show_mask`. "
     "All tools require a darktable instance running with remote control "
@@ -193,11 +199,11 @@ def build_server(
     connect_timeout: float = 5.0,
     request_timeout: float = 10.0,
 ) -> FastMCP:
-    """Builds the FastMCP server instance with all four read-only tools
-    registered. Discovery is resolved lazily, on the first tool call --
-    not at build time -- so the process can start (and, importantly, can
-    respond to MCP's `initialize` handshake) before a darktable instance
-    necessarily exists yet.
+    """Build the FastMCP server with its darkroom, preview, scope, and
+    drawn-mask tools. Discovery is resolved lazily, on the first tool call
+    -- not at build time -- so the process can start (and, importantly,
+    can respond to MCP's `initialize` handshake) before a darktable
+    instance necessarily exists yet.
     """
     app: FastMCP = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
 
@@ -539,6 +545,144 @@ def build_server(
         observed. Returns the new post-undo `revision`."""
         client = await _client()
         return await client.call("undo", {"expected_revision": expected_revision})
+
+    @app.tool()
+    async def list_mask_shapes() -> dict[str, Any]:
+        """List drawn-mask shapes and their module memberships. Requires
+        the `mask_shapes` capability."""
+        client = await _client()
+        await client.ensure_connected()
+        if "mask_shapes" not in client.capabilities:
+            raise TransportError(
+                "this darktable does not advertise mask_shapes; "
+                "upgrade darktable to manage drawn mask shapes"
+            )
+        return await client.call("list_mask_shapes")
+
+    @app.tool()
+    async def create_mask_shape(
+        type: str,
+        geometry: dict[str, Any],
+        name: str | None = None,
+        attach: dict[str, Any] | None = None,
+        space: str = "preview",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Create one drawn-mask shape. `type` and `geometry` must use a
+        darktable editable shape type and its complete geometry members;
+        `name` omitted means darktable chooses a name, and `attach` may
+        create it already attached to a module. Coordinates are
+        preview-normalized `[0,1]` over the rendered image (`space` defaults
+        to `"preview"`): point centers/anchors map exactly, while sizes and
+        angles may be reported `approximate` under perspective correction in
+        `size_mapping`. Editing a shared shape with `update_mask_shape`
+        changes every module using it; that update's `affects_instances`
+        reports how many. Requires `mask_shapes`."""
+        params: dict[str, Any] = {
+            "type": type,
+            "geometry": geometry,
+            "space": space,
+        }
+        if name is not None:
+            params["name"] = name
+        if attach is not None:
+            params["attach"] = attach
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        await client.ensure_connected()
+        if "mask_shapes" not in client.capabilities:
+            raise TransportError(
+                "this darktable does not advertise mask_shapes; "
+                "upgrade darktable to manage drawn mask shapes"
+            )
+        return await client.call("create_mask_shape", params)
+
+    @app.tool()
+    async def update_mask_shape(
+        id: int,
+        geometry: dict[str, Any],
+        name: str | None = None,
+        space: str = "preview",
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace one shape's complete geometry; coordinates are as in
+        `create_mask_shape` (preview-normalized `[0,1]`). A shared-shape
+        update edits every module using it, reported as `affects_instances`;
+        sizes/angles can be `approximate` under perspective in
+        `size_mapping`. Requires `mask_shapes`."""
+        params: dict[str, Any] = {"id": id, "geometry": geometry, "space": space}
+        if name is not None:
+            params["name"] = name
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        await client.ensure_connected()
+        if "mask_shapes" not in client.capabilities:
+            raise TransportError(
+                "this darktable does not advertise mask_shapes; "
+                "upgrade darktable to manage drawn mask shapes"
+            )
+        return await client.call("update_mask_shape", params)
+
+    @app.tool()
+    async def delete_mask_shape(
+        id: int, expected_revision: int | None = None
+    ) -> dict[str, Any]:
+        """Delete a drawn-mask shape and its memberships. Requires
+        `mask_shapes`."""
+        params: dict[str, Any] = {"id": id}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        await client.ensure_connected()
+        if "mask_shapes" not in client.capabilities:
+            raise TransportError(
+                "this darktable does not advertise mask_shapes; "
+                "upgrade darktable to manage drawn mask shapes"
+            )
+        return await client.call("delete_mask_shape", params)
+
+    @app.tool()
+    async def set_mask_attachment(
+        op: str,
+        shape_id: int,
+        attached: bool,
+        instance: int = 0,
+        state: str | None = None,
+        inverted: bool | None = None,
+        opacity: float | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Attach or detach a shape from one module instance. With
+        `attached=true`, this upserts membership and applies
+        `state`/`inverted`/`opacity`; with `attached=false`, it detaches but
+        the shape survives if another module uses it. `state` is ignored
+        when the shape becomes the bottom member of a module group (that
+        member has no combine op); `inverted` and `opacity` still apply.
+        Requires `mask_shapes`."""
+        params: dict[str, Any] = {
+            "op": op,
+            "shape_id": shape_id,
+            "attached": attached,
+            "instance": instance,
+        }
+        if state is not None:
+            params["state"] = state
+        if inverted is not None:
+            params["inverted"] = inverted
+        if opacity is not None:
+            params["opacity"] = opacity
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        client = await _client()
+        await client.ensure_connected()
+        if "mask_shapes" not in client.capabilities:
+            raise TransportError(
+                "this darktable does not advertise mask_shapes; "
+                "upgrade darktable to manage drawn mask shapes"
+            )
+        return await client.call("set_mask_attachment", params)
 
     # Mixed content for the mask branch, so structured output is off: an
     # ordinary preview still returns a single native Image block; a mask

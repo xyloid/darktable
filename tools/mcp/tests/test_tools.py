@@ -1515,6 +1515,11 @@ async def test_list_tools_exposes_exactly_the_plan_tool_names(tmp_path, fake_ser
         "undo",
         "render_preview",
         "get_scopes",
+        "list_mask_shapes",
+        "create_mask_shape",
+        "update_mask_shape",
+        "delete_mask_shape",
+        "set_mask_attachment",
     }
 
 
@@ -1673,3 +1678,215 @@ async def test_show_mask_returns_metadata_then_native_image(tmp_path, fake_serve
     assert base64.b64decode(result[1].data) == base64.b64decode(
         fixture["result"]["data"]
     )
+
+
+# -- Tier 3 / M-C: drawn-mask sidecar tools ---------------------------------
+
+
+async def test_list_mask_shapes_gated_on_mask_shapes_capability(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls: list[dict] = []
+    server.handle("list_mask_shapes", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("list_mask_shapes", {})
+
+    assert "mask_shapes" in str(excinfo.value)
+    assert "upgrade darktable" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_list_mask_shapes_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["mask_shapes"])
+    calls: list[dict | None] = []
+    server.handle("list_mask_shapes", lambda params: calls.append(params) or {"shapes": []})
+    app = await _built_server(tmp_path, server)
+
+    await app.call_tool("list_mask_shapes", {})
+
+    assert calls == [None]
+
+
+async def test_create_mask_shape_gated_on_mask_shapes_capability(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls: list[dict] = []
+    server.handle("create_mask_shape", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "create_mask_shape",
+            {
+                "type": "circle",
+                "geometry": {
+                    "center": [0.5, 0.5], "radius": 0.2, "border": 0.01
+                },
+            },
+        )
+
+    assert "mask_shapes" in str(excinfo.value)
+    assert "upgrade darktable" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_create_mask_shape_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["mask_shapes"])
+    calls: list[dict] = []
+    server.handle("create_mask_shape", lambda params: calls.append(params) or {"id": 12})
+    app = await _built_server(tmp_path, server)
+    params = {
+        "type": "circle",
+        "geometry": {"center": [0.1, 0.2], "radius": 0.2, "border": 0.01},
+        "name": "foreground",
+        "attach": {"op": "exposure", "instance": 0},
+        "space": "preview",
+        "expected_revision": 0,
+    }
+
+    await app.call_tool("create_mask_shape", params)
+
+    assert calls == [params]
+
+
+async def test_update_mask_shape_gated_on_mask_shapes_capability(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls: list[dict] = []
+    server.handle("update_mask_shape", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "update_mask_shape",
+            {
+                "id": 12,
+                "geometry": {
+                    "center": [0.5, 0.5], "radius": 0.2, "border": 0.01
+                },
+            },
+        )
+
+    assert "mask_shapes" in str(excinfo.value)
+    assert "upgrade darktable" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_update_mask_shape_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["mask_shapes"])
+    calls: list[dict] = []
+    server.handle("update_mask_shape", lambda params: calls.append(params) or {"id": 12})
+    app = await _built_server(tmp_path, server)
+    params = {
+        "id": 12,
+        "geometry": {"center": [0.5, 0.5], "radius": 0.2, "border": 0.01},
+        "name": "",
+        "space": "preview",
+        "expected_revision": 0,
+    }
+
+    await app.call_tool("update_mask_shape", params)
+
+    assert calls == [params]
+
+
+async def test_delete_mask_shape_gated_on_mask_shapes_capability(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls: list[dict] = []
+    server.handle("delete_mask_shape", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool("delete_mask_shape", {"id": 12})
+
+    assert "mask_shapes" in str(excinfo.value)
+    assert "upgrade darktable" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_delete_mask_shape_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["mask_shapes"])
+    calls: list[dict] = []
+    server.handle("delete_mask_shape", lambda params: calls.append(params) or {"id": 12})
+    app = await _built_server(tmp_path, server)
+    params = {"id": 12, "expected_revision": 0}
+
+    await app.call_tool("delete_mask_shape", params)
+
+    assert calls == [params]
+
+
+async def test_set_mask_attachment_gated_on_mask_shapes_capability(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    calls: list[dict] = []
+    server.handle("set_mask_attachment", lambda params: calls.append(params) or {})
+    app = await _built_server(tmp_path, server)
+
+    with pytest.raises(ToolError) as excinfo:
+        await app.call_tool(
+            "set_mask_attachment",
+            {"op": "exposure", "shape_id": 12, "attached": True},
+        )
+
+    assert "mask_shapes" in str(excinfo.value)
+    assert "upgrade darktable" in str(excinfo.value)
+    assert calls == []
+
+
+async def test_set_mask_attachment_passes_through_when_advertised(
+    tmp_path, fake_server_factory
+):
+    server = await fake_server_factory()
+    _advertise_capabilities(server, ["mask_shapes"])
+    calls: list[dict] = []
+    server.handle("set_mask_attachment", lambda params: calls.append(params) or {"attached": False})
+    app = await _built_server(tmp_path, server)
+    params = {
+        "op": "exposure",
+        "shape_id": 12,
+        "attached": False,
+        "instance": 0,
+        "state": "union",
+        "inverted": False,
+        "opacity": 0.0,
+        "expected_revision": 0,
+    }
+
+    await app.call_tool("set_mask_attachment", params)
+
+    assert calls == [params]
+
+
+async def test_mask_tool_descriptions_within_h7_budget(tmp_path, fake_server_factory):
+    server = await fake_server_factory()
+    app = await _built_server(tmp_path, server)
+    tools = {tool.name: tool for tool in await app.list_tools()}
+
+    def words(name: str) -> int:
+        return len((tools[name].description or "").split())
+
+    # H7: create+update combined <= 1500 tokens (~ words*1.3); others <= 500.
+    assert words("create_mask_shape") + words("update_mask_shape") <= 1150
+    for name in ("list_mask_shapes", "delete_mask_shape", "set_mask_attachment"):
+        assert words(name) <= 385
