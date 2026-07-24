@@ -25,6 +25,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Raw mask storage limits. Values outside these ranges are rejected instead
@@ -110,7 +111,8 @@ static char *_details_json(const char *parameter, const char *constraint)
 {
   JsonObject *details = json_object_new();
   json_object_set_string_member(details, "parameter", parameter);
-  json_object_set_string_member(details, "constraint", constraint);
+  if(constraint)
+    json_object_set_string_member(details, "constraint", constraint);
 
   JsonNode *root = json_node_new(JSON_NODE_OBJECT);
   json_node_take_object(root, details);
@@ -929,4 +931,304 @@ JsonNode *dt_remote_masks_list(dt_develop_t *dev)
 
   json_object_set_array_member(root, "shapes", shapes);
   return _take_object(root);
+}
+
+static gboolean _operation_error(dt_remote_error_t **error,
+                                 const dt_remote_error_code_t code,
+                                 const char *message,
+                                 const char *parameter,
+                                 const char *constraint)
+{
+  if(error)
+  {
+    *error = dt_remote_error_new(code, "%s", message);
+    if(parameter)
+      (*error)->details_json = _details_json(parameter, constraint);
+  }
+  return FALSE;
+}
+
+static gboolean _name_is_valid(const char *name,
+                               dt_remote_error_t **error)
+{
+  if(!name || !*name) return TRUE;
+  if(strlen(name) < sizeof(((dt_masks_form_t *)0)->name)) return TRUE;
+  return _operation_error(error, DT_REMOTE_ERR_INVALID_VALUE,
+                          "mask name must be fewer than 128 bytes",
+                          "name", "length_lt_128");
+}
+
+static size_t _point_size(const dt_masks_type_t type)
+{
+  switch(dt_remote_masks_kind_from_type(type))
+  {
+    case DT_REMOTE_SHAPE_CIRCLE:
+      return sizeof(dt_masks_point_circle_t);
+    case DT_REMOTE_SHAPE_ELLIPSE:
+      return sizeof(dt_masks_point_ellipse_t);
+    case DT_REMOTE_SHAPE_GRADIENT:
+      return sizeof(dt_masks_point_gradient_t);
+    case DT_REMOTE_SHAPE_UNSUPPORTED:
+      return 0;
+  }
+  return 0;
+}
+
+static gboolean _module_accepts_drawn_masks(const dt_iop_module_t *module)
+{
+  if(!module || !module->flags || !module->blend_params) return FALSE;
+  const int flags = module->flags();
+  return (flags & IOP_FLAGS_SUPPORTS_BLENDING)
+         && !(flags & IOP_FLAGS_NO_MASKS);
+}
+
+void dt_remote_masks_cancel_gui_edit_if_targeting(dt_develop_t *dev,
+                                                  dt_masks_form_t *form)
+{
+  if(!dev || !form || dev != darktable.develop) return;
+
+  const dt_masks_form_t *visible = dev->form_visible;
+  if(!visible) return;
+
+  const gboolean hit =
+    visible->formid == form->formid
+    || (dev->form_gui && dev->form_gui->formid == form->formid);
+  gboolean group_hit = FALSE;
+  if(!hit && (visible->type & DT_MASKS_GROUP))
+  {
+    for(GList *points = visible->points;
+        points;
+        points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *member = points->data;
+      if(member && member->formid == form->formid)
+      {
+        group_hit = TRUE;
+        break;
+      }
+    }
+  }
+
+  if(hit || group_hit) dt_masks_change_form_gui(NULL);
+}
+
+gboolean dt_remote_masks_create(dt_develop_t *dev,
+                                const dt_masks_type_t type,
+                                JsonObject *geom,
+                                const char *name_or_null,
+                                dt_iop_module_t *attach_module,
+                                dt_mask_id_t *new_id_out,
+                                dt_remote_error_t **error)
+{
+  if(!dev)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "no develop context", NULL, NULL);
+
+  const size_t point_size = _point_size(type);
+  if(point_size == 0)
+    return _operation_error(error, DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            "type is not creatable", "type", NULL);
+  if(!_name_is_valid(name_or_null, error)) return FALSE;
+
+  if(attach_module && !_module_accepts_drawn_masks(attach_module))
+    return _operation_error(error, DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            "module does not support drawn masks",
+                            "op", "masks_unsupported");
+  if(attach_module
+     && (attach_module->blend_params->mask_mode & DEVELOP_MASK_RASTER))
+    return _operation_error(error, DT_REMOTE_ERR_INVALID_VALUE,
+                            "module has a raster mask",
+                            "op", "raster_unsupported");
+
+  // Transform into detached storage first: no invalid request reaches
+  // dt_masks_create(), much less dev->forms.
+  void *point = malloc(point_size);
+  if(!point)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "failed to allocate mask point", NULL, NULL);
+  if(!dt_remote_masks_geometry_to_points(dev, type, geom, point, error))
+  {
+    free(point);
+    return FALSE;
+  }
+
+  dt_masks_form_t *form = dt_masks_create(type);
+  if(!form)
+  {
+    free(point);
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "failed to allocate mask shape", NULL, NULL);
+  }
+  form->points = g_list_append(form->points, point);
+  if(name_or_null && *name_or_null)
+    g_strlcpy(form->name, name_or_null, sizeof(form->name));
+
+  // save_creation snapshots blend_params twice for an attached creation.
+  // Set the mode first so both snapshots contain the same drawn-mask state.
+  if(attach_module)
+    attach_module->blend_params->mask_mode |=
+      DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+
+  dt_masks_gui_form_save_creation(dev, attach_module, form, NULL);
+  if(new_id_out) *new_id_out = form->formid;
+  return TRUE;
+}
+
+gboolean dt_remote_masks_update(dt_develop_t *dev,
+                                const dt_mask_id_t id,
+                                JsonObject *geom,
+                                const char *name_or_null,
+                                int *affects_out,
+                                dt_remote_error_t **error)
+{
+  if(!dev)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "no develop context", NULL, NULL);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, id);
+  if(!form)
+    return _operation_error(error, DT_REMOTE_ERR_NOT_FOUND,
+                            "no mask shape with that id", "id", NULL);
+
+  const size_t point_size = _point_size(form->type);
+  if(point_size == 0)
+    return _operation_error(error, DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            "shape is not editable", "type", NULL);
+  if(!_name_is_valid(name_or_null, error)) return FALSE;
+  if(!form->points || form->points->next || !form->points->data)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "editable mask shape has invalid point storage",
+                            NULL, NULL);
+
+  // Validate and transform into scratch storage before touching the live
+  // shape. A rejected replacement leaves geometry and name unchanged.
+  void *scratch = malloc(point_size);
+  if(!scratch)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "failed to allocate mask point", NULL, NULL);
+  if(!dt_remote_masks_geometry_to_points(dev, form->type, geom,
+                                         scratch, error))
+  {
+    free(scratch);
+    return FALSE;
+  }
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
+  memcpy(form->points->data, scratch, point_size);
+  free(scratch);
+  if(name_or_null && *name_or_null)
+    g_strlcpy(form->name, name_or_null, sizeof(form->name));
+
+  int affects = 0;
+  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
+  {
+    dt_iop_module_t *module = iops->data;
+    if(!_module_accepts_drawn_masks(module)) continue;
+    dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
+    for(GList *points = group->points;
+        points;
+        points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *member = points->data;
+      if(member && member->formid == id)
+      {
+        affects++;
+        break;
+      }
+    }
+  }
+
+  if(affects_out) *affects_out = affects;
+  dt_dev_add_masks_history_item(dev, NULL, TRUE);
+  return TRUE;
+}
+
+static gboolean _group_has_other_members(const dt_masks_form_t *group,
+                                         const dt_mask_id_t id)
+{
+  if(!group) return FALSE;
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    if(member && member->formid != id) return TRUE;
+  }
+  return FALSE;
+}
+
+gboolean dt_remote_masks_delete(dt_develop_t *dev,
+                                const dt_mask_id_t id,
+                                JsonArray *removed_from_out,
+                                dt_remote_error_t **error)
+{
+  if(!dev)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "no develop context", NULL, NULL);
+  if(dev != darktable.develop)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "mask deletion requires the live develop context",
+                            NULL, NULL);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, id);
+  if(!form)
+    return _operation_error(error, DT_REMOTE_ERR_NOT_FOUND,
+                            "no mask shape with that id", "id", NULL);
+  if(form->type & DT_MASKS_GROUP)
+    return _operation_error(error, DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            "group forms are engine-managed",
+                            "type", "group_internal");
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
+
+  GPtrArray *references = g_ptr_array_new();
+  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
+  {
+    dt_iop_module_t *module = iops->data;
+    if(!_module_accepts_drawn_masks(module)) continue;
+    dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
+    for(GList *points = group->points;
+        points;
+        points = g_list_next(points))
+    {
+      const dt_masks_point_group_t *member = points->data;
+      if(member && member->formid == id)
+      {
+        g_ptr_array_add(references, module);
+        // Clear before dt_masks_form_remove commits its internal history
+        // snapshots. This preserves the final mask_mode across reload/undo.
+        if(!_group_has_other_members(group, id))
+          module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+        break;
+      }
+    }
+  }
+
+  // NULL/NULL is the masks core's full-delete path. It removes the form
+  // from every module and deletes groups that become empty.
+  dt_masks_form_remove(NULL, NULL, form);
+
+  for(guint i = 0; i < references->len; i++)
+  {
+    dt_iop_module_t *module = g_ptr_array_index(references, i);
+    if(removed_from_out)
+    {
+      JsonObject *removed = json_object_new();
+      json_object_set_string_member(removed, "op", module->op);
+      json_object_set_int_member(removed, "instance",
+                                 module->multi_priority);
+      json_array_add_object_element(removed_from_out, removed);
+    }
+
+    // Defensive postcondition for malformed/duplicate group membership.
+    if(!dt_masks_get_from_id(dev, module->blend_params->mask_id))
+      module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+  }
+
+  g_ptr_array_unref(references);
+  return TRUE;
 }

@@ -95,4 +95,38 @@ gboolean dt_remote_masks_state_op_from_string(const char *s,
  * fresh pipe — the caller owns the ensure_fresh contract. Caller owns. */
 JsonNode *dt_remote_masks_list(struct dt_develop_t *dev);
 
+/** Cancel a live GUI edit of `form`, including an edit of a group that
+ * directly contains it. No-op unless `dev` is the live darkroom develop
+ * context. Must run on the GTK main thread. */
+void dt_remote_masks_cancel_gui_edit_if_targeting(struct dt_develop_t *dev,
+                                                  dt_masks_form_t *form);
+
+/** Create one editable fixed-size mask form, optionally attaching it to a
+ * blending module. Geometry is fully validated and transformed before the
+ * form enters dev->forms. The caller owns the pipe-freshness check. */
+gboolean dt_remote_masks_create(struct dt_develop_t *dev,
+                                dt_masks_type_t type,
+                                JsonObject *geom,
+                                const char *name_or_null,
+                                struct dt_iop_module_t *attach_module_or_null,
+                                dt_mask_id_t *new_id_out,
+                                dt_remote_error_t **error);
+
+/** Replace one editable form's geometry and optional name atomically.
+ * `affects_out` receives the number of directly referencing module
+ * instances. The caller owns the pipe-freshness check. */
+gboolean dt_remote_masks_update(struct dt_develop_t *dev,
+                                dt_mask_id_t id,
+                                JsonObject *geom,
+                                const char *name_or_null,
+                                int *affects_out,
+                                dt_remote_error_t **error);
+
+/** Permanently remove one form and all direct module memberships.
+ * `removed_from_out`, when non-NULL, receives {op,instance} objects. */
+gboolean dt_remote_masks_delete(struct dt_develop_t *dev,
+                                dt_mask_id_t id,
+                                JsonArray *removed_from_out,
+                                dt_remote_error_t **error);
+
 G_END_DECLS

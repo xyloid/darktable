@@ -345,6 +345,11 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
 
   // mask nb will be at least the length of the list
   guint nb = 0;
+  const gboolean has_requested_name = form->name[0] != '\0';
+  char requested_name[sizeof(form->name)] = { 0 };
+  if(has_requested_name)
+    g_strlcpy(requested_name, form->name, sizeof(requested_name));
+  guint requested_name_suffix = 1;
 
   // count only the same forms to have a clean numbering
   for(GList *l = dev->forms; l; l = g_list_next(l))
@@ -361,10 +366,35 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
   do
   {
     exist = FALSE;
-    nb++;
-
-    if(form->functions && form->functions->set_form_name)
-      form->functions->set_form_name(form, nb);
+    if(has_requested_name)
+    {
+      if(requested_name_suffix == 1)
+        g_strlcpy(form->name, requested_name, sizeof(form->name));
+      else
+      {
+        char suffix[32];
+        g_snprintf(suffix, sizeof(suffix), " #%u",
+                   requested_name_suffix);
+        int base_length =
+          MAX(0, (int)sizeof(form->name) - 1 - (int)strlen(suffix));
+        // `%.*s` truncates bytes, not UTF-8 characters. If the size limit
+        // lands inside a multibyte character, drop that whole character
+        // before appending the uniqueness suffix.
+        while(base_length > 0
+              && (((unsigned char)requested_name[base_length] & 0xc0)
+                  == 0x80))
+          base_length--;
+        g_snprintf(form->name, sizeof(form->name), "%.*s%s",
+                   base_length, requested_name, suffix);
+      }
+      requested_name_suffix++;
+    }
+    else
+    {
+      nb++;
+      if(form->functions && form->functions->set_form_name)
+        form->functions->set_form_name(form, nb);
+    }
 
     for(GList *l = dev->forms; l; l = g_list_next(l))
     {

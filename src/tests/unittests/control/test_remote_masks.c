@@ -27,10 +27,13 @@
 
 #include "common/darktable.h"
 #include "control/remote_masks.h"
+#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
+#include "gui/gtk.h"
+#include "views/view.h"
 
 #include <glib.h>
 #include <json-glib/json-glib.h>
@@ -193,6 +196,10 @@ typedef struct blend_fixture_t
   dt_develop_t dev;
   dt_iop_module_t *module;
   dt_develop_t *saved_global_develop;
+  dt_gui_gtk_t *saved_global_gui;
+  dt_view_manager_t *saved_view_manager;
+  dt_gui_gtk_t fake_gui;
+  dt_view_manager_t fake_view_manager;
 } blend_fixture_t;
 
 static blend_fixture_t *blend_fixture_new(const char *op)
@@ -237,7 +244,14 @@ static int blend_test_setup(void **state)
 {
   blend_fixture_t *fixture = blend_fixture_new("exposure");
   fixture->saved_global_develop = darktable.develop;
+  fixture->saved_global_gui = darktable.gui;
+  fixture->saved_view_manager = darktable.view_manager;
   darktable.develop = &fixture->dev;
+  darktable.gui = &fixture->fake_gui;
+  darktable.view_manager = &fixture->fake_view_manager;
+  fixture->dev.form_gui = calloc(1, sizeof(dt_masks_form_gui_t));
+  assert_non_null(fixture->dev.form_gui);
+  dt_masks_init_form_gui(fixture->dev.form_gui);
   *state = fixture;
   return 0;
 }
@@ -247,9 +261,23 @@ static int blend_test_teardown(void **state)
   blend_fixture_t *fixture = *state;
   if(!fixture) return 0;
 
-  // Restore the global before cleaning up the standalone develop context,
+  // A standalone dt_dev_init() has no darkroom-view GUI state. Tests that
+  // exercise the real mask cancellation/removal paths install minimal,
+  // zeroed GUI/view-manager shells and the same form_gui allocation that
+  // views/darkroom.c owns in production.
+  if(fixture->dev.form_gui)
+  {
+    dt_masks_clear_form_gui(&fixture->dev);
+    free(fixture->dev.form_gui);
+    fixture->dev.form_gui = NULL;
+    fixture->dev.form_visible = NULL;
+  }
+
+  // Restore globals before cleaning up the standalone develop context,
   // including when cmocka reaches teardown through a failed assertion.
   darktable.develop = fixture->saved_global_develop;
+  darktable.gui = fixture->saved_global_gui;
+  darktable.view_manager = fixture->saved_view_manager;
   blend_fixture_free(fixture);
   *state = NULL;
   return 0;
@@ -1094,6 +1122,419 @@ static void test_list_null_develop_contract(void **state)
   assert_null(dt_remote_masks_list(NULL));
 }
 
+static void test_guard_cancels_direct_target(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  assert_non_null(fixture->dev.form_gui);
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(form);
+  form->formid = 202;
+  fixture->dev.form_visible = form;
+  fixture->dev.form_gui->formid = form->formid;
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(&fixture->dev, form);
+
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  dt_masks_free_form(form);
+}
+
+static void test_guard_cancels_group_targeting_member(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  assert_non_null(fixture->dev.form_gui);
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
+  dt_masks_form_t *group = dt_masks_create(DT_MASKS_GROUP);
+  assert_non_null(form);
+  assert_non_null(group);
+  form->formid = 303;
+  group->formid = 404;
+  dt_masks_point_group_t *member =
+    g_malloc0(sizeof(dt_masks_point_group_t));
+  member->formid = form->formid;
+  member->parentid = group->formid;
+  group->points = g_list_append(group->points, member);
+  fixture->dev.form_visible = group;
+  fixture->dev.form_gui->formid = group->formid;
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(&fixture->dev, form);
+
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  dt_masks_free_form(group);
+  dt_masks_free_form(form);
+}
+
+static void test_guard_leaves_unrelated_edit_untouched(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  assert_non_null(fixture->dev.form_gui);
+
+  dt_masks_form_t *visible = dt_masks_create(DT_MASKS_CIRCLE);
+  dt_masks_form_t *other = dt_masks_create(DT_MASKS_ELLIPSE);
+  assert_non_null(visible);
+  assert_non_null(other);
+  visible->formid = 505;
+  other->formid = 606;
+  fixture->dev.form_visible = visible;
+  fixture->dev.form_gui->formid = visible->formid;
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(&fixture->dev, other);
+
+  assert_ptr_equal(fixture->dev.form_visible, visible);
+  assert_int_equal(fixture->dev.form_gui->formid, visible->formid);
+  fixture->dev.form_visible = NULL;
+  fixture->dev.form_gui->formid = 0;
+  dt_masks_free_form(visible);
+  dt_masks_free_form(other);
+}
+
+static void test_create_unattached_preserves_requested_unique_name(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.25,0.75],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t first_id = INVALID_MASKID;
+  dt_mask_id_t second_id = INVALID_MASKID;
+
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "subject", NULL,
+                                     &first_id, &error));
+  assert_null(error);
+  assert_true(dt_is_valid_maskid(first_id));
+  dt_masks_form_t *first =
+    dt_masks_get_from_id(&fixture->dev, first_id);
+  assert_non_null(first);
+  assert_string_equal(first->name, "subject");
+  assert_int_equal(first->type, DT_MASKS_CIRCLE);
+  assert_int_equal(g_list_length(first->points), 1);
+  const dt_masks_point_circle_t *point = first->points->data;
+  assert_float_equal(point->center[0], 0.25, 1e-6);
+  assert_float_equal(point->center[1], 0.75, 1e-6);
+  assert_float_equal(point->radius, 0.1, 1e-6);
+  assert_float_equal(point->border, 0.02, 1e-6);
+
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "subject", NULL,
+                                     &second_id, &error));
+  assert_null(error);
+  assert_true(dt_is_valid_maskid(second_id));
+  assert_int_not_equal(second_id, first_id);
+  dt_masks_form_t *second =
+    dt_masks_get_from_id(&fixture->dev, second_id);
+  assert_non_null(second);
+  assert_string_not_equal(second->name, first->name);
+  assert_true(g_str_has_prefix(second->name, "subject"));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+
+  json_object_unref(geometry);
+}
+
+static void test_duplicate_requested_name_keeps_valid_utf8(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  char name[128];
+  memset(name, 'a', 123);
+  name[123] = (char)0xf0;
+  name[124] = (char)0x9f;
+  name[125] = (char)0x98;
+  name[126] = (char)0x80;
+  name[127] = '\0';
+  assert_true(g_utf8_validate(name, -1, NULL));
+
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t first_id = INVALID_MASKID;
+  dt_mask_id_t second_id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, name, NULL,
+                                     &first_id, &error));
+  assert_null(error);
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, name, NULL,
+                                     &second_id, &error));
+  assert_null(error);
+  assert_int_not_equal(first_id, second_id);
+
+  const dt_masks_form_t *second =
+    dt_masks_get_from_id(&fixture->dev, second_id);
+  assert_non_null(second);
+  assert_true(g_utf8_validate(second->name, -1, NULL));
+
+  json_object_unref(geometry);
+}
+
+static void test_create_attached_sets_group_and_mask_mode(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.2,\"border\":0.03}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, NULL, fixture->module,
+                                     &id, &error));
+  assert_null(error);
+  assert_true(dt_is_valid_maskid(id));
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_ENABLED);
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_MASK);
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_CONDITIONAL);
+
+  dt_masks_form_t *group =
+    dt_masks_get_from_id(&fixture->dev,
+                         fixture->module->blend_params->mask_id);
+  assert_non_null(group);
+  assert_true(group->type & DT_MASKS_GROUP);
+  assert_int_equal(g_list_length(group->points), 1);
+  const dt_masks_point_group_t *member = group->points->data;
+  assert_int_equal(member->formid, id);
+  assert_int_equal(member->parentid, group->formid);
+  assert_true(member->state & DT_MASKS_STATE_USE);
+  assert_true(member->state & DT_MASKS_STATE_SHOW);
+  assert_int_equal(member->state & DT_MASKS_STATE_OP, 0);
+
+  json_object_unref(geometry);
+}
+
+static void test_create_rejects_overlong_name_without_mutation(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  char name[129];
+  memset(name, 'x', sizeof(name) - 1);
+  name[sizeof(name) - 1] = '\0';
+  const guint forms_before = g_list_length(fixture->dev.forms);
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = 777;
+
+  assert_false(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                      geometry, name, NULL, &id, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "name",
+                "length_lt_128");
+  assert_int_equal(id, 777);
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+
+  json_object_unref(geometry);
+}
+
+static void test_create_rejects_unsupported_attach_target(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_iop_module_t unsupported = { 0 };
+  dt_remote_error_t *error = NULL;
+  const guint forms_before = g_list_length(fixture->dev.forms);
+
+  assert_false(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                      geometry, NULL, &unsupported,
+                                      NULL, &error));
+  assert_non_null(error);
+  assert_int_equal(error->code, DT_REMOTE_ERR_UNSUPPORTED_FIELD);
+  dt_remote_error_free(error);
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+
+  json_object_unref(geometry);
+}
+
+static void test_create_rejects_raster_attach_without_mutation(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_RASTER;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  const guint forms_before = g_list_length(fixture->dev.forms);
+
+  assert_false(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                      geometry, NULL, fixture->module,
+                                      NULL, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "op",
+                "raster_unsupported");
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   DEVELOP_MASK_RASTER);
+
+  json_object_unref(geometry);
+}
+
+static void test_update_replaces_atomically_and_reports_users(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *initial =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  JsonObject *replacement =
+    _geom("{\"center\":[0.3,0.7],\"radius\":0.2,\"border\":0.04}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     initial, "before", fixture->module,
+                                     &id, &error));
+  assert_null(error);
+
+  int affects = -1;
+  assert_true(dt_remote_masks_update(&fixture->dev, id, replacement,
+                                     "after", &affects, &error));
+  assert_null(error);
+  assert_int_equal(affects, 1);
+  dt_masks_form_t *form = dt_masks_get_from_id(&fixture->dev, id);
+  assert_non_null(form);
+  assert_string_equal(form->name, "after");
+  assert_int_equal(g_list_length(form->points), 1);
+  const dt_masks_point_circle_t *point = form->points->data;
+  assert_float_equal(point->center[0], 0.3, 1e-6);
+  assert_float_equal(point->center[1], 0.7, 1e-6);
+  assert_float_equal(point->radius, 0.2, 1e-6);
+  assert_float_equal(point->border, 0.04, 1e-6);
+
+  dt_masks_point_circle_t before_invalid = *point;
+  JsonObject *invalid =
+    _geom("{\"center\":[0.1,0.2],\"radius\":0,\"border\":0.03}");
+  affects = 999;
+  assert_false(dt_remote_masks_update(&fixture->dev, id, invalid,
+                                      "must not apply", &affects, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius",
+                "must_be_positive");
+  point = form->points->data;
+  assert_memory_equal(point, &before_invalid, sizeof(before_invalid));
+  assert_string_equal(form->name, "after");
+  assert_int_equal(affects, 999);
+
+  json_object_unref(invalid);
+  json_object_unref(replacement);
+  json_object_unref(initial);
+}
+
+static void test_update_unknown_id_is_not_found(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  int affects = -1;
+
+  assert_false(dt_remote_masks_update(&fixture->dev, 99999, geometry,
+                                      NULL, &affects, &error));
+  _assert_error(&error, DT_REMOTE_ERR_NOT_FOUND, "id", NULL);
+  assert_int_equal(affects, -1);
+
+  json_object_unref(geometry);
+}
+
+static void test_delete_removes_membership_and_clears_only_drawn_bit(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->multi_priority = 4;
+  fixture->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_CONDITIONAL;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, NULL, fixture->module,
+                                     &id, &error));
+  assert_null(error);
+  dt_masks_form_t *form = dt_masks_get_from_id(&fixture->dev, id);
+  dt_masks_form_t *group =
+    dt_masks_get_from_id(&fixture->dev,
+                         fixture->module->blend_params->mask_id);
+  assert_non_null(form);
+  assert_non_null(group);
+
+  JsonArray *removed_from = json_array_new();
+  // dt_masks_form_remove() invokes the normal GUI history helper when it
+  // removes the now-empty module group. In this headless fixture, mark the
+  // call as a GUI update so that helper skips tag/thumbtable side effects;
+  // the masks-history path under test still runs.
+  DT_ENTER_GUI_UPDATE();
+  const gboolean deleted =
+    dt_remote_masks_delete(&fixture->dev, id, removed_from, &error);
+  DT_LEAVE_GUI_UPDATE();
+  assert_true(deleted);
+  assert_null(error);
+  assert_null(dt_masks_get_from_id(&fixture->dev, id));
+  assert_false(dt_is_valid_maskid(
+    fixture->module->blend_params->mask_id));
+  assert_false(fixture->module->blend_params->mask_mode
+               & DEVELOP_MASK_MASK);
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_ENABLED);
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_CONDITIONAL);
+  assert_int_equal(json_array_get_length(removed_from), 1);
+  JsonObject *removed = json_array_get_object_element(removed_from, 0);
+  assert_string_equal(json_object_get_string_member(removed, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(removed, "instance"), 4);
+
+  json_array_unref(removed_from);
+  json_object_unref(geometry);
+  dt_masks_free_form(group);
+  dt_masks_free_form(form);
+}
+
+static void test_delete_unknown_id_is_not_found(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonArray *removed_from = json_array_new();
+  dt_remote_error_t *error = NULL;
+
+  assert_false(dt_remote_masks_delete(&fixture->dev, 99999, removed_from,
+                                      &error));
+  _assert_error(&error, DT_REMOTE_ERR_NOT_FOUND, "id", NULL);
+  assert_int_equal(json_array_get_length(removed_from), 0);
+
+  json_array_unref(removed_from);
+}
+
+static void test_delete_rejects_engine_managed_group_id(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t shape_id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, NULL, fixture->module,
+                                     &shape_id, &error));
+  assert_null(error);
+  const dt_mask_id_t group_id =
+    fixture->module->blend_params->mask_id;
+  assert_true(dt_is_valid_maskid(group_id));
+  const uint32_t mode_before =
+    fixture->module->blend_params->mask_mode;
+
+  JsonArray *removed_from = json_array_new();
+  DT_ENTER_GUI_UPDATE();
+  const gboolean deleted =
+    dt_remote_masks_delete(&fixture->dev, group_id, removed_from, &error);
+  DT_LEAVE_GUI_UPDATE();
+
+  assert_false(deleted);
+  _assert_error(&error, DT_REMOTE_ERR_UNSUPPORTED_FIELD, "type",
+                "group_internal");
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, group_id);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_int_equal(json_array_get_length(removed_from), 0);
+
+  json_array_unref(removed_from);
+  json_object_unref(geometry);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1138,6 +1579,48 @@ int main(void)
       test_list_reports_complete_shapes_and_membership,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test(test_list_null_develop_contract),
+    cmocka_unit_test_setup_teardown(
+      test_guard_cancels_direct_target,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_guard_cancels_group_targeting_member,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_guard_leaves_unrelated_edit_untouched,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_create_unattached_preserves_requested_unique_name,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_duplicate_requested_name_keeps_valid_utf8,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_create_attached_sets_group_and_mask_mode,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_create_rejects_overlong_name_without_mutation,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_create_rejects_unsupported_attach_target,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_create_rejects_raster_attach_without_mutation,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_update_replaces_atomically_and_reports_users,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_update_unknown_id_is_not_found,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_delete_removes_membership_and_clears_only_drawn_bit,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_delete_unknown_id_is_not_found,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_delete_rejects_engine_managed_group_id,
+      blend_test_setup, blend_test_teardown),
   };
   return cmocka_run_group_tests(tests, harness_group_setup,
                                 harness_group_teardown);
