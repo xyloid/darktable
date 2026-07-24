@@ -1482,10 +1482,27 @@ static void test_creation_ext_preserves_disabled_and_orders_snapshots(
   assert_false(attached->enabled);
   assert_int_equal(unattached->blend_params->mask_mode, mode_before);
   assert_int_equal(unattached->blend_params->mask_id, NO_MASKID);
-  assert_non_null(
-    dt_masks_get_from_id_ext(unattached->forms, form_id));
-  assert_true(attached->blend_params->mask_mode & DEVELOP_MASK_MASK);
+  const dt_masks_form_t *unattached_form =
+    dt_masks_get_from_id_ext(unattached->forms, form_id);
+  assert_non_null(unattached_form);
+  assert_false(unattached_form->type & DT_MASKS_GROUP);
+  assert_int_equal(g_list_length(unattached->forms), 1);
+  assert_int_equal(attached->blend_params->mask_mode,
+                   mode_before | options.mask_mode_to_add);
   assert_true(dt_is_valid_maskid(attached->blend_params->mask_id));
+  assert_non_null(dt_masks_get_from_id_ext(attached->forms, form_id));
+  assert_int_equal(g_list_length(attached->forms), 2);
+  const dt_masks_form_t *attached_group =
+    dt_masks_get_from_id_ext(attached->forms,
+                             attached->blend_params->mask_id);
+  assert_non_null(attached_group);
+  assert_true(attached_group->type & DT_MASKS_GROUP);
+  assert_int_equal(g_list_length(attached_group->points), 1);
+  const dt_masks_point_group_t *attached_member =
+    attached_group->points->data;
+  assert_non_null(attached_member);
+  assert_int_equal(attached_member->formid, form_id);
+  assert_int_equal(attached_member->parentid, attached_group->formid);
 
   dt_dev_pop_history_items(&fixture->dev, history_before + 1);
   assert_non_null(dt_masks_get_from_id(&fixture->dev, form_id));
@@ -1498,17 +1515,75 @@ static void test_creation_ext_preserves_disabled_and_orders_snapshots(
   assert_false(fixture->module->enabled);
 }
 
-static void test_creation_wrapper_keeps_gui_default_naming(void **state)
+static void test_creation_ext_unattached_forces_one_global_snapshot(
+  void **state)
 {
   blend_fixture_t *fixture = *state;
+  _blend_fixture_enable_history(fixture);
+  dt_dev_add_masks_history_item(&fixture->dev, NULL, FALSE);
+  const int history_before = fixture->dev.history_end;
+  assert_true(history_before > 0);
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(form);
+  const dt_masks_form_creation_options_t options = {
+    .requested_name = "global subject",
+    .preserve_module_enabled = TRUE,
+    .mask_mode_to_add = 0,
+  };
+  dt_masks_gui_form_save_creation_ext(&fixture->dev, NULL, form, NULL,
+                                      &options);
+  const dt_mask_id_t form_id = form->formid;
+
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  const dt_dev_history_item_t *snapshot =
+    g_list_nth_data(fixture->dev.history, history_before);
+  assert_non_null(snapshot);
+  assert_true(dt_iop_module_is(snapshot->module, "mask_manager"));
+  assert_false(snapshot->enabled);
+  assert_int_equal(g_list_length(snapshot->forms), 1);
+  const dt_masks_form_t *snapshot_form =
+    dt_masks_get_from_id_ext(snapshot->forms, form_id);
+  assert_non_null(snapshot_form);
+  assert_string_equal(snapshot_form->name, options.requested_name);
+}
+
+static void test_creation_wrapper_keeps_legacy_behavior(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  _blend_fixture_enable_history(fixture);
+  fixture->module->enabled = FALSE;
+  const int history_before = fixture->dev.history_end;
+
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
   assert_non_null(form);
   g_strlcpy(form->name, "implicit remote name", sizeof(form->name));
 
-  dt_masks_gui_form_save_creation(&fixture->dev, NULL, form, NULL);
+  dt_masks_gui_form_save_creation(&fixture->dev, fixture->module,
+                                  form, NULL);
+  const dt_mask_id_t form_id = form->formid;
 
   assert_string_not_equal(form->name, "implicit remote name");
   assert_true(form->name[0] != '\0');
+  assert_true(fixture->module->enabled);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  const dt_dev_history_item_t *snapshot =
+    g_list_nth_data(fixture->dev.history, history_before);
+  assert_non_null(snapshot);
+  assert_true(snapshot->enabled);
+  assert_true(dt_is_valid_maskid(snapshot->blend_params->mask_id));
+  assert_non_null(dt_masks_get_from_id_ext(snapshot->forms, form_id));
+  const dt_masks_form_t *snapshot_group =
+    dt_masks_get_from_id_ext(snapshot->forms,
+                             snapshot->blend_params->mask_id);
+  assert_non_null(snapshot_group);
+  assert_true(snapshot_group->type & DT_MASKS_GROUP);
+  assert_int_equal(g_list_length(snapshot_group->points), 1);
+  const dt_masks_point_group_t *snapshot_member =
+    snapshot_group->points->data;
+  assert_non_null(snapshot_member);
+  assert_int_equal(snapshot_member->formid, form_id);
+  assert_int_equal(snapshot_member->parentid, snapshot_group->formid);
 }
 
 static void test_create_unattached_preserves_requested_unique_name(void **state)
@@ -1979,7 +2054,10 @@ int main(void)
       test_creation_ext_preserves_disabled_and_orders_snapshots,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
-      test_creation_wrapper_keeps_gui_default_naming,
+      test_creation_ext_unattached_forces_one_global_snapshot,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_creation_wrapper_keeps_legacy_behavior,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_create_unattached_preserves_requested_unique_name,
