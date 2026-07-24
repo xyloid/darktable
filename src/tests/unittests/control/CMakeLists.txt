@@ -88,6 +88,17 @@ if(WIN32)
     _copy_required_library(test_remote_blend lib_darktable)
 endif(WIN32)
 
+add_cmocka_test(test_remote_masks
+                SOURCES test_remote_masks.c
+                LINK_LIBRARIES lib_darktable cmocka)
+
+target_compile_definitions(test_remote_masks PRIVATE
+  DT_TEST_MODULEDIR="${CMAKE_BINARY_DIR}/lib/darktable")
+
+if(WIN32)
+    _copy_required_library(test_remote_masks lib_darktable)
+endif(WIN32)
+
 add_cmocka_test(test_remote_vector
                 SOURCES test_remote_vector.c
                 LINK_LIBRARIES lib_darktable cmocka)

@@ -301,9 +301,9 @@ static void _set_group_name_from_module(const dt_iop_module_t *module,
   g_free(module_label);
 }
 
-static dt_masks_form_t *_group_create(dt_develop_t *dev,
-                                      const dt_iop_module_t *module,
-                                      const dt_masks_type_t type)
+dt_masks_form_t *dt_masks_group_create_for_module(dt_develop_t *dev,
+                                                  const dt_iop_module_t *module,
+                                                  const dt_masks_type_t type)
 {
   dt_masks_form_t* grp = dt_masks_create(type);
   _set_group_name_from_module(module, grp);
@@ -389,9 +389,9 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
     {
       // we create a new group
       if(form->type & (DT_MASKS_CLONE|DT_MASKS_NON_CLONE))
-        grp = _group_create(dev, module, DT_MASKS_GROUP | DT_MASKS_CLONE);
+        grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP | DT_MASKS_CLONE);
       else
-        grp = _group_create(dev, module, DT_MASKS_GROUP);
+        grp = dt_masks_group_create_for_module(dev, module, DT_MASKS_GROUP);
     }
     // we add the form in this group
     dt_masks_point_group_t *grpt = malloc(sizeof(dt_masks_point_group_t));
@@ -1548,7 +1548,7 @@ static void _menu_add_exist(dt_iop_module_t *module,
   dt_masks_form_t *grp = _group_from_module(darktable.develop, module);
   if(!grp)
   {
-    grp = _group_create(darktable.develop, module, DT_MASKS_GROUP);
+    grp = dt_masks_group_create_for_module(darktable.develop, module, DT_MASKS_GROUP);
   }
   // we add the form in this group
   dt_masks_group_add_form(grp, form);
@@ -1584,7 +1584,7 @@ void dt_masks_iop_use_same_as(dt_iop_module_t *module,
   dt_masks_form_t *grp = _group_from_module(darktable.develop, module);
   if(!grp)
   {
-    grp = _group_create(darktable.develop, module, DT_MASKS_GROUP);
+    grp = dt_masks_group_create_for_module(darktable.develop, module, DT_MASKS_GROUP);
   }
   // we copy the src group in this group
   for(GList *points = src_grp->points; points; points = g_list_next(points))

@@ -628,6 +628,14 @@ void dt_masks_gui_form_save_creation(dt_develop_t *dev,
                                      struct dt_iop_module_t *module,
                                      dt_masks_form_t *form,
                                      dt_masks_form_gui_t *gui);
+/** create a masks group form for `module` of `type`
+ * (DT_MASKS_GROUP, optionally | DT_MASKS_CLONE), name it from the module,
+ * append it to dev->forms, and set module->blend_params->mask_id to the new
+ * group id. Formerly the static _group_create in masks.c; exported for the
+ * remote-edit engine's set_mask_attachment upsert path (M-C). */
+dt_masks_form_t *dt_masks_group_create_for_module(dt_develop_t *dev,
+                                                  const struct dt_iop_module_t *module,
+                                                  const dt_masks_type_t type);
 void dt_masks_group_ungroup(dt_masks_form_t *dest_grp, dt_masks_form_t *grp);
 void dt_masks_group_update_name(dt_iop_module_t *module);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
