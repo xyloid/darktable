@@ -385,7 +385,7 @@ static void test_core_group_contains_form_is_transitive_and_cycle_safe(
 
   _fixture_add_member(outer, 7997,
                       DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
-  assert_true(dt_masks_group_contains_form(&fixture->dev, outer, 7997));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, outer, 7997));
 }
 
 static void test_core_referencing_modules_flattens_nested_and_shared_paths(
@@ -411,9 +411,16 @@ static void test_core_referencing_modules_flattens_nested_and_shared_paths(
                       DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
   _fixture_add_member(first_root, inner->formid,
                       DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(first_root, 7997,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
 
   assert_int_equal(_list_pointer_count(fixture->dev.iop, fixture->module), 1);
   assert_int_equal(_list_pointer_count(fixture->dev.iop, second), 1);
+  GPtrArray *dangling_owners =
+    dt_masks_form_get_referencing_modules(&fixture->dev, 7997);
+  assert_non_null(dangling_owners);
+  assert_int_equal(dangling_owners->len, 0);
+  g_ptr_array_unref(dangling_owners);
   GPtrArray *owners =
     dt_masks_form_get_referencing_modules(&fixture->dev, leaf->formid);
   assert_non_null(owners);

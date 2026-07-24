@@ -2031,10 +2031,11 @@ static gboolean _group_contains_form(const dt_develop_t *dev,
   {
     const dt_masks_point_group_t *member = points->data;
     if(!member) continue;
-    if(member->formid == formid) return TRUE;
 
     const dt_masks_form_t *child =
       dt_masks_get_from_id(dev, member->formid);
+    if(!child) continue;
+    if(member->formid == formid) return TRUE;
     if(child && (child->type & DT_MASKS_GROUP)
        && _group_contains_form(dev, child, formid, visited))
       return TRUE;
