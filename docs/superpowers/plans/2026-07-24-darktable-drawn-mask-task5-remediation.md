@@ -23,6 +23,24 @@
 - Test each behavior through a failing test before changing production code.
 - End every implementation task with the focused `test_remote_masks` target green and a separate commit.
 
+## Binding Pre-flight Corrections
+
+The subagent-driven pre-flight review found three conflicts in the
+literal snippets below. These corrections are part of the approved plan
+and govern the affected tasks:
+
+- Task 1 must retain the existing `module == NULL` mask-manager
+  resolution before calling `_dev_add_history_item_ext`. The new
+  forced-snapshot path uses that same resolution; it must never pass a
+  null module to `_dev_add_history_item_ext`.
+- Task 4 migrates the remote creation call to the extended helper in the
+  same commit that restores compatibility-wrapper naming. This keeps the
+  focused suite green at the Task 4 boundary. Task 5 verifies and retains
+  that migration while adding its graph and H2 changes.
+- Task 4 clamps requested-name suffix truncation to
+  `strlen(requested_name)` before inspecting a UTF-8 boundary. It must
+  not index a short caller-owned string at the destination-buffer limit.
+
 ## File Map
 
 - `src/develop/develop.h`: declare a forced-new masks-history entry point.
@@ -108,7 +126,7 @@ fixture->module = _blend_fixture_add_module(fixture, op, 0);
 
 - [ ] **Step 2: Write the failing distinct-snapshot test**
 
-Add this test and register it with `blend_test_setup` /
+Add these tests and register them with `blend_test_setup` /
 `blend_test_teardown`:
 
 ```c
@@ -142,6 +160,27 @@ static void test_new_mask_history_forces_distinct_snapshots(void **state)
   assert_int_equal(g_list_length(first_hist->forms), 1);
   assert_int_equal(g_list_length(second_hist->forms), 2);
 }
+
+static void test_new_mask_history_resolves_global_mask_manager(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  _blend_fixture_enable_history(fixture);
+  const int before = fixture->dev.history_end;
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(form);
+  form->formid = 7103;
+  fixture->dev.forms = g_list_append(fixture->dev.forms, form);
+  dt_dev_add_new_masks_history_item(&fixture->dev, NULL, FALSE);
+
+  assert_int_equal(fixture->dev.history_end, before + 1);
+  const dt_dev_history_item_t *hist =
+    g_list_nth_data(fixture->dev.history, before);
+  assert_non_null(hist);
+  assert_true(dt_iop_module_is(hist->module, "mask_manager"));
+  assert_false(hist->enabled);
+  assert_int_equal(g_list_length(hist->forms), 1);
+}
 ```
 
 - [ ] **Step 3: Run the focused test and confirm the API is missing**
@@ -158,7 +197,51 @@ Expected: compilation or linking fails because
 - [ ] **Step 4: Declare and implement the forced-new helper**
 
 Add the declaration beside `dt_dev_add_masks_history_item` in
-`develop.h`. Replace the current wrapper in `develop.c` with:
+`develop.h`. First replace the body of
+`dt_dev_add_masks_history_item_ext` with a shared private engine that
+retains the existing null-module resolution:
+
+```c
+static void _dev_add_masks_history_item_ext(dt_develop_t *dev,
+                                            dt_iop_module_t *module,
+                                            gboolean enable,
+                                            const gboolean new_item,
+                                            const gboolean no_image)
+{
+  if(module == NULL)
+  {
+    for(GList *modules = dev->iop;
+        modules;
+        modules = g_list_next(modules))
+    {
+      dt_iop_module_t *candidate = modules->data;
+      if(dt_iop_module_is(candidate, "mask_manager"))
+      {
+        module = candidate;
+        break;
+      }
+    }
+    enable = FALSE;
+  }
+
+  if(module)
+    _dev_add_history_item_ext(dev, module, enable, new_item, no_image,
+                              TRUE, TRUE);
+  else
+    dt_print(DT_DEBUG_ALWAYS,
+             "[dt_dev_add_masks_history_item_ext] can't find mask manager module");
+}
+
+void dt_dev_add_masks_history_item_ext(dt_develop_t *dev,
+                                       dt_iop_module_t *module,
+                                       const gboolean enable,
+                                       const gboolean no_image)
+{
+  _dev_add_masks_history_item_ext(dev, module, enable, FALSE, no_image);
+}
+```
+
+Then replace the current masks-history wrapper with:
 
 ```c
 static void _dev_add_masks_history_item(dt_develop_t *dev,
@@ -182,8 +265,7 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
     _dev_undo_start_record_target(dev, target);
 
   if(dev->gui_attached)
-    _dev_add_history_item_ext(dev, module, enable, new_item,
-                              FALSE, TRUE, TRUE);
+    _dev_add_masks_history_item_ext(dev, module, enable, new_item, FALSE);
 
   dt_dev_pipe_synch_all(dev);
   dt_dev_invalidate_all(dev);
@@ -806,6 +888,7 @@ git commit -m "masks: add ownership-safe full shape deletion"
 
 - Modify: `src/develop/masks.h:620-635`
 - Modify: `src/develop/masks/masks.c:336-450`
+- Modify: `src/control/remote_masks.c:1020-1080`
 - Test: `src/tests/unittests/control/test_remote_masks.c`
 
 **Interfaces:**
@@ -949,7 +1032,9 @@ static void _set_unique_form_name(dt_develop_t *dev,
         char suffix[32];
         g_snprintf(suffix, sizeof(suffix), " #%u", suffix_number);
         int base_length =
-          MAX(0, (int)sizeof(form->name) - 1 - (int)strlen(suffix));
+          MIN((int)strlen(requested_name),
+              MAX(0, (int)sizeof(form->name) - 1
+                     - (int)strlen(suffix)));
         while(base_length > 0
               && (((unsigned char)requested_name[base_length] & 0xc0)
                   == 0x80))
@@ -1068,7 +1153,28 @@ void dt_masks_gui_form_save_creation_ext(
 }
 ```
 
-- [ ] **Step 6: Run focused tests**
+- [ ] **Step 6: Migrate remote creation atomically with the wrapper change**
+
+In `dt_remote_masks_create`, delete the pre-populated-name and
+pre-set-mask-mode blocks. Replace the old save call with:
+
+```c
+const dt_masks_form_creation_options_t options = {
+  .requested_name = name_or_null,
+  .preserve_module_enabled = TRUE,
+  .mask_mode_to_add =
+    attach_module ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK : 0,
+};
+dt_masks_gui_form_save_creation_ext(dev, attach_module, form, NULL,
+                                    &options);
+```
+
+This adoption belongs in Task 4 because the restored compatibility
+wrapper intentionally ignores a pre-populated `form->name`; leaving the
+remote caller on that wrapper until Task 5 would break requested naming
+at the Task 4 checkpoint.
+
+- [ ] **Step 7: Run focused tests**
 
 ```bash
 cmake --build build --target test_remote_masks -j2
@@ -1078,10 +1184,11 @@ ctest --test-dir build -R '^test_remote_masks$' --output-on-failure
 Expected: distinct snapshots, both undo states, disabled-module
 preservation, default naming, and existing GUI creation tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/develop/masks.h src/develop/masks/masks.c \
+  src/control/remote_masks.c \
   src/tests/unittests/control/test_remote_masks.c
 git commit -m "masks: add coherent extended form creation"
 ```
@@ -1319,21 +1426,13 @@ if(attach_module)
 Update the declaration comment in `remote_masks.h` to say that visible
 groups target members transitively.
 
-- [ ] **Step 6: Use explicit creation options**
+- [ ] **Step 6: Verify the explicit creation options migration**
 
-Delete the pre-populated-name and pre-set-mask-mode blocks. Replace the
-old save call with:
-
-```c
-const dt_masks_form_creation_options_t options = {
-  .requested_name = name_or_null,
-  .preserve_module_enabled = TRUE,
-  .mask_mode_to_add =
-    attach_module ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK : 0,
-};
-dt_masks_gui_form_save_creation_ext(dev, attach_module, form, NULL,
-                                    &options);
-```
+Task 4 already migrated `dt_remote_masks_create` atomically with the
+compatibility-wrapper naming change. Verify that the caller still uses
+`dt_masks_gui_form_save_creation_ext`, passes `name_or_null`, preserves
+module enabled state, and adds `DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK`
+only for attached creation. Do not add another creation path.
 
 - [ ] **Step 7: Add deterministic nested membership metadata lookup**
 
