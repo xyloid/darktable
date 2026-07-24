@@ -22,6 +22,7 @@
 #include "control/jobs.h"           // DT_JOB_QUEUE_SYSTEM_BG render job
 #include "control/remote_frame.h"   // DT_REMOTE_MAX_FRAME (proactive size check)
 #include "control/remote_blend.h"   // dt_remote_blend_mask_mode_string (mask_of)
+#include "control/remote_masks.h"
 #include "control/remote_parameters.h" // semantic curve schema/value types (milestone 2)
 #include "control/remote_server.h"  // dt_remote_async_* (production async table)
 
@@ -59,6 +60,11 @@ static const dt_remote_protocol_calls_t DEFAULT_CALLS = {
   .scopes_prepare = dt_remote_scopes_prepare,
   .blend_schema = dt_remote_blend_schema_for_ref,
   .blend_read = dt_remote_blend_read_for_ref,
+  .masks_list = dt_remote_masks_list_json,
+  .masks_create = dt_remote_masks_create_call,
+  .masks_update = dt_remote_masks_update_call,
+  .masks_delete = dt_remote_masks_delete_call,
+  .masks_attachment = dt_remote_masks_attachment_call,
 };
 
 static dt_remote_protocol_calls_t s_calls = {
@@ -78,6 +84,11 @@ static dt_remote_protocol_calls_t s_calls = {
   .scopes_prepare = dt_remote_scopes_prepare,
   .blend_schema = dt_remote_blend_schema_for_ref,
   .blend_read = dt_remote_blend_read_for_ref,
+  .masks_list = dt_remote_masks_list_json,
+  .masks_create = dt_remote_masks_create_call,
+  .masks_update = dt_remote_masks_update_call,
+  .masks_delete = dt_remote_masks_delete_call,
+  .masks_attachment = dt_remote_masks_attachment_call,
 };
 
 void dt_remote_protocol_set_calls(const dt_remote_protocol_calls_t *calls)
@@ -152,6 +163,27 @@ static dt_remote_error_t *_error_new(dt_remote_error_code_t code, const char *fo
   err->message = g_strdup_vprintf(format, args);
   va_end(args);
 
+  return err;
+}
+
+static dt_remote_error_t *_error_new_details(dt_remote_error_code_t code,
+                                             const char *message,
+                                             const char *parameter,
+                                             const char *constraint)
+{
+  dt_remote_error_t *err = _error_new(code, "%s", message);
+  JsonObject *details = json_object_new();
+  json_object_set_string_member(details, "parameter", parameter);
+  if(constraint)
+    json_object_set_string_member(details, "constraint", constraint);
+
+  JsonNode *root = json_node_new(JSON_NODE_OBJECT);
+  json_node_take_object(root, details);
+  JsonGenerator *generator = json_generator_new();
+  json_generator_set_root(generator, root);
+  err->details_json = json_generator_to_data(generator, NULL);
+  g_object_unref(generator);
+  json_node_unref(root);
   return err;
 }
 
@@ -968,6 +1000,8 @@ static JsonNode *_handler_hello(JsonObject *params, dt_remote_session_t *session
   json_builder_add_string_value(b, "blend_params");
   json_builder_add_string_value(b, "parametric_mask_params");
   json_builder_add_string_value(b, "mask_render");
+  // "mask_shapes" (mask Tier 3 / M-C) gates the drawn-mask methods.
+  json_builder_add_string_value(b, "mask_shapes");
   json_builder_add_string_value(b, "instances");
   json_builder_add_string_value(b, "history");
   json_builder_add_string_value(b, "preview");
@@ -2348,6 +2382,487 @@ static JsonNode *_handler_undo(JsonObject *params, dt_remote_session_t *session,
   return node;
 }
 
+/* ---------------------------------------------------------------------- */
+/* drawn masks (mask Tier 3 / M-C)                                        */
+/* ---------------------------------------------------------------------- */
+
+static const char *const LIST_MASK_SHAPES_KEYS[] = { NULL };
+static const char *const CREATE_MASK_SHAPE_KEYS[] =
+  { "type", "space", "geometry", "name", "attach", "expected_revision", NULL };
+static const char *const CREATE_MASK_ATTACH_KEYS[] = { "op", "instance", NULL };
+static const char *const UPDATE_MASK_SHAPE_KEYS[] =
+  { "id", "space", "geometry", "name", "expected_revision", NULL };
+static const char *const DELETE_MASK_SHAPE_KEYS[] =
+  { "id", "expected_revision", NULL };
+static const char *const SET_MASK_ATTACHMENT_KEYS[] =
+  { "op", "instance", "shape_id", "attached", "state", "inverted",
+    "opacity", "expected_revision", NULL };
+
+static JsonNode *_take_json_object(JsonObject *object)
+{
+  JsonNode *node = json_node_new(JSON_NODE_OBJECT);
+  json_node_take_object(node, object);
+  return node;
+}
+
+static gboolean _require_object(JsonObject *params, const char *key,
+                                JsonObject **out, dt_remote_error_t **err)
+{
+  if(!params || !json_object_has_member(params, key))
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("missing required parameter '%s'"), key);
+    return FALSE;
+  }
+
+  JsonNode *node = json_object_get_member(params, key);
+  if(!node || !JSON_NODE_HOLDS_OBJECT(node))
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("parameter '%s' must be an object"), key);
+    return FALSE;
+  }
+
+  *out = json_node_get_object(node);
+  return TRUE;
+}
+
+static gboolean _optional_nullable_string(JsonObject *params,
+                                          const char *key,
+                                          const char **out,
+                                          dt_remote_error_t **err)
+{
+  *out = NULL;
+  if(!params || !json_object_has_member(params, key)) return TRUE;
+
+  JsonNode *node = json_object_get_member(params, key);
+  if(node && json_node_get_node_type(node) == JSON_NODE_NULL) return TRUE;
+  return _require_string(params, key, out, err);
+}
+
+static gboolean _require_preview_space(JsonObject *params,
+                                       dt_remote_error_t **err)
+{
+  const char *space = NULL;
+  if(!_require_string(params, "space", &space, err)) return FALSE;
+  if(g_str_equal(space, "preview")) return TRUE;
+
+  if(err)
+    *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                      _("parameter 'space' must be 'preview'"));
+  return FALSE;
+}
+
+static gboolean _require_mask_id(JsonObject *params, const char *key,
+                                 dt_mask_id_t *out,
+                                 dt_remote_error_t **err)
+{
+  gint64 value = 0;
+  if(!_require_int(params, key, &value, err)) return FALSE;
+  if(value <= NO_MASKID || value > G_MAXINT32)
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("parameter '%s' must be a positive 32-bit integer"),
+                        key);
+    return FALSE;
+  }
+
+  *out = (dt_mask_id_t)value;
+  return TRUE;
+}
+
+static gboolean _optional_instance(JsonObject *params, const char *key,
+                                   const char *label, int *out,
+                                   dt_remote_error_t **err)
+{
+  gint64 value = 0;
+  if(!_optional_int_default(params, key, 0, &value, err)) return FALSE;
+  if(value < 0 || value > G_MAXINT)
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("parameter '%s' is out of range"), label);
+    return FALSE;
+  }
+
+  *out = (int)value;
+  return TRUE;
+}
+
+static gboolean _require_boolean(JsonObject *params, const char *key,
+                                 gboolean *out, dt_remote_error_t **err)
+{
+  if(!params || !json_object_has_member(params, key))
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("missing required parameter '%s'"), key);
+    return FALSE;
+  }
+
+  JsonNode *node = json_object_get_member(params, key);
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)
+     || json_node_get_value_type(node) != G_TYPE_BOOLEAN)
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("parameter '%s' must be a boolean"), key);
+    return FALSE;
+  }
+
+  *out = json_node_get_boolean(node);
+  return TRUE;
+}
+
+static gboolean _optional_string(JsonObject *params, const char *key,
+                                 const char **out, dt_remote_error_t **err)
+{
+  *out = NULL;
+  if(!params || !json_object_has_member(params, key)) return TRUE;
+  return _require_string(params, key, out, err);
+}
+
+static gboolean _optional_boolean_as_int(JsonObject *params, const char *key,
+                                         int *out, dt_remote_error_t **err)
+{
+  *out = -1;
+  if(!params || !json_object_has_member(params, key)) return TRUE;
+
+  gboolean value = FALSE;
+  if(!_require_boolean(params, key, &value, err)) return FALSE;
+  *out = value ? 1 : 0;
+  return TRUE;
+}
+
+static gboolean _optional_finite_double(JsonObject *params, const char *key,
+                                        gboolean *have, double *out,
+                                        dt_remote_error_t **err)
+{
+  *have = FALSE;
+  *out = 0.0;
+  if(!params || !json_object_has_member(params, key)) return TRUE;
+
+  if(!_node_to_finite_double(json_object_get_member(params, key), out))
+  {
+    if(err)
+      *err = _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                        _("parameter '%s' must be a finite number"), key);
+    return FALSE;
+  }
+
+  *have = TRUE;
+  return TRUE;
+}
+
+static dt_remote_error_t *_mask_method_unavailable(const char *method)
+{
+  return _error_new(DT_REMOTE_ERR_INTERNAL,
+                    _("method '%s' is unavailable"), method);
+}
+
+static JsonNode *_shape_result(JsonNode *entry, uint64_t revision,
+                               gboolean include_affects, int affects)
+{
+  JsonObject *result = json_object_new();
+  json_object_set_member(result, "shape", entry);
+  if(include_affects)
+    json_object_set_int_member(result, "affects_instances", affects);
+  json_object_set_int_member(result, "revision", (gint64)revision);
+  return _take_json_object(result);
+}
+
+static JsonNode *_handler_list_mask_shapes(JsonObject *params,
+                                           dt_remote_session_t *session,
+                                           dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, LIST_MASK_SHAPES_KEYS, &err))
+    return _handler_fail(err);
+  if(!s_calls.masks_list)
+    return _handler_fail(_mask_method_unavailable("list_mask_shapes"));
+
+  JsonNode *result = NULL;
+  uint64_t revision = 0;
+  if(!s_calls.masks_list(&result, &revision, &err))
+  {
+    if(result) json_node_unref(result);
+    return _handler_fail(err);
+  }
+  if(!result || !JSON_NODE_HOLDS_OBJECT(result))
+  {
+    if(result) json_node_unref(result);
+    return _handler_fail(
+      _error_new(DT_REMOTE_ERR_INTERNAL,
+                 _("list_mask_shapes returned an invalid result")));
+  }
+
+  json_object_set_int_member(json_node_get_object(result), "revision",
+                             (gint64)revision);
+  return result;
+}
+
+static JsonNode *_handler_create_mask_shape(JsonObject *params,
+                                            dt_remote_session_t *session,
+                                            dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, CREATE_MASK_SHAPE_KEYS, &err))
+    return _handler_fail(err);
+
+  const char *type_name = NULL;
+  if(!_require_string(params, "type", &type_name, &err))
+    return _handler_fail(err);
+  dt_masks_type_t type = 0;
+  if(!dt_remote_masks_type_from_string(type_name, &type))
+    return _handler_fail(
+      _error_new_details(DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                         _("unsupported mask shape type"),
+                         "type", NULL));
+
+  if(!_require_preview_space(params, &err)) return _handler_fail(err);
+
+  JsonObject *geometry = NULL;
+  if(!_require_object(params, "geometry", &geometry, &err))
+    return _handler_fail(err);
+
+  const char *name = NULL;
+  if(!_optional_nullable_string(params, "name", &name, &err))
+    return _handler_fail(err);
+
+  dt_remote_module_ref_t attach_ref = { 0 };
+  const dt_remote_module_ref_t *attach = NULL;
+  if(params && json_object_has_member(params, "attach"))
+  {
+    JsonNode *attach_node = json_object_get_member(params, "attach");
+    if(attach_node && json_node_get_node_type(attach_node) != JSON_NODE_NULL)
+    {
+      if(!JSON_NODE_HOLDS_OBJECT(attach_node))
+        return _handler_fail(
+          _error_new(DT_REMOTE_ERR_INVALID_VALUE,
+                     _("parameter 'attach' must be an object or null")));
+
+      JsonObject *attach_object = json_node_get_object(attach_node);
+      if(!_check_known_keys(attach_object, CREATE_MASK_ATTACH_KEYS, &err))
+        return _handler_fail(err);
+      if(!_require_string(attach_object, "op", &attach_ref.op, &err))
+        return _handler_fail(err);
+      if(!_optional_instance(attach_object, "instance",
+                             "attach.instance", &attach_ref.instance, &err))
+        return _handler_fail(err);
+      attach = &attach_ref;
+    }
+  }
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision,
+                               &err))
+    return _handler_fail(err);
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  if(!s_calls.masks_create)
+    return _handler_fail(_mask_method_unavailable("create_mask_shape"));
+
+  JsonNode *entry = NULL;
+  uint64_t revision = 0;
+  if(!s_calls.masks_create(type, geometry, name, attach,
+                           have_expected ? &expected_u64 : NULL,
+                           &entry, &revision, &err))
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(err);
+  }
+  if(!entry || !JSON_NODE_HOLDS_OBJECT(entry))
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(
+      _error_new(DT_REMOTE_ERR_INTERNAL,
+                 _("create_mask_shape returned an invalid shape")));
+  }
+
+  return _shape_result(entry, revision, FALSE, 0);
+}
+
+static JsonNode *_handler_update_mask_shape(JsonObject *params,
+                                            dt_remote_session_t *session,
+                                            dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, UPDATE_MASK_SHAPE_KEYS, &err))
+    return _handler_fail(err);
+
+  dt_mask_id_t id = NO_MASKID;
+  if(!_require_mask_id(params, "id", &id, &err)) return _handler_fail(err);
+  if(!_require_preview_space(params, &err)) return _handler_fail(err);
+
+  JsonObject *geometry = NULL;
+  if(!_require_object(params, "geometry", &geometry, &err))
+    return _handler_fail(err);
+
+  const char *name = NULL;
+  if(!_optional_nullable_string(params, "name", &name, &err))
+    return _handler_fail(err);
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision,
+                               &err))
+    return _handler_fail(err);
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  if(!s_calls.masks_update)
+    return _handler_fail(_mask_method_unavailable("update_mask_shape"));
+
+  JsonNode *entry = NULL;
+  int affects = 0;
+  uint64_t revision = 0;
+  if(!s_calls.masks_update(id, geometry, name,
+                           have_expected ? &expected_u64 : NULL,
+                           &entry, &affects, &revision, &err))
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(err);
+  }
+  if(!entry || !JSON_NODE_HOLDS_OBJECT(entry) || affects < 0)
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(
+      _error_new(DT_REMOTE_ERR_INTERNAL,
+                 _("update_mask_shape returned an invalid result")));
+  }
+
+  return _shape_result(entry, revision, TRUE, affects);
+}
+
+static JsonNode *_handler_delete_mask_shape(JsonObject *params,
+                                            dt_remote_session_t *session,
+                                            dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, DELETE_MASK_SHAPE_KEYS, &err))
+    return _handler_fail(err);
+
+  dt_mask_id_t id = NO_MASKID;
+  if(!_require_mask_id(params, "id", &id, &err)) return _handler_fail(err);
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision,
+                               &err))
+    return _handler_fail(err);
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+
+  if(!s_calls.masks_delete)
+    return _handler_fail(_mask_method_unavailable("delete_mask_shape"));
+
+  JsonArray *removed_from = NULL;
+  uint64_t revision = 0;
+  if(!s_calls.masks_delete(id, have_expected ? &expected_u64 : NULL,
+                           &removed_from, &revision, &err))
+  {
+    if(removed_from) json_array_unref(removed_from);
+    return _handler_fail(err);
+  }
+  if(!removed_from)
+    return _handler_fail(
+      _error_new(DT_REMOTE_ERR_INTERNAL,
+                 _("delete_mask_shape returned an invalid result")));
+
+  JsonObject *result = json_object_new();
+  json_object_set_array_member(result, "removed_from", removed_from);
+  json_object_set_int_member(result, "revision", (gint64)revision);
+  return _take_json_object(result);
+}
+
+static JsonNode *_handler_set_mask_attachment(JsonObject *params,
+                                              dt_remote_session_t *session,
+                                              dt_remote_pending_t *pending)
+{
+  (void)session;
+  (void)pending;
+
+  dt_remote_error_t *err = NULL;
+  if(!_check_known_keys(params, SET_MASK_ATTACHMENT_KEYS, &err))
+    return _handler_fail(err);
+
+  const char *op = NULL;
+  if(!_require_string(params, "op", &op, &err)) return _handler_fail(err);
+
+  int instance = 0;
+  if(!_optional_instance(params, "instance", "instance", &instance, &err))
+    return _handler_fail(err);
+
+  dt_mask_id_t shape_id = NO_MASKID;
+  if(!_require_mask_id(params, "shape_id", &shape_id, &err))
+    return _handler_fail(err);
+
+  gboolean attached = FALSE;
+  if(!_require_boolean(params, "attached", &attached, &err))
+    return _handler_fail(err);
+
+  const char *state = NULL;
+  int inverted = -1;
+  gboolean have_opacity = FALSE;
+  double opacity = 0.0;
+  if(attached)
+  {
+    if(!_optional_string(params, "state", &state, &err))
+      return _handler_fail(err);
+    if(!_optional_boolean_as_int(params, "inverted", &inverted, &err))
+      return _handler_fail(err);
+    if(!_optional_finite_double(params, "opacity", &have_opacity,
+                                &opacity, &err))
+      return _handler_fail(err);
+  }
+
+  gboolean have_expected = FALSE;
+  gint64 expected_revision = 0;
+  if(!_parse_expected_revision(params, &have_expected, &expected_revision,
+                               &err))
+    return _handler_fail(err);
+  const uint64_t expected_u64 = (uint64_t)expected_revision;
+  const dt_remote_module_ref_t ref = { .op = op, .instance = instance };
+
+  if(!s_calls.masks_attachment)
+    return _handler_fail(_mask_method_unavailable("set_mask_attachment"));
+
+  JsonNode *entry = NULL;
+  uint64_t revision = 0;
+  if(!s_calls.masks_attachment(
+       &ref, shape_id, attached, state, inverted,
+       have_opacity ? &opacity : NULL,
+       have_expected ? &expected_u64 : NULL,
+       &entry, &revision, &err))
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(err);
+  }
+  if(!entry || !JSON_NODE_HOLDS_OBJECT(entry))
+  {
+    if(entry) json_node_unref(entry);
+    return _handler_fail(
+      _error_new(DT_REMOTE_ERR_INTERNAL,
+                 _("set_mask_attachment returned an invalid shape")));
+  }
+
+  return _shape_result(entry, revision, FALSE, 0);
+}
+
 static const char *const RENDER_PREVIEW_KEYS[] =
   { "max_px", "quality", "show_mask", NULL };
 static const char *const SHOW_MASK_KEYS[] = { "op", "instance", NULL };
@@ -2523,7 +3038,7 @@ static JsonNode *_handler_compute_scopes(JsonObject *params, dt_remote_session_t
 }
 
 /* ---------------------------------------------------------------------- */
-/* allowlist (internals §6: 13 entries, static, looked up by g_str_equal)  */
+/* allowlist (internals §6: 18 entries, static, looked up by g_str_equal)  */
 /* ---------------------------------------------------------------------- */
 
 // Every method has a real handler now (compute_scopes was the last one).
@@ -2543,6 +3058,11 @@ static const dt_remote_method_t g_methods[] = {
   { "undo",                   TRUE,  TRUE,  FALSE, _handler_undo },
   { "render_preview",         TRUE,  FALSE, TRUE,  _handler_render_preview },
   { "compute_scopes",         TRUE,  FALSE, TRUE,  _handler_compute_scopes },
+  { "list_mask_shapes",       TRUE,  FALSE, FALSE, _handler_list_mask_shapes },
+  { "create_mask_shape",      TRUE,  TRUE,  FALSE, _handler_create_mask_shape },
+  { "update_mask_shape",      TRUE,  TRUE,  FALSE, _handler_update_mask_shape },
+  { "delete_mask_shape",      TRUE,  TRUE,  FALSE, _handler_delete_mask_shape },
+  { "set_mask_attachment",    TRUE,  TRUE,  FALSE, _handler_set_mask_attachment },
 };
 
 static const dt_remote_method_t *_find_method(const char *name)

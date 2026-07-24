@@ -1,0 +1,1 @@
+{"id":62,"ok":true,"result":{"shape":{"id":100,"type":"circle","name":"new name","space":"preview","editable":true,"geometry":{"center":[0.5,0.4],"radius":0.12,"border":0.02,"size_mapping":"exact"},"raw_geometry":{"center":[0.5,0.4],"radius":0.12,"border":0.02},"used_by":[]},"affects_instances":1,"revision":43}}

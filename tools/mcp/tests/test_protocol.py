@@ -126,6 +126,33 @@ async def test_hello_wrong_token_raises_protocol_error(fake_server_factory):
             "render_preview_show_mask_request.json",
             "render_preview_show_mask_response.json",
         ),
+        # mask Tier 3 / M-C: the five drawn-mask method result shapes are
+        # transported verbatim by the raw protocol client.
+        (
+            "list_mask_shapes",
+            "list_mask_shapes_request.json",
+            "list_mask_shapes_response.json",
+        ),
+        (
+            "create_mask_shape",
+            "create_mask_shape_request.json",
+            "create_mask_shape_response.json",
+        ),
+        (
+            "update_mask_shape",
+            "update_mask_shape_request.json",
+            "update_mask_shape_response.json",
+        ),
+        (
+            "delete_mask_shape",
+            "delete_mask_shape_request.json",
+            "delete_mask_shape_response.json",
+        ),
+        (
+            "set_mask_attachment",
+            "set_mask_attachment_request.json",
+            "set_mask_attachment_response.json",
+        ),
     ],
 )
 async def test_success_responses_match_shared_fixtures(
@@ -163,6 +190,7 @@ async def test_client_capabilities_populated_from_hello(fake_server_factory):
     assert "blend_params" in client.capabilities
     assert "parametric_mask_params" in client.capabilities
     assert "mask_render" in client.capabilities
+    assert "mask_shapes" in client.capabilities
 
     await client.close()
 

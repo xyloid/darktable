@@ -1740,10 +1740,11 @@ static void test_hello_success(void **state)
   // "band_params" (milestone 5: capability-gated semantic band read/write) +
   // "quantity_params" (milestone 6: capability-gated semantic quantity
   // read/write) + "blend_params" (mask Tier 1 / M-A: blend
-  // schema/read/patch/readback) + "instances"/"history" (step 8) +
+  // schema/read/patch/readback) + the Tier 2 mask capabilities +
+  // "mask_shapes" (mask Tier 3 / M-C) + "instances"/"history" (step 8) +
   // "preview" (step 9) + "scopes" (step 10) -- the full capability set.
   JsonArray *caps = json_object_get_array_member(result, "capabilities");
-  assert_int_equal(json_array_get_length(caps), 13);
+  assert_int_equal(json_array_get_length(caps), 14);
   assert_string_equal(json_array_get_string_element(caps, 0), "params");
   assert_string_equal(json_array_get_string_element(caps, 1), "semantic_params");
   assert_string_equal(json_array_get_string_element(caps, 2), "curve_params");
@@ -1753,10 +1754,11 @@ static void test_hello_success(void **state)
   assert_string_equal(json_array_get_string_element(caps, 6), "blend_params");
   assert_string_equal(json_array_get_string_element(caps, 7), "parametric_mask_params");
   assert_string_equal(json_array_get_string_element(caps, 8), "mask_render");
-  assert_string_equal(json_array_get_string_element(caps, 9), "instances");
-  assert_string_equal(json_array_get_string_element(caps, 10), "history");
-  assert_string_equal(json_array_get_string_element(caps, 11), "preview");
-  assert_string_equal(json_array_get_string_element(caps, 12), "scopes");
+  assert_string_equal(json_array_get_string_element(caps, 9), "mask_shapes");
+  assert_string_equal(json_array_get_string_element(caps, 10), "instances");
+  assert_string_equal(json_array_get_string_element(caps, 11), "history");
+  assert_string_equal(json_array_get_string_element(caps, 12), "preview");
+  assert_string_equal(json_array_get_string_element(caps, 13), "scopes");
 
   json_node_unref(actual);
   json_node_unref(request_node);
@@ -2377,6 +2379,44 @@ static void _assert_inline_error(const char *json_text, const char *expected_cod
   assert_false(json_object_get_boolean_member(resp, "ok"));
   assert_string_equal(json_object_get_string_member(json_object_get_object_member(resp, "error"), "code"),
                       expected_code);
+  json_node_unref(actual);
+}
+
+static void _assert_inline_error_message(const char *json_text,
+                                         const char *expected_code,
+                                         const char *message_fragment)
+{
+  JsonNode *actual = _dispatch_inline(json_text);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *error = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"),
+                      expected_code);
+  assert_non_null(g_strstr_len(json_object_get_string_member(error, "message"),
+                              -1, message_fragment));
+  json_node_unref(actual);
+}
+
+static void _assert_inline_error_details(const char *json_text,
+                                         const char *expected_code,
+                                         const char *expected_parameter,
+                                         const char *expected_constraint)
+{
+  JsonNode *actual = _dispatch_inline(json_text);
+  JsonObject *resp = json_node_get_object(actual);
+  assert_false(json_object_get_boolean_member(resp, "ok"));
+  JsonObject *error = json_object_get_object_member(resp, "error");
+  assert_string_equal(json_object_get_string_member(error, "code"),
+                      expected_code);
+  JsonObject *details = json_object_get_object_member(error, "details");
+  assert_non_null(details);
+  assert_string_equal(json_object_get_string_member(details, "parameter"),
+                      expected_parameter);
+  if(expected_constraint)
+    assert_string_equal(json_object_get_string_member(details, "constraint"),
+                        expected_constraint);
+  else
+    assert_false(json_object_has_member(details, "constraint"));
   json_node_unref(actual);
 }
 
@@ -5600,10 +5640,312 @@ static void test_method_not_implemented_yet(void **state)
 }
 
 /* ---------------------------------------------------------------------- */
+/* mask Tier 3 / M-C: drawn-mask protocol fixtures                        */
+/* ---------------------------------------------------------------------- */
+
+static JsonNode *_mask_entry(const char *name, double opacity)
+{
+  char *text = g_strdup_printf(
+    "{\"id\":100,\"type\":\"circle\",\"name\":\"%s\",\"space\":\"preview\","
+    "\"editable\":true,\"geometry\":{\"center\":[0.62,0.41],\"radius\":0.11,"
+    "\"border\":0.04,\"size_mapping\":\"exact\"},\"raw_geometry\":{\"center\":[0.598,0.463],"
+    "\"radius\":0.093,\"border\":0.05},\"used_by\":[{\"op\":\"exposure\",\"instance\":0,"
+    "\"state\":[\"union\"],\"inverted\":false,\"opacity\":%.2f}]}",
+    name, opacity);
+  JsonNode *entry = json_from_string(text, NULL);
+  g_free(text);
+  return entry;
+}
+
+static gboolean stub_masks_list(JsonNode **out, uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_non_null(out);
+  assert_null(*out);
+  *out = json_from_string(
+    "{\"shapes\":[{\"id\":100,\"type\":\"circle\",\"name\":\"circle #1\",\"space\":\"preview\","
+    "\"editable\":true,\"geometry\":{\"center\":[0.62,0.41],\"radius\":0.11,\"border\":0.04,"
+    "\"size_mapping\":\"exact\"},\"raw_geometry\":{\"center\":[0.598,0.463],\"radius\":0.093,"
+    "\"border\":0.05},\"used_by\":[]}]}", NULL);
+  *revision = 42;
+  return TRUE;
+}
+
+static gboolean stub_masks_create(dt_masks_type_t type, JsonObject *geom, const char *name,
+                                  const dt_remote_module_ref_t *attach, const uint64_t *expected,
+                                  JsonNode **entry, uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_int_equal(type, DT_MASKS_CIRCLE);
+  assert_non_null(geom);
+  assert_true(json_object_has_member(geom, "center"));
+  assert_null(name);
+  assert_non_null(attach);
+  assert_string_equal(attach->op, "exposure");
+  assert_int_equal(attach->instance, 0);
+  assert_null(expected);
+  assert_non_null(entry);
+  assert_null(*entry);
+  *entry = _mask_entry("circle #1", 0.85);
+  *revision = 42;
+  return TRUE;
+}
+
+static gboolean stub_masks_update(dt_mask_id_t id, JsonObject *geom, const char *name,
+                                  const uint64_t *expected, JsonNode **entry, int *affects,
+                                  uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_int_equal(id, 100);
+  assert_non_null(geom);
+  assert_string_equal(name, "new name");
+  assert_non_null(expected);
+  assert_int_equal(*expected, 42);
+  assert_non_null(entry);
+  assert_null(*entry);
+  *entry = json_from_string(
+    "{\"id\":100,\"type\":\"circle\",\"name\":\"new name\",\"space\":\"preview\","
+    "\"editable\":true,\"geometry\":{\"center\":[0.5,0.4],\"radius\":0.12,\"border\":0.02,"
+    "\"size_mapping\":\"exact\"},\"raw_geometry\":{\"center\":[0.5,0.4],\"radius\":0.12,"
+    "\"border\":0.02},\"used_by\":[]}", NULL);
+  *affects = 1;
+  *revision = 43;
+  return TRUE;
+}
+
+static gboolean stub_masks_update_not_found(dt_mask_id_t id, JsonObject *geom, const char *name,
+                                            const uint64_t *expected, JsonNode **entry, int *affects,
+                                            uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)geom;
+  (void)name;
+  (void)entry;
+  (void)affects;
+  (void)revision;
+  assert_int_equal(id, 999);
+  assert_null(expected);
+  *error = _make_error(DT_REMOTE_ERR_NOT_FOUND, g_strdup("mask shape not found"));
+  (*error)->details_json = g_strdup("{\"parameter\":\"id\"}");
+  return FALSE;
+}
+
+static gboolean stub_masks_delete(dt_mask_id_t id, const uint64_t *expected, JsonArray **removed,
+                                  uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_int_equal(id, 100);
+  assert_non_null(expected);
+  assert_int_equal(*expected, 43);
+  assert_non_null(removed);
+  assert_null(*removed);
+  *removed = json_array_new();
+  JsonObject *ref = json_object_new();
+  json_object_set_string_member(ref, "op", "exposure");
+  json_object_set_int_member(ref, "instance", 0);
+  json_array_add_object_element(*removed, ref);
+  *revision = 44;
+  return TRUE;
+}
+
+static gboolean stub_masks_attachment(const dt_remote_module_ref_t *ref, dt_mask_id_t shape_id,
+                                      gboolean attached, const char *state, int inverted,
+                                      const double *opacity, const uint64_t *expected,
+                                      JsonNode **entry, uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+  assert_int_equal(shape_id, 100);
+  assert_true(attached);
+  assert_string_equal(state, "union");
+  assert_int_equal(inverted, 0);
+  assert_non_null(opacity);
+  assert_float_equal(*opacity, 0.8, 1e-12);
+  assert_non_null(expected);
+  assert_int_equal(*expected, 42);
+  assert_non_null(entry);
+  assert_null(*entry);
+  *entry = _mask_entry("circle #1", *opacity);
+  *revision = 43;
+  return TRUE;
+}
+
+static gboolean stub_masks_attachment_sum_error(const dt_remote_module_ref_t *ref, dt_mask_id_t shape_id,
+                                                gboolean attached, const char *state, int inverted,
+                                                const double *opacity, const uint64_t *expected,
+                                                JsonNode **entry, uint64_t *revision, dt_remote_error_t **error)
+{
+  (void)entry;
+  (void)revision;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+  assert_int_equal(shape_id, 100);
+  assert_true(attached);
+  assert_string_equal(state, "sum");
+  assert_int_equal(inverted, -1);
+  assert_null(opacity);
+  assert_null(expected);
+  *error = _make_error(DT_REMOTE_ERR_INVALID_VALUE, g_strdup("sum is brush-only"));
+  (*error)->details_json = g_strdup("{\"parameter\":\"state\",\"constraint\":\"sum_is_brush_only\"}");
+  return FALSE;
+}
+
+static void test_list_mask_shapes_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .masks_list = stub_masks_list };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("list_mask_shapes_request.json",
+                           "list_mask_shapes_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_create_mask_shape_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .masks_create = stub_masks_create };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("create_mask_shape_request.json",
+                           "create_mask_shape_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_update_mask_shape_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .masks_update = stub_masks_update };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("update_mask_shape_request.json",
+                           "update_mask_shape_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_update_mask_shape_not_found(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .masks_update = stub_masks_update_not_found
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("update_mask_shape_error_not_found_request.json",
+                           "update_mask_shape_error_not_found_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_delete_mask_shape_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = { .masks_delete = stub_masks_delete };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("delete_mask_shape_request.json",
+                           "delete_mask_shape_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_mask_attachment_round_trip(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .masks_attachment = stub_masks_attachment
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_mask_attachment_request.json",
+                           "set_mask_attachment_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_mask_attachment_sum_error(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .masks_attachment = stub_masks_attachment_sum_error
+  };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_dispatch_matches("set_mask_attachment_error_sum_request.json",
+                           "set_mask_attachment_error_sum_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_create_mask_shape_input_validation(void **state)
+{
+  (void)state;
+  _assert_inline_error_message(
+    "{\"id\":67,\"method\":\"create_mask_shape\",\"params\":{\"type\":\"circle\","
+    "\"space\":\"image\",\"geometry\":{}}}",
+    "invalid_value", "space");
+  _assert_inline_error_message(
+    "{\"id\":68,\"method\":\"create_mask_shape\",\"params\":{\"type\":\"circle\","
+    "\"space\":\"preview\",\"geometry\":true}}",
+    "invalid_value", "geometry");
+  _assert_inline_error_message(
+    "{\"id\":69,\"method\":\"create_mask_shape\",\"params\":{\"type\":\"circle\","
+    "\"space\":\"preview\",\"geometry\":{},\"attach\":true}}",
+    "invalid_value", "attach");
+  _assert_inline_error_message(
+    "{\"id\":70,\"method\":\"create_mask_shape\",\"params\":{\"type\":\"circle\","
+    "\"space\":\"preview\",\"geometry\":{},\"attach\":{\"op\":\"exposure\","
+    "\"extra\":1}}}",
+    "invalid_value", "extra");
+}
+
+static void test_create_mask_shape_rejects_unsupported_type_with_details(void **state)
+{
+  (void)state;
+  _assert_inline_error_details(
+    "{\"id\":71,\"method\":\"create_mask_shape\",\"params\":{\"type\":\"path\","
+    "\"space\":\"preview\",\"geometry\":{}}}",
+    "unsupported_field", "type", NULL);
+}
+
+static void test_update_mask_shape_input_validation(void **state)
+{
+  (void)state;
+  _assert_inline_error_message(
+    "{\"id\":72,\"method\":\"update_mask_shape\",\"params\":{\"id\":2147483648,"
+    "\"space\":\"preview\",\"geometry\":{}}}",
+    "invalid_value", "id");
+  _assert_inline_error_message(
+    "{\"id\":73,\"method\":\"update_mask_shape\",\"params\":{\"id\":0,"
+    "\"space\":\"preview\",\"geometry\":{}}}",
+    "invalid_value", "id");
+  _assert_inline_error_message(
+    "{\"id\":74,\"method\":\"update_mask_shape\",\"params\":{\"id\":100,"
+    "\"space\":\"preview\",\"geometry\":[]}}",
+    "invalid_value", "geometry");
+}
+
+static void test_set_mask_attachment_input_validation(void **state)
+{
+  (void)state;
+  _assert_inline_error_message(
+    "{\"id\":75,\"method\":\"set_mask_attachment\",\"params\":{\"op\":\"exposure\","
+    "\"shape_id\":100,\"attached\":1}}",
+    "invalid_value", "attached");
+  _assert_inline_error_message(
+    "{\"id\":76,\"method\":\"set_mask_attachment\",\"params\":{\"op\":\"exposure\","
+    "\"shape_id\":100,\"attached\":true,\"inverted\":1}}",
+    "invalid_value", "inverted");
+  _assert_inline_error_message(
+    "{\"id\":77,\"method\":\"set_mask_attachment\",\"params\":{\"op\":\"exposure\","
+    "\"shape_id\":100,\"attached\":true,\"opacity\":1e400}}",
+    "invalid_value", "opacity");
+}
+
+static void test_mask_method_with_unavailable_callback_fails_cleanly(void **state)
+{
+  (void)state;
+  const dt_remote_protocol_calls_t calls = { 0 };
+  dt_remote_protocol_set_calls(&calls);
+  _assert_inline_error("{\"id\":78,\"method\":\"list_mask_shapes\"}",
+                       "internal");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+/* ---------------------------------------------------------------------- */
 /* allowlist table                                                          */
 /* ---------------------------------------------------------------------- */
 
-static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state)
+static void test_allowlist_has_eighteen_methods_with_expected_flags(void **state)
 {
   (void)state;
 
@@ -5611,6 +5953,8 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
     "hello", "get_state", "list_modules", "get_module_schema", "get_module_params",
     "set_module_params", "set_module_enabled", "reset_module", "create_module_instance",
     "get_history", "undo", "render_preview", "compute_scopes",
+    "list_mask_shapes", "create_mask_shape", "update_mask_shape", "delete_mask_shape",
+    "set_mask_attachment",
   };
   for(size_t i = 0; i < G_N_ELEMENTS(names); i++)
     assert_non_null(dt_remote_protocol_lookup_method(names[i]));
@@ -5654,6 +5998,14 @@ static void test_allowlist_has_thirteen_methods_with_expected_flags(void **state
   assert_false(scopes->is_mutation);
   assert_true(scopes->is_async);
   assert_non_null(scopes->handler);  // implemented in plan step 10
+
+  const dt_remote_method_t *list_masks = dt_remote_protocol_lookup_method("list_mask_shapes");
+  assert_true(list_masks->needs_darkroom);
+  assert_false(list_masks->is_mutation);
+
+  const dt_remote_method_t *create_mask = dt_remote_protocol_lookup_method("create_mask_shape");
+  assert_true(create_mask->is_mutation);
+  assert_false(create_mask->is_async);
 }
 
 int main(int argc, char *argv[])
@@ -5808,7 +6160,20 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_error_unknown_method),
     cmocka_unit_test(test_method_not_implemented_yet),
 
-    cmocka_unit_test(test_allowlist_has_thirteen_methods_with_expected_flags),
+    cmocka_unit_test(test_list_mask_shapes_round_trip),
+    cmocka_unit_test(test_create_mask_shape_round_trip),
+    cmocka_unit_test(test_update_mask_shape_round_trip),
+    cmocka_unit_test(test_update_mask_shape_not_found),
+    cmocka_unit_test(test_delete_mask_shape_round_trip),
+    cmocka_unit_test(test_set_mask_attachment_round_trip),
+    cmocka_unit_test(test_set_mask_attachment_sum_error),
+    cmocka_unit_test(test_create_mask_shape_input_validation),
+    cmocka_unit_test(test_create_mask_shape_rejects_unsupported_type_with_details),
+    cmocka_unit_test(test_update_mask_shape_input_validation),
+    cmocka_unit_test(test_set_mask_attachment_input_validation),
+    cmocka_unit_test(test_mask_method_with_unavailable_callback_fails_cleanly),
+
+    cmocka_unit_test(test_allowlist_has_eighteen_methods_with_expected_flags),
   };
 
   return cmocka_run_group_tests(tests, NULL, NULL);

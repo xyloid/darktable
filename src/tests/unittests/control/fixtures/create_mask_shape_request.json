@@ -1,0 +1,1 @@
+{"id":61,"method":"create_mask_shape","params":{"type":"circle","space":"preview","geometry":{"center":[0.62,0.41],"radius":0.10,"border":0.03},"name":null,"attach":{"op":"exposure","instance":0}}}

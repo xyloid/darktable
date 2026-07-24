@@ -38,6 +38,7 @@
 
 #include "control/remote_edit.h"
 #include "control/remote_scopes.h"
+#include "develop/masks.h"
 
 #include <glib.h>
 #include <json-glib/json-glib.h>
@@ -126,6 +127,22 @@ typedef struct dt_remote_protocol_calls_t
   // member. A NULL function pointer (older test call tables) also omits.
   JsonNode *(*blend_schema)(const dt_remote_module_ref_t *ref);
   JsonNode *(*blend_read)(const dt_remote_module_ref_t *ref);
+  // Tier-3 drawn masks (mask_shapes capability). NULL-returning-on-omit is
+  // NOT used here (these are actions, not attach points); a NULL pointer in
+  // a test call table means the method is unavailable.
+  gboolean (*masks_list)(JsonNode **out, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*masks_create)(dt_masks_type_t type, JsonObject *geom, const char *name,
+                           const dt_remote_module_ref_t *attach_ref, const uint64_t *expected_revision,
+                           JsonNode **entry_out, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*masks_update)(dt_mask_id_t id, JsonObject *geom, const char *name,
+                           const uint64_t *expected_revision, JsonNode **entry_out,
+                           int *affects_out, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*masks_delete)(dt_mask_id_t id, const uint64_t *expected_revision,
+                           JsonArray **removed_from_out, uint64_t *revision, dt_remote_error_t **error);
+  gboolean (*masks_attachment)(const dt_remote_module_ref_t *ref, dt_mask_id_t shape_id,
+                               gboolean attached, const char *state, int inverted,
+                               const double *opacity, const uint64_t *expected_revision,
+                               JsonNode **entry_out, uint64_t *revision, dt_remote_error_t **error);
 } dt_remote_protocol_calls_t;
 
 /** overrides the remote-edit call table (test seam only). Pass NULL to

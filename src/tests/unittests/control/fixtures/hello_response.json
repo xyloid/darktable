@@ -15,6 +15,7 @@
       "blend_params",
       "parametric_mask_params",
       "mask_render",
+      "mask_shapes",
       "instances",
       "history",
       "preview",
