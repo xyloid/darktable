@@ -33,6 +33,7 @@
 #include "common/opencl.h"
 #include "common/tags.h"
 #include "common/presets.h"
+#include "common/undo.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "control/jobs.h"
@@ -1530,8 +1531,22 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
 
   dt_pthread_mutex_lock(&dev->history_mutex);
 
-  const gboolean need_end_record =
-    _dev_undo_start_record_target(dev, target);
+  // Forced-new mask snapshots are public undo boundaries, not just distinct
+  // dev->history entries. Bypass target merging and bracket the one signal-
+  // backed undo record so common/undo.c cannot time-coalesce it with an
+  // adjacent forced snapshot. Avoid empty groups when the signal is gated.
+  const gboolean isolate_undo_record =
+    new_item && darktable.undo && dev->gui_attached
+    && dt_view_get_current() == DT_VIEW_DARKROOM
+    && dt_control_running();
+  if(isolate_undo_record)
+    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+
+  gboolean need_end_record = TRUE;
+  if(new_item)
+    dt_dev_undo_start_record(dev);
+  else
+    need_end_record = _dev_undo_start_record_target(dev, target);
 
   if(dev->gui_attached)
     _dev_add_masks_history_item_ext(dev, module, enable, new_item, FALSE);
@@ -1541,6 +1556,8 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
 
   if(need_end_record)
     dt_dev_undo_end_record(dev);
+  if(isolate_undo_record)
+    dt_undo_end_group(darktable.undo);
 
   dt_pthread_mutex_unlock(&dev->history_mutex);
 

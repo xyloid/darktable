@@ -182,6 +182,14 @@ module group, adds the membership, ORs `mask_mode_to_add`, and records the
 second history item. When `preserve_module_enabled` is true, both history
 calls pass the module's existing enabled value instead of `TRUE`.
 
+Each forced-new masks history call is also a production undo boundary:
+it bypasses edited-target suppression and encloses its signal-backed
+`DT_UNDO_HISTORY` record in a singleton undo group, preventing the undo
+manager's adjacent-time coalescing. The group is omitted when the undo
+signal is gated or no undo manager exists, so headless and shutdown paths
+do not create empty groups. Ordinary masks-history calls retain their
+existing target/time merging behavior.
+
 The resulting undo states are:
 
 1. After the remote call: form present, membership present, group and

@@ -26,7 +26,12 @@
 #include <cmocka.h>
 
 #include "common/darktable.h"
+#include "common/undo.h"
+#include "control/control.h"
+#include "control/remote_edit.h"
 #include "control/remote_masks.h"
+#include "control/remote_revision.h"
+#include "control/signal.h"
 #include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -198,9 +203,58 @@ typedef struct blend_fixture_t
   dt_develop_t *saved_global_develop;
   dt_gui_gtk_t *saved_global_gui;
   dt_view_manager_t *saved_view_manager;
+  dt_undo_t *saved_global_undo;
   dt_gui_gtk_t fake_gui;
   dt_view_manager_t fake_view_manager;
+  dt_view_t fake_view;
+  GMainContext *main_context;
+  pthread_t saved_gui_thread;
+  gboolean saved_gui_thread_valid;
+  gint saved_control_running;
+  guint undo_snapshot_records;
 } blend_fixture_t;
+
+typedef struct test_history_undo_t
+{
+  blend_fixture_t *fixture;
+  int history_end;
+} test_history_undo_t;
+
+static uint32_t _test_darkroom_view(const dt_view_t *self)
+{
+  (void)self;
+  return DT_VIEW_DARKROOM;
+}
+
+static void _test_history_undo_pop(gpointer user_data,
+                                   dt_undo_type_t type,
+                                   dt_undo_data_t data,
+                                   dt_undo_action_t action,
+                                   GList **imgs)
+{
+  (void)user_data;
+  (void)action;
+  (void)imgs;
+  assert_int_equal(type, DT_UNDO_HISTORY);
+
+  test_history_undo_t *snapshot = data;
+  const int current_history_end = snapshot->fixture->dev.history_end;
+  dt_dev_pop_history_items_ext(&snapshot->fixture->dev,
+                               snapshot->history_end);
+  snapshot->history_end = current_history_end;
+}
+
+static void _test_history_will_change(gpointer instance,
+                                      blend_fixture_t *fixture)
+{
+  (void)instance;
+  test_history_undo_t *snapshot = g_new(test_history_undo_t, 1);
+  snapshot->fixture = fixture;
+  snapshot->history_end = fixture->dev.history_end;
+  fixture->undo_snapshot_records++;
+  dt_undo_record(darktable.undo, fixture, DT_UNDO_HISTORY, snapshot,
+                 _test_history_undo_pop, g_free);
+}
 
 static dt_iop_module_t *_blend_fixture_add_module(blend_fixture_t *fixture,
                                                   const char *op,
@@ -271,6 +325,7 @@ static int blend_test_setup(void **state)
   fixture->saved_global_develop = darktable.develop;
   fixture->saved_global_gui = darktable.gui;
   fixture->saved_view_manager = darktable.view_manager;
+  fixture->saved_global_undo = darktable.undo;
   darktable.develop = &fixture->dev;
   darktable.gui = &fixture->fake_gui;
   darktable.view_manager = &fixture->fake_view_manager;
@@ -316,6 +371,73 @@ static int blend_history_test_setup(void **state)
   return 0;
 }
 
+static int blend_undo_test_setup(void **state)
+{
+  const int result = blend_history_test_setup(state);
+  if(result != 0) return result;
+
+  blend_fixture_t *fixture = *state;
+  fixture->dev.image_storage.id = 1;
+  fixture->fake_view.view = _test_darkroom_view;
+  g_strlcpy(fixture->fake_view.module_name, "darkroom",
+            sizeof(fixture->fake_view.module_name));
+  fixture->fake_view_manager.current_view = &fixture->fake_view;
+
+  fixture->main_context = g_main_context_default();
+  if(!g_main_context_acquire(fixture->main_context))
+  {
+    blend_test_teardown(state);
+    return -1;
+  }
+  if(darktable.control)
+  {
+    fixture->saved_gui_thread = darktable.control->gui_thread;
+    fixture->saved_gui_thread_valid = TRUE;
+    fixture->saved_control_running =
+      dt_atomic_get_int(&darktable.control->running);
+    darktable.control->gui_thread = pthread_self();
+    dt_atomic_set_int(&darktable.control->running, DT_CONTROL_STATE_RUNNING);
+  }
+
+  darktable.undo = dt_undo_init();
+  dt_remote_revision_test_reset_singleton();
+  dt_remote_revision_connect();
+  DT_CONTROL_SIGNAL_CONNECT(DT_SIGNAL_DEVELOP_HISTORY_WILL_CHANGE,
+                            _test_history_will_change, fixture);
+  return 0;
+}
+
+static int blend_undo_test_teardown(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  if(!fixture) return 0;
+
+  DT_CONTROL_SIGNAL_DISCONNECT(_test_history_will_change, fixture);
+  dt_remote_revision_disconnect();
+  dt_remote_revision_test_reset_singleton();
+
+  dt_undo_t *test_undo = darktable.undo;
+  darktable.undo = fixture->saved_global_undo;
+  if(test_undo)
+  {
+    dt_undo_cleanup(test_undo);
+    free(test_undo);
+  }
+
+  if(fixture->main_context)
+  {
+    g_main_context_release(fixture->main_context);
+    fixture->main_context = NULL;
+  }
+  if(fixture->saved_gui_thread_valid && darktable.control)
+  {
+    darktable.control->gui_thread = fixture->saved_gui_thread;
+    dt_atomic_set_int(&darktable.control->running,
+                      fixture->saved_control_running);
+  }
+  return blend_test_teardown(state);
+}
+
 static JsonObject *_find_shape(JsonArray *shapes, const dt_mask_id_t id)
 {
   for(guint i = 0; i < json_array_get_length(shapes); i++)
@@ -324,6 +446,36 @@ static JsonObject *_find_shape(JsonArray *shapes, const dt_mask_id_t id)
     if(json_object_get_int_member(shape, "id") == id) return shape;
   }
   return NULL;
+}
+
+static void _assert_only_usage(blend_fixture_t *fixture,
+                               const dt_mask_id_t id,
+                               const char *state,
+                               const gboolean inverted,
+                               const double opacity)
+{
+  JsonNode *node = dt_remote_masks_list(&fixture->dev);
+  JsonObject *root = _node_object(node);
+  JsonObject *shape =
+    _find_shape(json_object_get_array_member(root, "shapes"), id);
+  assert_non_null(shape);
+
+  JsonArray *used_by = json_object_get_array_member(shape, "used_by");
+  assert_non_null(used_by);
+  assert_int_equal(json_array_get_length(used_by), 1);
+  JsonObject *usage = json_array_get_object_element(used_by, 0);
+  assert_string_equal(json_object_get_string_member(usage, "op"),
+                      fixture->module->op);
+  assert_int_equal(json_object_get_int_member(usage, "instance"),
+                   fixture->module->multi_priority);
+  JsonArray *states = json_object_get_array_member(usage, "state");
+  assert_int_equal(json_array_get_length(states), 1);
+  assert_string_equal(json_array_get_string_element(states, 0), state);
+  assert_int_equal(json_object_get_boolean_member(usage, "inverted"),
+                   inverted);
+  assert_float_equal(json_object_get_double_member(usage, "opacity"),
+                     opacity, 1e-6);
+  json_node_unref(node);
 }
 
 static dt_masks_form_t *_fixture_add_form(blend_fixture_t *fixture,
@@ -1443,6 +1595,106 @@ static void test_nested_membership_reports_and_updates_owner(void **state)
   json_node_unref(node);
 }
 
+static void test_used_by_metadata_prefers_nested_first_path(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *target =
+    _fixture_add_form(fixture, DT_MASKS_BRUSH, 7411);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7412);
+  _fixture_add_member(inner, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_DIFFERENCE
+                        | DT_MASKS_STATE_INVERSE,
+                      0.21f);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(root, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_EXCLUSION,
+                      0.91f);
+
+  _assert_only_usage(fixture, target->formid, "difference", TRUE, 0.21);
+}
+
+static void test_used_by_metadata_prefers_direct_first_reverse_order(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *target =
+    _fixture_add_form(fixture, DT_MASKS_BRUSH, 7421);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7422);
+  _fixture_add_member(inner, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_DIFFERENCE,
+                      0.82f);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_EXCLUSION
+                        | DT_MASKS_STATE_INVERSE,
+                      0.32f);
+  _fixture_add_member(root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+
+  _assert_only_usage(fixture, target->formid, "exclusion", TRUE, 0.32);
+}
+
+static void test_used_by_duplicate_direct_edges_use_first_metadata(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *target =
+    _fixture_add_form(fixture, DT_MASKS_BRUSH, 7431);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_INTERSECTION
+                        | DT_MASKS_STATE_INVERSE,
+                      0.41f);
+  _fixture_add_member(root, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_EXCLUSION,
+                      0.91f);
+
+  _assert_only_usage(fixture, target->formid, "intersection", TRUE, 0.41);
+}
+
+static void test_used_by_skips_cycle_and_missing_branch_in_order(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *target =
+    _fixture_add_form(fixture, DT_MASKS_BRUSH, 7441);
+  dt_masks_form_t *blocked_branch =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7442);
+  dt_masks_form_t *discoverable_branch =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7443);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+
+  _fixture_add_member(blocked_branch, 99991,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.11f);
+  _fixture_add_member(blocked_branch, root->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.12f);
+  _fixture_add_member(discoverable_branch, target->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_DIFFERENCE
+                        | DT_MASKS_STATE_INVERSE,
+                      0.63f);
+  _fixture_add_member(root, blocked_branch->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.71f);
+  _fixture_add_member(root, discoverable_branch->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.72f);
+
+  _assert_only_usage(fixture, target->formid, "difference", TRUE, 0.63);
+}
+
 static void test_list_null_develop_contract(void **state)
 {
   (void)state;
@@ -2122,6 +2374,104 @@ static void test_remote_create_existing_group_snapshots_are_coherent(
   json_object_unref(geometry);
 }
 
+static void test_remote_create_attached_undo_has_two_real_boundaries(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  fixture->module->blend_params->mask_id = NO_MASKID;
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_CONDITIONAL;
+  const uint32_t mode_before = fixture->module->blend_params->mask_mode;
+
+  // Keep an unrelated edited member visible so both forced-new history calls
+  // present the same non-NULL target to the ordinary target-merging path.
+  dt_masks_form_t *unrelated =
+    _fixture_add_form(fixture, DT_MASKS_BRUSH, 7611);
+  dt_masks_form_t *visible_group =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7612);
+  _fixture_add_member(visible_group, unrelated->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.5f);
+  const dt_mask_id_t unrelated_id = unrelated->formid;
+  const dt_mask_id_t visible_group_id = visible_group->formid;
+
+  // Seed a coherent pre-create forms snapshot without making an empty undo
+  // group: history signals are gated when the current view is not darkroom.
+  fixture->fake_view_manager.current_view = NULL;
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+  const int history_before = fixture->dev.history_end;
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+
+  fixture->dev.form_visible = visible_group;
+  fixture->dev.form_gui->formid = visible_group->formid;
+  fixture->dev.form_gui->group_edited = 0;
+  fixture->fake_view_manager.current_view = &fixture->fake_view;
+  const uint64_t revision_before =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  JsonObject *geometry =
+    _geom("{\"center\":[0.35,0.45],\"radius\":0.12,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t new_id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "two undo boundaries",
+                                     fixture->module, &new_id, &error));
+  assert_null(error);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  const dt_mask_id_t created_group_id =
+    fixture->module->blend_params->mask_id;
+  assert_true(dt_is_valid_maskid(created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   mode_before | DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_false(fixture->module->enabled);
+
+  const uint64_t attached_revision =
+    dt_remote_revision_get(dt_remote_revision_current());
+  fixture->dev.form_visible = NULL;
+  fixture->dev.form_gui->formid = 0;
+
+  // dt_undo_do_undo's GUI cursor wrapper requires a real GTK shell. Setting
+  // this headless fixture's zeroed shell aside leaves the production remote
+  // undo, filter, grouping, and revision fallback paths unchanged.
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  uint64_t unattached_revision = 0;
+  assert_true(dt_remote_undo(attached_revision, &unattached_revision,
+                             &error));
+  darktable.gui = fake_gui;
+  assert_null(error);
+  assert_int_equal(unattached_revision, attached_revision + 1);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, unrelated_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, visible_group_id));
+
+  darktable.gui = NULL;
+  uint64_t absent_revision = 0;
+  assert_true(dt_remote_undo(unattached_revision, &absent_revision,
+                             &error));
+  darktable.gui = fake_gui;
+  assert_null(error);
+  assert_int_equal(absent_revision, unattached_revision + 1);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  assert_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, unrelated_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, visible_group_id));
+
+  assert_int_equal(attached_revision, revision_before + 2);
+  assert_int_equal(fixture->undo_snapshot_records, 2);
+  json_object_unref(geometry);
+}
+
 static void test_remote_create_unattached_has_one_history_item(void **state)
 {
   blend_fixture_t *fixture = *state;
@@ -2405,6 +2755,18 @@ int main(void)
     cmocka_unit_test_setup_teardown(
       test_nested_membership_reports_and_updates_owner,
       blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_used_by_metadata_prefers_nested_first_path,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_used_by_metadata_prefers_direct_first_reverse_order,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_used_by_duplicate_direct_edges_use_first_metadata,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_used_by_skips_cycle_and_missing_branch_in_order,
+      blend_test_setup, blend_test_teardown),
     cmocka_unit_test(test_list_null_develop_contract),
     cmocka_unit_test_setup_teardown(
       test_guard_cancels_direct_target,
@@ -2466,6 +2828,9 @@ int main(void)
     cmocka_unit_test_setup_teardown(
       test_remote_create_existing_group_snapshots_are_coherent,
       blend_history_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_remote_create_attached_undo_has_two_real_boundaries,
+      blend_undo_test_setup, blend_undo_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_remote_create_unattached_has_one_history_item,
       blend_history_test_setup, blend_test_teardown),

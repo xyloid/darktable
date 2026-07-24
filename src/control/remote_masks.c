@@ -866,12 +866,6 @@ static const dt_masks_point_group_t *_find_membership(
   {
     const dt_masks_point_group_t *member = points->data;
     if(member && member->formid == id) return member;
-  }
-  for(GList *points = group->points;
-      points;
-      points = g_list_next(points))
-  {
-    const dt_masks_point_group_t *member = points->data;
     const dt_masks_form_t *child =
       member ? dt_masks_get_from_id(dev, member->formid) : NULL;
     const dt_masks_point_group_t *found =

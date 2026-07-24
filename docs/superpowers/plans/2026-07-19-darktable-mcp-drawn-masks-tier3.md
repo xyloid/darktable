@@ -1431,12 +1431,6 @@ static const dt_masks_point_group_t *_find_membership(
   {
     const dt_masks_point_group_t *member = points->data;
     if(member && member->formid == id) return member;
-  }
-  for(GList *points = group->points;
-      points;
-      points = g_list_next(points))
-  {
-    const dt_masks_point_group_t *member = points->data;
     const dt_masks_form_t *child =
       member ? dt_masks_get_from_id(dev, member->formid) : NULL;
     const dt_masks_point_group_t *found =
@@ -1447,8 +1441,8 @@ static const dt_masks_point_group_t *_find_membership(
 }
 
 // Walk every blending module whose base group transitively contains id.
-// _find_membership is cycle-safe and returns the target's nearest edge
-// on the first depth-first path.
+// _find_membership is cycle-safe and returns the target edge reached first
+// by ordered DFS (test an edge, then recurse before advancing).
 static void _append_used_by(dt_develop_t *dev, dt_mask_id_t id, JsonArray *out)
 {
   for(GList *iops = dev->iop; iops; iops = g_list_next(iops))

@@ -17,7 +17,10 @@
 - All new graph traversal must terminate for missing children, duplicate paths, and malformed cycles.
 - A retired form leaves `dev->forms` and enters `dev->allforms` exactly once; never free it immediately.
 - Remote create, update, and delete must preserve `dt_iop_module_t.enabled`.
-- Create-with-attachment must produce two distinct masks-history entries: unattached form first, coherent attachment second.
+- Create-with-attachment must produce two distinct masks-history and
+  production undo entries: unattached form first, coherent attachment
+  second. Each forced-new entry bypasses target suppression and has an
+  explicit no-coalesce undo boundary.
 - Full delete must produce one global masks-history entry plus one entry per module base group retired by its cascade.
 - The only bit cleared when a module loses its final drawn-mask group is `DEVELOP_MASK_MASK`.
 - Test each behavior through a failing test before changing production code.
@@ -261,8 +264,19 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
   }
 
   dt_pthread_mutex_lock(&dev->history_mutex);
-  const gboolean need_end_record =
-    _dev_undo_start_record_target(dev, target);
+
+  const gboolean isolate_undo_record =
+    new_item && darktable.undo && dev->gui_attached
+    && dt_view_get_current() == DT_VIEW_DARKROOM
+    && dt_control_running();
+  if(isolate_undo_record)
+    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+
+  gboolean need_end_record = TRUE;
+  if(new_item)
+    dt_dev_undo_start_record(dev);
+  else
+    need_end_record = _dev_undo_start_record_target(dev, target);
 
   if(dev->gui_attached)
     _dev_add_masks_history_item_ext(dev, module, enable, new_item, FALSE);
@@ -272,6 +286,8 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
 
   if(need_end_record)
     dt_dev_undo_end_record(dev);
+  if(isolate_undo_record)
+    dt_undo_end_group(darktable.undo);
 
   dt_pthread_mutex_unlock(&dev->history_mutex);
 
@@ -1455,12 +1471,6 @@ static const dt_masks_point_group_t *_find_membership(
   {
     const dt_masks_point_group_t *member = points->data;
     if(member && member->formid == id) return member;
-  }
-  for(GList *points = group->points;
-      points;
-      points = g_list_next(points))
-  {
-    const dt_masks_point_group_t *member = points->data;
     const dt_masks_form_t *child =
       member ? dt_masks_get_from_id(dev, member->formid) : NULL;
     const dt_masks_point_group_t *found =
@@ -1514,8 +1524,10 @@ static void _append_used_by(dt_develop_t *dev,
 }
 ```
 
-This emits at most one entry per module, using the target form's nearest
-membership edge on the first depth-first path. That edge supplies state,
+This emits at most one entry per module, using the target edge reached
+first by an ordered depth-first traversal. For each membership in list
+order, the walk tests that edge and then recurses immediately before
+advancing to its next sibling. The selected target edge supplies state,
 inversion, and opacity; outer-group composition remains engine-internal.
 
 - [ ] **Step 8: Replace shallow update and delete ownership**
@@ -1956,9 +1968,9 @@ Make these statements explicit:
   module state; the second contains the membership and the
   `ENABLED|MASK` mode addition. Both preserve `module->enabled`.
 - Nested `used_by` is flattened to one entry per referencing module.
-  State, inversion, and opacity come from the target form's nearest
-  membership edge on the first depth-first path from that module's base
-  group.
+  State, inversion, and opacity come from the target edge reached first by
+  an ordered depth-first traversal from that module's base group: test
+  each membership and recurse immediately before advancing.
 ```
 
 Remove the statements that the legacy helper is already sufficient for

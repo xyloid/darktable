@@ -72,9 +72,11 @@ All verified 2026-07-19:
   creation reaches it through `dt_masks_gui_form_save_creation_ext`, and
   full delete records its module and global entries with it. Legacy and
   compatibility paths retain `dt_dev_add_masks_history_item`. Both route
-  through the shared masks-history wrapper, raise
-  `DEVELOP_HISTORY_CHANGE`, and remain covered by remote `undo`
-  (`DT_UNDO_DEVELOP` ⊇ `DT_UNDO_MASK`).
+  through the shared masks-history wrapper and remain covered by remote
+  `undo` (`DT_UNDO_DEVELOP` ⊇ `DT_UNDO_HISTORY`). Each forced-new call
+  bypasses edited-target suppression and places its signal-backed record
+  in its own history undo group, so adjacent forced snapshots cannot
+  time-coalesce; ordinary masks-history calls keep their existing merging.
 - Shape geometry structs: circle `{center[2], radius, border}`; ellipse
   `{center[2], radius[2], rotation, border, flags}` with flags
   `EQUIDISTANT|PROPORTIONAL`; gradient `{anchor[2], rotation,
@@ -144,9 +146,10 @@ Response:
 ```
 
 - Nested `used_by` is flattened to one entry per referencing module.
-  State, inversion, and opacity come from the target form's nearest
-  membership edge on the first depth-first path from that module's base
-  group.
+  State, inversion, and opacity come from the target edge reached first by
+  an ordered depth-first traversal from that module's base group: for each
+  membership in list order, test the target and then recurse immediately
+  before advancing to the next membership.
 - Group forms themselves are **not** listed as shapes; they are
   represented through `used_by`. (Decision 4 below.)
 - Deferred-type forms present in the edit (paths, brushes, clones) are
@@ -321,7 +324,8 @@ explicit creation options and `dt_masks_gui_form_save_creation_ext`, plus
   reverts one history item; undoing a `create_mask_shape`+attach takes
   two undo calls (the GUI has the same layered behavior). The reference
   documents this per method ("this call produces N history items").
-  Batching into one undo record is explicitly out of v1 scope.
+  Each forced-new item has its own no-coalesce undo boundary; batching
+  the two items into one undo record is explicitly out of v1 scope.
 - `get_history` already lists mask items (they are ordinary history
   entries via the mask_manager/module); no change.
 
