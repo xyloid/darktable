@@ -1185,3 +1185,95 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev,
   g_ptr_array_unref(references);
   return TRUE;
 }
+
+gboolean dt_remote_masks_set_attachment(
+  dt_develop_t *dev,
+  dt_iop_module_t *module,
+  const dt_mask_id_t shape_id,
+  const gboolean attached,
+  const char *state_or_null,
+  const int inverted,
+  const double *opacity_or_null,
+  dt_remote_error_t **error)
+{
+  if(!dev)
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "no develop context", NULL, NULL);
+  if(!_module_accepts_drawn_masks(module))
+    return _operation_error(error, DT_REMOTE_ERR_UNSUPPORTED_FIELD,
+                            "module does not support drawn masks",
+                            "op", "masks_unsupported");
+
+  dt_masks_form_t *form = dt_masks_get_from_id(dev, shape_id);
+  if(!form)
+    return _operation_error(error, DT_REMOTE_ERR_NOT_FOUND,
+                            "no mask shape with that id", "shape_id", NULL);
+
+  if(!attached)
+  {
+    dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, module->blend_params->mask_id);
+    if(!dt_masks_group_get_direct_member(group, shape_id)) return TRUE;
+    // Do not cancel a live edit for an idempotent no-op.  Once a direct edge
+    // is known to exist, the target guard reaches any visible containing
+    // group transitively before the edge is removed.
+    dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
+    if(!dt_masks_module_remove_direct_mask_member(dev, module, shape_id))
+      return TRUE;
+    dt_dev_add_masks_history_item(dev, module, module->enabled);
+    return TRUE;
+  }
+
+  if(module->blend_params->mask_mode & DEVELOP_MASK_RASTER)
+    return _operation_error(error, DT_REMOTE_ERR_INVALID_VALUE,
+                            "module has a raster mask",
+                            "op", "raster_unsupported");
+
+  int op_bit = DT_MASKS_STATE_UNION;
+  if(state_or_null
+     && !dt_remote_masks_state_op_from_string(state_or_null, &op_bit))
+    return _operation_error(
+      error, DT_REMOTE_ERR_INVALID_VALUE, "bad combine state", "state",
+      !g_strcmp0(state_or_null, "sum") ? "sum_is_brush_only" : "unknown_state");
+  if(opacity_or_null && !isfinite(*opacity_or_null))
+    return _operation_error(error, DT_REMOTE_ERR_INVALID_VALUE,
+                            "opacity must be finite", "opacity", "not_finite");
+
+  dt_masks_form_t *group =
+    dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
+  if(group) dt_remote_masks_cancel_gui_edit_if_targeting(dev, group);
+  if(!group)
+  {
+    const dt_masks_type_t group_type =
+      form->type & (DT_MASKS_CLONE | DT_MASKS_NON_CLONE)
+        ? DT_MASKS_GROUP | DT_MASKS_CLONE : DT_MASKS_GROUP;
+    group = dt_masks_group_create_for_module(dev, module, group_type);
+  }
+  if(!(group->type & DT_MASKS_GROUP))
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "module mask id is not a group", NULL, NULL);
+
+  dt_masks_point_group_t *member =
+    dt_masks_group_get_direct_member(group, shape_id);
+  if(!member)
+  {
+    member = dt_masks_group_add_form(group, form);
+    if(!member)
+      return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                              "failed to attach mask shape", NULL, NULL);
+  }
+
+  const gboolean is_first = group->points && group->points->data == member;
+  member->state = (member->state & ~DT_MASKS_STATE_OP)
+                  | DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW;
+  if(!is_first) member->state |= op_bit;
+  if(inverted == 1) member->state |= DT_MASKS_STATE_INVERSE;
+  else if(inverted == 0) member->state &= ~DT_MASKS_STATE_INVERSE;
+  if(opacity_or_null)
+    member->opacity = (float)CLAMP(*opacity_or_null, 0.0, 1.0);
+
+  module->blend_params->mask_mode |= DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  dt_dev_add_masks_history_item(dev, module, module->enabled);
+  return TRUE;
+}

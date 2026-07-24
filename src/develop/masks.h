@@ -653,6 +653,14 @@ void dt_masks_group_ungroup(dt_masks_form_t *dest_grp, dt_masks_form_t *grp);
 void dt_masks_group_update_name(dt_iop_module_t *module);
 dt_masks_point_group_t *dt_masks_group_add_form(dt_masks_form_t *grp,
                                                 const dt_masks_form_t *form);
+/** Return a direct membership edge only; does not traverse nested groups. */
+dt_masks_point_group_t *dt_masks_group_get_direct_member(
+  dt_masks_form_t *group, dt_mask_id_t formid);
+/** Remove direct membership edge(s) from a module's base group.  Returns
+ * FALSE without mutation when the base group or edge is absent.  An emptied
+ * base group is retired into dev->allforms; callers own history recording. */
+gboolean dt_masks_module_remove_direct_mask_member(
+  dt_develop_t *dev, struct dt_iop_module_t *module, dt_mask_id_t formid);
 gboolean dt_masks_group_contains_form(const dt_develop_t *dev,
                                       const dt_masks_form_t *group,
                                       dt_mask_id_t formid);

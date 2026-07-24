@@ -3414,6 +3414,263 @@ static void test_remote_create_unattached_has_one_history_item(void **state)
   json_object_unref(geometry);
 }
 
+static int _attachment_no_masks_flags(void)
+{
+  return IOP_FLAGS_SUPPORTS_BLENDING | IOP_FLAGS_NO_MASKS;
+}
+
+static void test_attachment_upsert_sets_member_state_and_cleans_stale_ops(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *first =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8101);
+  dt_masks_form_t *second =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8102);
+  dt_remote_error_t *error = NULL;
+  const double first_opacity = 0.2;
+  const double second_opacity = 0.8;
+
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             first->formid, TRUE, "difference",
+                                             1, &first_opacity, &error));
+  assert_null(error);
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             second->formid, TRUE, "union", 0,
+                                             &second_opacity, &error));
+  assert_null(error);
+  dt_masks_form_t *group = dt_masks_get_from_id(
+    &fixture->dev, fixture->module->blend_params->mask_id);
+  assert_non_null(group);
+  dt_masks_point_group_t *first_member = group->points->data;
+  dt_masks_point_group_t *second_member = group->points->next->data;
+  assert_int_equal(first_member->state & DT_MASKS_STATE_OP, 0);
+  assert_true(first_member->state & DT_MASKS_STATE_INVERSE);
+  assert_float_equal(first_member->opacity, first_opacity, 1e-6);
+  assert_int_equal(second_member->state & DT_MASKS_STATE_OP,
+                   DT_MASKS_STATE_UNION);
+
+  second_member->state |= DT_MASKS_STATE_SUM | DT_MASKS_STATE_DIFFERENCE
+                          | DT_MASKS_STATE_EXCLUSION | DT_MASKS_STATE_INVERSE;
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             first->formid, TRUE, "union", 0,
+                                             NULL, &error));
+  assert_null(error);
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             second->formid, TRUE,
+                                             "intersection", 0, NULL, &error));
+  assert_null(error);
+  assert_int_equal(first_member->state & DT_MASKS_STATE_OP, 0);
+  assert_false(first_member->state & DT_MASKS_STATE_INVERSE);
+  assert_int_equal(second_member->state & DT_MASKS_STATE_OP,
+                   DT_MASKS_STATE_INTERSECTION);
+  assert_false(second_member->state & DT_MASKS_STATE_INVERSE);
+  assert_true(fixture->module->blend_params->mask_mode & DEVELOP_MASK_ENABLED);
+  assert_true(fixture->module->blend_params->mask_mode & DEVELOP_MASK_MASK);
+}
+
+static void test_attachment_detach_last_member_preserves_shape_and_history(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  fixture->module->blend_params->mask_mode =
+    DEVELOP_MASK_RASTER | DEVELOP_MASK_CONDITIONAL | DEVELOP_MASK_MASK;
+  dt_masks_form_t *shape =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8111);
+  dt_masks_form_t *group = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(group, shape->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.5f);
+  const int history_before = fixture->dev.history_end;
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, FALSE, NULL, -1,
+                                             NULL, &error));
+  assert_null(error);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   DEVELOP_MASK_RASTER | DEVELOP_MASK_CONDITIONAL);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape->formid));
+  assert_null(dt_masks_get_from_id(&fixture->dev, group->formid));
+  assert_int_equal(_list_pointer_count(fixture->dev.allforms, group), 1);
+}
+
+static void test_attachment_attach_preserves_disabled_module_and_history(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_CONDITIONAL;
+  dt_masks_form_t *shape =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8112);
+  const int history_before = fixture->dev.history_end;
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, TRUE, "union", 0,
+                                             NULL, &error));
+  assert_null(error);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK
+                     | DEVELOP_MASK_CONDITIONAL);
+}
+
+static void test_attachment_detach_is_direct_idempotent_and_keeps_shared_shape(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_iop_module_t *other = _blend_fixture_add_module(fixture, "exposure", 1);
+  dt_masks_form_t *shape =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8121);
+  dt_remote_error_t *error = NULL;
+  const int history_before = fixture->dev.history_end;
+  fixture->dev.form_visible = shape;
+  fixture->dev.form_gui->formid = shape->formid;
+
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, FALSE, NULL, -1,
+                                             NULL, &error));
+  assert_null(error);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  assert_ptr_equal(fixture->dev.form_visible, shape);
+  assert_int_equal(fixture->dev.form_gui->formid, shape->formid);
+  fixture->dev.form_visible = NULL;
+  fixture->dev.form_gui->formid = 0;
+
+  dt_masks_form_t *nested =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 8122);
+  _fixture_add_member(nested, shape->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.4f);
+  dt_masks_form_t *base = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(base, nested->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.4f);
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, FALSE, NULL, -1,
+                                             NULL, &error));
+  assert_null(error);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  assert_true(dt_masks_group_contains_form(&fixture->dev, base, shape->formid));
+
+  dt_masks_form_t *other_group = dt_masks_group_create_for_module(
+    &fixture->dev, other, DT_MASKS_GROUP);
+  _fixture_add_member(other_group, shape->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.4f);
+  _fixture_add_member(base, shape->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.4f);
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, FALSE, NULL, -1,
+                                             NULL, &error));
+  assert_null(error);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape->formid));
+  assert_null(dt_masks_group_get_direct_member(base, shape->formid));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, base, shape->formid));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, other_group,
+                                           shape->formid));
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+}
+
+static void test_attachment_attach_cancels_visible_group_and_clone_detaches(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *group = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  dt_masks_form_t *shape = _fixture_add_form(
+    fixture, DT_MASKS_CIRCLE | DT_MASKS_CLONE, 8131);
+  fixture->dev.form_visible = group;
+  fixture->dev.form_gui->formid = group->formid;
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, TRUE, "union", 0,
+                                             NULL, &error));
+  assert_null(error);
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  fixture->dev.form_visible = group;
+  fixture->dev.form_gui->formid = group->formid;
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, TRUE, "union", 0,
+                                             NULL, &error));
+  assert_null(error);
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, FALSE, NULL, -1,
+                                             NULL, &error));
+  assert_null(error);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape->formid));
+}
+
+static void test_attachment_rejects_invalid_targets_and_validates_opacity(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *shape =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 8141);
+  dt_remote_error_t *error = NULL;
+  int (*saved_flags)(void) = fixture->module->flags;
+  fixture->module->flags = _attachment_no_masks_flags;
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              shape->formid, TRUE, "union", 0,
+                                              NULL, &error));
+  _assert_error(&error, DT_REMOTE_ERR_UNSUPPORTED_FIELD, "op",
+                "masks_unsupported");
+  fixture->module->flags = saved_flags;
+
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              99999, TRUE, "union", 0, NULL,
+                                              &error));
+  _assert_error(&error, DT_REMOTE_ERR_NOT_FOUND, "shape_id", NULL);
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_RASTER;
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              shape->formid, TRUE, "union", 0,
+                                              NULL, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "op",
+                "raster_unsupported");
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_DISABLED;
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              shape->formid, TRUE, "sum", 0,
+                                              NULL, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "state",
+                "sum_is_brush_only");
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              shape->formid, TRUE, "invalid", 0,
+                                              NULL, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "state",
+                "unknown_state");
+  const double nonfinite = NAN;
+  assert_false(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                              shape->formid, TRUE, "union", 0,
+                                              &nonfinite, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "opacity", "not_finite");
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+
+  const double clamped = 2.0;
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, TRUE, "union", 0,
+                                             &clamped, &error));
+  assert_null(error);
+  dt_masks_form_t *group = dt_masks_get_from_id(
+    &fixture->dev, fixture->module->blend_params->mask_id);
+  assert_float_equal(((dt_masks_point_group_t *)group->points->data)->opacity,
+                     1.0, 1e-6);
+  const double clamped_low = -2.0;
+  assert_true(dt_remote_masks_set_attachment(&fixture->dev, fixture->module,
+                                             shape->formid, TRUE, "union", 0,
+                                             &clamped_low, &error));
+  assert_null(error);
+  assert_float_equal(((dt_masks_point_group_t *)group->points->data)->opacity,
+                     0.0, 1e-6);
+}
+
 static void test_remote_update_has_one_history_item(void **state)
 {
   blend_fixture_t *fixture = *state;
@@ -3733,6 +3990,24 @@ int main(void)
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_create_rejects_raster_attach_without_mutation,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_upsert_sets_member_state_and_cleans_stale_ops,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_detach_last_member_preserves_shape_and_history,
+      blend_history_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_attach_preserves_disabled_module_and_history,
+      blend_history_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_detach_is_direct_idempotent_and_keeps_shared_shape,
+      blend_history_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_attach_cancels_visible_group_and_clone_detaches,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_attachment_rejects_invalid_targets_and_validates_opacity,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_update_replaces_atomically_and_reports_users,

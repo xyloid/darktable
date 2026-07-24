@@ -2092,6 +2092,36 @@ void dt_masks_form_remove(dt_iop_module_t *module,
   if(form_removed) dt_dev_add_masks_history_item(darktable.develop, module, TRUE);
 }
 
+dt_masks_point_group_t *dt_masks_group_get_direct_member(
+  dt_masks_form_t *group, const dt_mask_id_t formid)
+{
+  if(!group || !(group->type & DT_MASKS_GROUP)) return NULL;
+  for(GList *points = group->points; points; points = g_list_next(points))
+  {
+    dt_masks_point_group_t *member = points->data;
+    if(member && member->formid == formid) return member;
+  }
+  return NULL;
+}
+
+gboolean dt_masks_module_remove_direct_mask_member(
+  dt_develop_t *dev, dt_iop_module_t *module, const dt_mask_id_t formid)
+{
+  if(!dev || !module || !module->blend_params) return FALSE;
+  dt_masks_form_t *group =
+    dt_masks_get_from_id(dev, module->blend_params->mask_id);
+  if(!group || !_remove_id_from_group(group, formid)) return FALSE;
+
+  if(!group->points)
+  {
+    module->blend_params->mask_id = NO_MASKID;
+    module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+    _retire_form(dev, group);
+  }
+  dt_masks_iop_update(module);
+  return TRUE;
+}
+
 float dt_masks_form_change_opacity(dt_masks_form_t *form,
                                    const dt_mask_id_t parentid,
                                    const float amount)

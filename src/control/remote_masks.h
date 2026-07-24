@@ -131,4 +131,16 @@ gboolean dt_remote_masks_delete(struct dt_develop_t *dev,
                                 JsonArray *removed_from_out,
                                 dt_remote_error_t **error);
 
+/** Attach or detach one shape directly to/from a module's base group.
+ * `state_or_null` defaults to union, `inverted` is -1 to leave unchanged,
+ * and `opacity_or_null` leaves opacity unchanged. */
+gboolean dt_remote_masks_set_attachment(struct dt_develop_t *dev,
+                                        struct dt_iop_module_t *module,
+                                        dt_mask_id_t shape_id,
+                                        gboolean attached,
+                                        const char *state_or_null,
+                                        int inverted,
+                                        const double *opacity_or_null,
+                                        dt_remote_error_t **error);
+
 G_END_DECLS
