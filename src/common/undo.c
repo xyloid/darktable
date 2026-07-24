@@ -49,7 +49,7 @@ dt_undo_t *dt_undo_init(void)
   dt_undo_t *udata = malloc(sizeof(dt_undo_t));
   udata->undo_list = NULL;
   udata->redo_list = NULL;
-  udata->disable_next = FALSE;
+  udata->disable_next_owners = NULL;
 
   pthread_mutexattr_t recursive_locking;
   pthread_mutexattr_init(&recursive_locking);
@@ -72,11 +72,37 @@ dt_undo_t *dt_undo_init(void)
 #define LOCK    dt_pthread_mutex_lock(&self->mutex);
 #define UNLOCK  dt_pthread_mutex_unlock(&self->mutex)
 
+static GList *_undo_disable_next_owner_link(dt_undo_t *self,
+                                            const pthread_t thread)
+{
+  for(GList *owners = self->disable_next_owners;
+      owners;
+      owners = g_list_next(owners))
+  {
+    const pthread_t *owner = owners->data;
+    if(pthread_equal(*owner, thread)) return owners;
+  }
+  return NULL;
+}
+
+static void _undo_clear_disable_next(dt_undo_t *self)
+{
+  g_list_free_full(self->disable_next_owners, free);
+  self->disable_next_owners = NULL;
+}
+
 void dt_undo_disable_next(dt_undo_t *self)
 {
   if(!self) return;
   LOCK;
-  self->disable_next = TRUE;
+  const pthread_t thread = pthread_self();
+  if(!_undo_disable_next_owner_link(self, thread))
+  {
+    pthread_t *owner = malloc(sizeof(*owner));
+    *owner = thread;
+    self->disable_next_owners =
+      g_list_prepend(self->disable_next_owners, owner);
+  }
   dt_print(DT_DEBUG_UNDO, "[undo] disable next");
   UNLOCK;
 }
@@ -144,27 +170,36 @@ static dt_undo_item_t *_undo_push_group(dt_undo_t *self,
   return _undo_push_item(self, NULL, type, NULL, TRUE, NULL, NULL);
 }
 
+static void _undo_seal_group_segment(dt_undo_t *self,
+                                     const dt_undo_type_t type,
+                                     gpointer *group_start)
+{
+  dt_undo_item_t *start = *group_start;
+  if(!start) return;
+
+  GList *start_link = g_list_find(self->undo_list, start);
+  if(start_link && start_link == self->undo_list)
+  {
+    self->undo_list =
+      g_list_delete_link(self->undo_list, start_link);
+    _free_undo_data(start);
+  }
+  else if(start_link)
+    _undo_push_group(self, type);
+
+  // A missing marker is not owned by undo_list (for example, an older
+  // traversal moved it to redo). Never free through a stale pointer; the
+  // list that still owns the marker handles cleanup.
+  *group_start = NULL;
+}
+
 static void _undo_commit_isolated_group(dt_undo_t *self)
 {
   assert(self->isolated_group_active);
   assert(!self->isolated_group_committed);
 
-  dt_undo_item_t *ambient_start =
-    self->isolated_saved_group_start;
-  if(ambient_start)
-  {
-    GList *start_link = g_list_find(self->undo_list, ambient_start);
-    assert(start_link);
-    if(start_link == self->undo_list)
-    {
-      self->undo_list =
-        g_list_delete_link(self->undo_list, start_link);
-      _free_undo_data(ambient_start);
-    }
-    else
-      _undo_push_group(self, self->isolated_saved_group);
-    self->isolated_saved_group_start = NULL;
-  }
+  _undo_seal_group_segment(self, self->isolated_saved_group,
+                           &self->isolated_saved_group_start);
 
   self->coalesce_epoch++;
   self->group_start = _undo_push_group(self, self->group);
@@ -186,10 +221,14 @@ static void _undo_record(dt_undo_t *self,
 
   LOCK;
 
-  if(self->disable_next)
+  GList *disable_owner =
+    _undo_disable_next_owner_link(self, pthread_self());
+  if(disable_owner)
   {
+    free(disable_owner->data);
+    self->disable_next_owners =
+      g_list_delete_link(self->disable_next_owners, disable_owner);
     if(free_data) free_data(data);
-    self->disable_next = FALSE;
     dt_print(DT_DEBUG_UNDO, "[undo] record for type %d, disable next",
              type);
     UNLOCK;
@@ -336,6 +375,12 @@ static void _undo_do_undo_redo(dt_undo_t *self,
     UNLOCK;
     return;
   }
+
+  // An active ordinary group may span a long background job. Close only
+  // its current list segment before traversal; keep the logical group open
+  // and start a new segment lazily if that job records again.
+  if(self->group != DT_UNDO_NONE)
+    _undo_seal_group_segment(self, self->group, &self->group_start);
 
   // we take/remove item from the FROM list and add them into the TO list:
   GList **from = action == DT_ACTION_UNDO ? &self->undo_list : &self->redo_list;
@@ -488,12 +533,15 @@ void dt_undo_clear(dt_undo_t *self, uint32_t filter)
     UNLOCK;
     return;
   }
+  _undo_clear_disable_next(self);
   _undo_clear_list(&self->undo_list, filter);
   _undo_clear_list(&self->redo_list, filter);
   self->undo_list = NULL;
   self->redo_list = NULL;
   self->group_start = NULL;
-  self->disable_next = FALSE;
+  // Preserve clear's reset contract even if a recursive free callback armed
+  // a fresh token while the lists were being released.
+  _undo_clear_disable_next(self);
   UNLOCK;
 }
 

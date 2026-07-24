@@ -2491,6 +2491,7 @@ typedef struct test_counter_undo_t
 {
   int *value;
   int *free_count;
+  dt_undo_type_t type;
 } test_counter_undo_t;
 
 typedef struct test_undo_trylock_t
@@ -2527,8 +2528,8 @@ static void _test_counter_undo_pop(gpointer user_data,
 {
   (void)user_data;
   (void)imgs;
-  assert_int_equal(type, DT_UNDO_HISTORY);
   test_counter_undo_t *record = data;
+  assert_int_equal(type, record->type);
   if(action == DT_ACTION_UNDO)
     (*record->value)--;
   else
@@ -2542,14 +2543,58 @@ static void _test_counter_undo_free(gpointer data)
   g_free(record);
 }
 
-static void _record_counter_undo(int *value, int *free_count)
+static void _record_counter_undo_type(const dt_undo_type_t type,
+                                      int *value,
+                                      int *free_count)
 {
   test_counter_undo_t *record = g_new(test_counter_undo_t, 1);
   record->value = value;
   record->free_count = free_count;
+  record->type = type;
   (*value)++;
-  dt_undo_record(darktable.undo, NULL, DT_UNDO_HISTORY, record,
+  dt_undo_record(darktable.undo, NULL, type, record,
                  _test_counter_undo_pop, _test_counter_undo_free);
+}
+
+static void _record_counter_undo(int *value, int *free_count)
+{
+  _record_counter_undo_type(DT_UNDO_HISTORY, value, free_count);
+}
+
+typedef struct test_disable_next_thread_t
+{
+  GMutex mutex;
+  GCond cond;
+  gboolean suppression_armed;
+  gboolean record_allowed;
+  dt_undo_type_t type;
+  int value;
+  int free_count;
+} test_disable_next_thread_t;
+
+typedef struct test_group_segment_counters_t
+{
+  int prefix_value;
+  int isolated_value;
+  int suffix_value;
+  int free_count;
+} test_group_segment_counters_t;
+
+static void *_test_disable_next_worker(void *user_data)
+{
+  test_disable_next_thread_t *worker = user_data;
+  dt_undo_disable_next(darktable.undo);
+
+  g_mutex_lock(&worker->mutex);
+  worker->suppression_armed = TRUE;
+  g_cond_signal(&worker->cond);
+  while(!worker->record_allowed)
+    g_cond_wait(&worker->cond, &worker->mutex);
+  g_mutex_unlock(&worker->mutex);
+
+  _record_counter_undo_type(worker->type,
+                            &worker->value, &worker->free_count);
+  return NULL;
 }
 
 static void test_isolated_undo_scope_has_no_empty_or_stale_state(
@@ -2656,6 +2701,267 @@ static void test_isolated_undo_scope_has_no_empty_or_stale_state(
   assert_int_equal(value, 2);
   dt_undo_clear(darktable.undo, DT_UNDO_ALL);
   assert_int_equal(free_count, 7);
+}
+
+static void test_public_undo_seals_open_group_before_isolated_record(
+  void **state)
+{
+  (void)state;
+  test_group_segment_counters_t *counters =
+    g_new0(test_group_segment_counters_t, 1);
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+
+  // Public traversal discards an empty physical segment while leaving the
+  // logical ambient group open for a future lazy segment.
+  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+  assert_int_equal(darktable.undo->group, DT_UNDO_DUPLICATE);
+  assert_int_equal(darktable.undo->group_indent, 1);
+  assert_null(darktable.undo->group_start);
+  dt_undo_end_group(darktable.undo);
+
+  dt_undo_start_group(darktable.undo, DT_UNDO_DUPLICATE);
+  _record_counter_undo_type(DT_UNDO_DUPLICATE,
+                            &counters->prefix_value,
+                            &counters->free_count);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->prefix_value, 0);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 3);
+  assert_int_equal(darktable.undo->group, DT_UNDO_DUPLICATE);
+  assert_int_equal(darktable.undo->group_indent, 1);
+  assert_null(darktable.undo->group_start);
+
+  // Redo can traverse the sealed prefix while the logical group remains
+  // active. Undo it again so the next accepted record invalidates that redo.
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->prefix_value, 1);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 3);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+  assert_null(darktable.undo->group_start);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->prefix_value, 0);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 3);
+  assert_null(darktable.undo->group_start);
+
+  // Recording after an undo invalidates the redo segment. The isolated
+  // record must not dereference the ambient segment marker that undo moved.
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  _record_counter_undo(&counters->isolated_value,
+                       &counters->free_count);
+  dt_undo_end_isolated_group(darktable.undo);
+  _record_counter_undo_type(DT_UNDO_DUPLICATE,
+                            &counters->suffix_value,
+                            &counters->free_count);
+  dt_undo_end_group(darktable.undo);
+
+  assert_int_equal(counters->prefix_value, 0);
+  assert_int_equal(counters->isolated_value, 1);
+  assert_int_equal(counters->suffix_value, 1);
+  assert_int_equal(counters->free_count, 1);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 6);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+  assert_int_equal(darktable.undo->group, DT_UNDO_NONE);
+  assert_int_equal(darktable.undo->group_indent, 0);
+  assert_null(darktable.undo->group_start);
+
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->suffix_value, 0);
+  assert_int_equal(counters->isolated_value, 1);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->isolated_value, 0);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 6);
+
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->isolated_value, 1);
+  assert_int_equal(counters->suffix_value, 0);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(counters->suffix_value, 1);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 6);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  darktable.gui = fake_gui;
+  const int final_free_count = counters->free_count;
+  g_free(counters);
+  assert_int_equal(final_free_count, 3);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+}
+
+static void test_disable_next_is_consumed_only_by_arming_thread(
+  void **state)
+{
+  (void)state;
+  test_disable_next_thread_t worker = {
+    .type = DT_UNDO_LT_HISTORY
+  };
+  int main_value = 0;
+  int main_free_count = 0;
+  g_mutex_init(&worker.mutex);
+  g_cond_init(&worker.cond);
+
+  pthread_t thread;
+  assert_int_equal(dt_pthread_create(&thread, _test_disable_next_worker,
+                                     &worker), 0);
+  g_mutex_lock(&worker.mutex);
+  while(!worker.suppression_armed)
+    g_cond_wait(&worker.cond, &worker.mutex);
+  g_mutex_unlock(&worker.mutex);
+
+  // A different thread's isolated record must neither consume the worker's
+  // suppression nor leave an empty isolated scope.
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  _record_counter_undo(&main_value, &main_free_count);
+  dt_undo_end_isolated_group(darktable.undo);
+
+  g_mutex_lock(&worker.mutex);
+  worker.record_allowed = TRUE;
+  g_cond_signal(&worker.cond);
+  g_mutex_unlock(&worker.mutex);
+  assert_int_equal(dt_pthread_join(thread), 0);
+
+  const int recorded_main_value = main_value;
+  const int freed_main_records = main_free_count;
+  const int worker_value = worker.value;
+  const int freed_worker_records = worker.free_count;
+  const int undo_length = g_list_length(darktable.undo->undo_list);
+  const int redo_length = g_list_length(darktable.undo->redo_list);
+  const uint64_t coalesce_epoch = darktable.undo->coalesce_epoch;
+  const gboolean isolated_active = darktable.undo->isolated_group_active;
+  const gboolean isolated_committed =
+    darktable.undo->isolated_group_committed;
+
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  const int main_value_after_undo = main_value;
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  darktable.gui = fake_gui;
+  const int main_value_after_redo = main_value;
+
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  const int final_main_free_count = main_free_count;
+  const int final_worker_free_count = worker.free_count;
+
+  // An explicit clear still cancels a same-thread pending suppression.
+  int after_clear_value = 0;
+  int after_clear_free_count = 0;
+  dt_undo_disable_next(darktable.undo);
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  _record_counter_undo(&after_clear_value, &after_clear_free_count);
+  const int after_clear_undo_length =
+    g_list_length(darktable.undo->undo_list);
+  const int after_clear_pre_cleanup_free_count = after_clear_free_count;
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  const int after_clear_final_free_count = after_clear_free_count;
+
+  // Two pending worker tokens must coexist rather than letting the second
+  // armer replace the first.
+  test_disable_next_thread_t first = {
+    .type = DT_UNDO_HISTORY
+  };
+  test_disable_next_thread_t second = {
+    .type = DT_UNDO_LT_HISTORY
+  };
+  g_mutex_init(&first.mutex);
+  g_cond_init(&first.cond);
+  g_mutex_init(&second.mutex);
+  g_cond_init(&second.cond);
+
+  pthread_t first_thread;
+  const int first_create_result =
+    dt_pthread_create(&first_thread, _test_disable_next_worker, &first);
+  if(first_create_result == 0)
+  {
+    g_mutex_lock(&first.mutex);
+    while(!first.suppression_armed)
+      g_cond_wait(&first.cond, &first.mutex);
+    g_mutex_unlock(&first.mutex);
+  }
+
+  pthread_t second_thread;
+  const int second_create_result =
+    dt_pthread_create(&second_thread, _test_disable_next_worker, &second);
+  if(second_create_result == 0)
+  {
+    g_mutex_lock(&second.mutex);
+    while(!second.suppression_armed)
+      g_cond_wait(&second.cond, &second.mutex);
+    g_mutex_unlock(&second.mutex);
+  }
+
+  g_mutex_lock(&first.mutex);
+  first.record_allowed = TRUE;
+  g_cond_signal(&first.cond);
+  g_mutex_unlock(&first.mutex);
+  g_mutex_lock(&second.mutex);
+  second.record_allowed = TRUE;
+  g_cond_signal(&second.cond);
+  g_mutex_unlock(&second.mutex);
+
+  int first_join_result = first_create_result;
+  if(first_create_result == 0)
+    first_join_result = dt_pthread_join(first_thread);
+  int second_join_result = second_create_result;
+  if(second_create_result == 0)
+    second_join_result = dt_pthread_join(second_thread);
+
+  const int first_value = first.value;
+  const int second_value = second.value;
+  const int first_free_count = first.free_count;
+  const int second_free_count = second.free_count;
+  const int concurrent_undo_length =
+    g_list_length(darktable.undo->undo_list);
+  const int concurrent_redo_length =
+    g_list_length(darktable.undo->redo_list);
+
+  // Keep failure teardown safe: any incorrectly accepted record still
+  // points into these live stack fixtures when clear releases it.
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  const int first_final_free_count = first.free_count;
+  const int second_final_free_count = second.free_count;
+
+  g_cond_clear(&worker.cond);
+  g_mutex_clear(&worker.mutex);
+  g_cond_clear(&first.cond);
+  g_mutex_clear(&first.mutex);
+  g_cond_clear(&second.cond);
+  g_mutex_clear(&second.mutex);
+
+  assert_int_equal(recorded_main_value, 1);
+  assert_int_equal(freed_main_records, 0);
+  assert_int_equal(worker_value, 1);
+  assert_int_equal(freed_worker_records, 1);
+  assert_int_equal(undo_length, 3);
+  assert_int_equal(redo_length, 0);
+  assert_int_equal(coalesce_epoch, 2);
+  assert_false(isolated_active);
+  assert_false(isolated_committed);
+  assert_int_equal(main_value_after_undo, 0);
+  assert_int_equal(main_value_after_redo, 1);
+  assert_int_equal(final_main_free_count, 1);
+  assert_int_equal(final_worker_free_count, 1);
+  assert_int_equal(after_clear_undo_length, 1);
+  assert_int_equal(after_clear_pre_cleanup_free_count, 0);
+  assert_int_equal(after_clear_final_free_count, 1);
+  assert_int_equal(first_create_result, 0);
+  assert_int_equal(second_create_result, 0);
+  assert_int_equal(first_join_result, 0);
+  assert_int_equal(second_join_result, 0);
+  assert_int_equal(first_value, 1);
+  assert_int_equal(second_value, 1);
+  assert_int_equal(first_free_count, 1);
+  assert_int_equal(second_free_count, 1);
+  assert_int_equal(concurrent_undo_length, 0);
+  assert_int_equal(concurrent_redo_length, 0);
+  assert_int_equal(first_final_free_count, 1);
+  assert_int_equal(second_final_free_count, 1);
 }
 
 static void test_remote_create_attached_undo_isolated_from_newer_history(
@@ -3451,6 +3757,12 @@ int main(void)
       blend_undo_test_setup, blend_undo_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_isolated_undo_scope_has_no_empty_or_stale_state,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_disable_next_is_consumed_only_by_arming_thread,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_public_undo_seals_open_group_before_isolated_record,
       blend_undo_test_setup, blend_undo_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_remote_create_attached_undo_isolated_from_newer_history,

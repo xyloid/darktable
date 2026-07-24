@@ -67,13 +67,15 @@ typedef struct dt_undo_t
   int isolated_saved_group_indent;
   gpointer isolated_saved_group_start;
   dt_pthread_mutex_t mutex;
-  gboolean disable_next;
+  GList *disable_next_owners;
 } dt_undo_t;
 
 dt_undo_t *dt_undo_init(void);
 void dt_undo_cleanup(dt_undo_t *self);
 
-// create a group of item to be handled together, a group
+// Create a group of items to be handled together. Public undo/redo seals
+// the current physical segment without ending the logical group; its next
+// accepted record starts a new segment lazily.
 void dt_undo_start_group(dt_undo_t *self,
                          const dt_undo_type_t type);
 void dt_undo_end_group(dt_undo_t *self);
@@ -123,8 +125,10 @@ void dt_undo_iterate(dt_undo_t *self,
                                    const dt_undo_type_t type,
                                    const dt_undo_data_t item));
 
-// disable the next data record, this is to avoid recording when reverting
-// a value (in undo callbacks). Structural group markers are unaffected.
+// Disable the next data record made by the calling thread. This avoids
+// recording when reverting a value in an undo callback without suppressing
+// an interleaved record from another thread. Structural markers are
+// unaffected, and clear cancels a pending suppression.
 void dt_undo_disable_next(dt_undo_t *self);
 
 // clang-format off

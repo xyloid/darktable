@@ -21,6 +21,10 @@
   production undo entries: unattached form first, coherent attachment
   second. Each forced-new entry bypasses target suppression and has an
   explicit no-coalesce undo boundary.
+- Public undo/redo seals the current physical segment of a long-lived
+  ordinary group without ending its logical depth; later accepted records
+  resume lazily. One-shot record suppression is consumed only by the thread
+  that armed it and is cancelled by clear.
 - Full delete must produce one global masks-history entry plus one entry
   per unique module whose base group is retired by its cascade.
 - The only bit cleared when a module loses its final drawn-mask group is `DEVELOP_MASK_MASK`.
@@ -1935,10 +1939,10 @@ caller was deliberately not migrated by the Task 5 remediation.
 | `src/develop/masks/gradient.c:371` right-click removal | `module, parent group, form` | detach gradient | yes | GUI gesture and history coalescing are intentional behavior | retain until GUI interaction tests exist | Review later |
 | `src/develop/masks/brush.c:1726` permanent removal | `module, NULL, form` | permanently delete brush | yes | shallow incoming-reference cleanup and unowned unlink need review | candidate for `dt_masks_form_remove_shape_full` after clone/brush semantics are pinned | Review later |
 | `src/develop/masks/brush.c:1789` parent removal | `module, parent group, form` | detach brush | yes | empty-group recursion and GUI history must remain stable | retain pending GUI tests | Review later |
-| `src/develop/masks/masks.c:1547` module mask reset | `module, NULL, base group` | drop all forms from one module | yes | clone groups cascade into hidden children | keep legacy until group-deletion semantics receive a separate design | Review later |
-| `src/develop/masks/masks.c:1852` empty-parent recursion | `module, NULL, group` | retire an emptied parent | yes | ownership leak is known; changing it alters every detach path | migrate as part of a dedicated legacy-removal project | Review later |
-| `src/develop/masks/masks.c:1866` clone-child recursion | `module, clone group, child` | remove inaccessible clone children | yes | clone ownership differs from ordinary drawn forms | retain legacy clone semantics | Review later |
-| `src/develop/masks/masks.c:1911` empty module-group recursion | `module, NULL, base group` | retire an empty module group | yes | history enable and ownership need broad regression coverage | migrate with the parent-recursion caller | Review later |
+| `src/develop/masks/masks.c:1583` module mask reset | `module, NULL, base group` | drop all forms from one module | yes | clone groups cascade into hidden children | keep legacy until group-deletion semantics receive a separate design | Review later |
+| `src/develop/masks/masks.c:2016` empty-parent recursion | `module, NULL, group` | retire an emptied parent | yes | ownership leak is known; changing it alters every detach path | migrate as part of a dedicated legacy-removal project | Review later |
+| `src/develop/masks/masks.c:2030` clone-child recursion | `module, clone group, child` | remove inaccessible clone children | yes | clone ownership differs from ordinary drawn forms | retain legacy clone semantics | Review later |
+| `src/develop/masks/masks.c:2075` empty module-group recursion | `module, NULL, base group` | retire an empty module group | yes | history enable and ownership need broad regression coverage | migrate with the parent-recursion caller | Review later |
 | `src/develop/imageop.c:2326` module reset | `module, NULL, base group` | remove masks during parameter reset | yes | reset ordering and history differ from remote shape deletion | migrate only with imageop reset tests | Review later |
 | `src/develop/masks/path.c:2289` permanent removal | `module, NULL, form` | permanently delete path | yes | shallow incoming-reference cleanup and unowned unlink need review | candidate for the new full-delete API after path/clone flags are covered | Review later |
 | `src/develop/masks/path.c:2361` parent removal | `module, parent group, form` | detach path | yes | GUI list removal occurs immediately before the core call | retain until list/selection ordering is tested | Review later |
@@ -2016,7 +2020,7 @@ the new full-delete call.
 Append these rows:
 
 ```markdown
-| `src/common/undo.h` / `undo.c` | paired recording guard plus lazy mutex-held isolated groups with two-sided coalescing epochs and ambient split/resume | isolated-scope + public create undo/redo tests |
+| `src/common/undo.h` / `undo.c` | paired recording guard plus lazy mutex-held isolated groups with two-sided coalescing epochs, public-traversal segment sealing, and thread-owned one-shot suppression | isolated/open-group/cross-thread + public create undo/redo tests |
 | `src/develop/develop.h` / `develop.c` | additive `dt_dev_add_new_masks_history_item`, hard-isolated target-bypass records, and explicit in-memory empty-forms history sentinel; persisted empty replay is inferred only for `mask_manager`, while the pre-existing arbitrary non-manager limitation remains out of scope | forced-new + create two-step + empty-delete undo tests |
 | `src/develop/masks.h` / `masks.c` | additive cycle-safe graph queries, staged ownership-aware full deletion, explicit creation options, and extended creation helper; legacy removal retained | nested/cycle/shared-owner/full-delete prefix tests + `MASKS_REMOVE_CALLER_AUDIT` |
 ```

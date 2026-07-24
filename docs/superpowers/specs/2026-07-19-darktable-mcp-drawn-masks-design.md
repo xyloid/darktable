@@ -78,7 +78,10 @@ All verified 2026-07-19:
   in a lazy isolated undo scope. Two-sided coalescing epochs prevent both
   older and newer ordinary records from crossing it; an active outer group
   is split into nonempty segments and resumed only by the next real record.
-  Ordinary masks-history calls keep their existing merging.
+  Public undo/redo seals an open ordinary segment before traversal while
+  keeping the logical group active, and one-shot record suppression belongs
+  to its arming thread. Ordinary masks-history calls keep their existing
+  merging.
 - Shape geometry structs: circle `{center[2], radius, border}`; ellipse
   `{center[2], radius[2], rotation, border, flags}` with flags
   `EQUIDISTANT|PROPORTIONAL`; gradient `{anchor[2], rotation,

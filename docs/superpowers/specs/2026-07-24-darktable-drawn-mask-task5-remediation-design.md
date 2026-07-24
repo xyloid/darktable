@@ -196,6 +196,16 @@ only on the next accepted record. Gated or disabled records therefore
 leave no empty group, stale one-shot state, or redo invalidation. Ordinary
 masks-history calls retain their existing target/time merging behavior.
 
+Public undo or redo can also run while a long-lived ordinary group remains
+logically open. Before traversal, the undo core discards an empty physical
+segment or closes a nonempty one, clears its active-marker alias, and leaves
+the group depth intact. A later accepted record opens a new segment lazily;
+the group mutex is not retained across the background operation. Saved
+ambient markers are treated defensively if they are no longer in the undo
+list. `dt_undo_disable_next` is likewise a one-shot token for the thread
+that armed it: interleaved records from other threads do not consume it,
+and an explicit clear cancels it.
+
 In-memory mask history items explicitly distinguish “no forms snapshot”
 from an explicit empty forms snapshot via `forms_history`. The
 `masks_history` table has no row for an empty list, so reload infers that
