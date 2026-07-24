@@ -1466,35 +1466,41 @@ void dt_dev_add_new_history_item(dt_develop_t *dev,
   _dev_add_history_item(dev, module, enable, TRUE, NULL);
 }
 
-void dt_dev_add_masks_history_item_ext(dt_develop_t *dev,
-                                       dt_iop_module_t *_module,
-                                       const gboolean _enable,
-                                       const gboolean no_image)
+static void _dev_add_masks_history_item_ext(dt_develop_t *dev,
+                                            dt_iop_module_t *module,
+                                            gboolean enable,
+                                            const gboolean new_item,
+                                            const gboolean no_image)
 {
-  dt_iop_module_t *module = _module;
-  gboolean enable = _enable;
-
-  // no module means that is called from the mask manager, so find the iop
   if(module == NULL)
   {
-    for(GList *modules = dev->iop; modules; modules = g_list_next(modules))
+    for(GList *modules = dev->iop;
+        modules;
+        modules = g_list_next(modules))
     {
-      dt_iop_module_t *mod = modules->data;
-      if(dt_iop_module_is(mod, "mask_manager"))
+      dt_iop_module_t *candidate = modules->data;
+      if(dt_iop_module_is(candidate, "mask_manager"))
       {
-        module = mod;
+        module = candidate;
         break;
       }
     }
     enable = FALSE;
   }
   if(module)
-  {
-    _dev_add_history_item_ext(dev, module, enable, FALSE, no_image, TRUE, TRUE);
-  }
+    _dev_add_history_item_ext(dev, module, enable, new_item, no_image,
+                              TRUE, TRUE);
   else
     dt_print(DT_DEBUG_ALWAYS,
              "[dt_dev_add_masks_history_item_ext] can't find mask manager module");
+}
+
+void dt_dev_add_masks_history_item_ext(dt_develop_t *dev,
+                                       dt_iop_module_t *module,
+                                       const gboolean enable,
+                                       const gboolean no_image)
+{
+  _dev_add_masks_history_item_ext(dev, module, enable, FALSE, no_image);
 }
 
 void dt_dev_pipe_synch_all(dt_develop_t *dev)
@@ -1507,9 +1513,10 @@ void dt_dev_pipe_synch_all(dt_develop_t *dev)
     dev->preview2.pipe->changed |= DT_DEV_PIPE_SYNCH;
 }
 
-void dt_dev_add_masks_history_item(dt_develop_t *dev,
-                                   dt_iop_module_t *module,
-                                   const gboolean enable)
+static void _dev_add_masks_history_item(dt_develop_t *dev,
+                                        dt_iop_module_t *module,
+                                        const gboolean enable,
+                                        const gboolean new_item)
 {
   gpointer target = NULL;
 
@@ -1527,11 +1534,8 @@ void dt_dev_add_masks_history_item(dt_develop_t *dev,
     _dev_undo_start_record_target(dev, target);
 
   if(dev->gui_attached)
-  {
-    dt_dev_add_masks_history_item_ext(dev, module, enable, FALSE);
-  }
+    _dev_add_masks_history_item_ext(dev, module, enable, new_item, FALSE);
 
-  // invalidate buffers and force redraw of darkroom
   dt_dev_pipe_synch_all(dev);
   dt_dev_invalidate_all(dev);
 
@@ -1542,12 +1546,23 @@ void dt_dev_add_masks_history_item(dt_develop_t *dev,
 
   if(dev->gui_attached)
   {
-    /* recreate mask list */
     dt_dev_masks_list_change(dev);
-
-    /* redraw */
     dt_control_queue_redraw_center();
   }
+}
+
+void dt_dev_add_masks_history_item(dt_develop_t *dev,
+                                   dt_iop_module_t *module,
+                                   const gboolean enable)
+{
+  _dev_add_masks_history_item(dev, module, enable, FALSE);
+}
+
+void dt_dev_add_new_masks_history_item(dt_develop_t *dev,
+                                       dt_iop_module_t *module,
+                                       const gboolean enable)
+{
+  _dev_add_masks_history_item(dev, module, enable, TRUE);
 }
 
 void dt_dev_free_history_item(gpointer data)

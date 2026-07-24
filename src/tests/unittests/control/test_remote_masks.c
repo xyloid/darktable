@@ -202,6 +202,39 @@ typedef struct blend_fixture_t
   dt_view_manager_t fake_view_manager;
 } blend_fixture_t;
 
+static dt_iop_module_t *_blend_fixture_add_module(blend_fixture_t *fixture,
+                                                  const char *op,
+                                                  const int priority)
+{
+  dt_iop_module_t *module = g_malloc0(sizeof(dt_iop_module_t));
+  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
+  assert_non_null(so);
+  assert_false(dt_iop_load_module(module, so, &fixture->dev));
+  memcpy(module->params, module->default_params, module->params_size);
+  module->multi_priority = priority;
+  fixture->dev.iop = g_list_append(fixture->dev.iop, module);
+  return module;
+}
+
+static void _blend_fixture_enable_history(blend_fixture_t *fixture)
+{
+  gboolean has_mask_manager = FALSE;
+  for(GList *modules = fixture->dev.iop;
+      modules;
+      modules = g_list_next(modules))
+  {
+    const dt_iop_module_t *module = modules->data;
+    if(dt_iop_module_is(module, "mask_manager"))
+    {
+      has_mask_manager = TRUE;
+      break;
+    }
+  }
+  if(!has_mask_manager)
+    _blend_fixture_add_module(fixture, "mask_manager", 0);
+  fixture->dev.gui_attached = TRUE;
+}
+
 static blend_fixture_t *blend_fixture_new(const char *op)
 {
   blend_fixture_t *fixture = g_new0(blend_fixture_t, 1);
@@ -221,15 +254,7 @@ static blend_fixture_t *blend_fixture_new(const char *op)
   fixture->dev.image_storage.width = 1000;
   fixture->dev.image_storage.height = 1000;
 
-  fixture->module = g_malloc0(sizeof(dt_iop_module_t));
-  dt_iop_module_so_t *so = dt_iop_get_module_so(op);
-  assert_non_null(so);
-  assert_false(
-    dt_iop_load_module(fixture->module, so, &fixture->dev));
-  memcpy(fixture->module->params, fixture->module->default_params,
-         fixture->module->params_size);
-  fixture->dev.iop =
-    g_list_append(fixture->dev.iop, fixture->module);
+  fixture->module = _blend_fixture_add_module(fixture, op, 0);
   return fixture;
 }
 
@@ -1535,6 +1560,58 @@ static void test_delete_rejects_engine_managed_group_id(void **state)
   json_object_unref(geometry);
 }
 
+static void test_new_mask_history_forces_distinct_snapshots(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  _blend_fixture_enable_history(fixture);
+  const int before = fixture->dev.history_end;
+
+  dt_masks_form_t *first = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(first);
+  first->formid = 7101;
+  fixture->dev.forms = g_list_append(fixture->dev.forms, first);
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+
+  dt_masks_form_t *second = dt_masks_create(DT_MASKS_ELLIPSE);
+  assert_non_null(second);
+  second->formid = 7102;
+  fixture->dev.forms = g_list_append(fixture->dev.forms, second);
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+
+  assert_int_equal(fixture->dev.history_end, before + 2);
+  const dt_dev_history_item_t *first_hist =
+    g_list_nth_data(fixture->dev.history, before);
+  const dt_dev_history_item_t *second_hist =
+    g_list_nth_data(fixture->dev.history, before + 1);
+  assert_non_null(first_hist);
+  assert_non_null(second_hist);
+  assert_int_equal(g_list_length(first_hist->forms), 1);
+  assert_int_equal(g_list_length(second_hist->forms), 2);
+}
+
+static void test_new_mask_history_resolves_global_mask_manager(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  _blend_fixture_enable_history(fixture);
+  const int before = fixture->dev.history_end;
+
+  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
+  assert_non_null(form);
+  form->formid = 7103;
+  fixture->dev.forms = g_list_append(fixture->dev.forms, form);
+  dt_dev_add_new_masks_history_item(&fixture->dev, NULL, FALSE);
+
+  assert_int_equal(fixture->dev.history_end, before + 1);
+  const dt_dev_history_item_t *hist =
+    g_list_nth_data(fixture->dev.history, before);
+  assert_non_null(hist);
+  assert_true(dt_iop_module_is(hist->module, "mask_manager"));
+  assert_false(hist->enabled);
+  assert_int_equal(g_list_length(hist->forms), 1);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -1620,6 +1697,12 @@ int main(void)
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_delete_rejects_engine_managed_group_id,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_new_mask_history_forces_distinct_snapshots,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_new_mask_history_resolves_global_mask_manager,
       blend_test_setup, blend_test_teardown),
   };
   return cmocka_run_group_tests(tests, harness_group_setup,

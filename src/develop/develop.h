@@ -411,6 +411,9 @@ void dt_dev_add_masks_history_item_ext(dt_develop_t *dev,
 void dt_dev_add_masks_history_item(dt_develop_t *dev,
                                    struct dt_iop_module_t *_module,
                                    const gboolean enable);
+void dt_dev_add_new_masks_history_item(dt_develop_t *dev,
+                                       struct dt_iop_module_t *_module,
+                                       const gboolean enable);
 void dt_dev_reload_history_items(dt_develop_t *dev);
 void dt_dev_pop_history_items_ext(dt_develop_t *dev, const int32_t cnt);
 void dt_dev_pop_history_items(dt_develop_t *dev, const int32_t cnt);
