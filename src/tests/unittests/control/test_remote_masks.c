@@ -1372,6 +1372,69 @@ static void test_list_reports_complete_shapes_and_membership(void **state)
   json_node_unref(node);
 }
 
+static void test_nested_membership_reports_and_updates_owner(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->multi_priority = 6;
+  dt_masks_form_t *circle =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7401);
+  dt_masks_point_circle_t *point =
+    g_malloc0(sizeof(dt_masks_point_circle_t));
+  *point = (dt_masks_point_circle_t){
+    .center = { 0.5f, 0.5f },
+    .radius = 0.1f,
+    .border = 0.02f,
+  };
+  circle->points = g_list_append(circle->points, point);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7402);
+  _fixture_add_member(inner, circle->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_DIFFERENCE
+                        | DT_MASKS_STATE_INVERSE,
+                      0.42f);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+
+  JsonNode *node = dt_remote_masks_list(&fixture->dev);
+  JsonObject *root_object = _node_object(node);
+  JsonArray *shapes =
+    json_object_get_array_member(root_object, "shapes");
+  JsonObject *listed = _find_shape(shapes, circle->formid);
+  assert_non_null(listed);
+  JsonArray *used_by = json_object_get_array_member(listed, "used_by");
+  assert_int_equal(json_array_get_length(used_by), 1);
+  JsonObject *usage = json_array_get_object_element(used_by, 0);
+  assert_string_equal(json_object_get_string_member(usage, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(usage, "instance"), 6);
+  JsonArray *state_array =
+    json_object_get_array_member(usage, "state");
+  assert_string_equal(json_array_get_string_element(state_array, 0),
+                      "difference");
+  assert_true(json_object_get_boolean_member(usage, "inverted"));
+  assert_float_equal(json_object_get_double_member(usage, "opacity"),
+                     0.42, 1e-6);
+
+  JsonObject *replacement =
+    _geom("{\"center\":[0.2,0.3],\"radius\":0.15,\"border\":0.02}");
+  int affects = -1;
+  dt_remote_error_t *error = NULL;
+  fixture->dev.form_visible = root;
+  fixture->dev.form_gui->formid = root->formid;
+  assert_true(dt_remote_masks_update(&fixture->dev, circle->formid,
+                                     replacement, NULL, &affects,
+                                     &error));
+  assert_null(error);
+  assert_int_equal(affects, 1);
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  json_object_unref(replacement);
+  json_node_unref(node);
+}
+
 static void test_list_null_develop_contract(void **state)
 {
   (void)state;
@@ -1401,17 +1464,11 @@ static void test_guard_cancels_group_targeting_member(void **state)
   blend_fixture_t *fixture = *state;
   assert_non_null(fixture->dev.form_gui);
 
-  dt_masks_form_t *form = dt_masks_create(DT_MASKS_CIRCLE);
-  dt_masks_form_t *group = dt_masks_create(DT_MASKS_GROUP);
-  assert_non_null(form);
-  assert_non_null(group);
-  form->formid = 303;
-  group->formid = 404;
-  dt_masks_point_group_t *member =
-    g_malloc0(sizeof(dt_masks_point_group_t));
-  member->formid = form->formid;
-  member->parentid = group->formid;
-  group->points = g_list_append(group->points, member);
+  dt_masks_form_t *form =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 303);
+  dt_masks_form_t *group =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 404);
+  _fixture_add_member(group, form->formid, 0, 0.0f);
   fixture->dev.form_visible = group;
   fixture->dev.form_gui->formid = group->formid;
 
@@ -1419,8 +1476,28 @@ static void test_guard_cancels_group_targeting_member(void **state)
 
   assert_null(fixture->dev.form_visible);
   assert_int_equal(fixture->dev.form_gui->formid, 0);
-  dt_masks_free_form(group);
-  dt_masks_free_form(form);
+}
+
+static void test_guard_cancels_transitive_group_target(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7501);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7502);
+  dt_masks_form_t *outer =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7503);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(outer, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  fixture->dev.form_visible = outer;
+  fixture->dev.form_gui->formid = outer->formid;
+
+  dt_remote_masks_cancel_gui_edit_if_targeting(&fixture->dev, leaf);
+
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
 }
 
 static void test_guard_leaves_unrelated_edit_untouched(void **state)
@@ -1701,6 +1778,28 @@ static void test_create_attached_sets_group_and_mask_mode(void **state)
   json_object_unref(geometry);
 }
 
+static void test_create_attached_cancels_visible_existing_group(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *group = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  fixture->dev.form_visible = group;
+  fixture->dev.form_gui->formid = group->formid;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "guarded",
+                                     fixture->module, &id, &error));
+  assert_null(error);
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  assert_true(dt_masks_group_contains_form(&fixture->dev, group, id));
+  json_object_unref(geometry);
+}
+
 static void test_create_rejects_overlong_name_without_mutation(void **state)
 {
   blend_fixture_t *fixture = *state;
@@ -1849,14 +1948,8 @@ static void test_delete_removes_membership_and_clears_only_drawn_bit(void **stat
   assert_non_null(group);
 
   JsonArray *removed_from = json_array_new();
-  // dt_masks_form_remove() invokes the normal GUI history helper when it
-  // removes the now-empty module group. In this headless fixture, mark the
-  // call as a GUI update so that helper skips tag/thumbtable side effects;
-  // the masks-history path under test still runs.
-  DT_ENTER_GUI_UPDATE();
   const gboolean deleted =
     dt_remote_masks_delete(&fixture->dev, id, removed_from, &error);
-  DT_LEAVE_GUI_UPDATE();
   assert_true(deleted);
   assert_null(error);
   assert_null(dt_masks_get_from_id(&fixture->dev, id));
@@ -1876,8 +1969,51 @@ static void test_delete_removes_membership_and_clears_only_drawn_bit(void **stat
 
   json_array_unref(removed_from);
   json_object_unref(geometry);
-  dt_masks_free_form(group);
-  dt_masks_free_form(form);
+}
+
+static void test_remote_delete_nested_leaf_keeps_sibling(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->multi_priority = 7;
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7511);
+  dt_masks_form_t *sibling =
+    _fixture_add_form(fixture, DT_MASKS_ELLIPSE, 7512);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7513);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.6f);
+  _fixture_add_member(inner, sibling->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_UNION,
+                      0.8f);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  fixture->dev.form_visible = root;
+  fixture->dev.form_gui->formid = root->formid;
+  JsonArray *removed_from = json_array_new();
+  dt_remote_error_t *error = NULL;
+
+  assert_true(dt_remote_masks_delete(&fixture->dev, leaf->formid,
+                                     removed_from, &error));
+  assert_null(error);
+  assert_int_equal(json_array_get_length(removed_from), 1);
+  JsonObject *removed =
+    json_array_get_object_element(removed_from, 0);
+  assert_string_equal(json_object_get_string_member(removed, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(removed, "instance"), 7);
+  assert_null(fixture->dev.form_visible);
+  assert_int_equal(fixture->dev.form_gui->formid, 0);
+  assert_null(dt_masks_get_from_id(&fixture->dev, leaf->formid));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, root,
+                                           sibling->formid));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, root,
+                                            leaf->formid));
+  assert_int_equal(_list_pointer_count(fixture->dev.allforms, leaf), 1);
+  json_array_unref(removed_from);
 }
 
 static void test_delete_unknown_id_is_not_found(void **state)
@@ -2040,12 +2176,18 @@ int main(void)
     cmocka_unit_test_setup_teardown(
       test_list_reports_complete_shapes_and_membership,
       blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_nested_membership_reports_and_updates_owner,
+      blend_test_setup, blend_test_teardown),
     cmocka_unit_test(test_list_null_develop_contract),
     cmocka_unit_test_setup_teardown(
       test_guard_cancels_direct_target,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_guard_cancels_group_targeting_member,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_guard_cancels_transitive_group_target,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_guard_leaves_unrelated_edit_untouched,
@@ -2069,6 +2211,9 @@ int main(void)
       test_create_attached_sets_group_and_mask_mode,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
+      test_create_attached_cancels_visible_existing_group,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
       test_create_rejects_overlong_name_without_mutation,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
@@ -2085,6 +2230,9 @@ int main(void)
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_delete_removes_membership_and_clears_only_drawn_bit,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_remote_delete_nested_leaf_keeps_sibling,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_delete_unknown_id_is_not_found,

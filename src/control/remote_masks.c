@@ -850,6 +850,37 @@ gboolean dt_remote_masks_state_op_from_string(const char *s,
   return TRUE;
 }
 
+static const dt_masks_point_group_t *_find_membership(
+  const dt_develop_t *dev,
+  const dt_masks_form_t *group,
+  const dt_mask_id_t id,
+  GHashTable *visited)
+{
+  if(!dev || !group || !(group->type & DT_MASKS_GROUP)) return NULL;
+  if(g_hash_table_contains(visited, group)) return NULL;
+  g_hash_table_add(visited, (gpointer)group);
+
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    if(member && member->formid == id) return member;
+  }
+  for(GList *points = group->points;
+      points;
+      points = g_list_next(points))
+  {
+    const dt_masks_point_group_t *member = points->data;
+    const dt_masks_form_t *child =
+      member ? dt_masks_get_from_id(dev, member->formid) : NULL;
+    const dt_masks_point_group_t *found =
+      child ? _find_membership(dev, child, id, visited) : NULL;
+    if(found) return found;
+  }
+  return NULL;
+}
+
 static void _append_used_by(dt_develop_t *dev,
                             const dt_mask_id_t id,
                             JsonArray *out)
@@ -861,31 +892,31 @@ static void _append_used_by(dt_develop_t *dev,
        || !(module->flags() & IOP_FLAGS_SUPPORTS_BLENDING))
       continue;
 
-    dt_masks_form_t *group =
+    const dt_masks_form_t *group =
       dt_masks_get_from_id(dev, module->blend_params->mask_id);
-    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
+    if(!group || !dt_masks_group_contains_form(dev, group, id))
+      continue;
 
-    for(GList *points = group->points;
-        points;
-        points = g_list_next(points))
-    {
-      const dt_masks_point_group_t *member = points->data;
-      if(!member || member->formid != id) continue;
+    GHashTable *visited =
+      g_hash_table_new(g_direct_hash, g_direct_equal);
+    const dt_masks_point_group_t *member =
+      _find_membership(dev, group, id, visited);
+    g_hash_table_unref(visited);
+    if(!member) continue;
 
-      JsonObject *usage = json_object_new();
-      json_object_set_string_member(usage, "op", module->op);
-      json_object_set_int_member(usage, "instance",
-                                 module->multi_priority);
-      JsonArray *state = json_array_new();
-      json_array_add_string_element(
-        state, dt_remote_masks_state_op_string(member->state));
-      json_object_set_array_member(usage, "state", state);
-      json_object_set_boolean_member(
-        usage, "inverted",
-        (member->state & DT_MASKS_STATE_INVERSE) != 0);
-      json_object_set_double_member(usage, "opacity", member->opacity);
-      json_array_add_object_element(out, usage);
-    }
+    JsonObject *usage = json_object_new();
+    json_object_set_string_member(usage, "op", module->op);
+    json_object_set_int_member(usage, "instance",
+                               module->multi_priority);
+    JsonArray *state = json_array_new();
+    json_array_add_string_element(
+      state, dt_remote_masks_state_op_string(member->state));
+    json_object_set_array_member(usage, "state", state);
+    json_object_set_boolean_member(
+      usage, "inverted",
+      (member->state & DT_MASKS_STATE_INVERSE) != 0);
+    json_object_set_double_member(usage, "opacity", member->opacity);
+    json_array_add_object_element(out, usage);
   }
 }
 
@@ -992,24 +1023,9 @@ void dt_remote_masks_cancel_gui_edit_if_targeting(dt_develop_t *dev,
 
   const gboolean hit =
     visible->formid == form->formid
-    || (dev->form_gui && dev->form_gui->formid == form->formid);
-  gboolean group_hit = FALSE;
-  if(!hit && (visible->type & DT_MASKS_GROUP))
-  {
-    for(GList *points = visible->points;
-        points;
-        points = g_list_next(points))
-    {
-      const dt_masks_point_group_t *member = points->data;
-      if(member && member->formid == form->formid)
-      {
-        group_hit = TRUE;
-        break;
-      }
-    }
-  }
-
-  if(hit || group_hit) dt_masks_change_form_gui(NULL);
+    || (dev->form_gui && dev->form_gui->formid == form->formid)
+    || dt_masks_group_contains_form(dev, visible, form->formid);
+  if(hit) dt_masks_change_form_gui(NULL);
 }
 
 gboolean dt_remote_masks_create(dt_develop_t *dev,
@@ -1067,6 +1083,13 @@ gboolean dt_remote_masks_create(dt_develop_t *dev,
     .mask_mode_to_add =
       attach_module ? DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK : 0,
   };
+  if(attach_module)
+  {
+    dt_masks_form_t *group =
+      dt_masks_get_from_id(dev, attach_module->blend_params->mask_id);
+    if(group)
+      dt_remote_masks_cancel_gui_edit_if_targeting(dev, group);
+  }
   dt_masks_gui_form_save_creation_ext(dev, attach_module, form, NULL,
                                       &options);
   if(new_id_out) *new_id_out = form->formid;
@@ -1118,44 +1141,12 @@ gboolean dt_remote_masks_update(dt_develop_t *dev,
   if(name_or_null && *name_or_null)
     g_strlcpy(form->name, name_or_null, sizeof(form->name));
 
-  int affects = 0;
-  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
-  {
-    dt_iop_module_t *module = iops->data;
-    if(!_module_accepts_drawn_masks(module)) continue;
-    dt_masks_form_t *group =
-      dt_masks_get_from_id(dev, module->blend_params->mask_id);
-    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
-    for(GList *points = group->points;
-        points;
-        points = g_list_next(points))
-    {
-      const dt_masks_point_group_t *member = points->data;
-      if(member && member->formid == id)
-      {
-        affects++;
-        break;
-      }
-    }
-  }
-
-  if(affects_out) *affects_out = affects;
-  dt_dev_add_masks_history_item(dev, NULL, TRUE);
+  GPtrArray *owners =
+    dt_masks_form_get_referencing_modules(dev, id);
+  if(affects_out) *affects_out = owners->len;
+  g_ptr_array_unref(owners);
+  dt_dev_add_new_masks_history_item(dev, NULL, FALSE);
   return TRUE;
-}
-
-static gboolean _group_has_other_members(const dt_masks_form_t *group,
-                                         const dt_mask_id_t id)
-{
-  if(!group) return FALSE;
-  for(GList *points = group->points;
-      points;
-      points = g_list_next(points))
-  {
-    const dt_masks_point_group_t *member = points->data;
-    if(member && member->formid != id) return TRUE;
-  }
-  return FALSE;
 }
 
 gboolean dt_remote_masks_delete(dt_develop_t *dev,
@@ -1182,52 +1173,21 @@ gboolean dt_remote_masks_delete(dt_develop_t *dev,
 
   dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
 
-  GPtrArray *references = g_ptr_array_new();
-  for(GList *iops = dev->iop; iops; iops = g_list_next(iops))
-  {
-    dt_iop_module_t *module = iops->data;
-    if(!_module_accepts_drawn_masks(module)) continue;
-    dt_masks_form_t *group =
-      dt_masks_get_from_id(dev, module->blend_params->mask_id);
-    if(!group || !(group->type & DT_MASKS_GROUP)) continue;
-    for(GList *points = group->points;
-        points;
-        points = g_list_next(points))
-    {
-      const dt_masks_point_group_t *member = points->data;
-      if(member && member->formid == id)
-      {
-        g_ptr_array_add(references, module);
-        // Clear before dt_masks_form_remove commits its internal history
-        // snapshots. This preserves the final mask_mode across reload/undo.
-        if(!_group_has_other_members(group, id))
-          module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
-        break;
-      }
-    }
-  }
-
-  // NULL/NULL is the masks core's full-delete path. It removes the form
-  // from every module and deletes groups that become empty.
-  dt_masks_form_remove(NULL, NULL, form);
+  GPtrArray *references = NULL;
+  if(!dt_masks_form_remove_shape_full(dev, form, &references))
+    return _operation_error(error, DT_REMOTE_ERR_INTERNAL,
+                            "failed to delete mask shape", NULL, NULL);
 
   for(guint i = 0; i < references->len; i++)
   {
     dt_iop_module_t *module = g_ptr_array_index(references, i);
-    if(removed_from_out)
-    {
-      JsonObject *removed = json_object_new();
-      json_object_set_string_member(removed, "op", module->op);
-      json_object_set_int_member(removed, "instance",
-                                 module->multi_priority);
-      json_array_add_object_element(removed_from_out, removed);
-    }
-
-    // Defensive postcondition for malformed/duplicate group membership.
-    if(!dt_masks_get_from_id(dev, module->blend_params->mask_id))
-      module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+    if(!removed_from_out) continue;
+    JsonObject *removed = json_object_new();
+    json_object_set_string_member(removed, "op", module->op);
+    json_object_set_int_member(removed, "instance",
+                               module->multi_priority);
+    json_array_add_object_element(removed_from_out, removed);
   }
-
   g_ptr_array_unref(references);
   return TRUE;
 }
