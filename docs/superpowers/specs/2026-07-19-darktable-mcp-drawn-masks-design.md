@@ -67,12 +67,14 @@ All verified 2026-07-19:
   (`masks.h:52`). Brush members default to `SUM`, others to `UNION`.
 - **mask_mode.** "drawn mask" = `DEVELOP_MASK_ENABLED|DEVELOP_MASK_MASK`;
   "drawn & parametric" adds `CONDITIONAL` (`dt_develop_mask_mode_names`).
-- **History/undo.** Masks history items route through
-  `dt_dev_add_masks_history_item` → `_dev_add_history_item_ext(..., TRUE)`
-  which snapshots params + blend params + forms and raises
-  `DEVELOP_HISTORY_CHANGE`; the revision tracker counts each delivery,
-  and remote `undo` (`DT_UNDO_DEVELOP` ⊇ `DT_UNDO_MASK`) already covers
-  mask items.
+- **History/undo.** Remediated remote create, update, and full delete use
+  forced-new masks snapshots through `dt_dev_add_new_masks_history_item`;
+  creation reaches it through `dt_masks_gui_form_save_creation_ext`, and
+  full delete records its module and global entries with it. Legacy and
+  compatibility paths retain `dt_dev_add_masks_history_item`. Both route
+  through the shared masks-history wrapper, raise
+  `DEVELOP_HISTORY_CHANGE`, and remain covered by remote `undo`
+  (`DT_UNDO_DEVELOP` ⊇ `DT_UNDO_MASK`).
 - Shape geometry structs: circle `{center[2], radius, border}`; ellipse
   `{center[2], radius[2], rotation, border, flags}` with flags
   `EQUIDISTANT|PROPORTIONAL`; gradient `{anchor[2], rotation,
@@ -299,14 +301,12 @@ all mutating ones take `expected_revision` CAS like every mutation.
   path and a documented manual test; a use-after-free here is the
   predicted failure mode when a user meets the agent mid-drag.
 
-### One darktable-core change
+### darktable-core additions
 
-`_group_create` (`masks.c:305`) is static; `attach_mask` on a module
-with no existing group needs it. Export as
-`dt_masks_group_create_for_module(dev, module)` (rename-and-export, GUI
-path updated to call it — behavior-identical refactor, same pattern as
-Tier 1's mode-table extraction). Everything else engine-side uses
-already-public masks API.
+The core exports `dt_masks_group_create_for_module`, cycle-safe graph and
+owner queries, and ownership-safe non-group full deletion. It also adds
+explicit creation options and `dt_masks_gui_form_save_creation_ext`, plus
+`dt_dev_add_new_masks_history_item` for forced-new masks snapshots.
 
 ### History, revision, undo
 
