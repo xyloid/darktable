@@ -30,9 +30,8 @@
 /* error helper                                                           */
 /* ---------------------------------------------------------------------- */
 
-// Local to this file: remote_edit.c's dt_remote_error_new() is static to
-// that translation unit, so remote_curve.c mirrors the same idiom rather
-// than exporting a shared constructor for one internal error code.
+// File-local error constructor retained for the curve engine's existing
+// call sites.
 static dt_remote_error_t *dt_remote_curve_error_new(dt_remote_error_code_t code,
                                                     const char *format, ...)
   G_GNUC_PRINTF(2, 3);
