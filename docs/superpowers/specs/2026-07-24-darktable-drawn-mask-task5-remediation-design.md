@@ -118,15 +118,16 @@ Full deletion performs these steps in order:
 2. Remove every direct membership whose `formid` is the target ID from
    every group in `dev->forms`.
 3. Queue only parent groups that became empty because of step 2.
-4. Retire the target form.
-5. Repeatedly remove the ID of each queued empty group from all remaining
-   groups, queue newly emptied parents, clear any module `mask_id` that
-   names the empty group, and retire the empty group.
-6. For every module whose base group was retired, clear
-   `DEVELOP_MASK_MASK` while preserving all other `mask_mode` bits and the
-   module's enabled state.
-7. Record the specified history items after the graph and blend
-   parameters are coherent.
+4. Repeatedly process each queued empty group while leaving the target
+   and every queued/cascaded group active in `dev->forms`. For every
+   module whose `mask_id` names that group, clear its ID and
+   `DEVELOP_MASK_MASK`, preserve all other mode bits and enabled state,
+   and immediately record that module's forced-new history snapshot.
+5. Remove the empty group's ID from all remaining groups and queue newly
+   emptied parents, still without retiring any queued form.
+6. Once the queue drains and every affected module snapshot has been
+   recorded, retire the target and all queued groups.
+7. Record the final global mask-manager snapshot of the pruned graph.
 
 Retiring a form means removing its pointer from `dev->forms` and appending
 it to `dev->allforms` exactly once. Forms are not freed immediately:
@@ -135,10 +136,12 @@ Duplicate incoming memberships are all removed. Unrelated empty groups
 that predate the request are left unchanged.
 
 The operation records one global masks-history item for the shape
-deletion and one module masks-history item for each module base group
-retired by the cascade. Module history uses the module's current
-`enabled` value rather than forcing it true. This preserves the Tier-3
-contract of `1 + emptied module groups` history items.
+deletion and one module masks-history item for each unique module whose
+base group is retired by the cascade. Module history uses the module's
+current `enabled` value rather than forcing it true. Thus every replay
+prefix is coherent: a still-valid module `mask_id` always resolves to an
+active form, then the final global snapshot retires the graph. This
+preserves the Tier-3 contract of `1 + affected modules` history items.
 
 ## Creation interface and history
 
@@ -184,11 +187,23 @@ calls pass the module's existing enabled value instead of `TRUE`.
 
 Each forced-new masks history call is also a production undo boundary:
 it bypasses edited-target suppression and encloses its signal-backed
-`DT_UNDO_HISTORY` record in a singleton undo group, preventing the undo
-manager's adjacent-time coalescing. The group is omitted when the undo
-signal is gated or no undo manager exists, so headless and shutdown paths
-do not create empty groups. Ordinary masks-history calls retain their
-existing target/time merging behavior.
+`DT_UNDO_HISTORY` record in a first-class isolated undo scope. The scope
+holds the recursive undo mutex from begin through record and end, and
+stamps the committed group between two coalescing epochs, so ordinary
+records cannot time-coalesce across either side. If an ordinary group is
+active, the scope closes its nonempty prefix and lazily resumes a suffix
+only on the next accepted record. Gated or disabled records therefore
+leave no empty group, stale one-shot state, or redo invalidation. Ordinary
+masks-history calls retain their existing target/time merging behavior.
+
+In-memory mask history items explicitly distinguish “no forms snapshot”
+from an explicit empty forms snapshot via `forms_history`. The
+`masks_history` table has no row for an empty list, so reload infers that
+state for the final `mask_manager` snapshot used by remote full deletion;
+the staged non-manager snapshots retain active forms and persist as
+ordinary mask rows. Reloading an arbitrary empty snapshot on a
+non-`mask_manager` item remains a pre-existing schema limitation and is
+outside this remediation.
 
 The resulting undo states are:
 

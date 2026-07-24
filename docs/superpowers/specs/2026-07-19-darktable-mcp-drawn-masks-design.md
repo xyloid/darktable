@@ -75,8 +75,10 @@ All verified 2026-07-19:
   through the shared masks-history wrapper and remain covered by remote
   `undo` (`DT_UNDO_DEVELOP` ⊇ `DT_UNDO_HISTORY`). Each forced-new call
   bypasses edited-target suppression and places its signal-backed record
-  in its own history undo group, so adjacent forced snapshots cannot
-  time-coalesce; ordinary masks-history calls keep their existing merging.
+  in a lazy isolated undo scope. Two-sided coalescing epochs prevent both
+  older and newer ordinary records from crossing it; an active outer group
+  is split into nonempty segments and resumed only by the next real record.
+  Ordinary masks-history calls keep their existing merging.
 - Shape geometry structs: circle `{center[2], radius, border}`; ellipse
   `{center[2], radius[2], rotation, border, flags}` with flags
   `EQUIDISTANT|PROPORTIONAL`; gradient `{anchor[2], rotation,
@@ -216,7 +218,11 @@ Engine: `dt_masks_form_remove_shape_full(dev, form, &references)` removes
 incoming references at every nesting depth, retires the shape and any
 newly unowned groups into `dev->allforms`, and clears `MASK` when a
 module's base group empties. Response: `removed_from` list of affected
-instances + revision.
+instances + revision. Each affected module is cleared and snapshotted
+while its now-empty base group remains active. Only after every module
+snapshot does the engine retire the target/cascaded groups and record the
+global snapshot. Consequently every undo/redo history prefix is coherent:
+any valid `mask_id` resolves in that prefix's forms graph.
 
 ### `attach_mask` / `detach_mask`
 
@@ -324,8 +330,18 @@ explicit creation options and `dt_masks_gui_form_save_creation_ext`, plus
   reverts one history item; undoing a `create_mask_shape`+attach takes
   two undo calls (the GUI has the same layered behavior). The reference
   documents this per method ("this call produces N history items").
-  Each forced-new item has its own no-coalesce undo boundary; batching
-  the two items into one undo record is explicitly out of v1 scope.
+  Each forced-new item has its own hard, two-sided no-coalesce undo
+  boundary; batching the two items into one undo record is explicitly out
+  of v1 scope.
+- In-memory mask history carries an explicit `forms_history` bit so an
+  empty forms snapshot is not confused with an item that has no masks
+  snapshot. A persisted final `mask_manager` item is the empty-snapshot
+  sentinel because an empty `masks_history` list has no database row.
+  Arbitrary empty non-`mask_manager` snapshots still cannot be recovered
+  after reload; that pre-existing schema limitation is outside this remote
+  masks remediation. Remote full deletion remains persistent because its
+  staged non-manager snapshots are nonempty and its final empty snapshot
+  is the `mask_manager` sentinel.
 - `get_history` already lists mask items (they are ordinary history
   entries via the mask_manager/module); no change.
 

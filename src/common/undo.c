@@ -34,6 +34,7 @@ typedef struct dt_undo_item_t
   dt_undo_type_t type;
   dt_undo_data_t data;
   double ts;
+  uint64_t coalesce_epoch;
   gboolean is_group;
   void (*undo)(gpointer user_data,
                dt_undo_type_t type,
@@ -57,6 +58,13 @@ dt_undo_t *dt_undo_init(void)
 
   udata->group = DT_UNDO_NONE;
   udata->group_indent = 0;
+  udata->group_start = NULL;
+  udata->coalesce_epoch = 0;
+  udata->isolated_group_active = FALSE;
+  udata->isolated_group_committed = FALSE;
+  udata->isolated_saved_group = DT_UNDO_NONE;
+  udata->isolated_saved_group_indent = 0;
+  udata->isolated_saved_group_start = NULL;
   dt_print(DT_DEBUG_UNDO, "[undo] init");
   return udata;
 }
@@ -66,12 +74,24 @@ dt_undo_t *dt_undo_init(void)
 
 void dt_undo_disable_next(dt_undo_t *self)
 {
+  if(!self) return;
+  LOCK;
   self->disable_next = TRUE;
   dt_print(DT_DEBUG_UNDO, "[undo] disable next");
+  UNLOCK;
 }
 
 void dt_undo_cleanup(dt_undo_t *self)
 {
+  if(!self) return;
+  LOCK;
+  if(self->isolated_group_active)
+  {
+    assert(!self->isolated_group_active);
+    UNLOCK;
+    return;
+  }
+  UNLOCK;
   dt_undo_clear(self, DT_UNDO_ALL);
   dt_pthread_mutex_destroy(&self->mutex);
 }
@@ -83,11 +103,78 @@ static void _free_undo_data(void *p)
   free(item);
 }
 
+static dt_undo_item_t *_undo_push_item(
+  dt_undo_t *self,
+  gpointer user_data,
+  const dt_undo_type_t type,
+  const dt_undo_data_t data,
+  const gboolean is_group,
+  void (*undo)(gpointer user_data,
+               const dt_undo_type_t type,
+               const dt_undo_data_t item,
+               const dt_undo_action_t action,
+               GList **imgs),
+  void (*free_data)(gpointer data))
+{
+  dt_undo_item_t *item = malloc(sizeof(dt_undo_item_t));
+
+  item->user_data = user_data;
+  item->type      = type;
+  item->data      = data;
+  item->undo      = undo;
+  item->free_data = free_data;
+  item->ts        = dt_get_wtime();
+  item->coalesce_epoch = self->coalesce_epoch;
+  item->is_group  = is_group;
+
+  self->undo_list = g_list_prepend(self->undo_list, (gpointer)item);
+
+  // recording an undo data, invalidate all the redo
+  g_list_free_full(self->redo_list, _free_undo_data);
+  self->redo_list = NULL;
+
+  dt_print(DT_DEBUG_UNDO, "[undo] record for type %d (length %d)",
+           type, g_list_length(self->undo_list));
+  return item;
+}
+
+static dt_undo_item_t *_undo_push_group(dt_undo_t *self,
+                                        const dt_undo_type_t type)
+{
+  return _undo_push_item(self, NULL, type, NULL, TRUE, NULL, NULL);
+}
+
+static void _undo_commit_isolated_group(dt_undo_t *self)
+{
+  assert(self->isolated_group_active);
+  assert(!self->isolated_group_committed);
+
+  dt_undo_item_t *ambient_start =
+    self->isolated_saved_group_start;
+  if(ambient_start)
+  {
+    GList *start_link = g_list_find(self->undo_list, ambient_start);
+    assert(start_link);
+    if(start_link == self->undo_list)
+    {
+      self->undo_list =
+        g_list_delete_link(self->undo_list, start_link);
+      _free_undo_data(ambient_start);
+    }
+    else
+      _undo_push_group(self, self->isolated_saved_group);
+    self->isolated_saved_group_start = NULL;
+  }
+
+  self->coalesce_epoch++;
+  self->group_start = _undo_push_group(self, self->group);
+  self->isolated_group_committed = TRUE;
+}
+
 static void _undo_record(dt_undo_t *self,
                          gpointer user_data,
                          const dt_undo_type_t type,
                          const dt_undo_data_t data,
-                         const gboolean is_group,
                          void (*undo)(gpointer user_data,
                                       const dt_undo_type_t type,
                                       const dt_undo_data_t item,
@@ -99,35 +186,23 @@ static void _undo_record(dt_undo_t *self,
 
   LOCK;
 
-  const gboolean disable_next = self->disable_next;
-  if(disable_next)
+  if(self->disable_next)
   {
     if(free_data) free_data(data);
     self->disable_next = FALSE;
-  }
-  else
-  {
-    dt_undo_item_t *item = malloc(sizeof(dt_undo_item_t));
-
-    item->user_data = user_data;
-    item->type      = type;
-    item->data      = data;
-    item->undo      = undo;
-    item->free_data = free_data;
-    item->ts        = dt_get_wtime();
-    item->is_group  = is_group;
-
-    self->undo_list = g_list_prepend(self->undo_list, (gpointer)item);
-
-    // recording an undo data, invalidate all the redo
-    g_list_free_full(self->redo_list, _free_undo_data);
-    self->redo_list = NULL;
-
-    dt_print(DT_DEBUG_UNDO, "[undo] record for type %d (length %d)%s",
-             type, g_list_length(self->undo_list),
-             disable_next ? ", disable next": "");
+    dt_print(DT_DEBUG_UNDO, "[undo] record for type %d, disable next",
+             type);
+    UNLOCK;
+    return;
   }
 
+  if(self->isolated_group_active
+     && !self->isolated_group_committed)
+    _undo_commit_isolated_group(self);
+  else if(self->group != DT_UNDO_NONE && !self->group_start)
+    self->group_start = _undo_push_group(self, self->group);
+
+  _undo_push_item(self, user_data, type, data, FALSE, undo, free_data);
   UNLOCK;
 }
 
@@ -142,7 +217,7 @@ void dt_undo_start_group(dt_undo_t *self,
     dt_print(DT_DEBUG_UNDO, "[undo] start group for type %d", type);
     self->group = type;
     self->group_indent = 1;
-    _undo_record(self, NULL, type, NULL, TRUE, NULL, NULL);
+    self->group_start = _undo_push_group(self, type);
   }
   else
     self->group_indent++;
@@ -154,13 +229,78 @@ void dt_undo_end_group(dt_undo_t *self)
   if(!self) return;
   LOCK;
   assert(self->group_indent>0);
+  assert(!self->isolated_group_active || self->group_indent > 1);
   self->group_indent--;
   if(self->group_indent == 0)
   {
-    _undo_record(self, NULL, self->group, NULL, TRUE, NULL, NULL);
+    if(self->group_start)
+      _undo_push_group(self, self->group);
     dt_print(DT_DEBUG_UNDO, "[undo] end group for type %d", self->group);
     self->group = DT_UNDO_NONE;
+    self->group_start = NULL;
   }
+  UNLOCK;
+}
+
+void dt_undo_start_recording(dt_undo_t *self)
+{
+  if(!self) return;
+  LOCK;
+}
+
+void dt_undo_end_recording(dt_undo_t *self)
+{
+  if(!self) return;
+  UNLOCK;
+}
+
+void dt_undo_start_isolated_group(dt_undo_t *self,
+                                  const dt_undo_type_t type)
+{
+  if(!self) return;
+
+  // Deliberately retained until dt_undo_end_isolated_group(). Recursive
+  // acquisition lets the records inside this same-thread scope use the
+  // ordinary public API while excluding interleaving writers.
+  LOCK;
+  assert(!self->isolated_group_active);
+  self->isolated_group_active = TRUE;
+  self->isolated_group_committed = FALSE;
+  self->isolated_saved_group = self->group;
+  self->isolated_saved_group_indent = self->group_indent;
+  self->isolated_saved_group_start = self->group_start;
+  self->group = type;
+  self->group_indent = 1;
+  self->group_start = NULL;
+  dt_print(DT_DEBUG_UNDO, "[undo] start isolated group for type %d",
+           type);
+}
+
+void dt_undo_end_isolated_group(dt_undo_t *self)
+{
+  if(!self) return;
+
+  // This releases the acquisition retained by start; do not acquire an
+  // additional level here.
+  assert(self->isolated_group_active);
+  assert(self->group_indent == 1);
+  if(self->isolated_group_committed)
+  {
+    _undo_push_group(self, self->group);
+    self->coalesce_epoch++;
+  }
+
+  self->group = self->isolated_saved_group;
+  self->group_indent = self->isolated_saved_group_indent;
+  self->group_start = self->isolated_group_committed
+                        ? NULL
+                        : self->isolated_saved_group_start;
+  self->isolated_group_active = FALSE;
+  self->isolated_group_committed = FALSE;
+  self->isolated_saved_group = DT_UNDO_NONE;
+  self->isolated_saved_group_indent = 0;
+  self->isolated_saved_group_start = NULL;
+  dt_print(DT_DEBUG_UNDO, "[undo] end isolated group");
   UNLOCK;
 }
 
@@ -175,7 +315,7 @@ void dt_undo_record(dt_undo_t *self,
                                  GList **imgs),
                     void (*free_data)(gpointer data))
 {
-  _undo_record(self, user_data, type, data, FALSE, undo, free_data);
+  _undo_record(self, user_data, type, data, undo, free_data);
 }
 
 gint _images_list_cmp(gconstpointer a, gconstpointer b)
@@ -190,6 +330,12 @@ static void _undo_do_undo_redo(dt_undo_t *self,
   if(!self) return;
 
   LOCK;
+  if(self->isolated_group_active)
+  {
+    assert(!self->isolated_group_active);
+    UNLOCK;
+    return;
+  }
 
   // we take/remove item from the FROM list and add them into the TO list:
   GList **from = action == DT_ACTION_UNDO ? &self->undo_list : &self->redo_list;
@@ -243,6 +389,7 @@ static void _undo_do_undo_redo(dt_undo_t *self,
       else
       {
         const double first_item_ts = item->ts;
+        const uint64_t first_item_epoch = item->coalesce_epoch;
         gboolean in_group = FALSE;
 
         //  when found, handle all items of the same type and in the same time period
@@ -267,7 +414,10 @@ static void _undo_do_undo_redo(dt_undo_t *self,
           if(l) item = (dt_undo_item_t *)l->data;
         } while(l
                 && (item->type & filter)
-                && (in_group || (fabs(item->ts - first_item_ts) < MAX_TIME_PERIOD)));
+                && (in_group
+                    || (item->coalesce_epoch == first_item_epoch
+                        && fabs(item->ts - first_item_ts)
+                             < MAX_TIME_PERIOD)));
       }
 
       break;
@@ -332,10 +482,17 @@ void dt_undo_clear(dt_undo_t *self, uint32_t filter)
   if(!self) return;
 
   LOCK;
+  if(self->isolated_group_active)
+  {
+    assert(!self->isolated_group_active);
+    UNLOCK;
+    return;
+  }
   _undo_clear_list(&self->undo_list, filter);
   _undo_clear_list(&self->redo_list, filter);
   self->undo_list = NULL;
   self->redo_list = NULL;
+  self->group_start = NULL;
   self->disable_next = FALSE;
   UNLOCK;
 }
@@ -367,6 +524,12 @@ void dt_undo_iterate(dt_undo_t *self,
 {
   if(!self) return;
   LOCK;
+  if(self->isolated_group_active)
+  {
+    assert(!self->isolated_group_active);
+    UNLOCK;
+    return;
+  }
   _undo_iterate(self->undo_list, filter, user_data, apply);
   _undo_iterate(self->redo_list, filter, user_data, apply);
   UNLOCK;

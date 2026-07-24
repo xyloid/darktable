@@ -59,6 +59,13 @@ typedef struct dt_undo_t
   GList *undo_list, *redo_list;
   dt_undo_type_t group;
   int group_indent;
+  gpointer group_start;
+  uint64_t coalesce_epoch;
+  gboolean isolated_group_active;
+  gboolean isolated_group_committed;
+  dt_undo_type_t isolated_saved_group;
+  int isolated_saved_group_indent;
+  gpointer isolated_saved_group_start;
   dt_pthread_mutex_t mutex;
   gboolean disable_next;
 } dt_undo_t;
@@ -70,6 +77,22 @@ void dt_undo_cleanup(dt_undo_t *self);
 void dt_undo_start_group(dt_undo_t *self,
                          const dt_undo_type_t type);
 void dt_undo_end_group(dt_undo_t *self);
+
+// Retain the recursive undo mutex across a caller-managed record/mutation
+// transaction without changing grouping or time-coalescing behavior. Paired
+// calls must run on the same thread.
+void dt_undo_start_recording(dt_undo_t *self);
+void dt_undo_end_recording(dt_undo_t *self);
+
+// Create an atomic group with hard time-coalescing boundaries. The scope is
+// materialized only by its first accepted record, and may temporarily split
+// an ordinary group without creating empty group segments. Start and end
+// must run on the same thread; the recursive undo mutex is held between them.
+// Undo, redo, clear, iterate, and cleanup are invalid inside the scope (and
+// become no-ops in release builds); calls from other threads wait for end.
+void dt_undo_start_isolated_group(dt_undo_t *self,
+                                  const dt_undo_type_t type);
+void dt_undo_end_isolated_group(dt_undo_t *self);
 
 // record a change that will be insered into the undo list
 void dt_undo_record(dt_undo_t *self,
@@ -100,8 +123,8 @@ void dt_undo_iterate(dt_undo_t *self,
                                    const dt_undo_type_t type,
                                    const dt_undo_data_t item));
 
-// disable the next record, this is to avoid recording when reverting
-// a value (in undo callbacks)
+// disable the next data record, this is to avoid recording when reverting
+// a value (in undo callbacks). Structural group markers are unaffected.
 void dt_undo_disable_next(dt_undo_t *self);
 
 // clang-format off

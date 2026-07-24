@@ -1292,6 +1292,7 @@ static void _dev_add_history_item_ext(dt_develop_t *dev,
       hist->forms = dt_masks_dup_forms_deep(dev->forms, NULL);
     else
       hist->forms = NULL;
+    hist->forms_history = include_masks;
 
     dev->history = g_list_append(dev->history, hist);
     if(!no_image)
@@ -1321,6 +1322,7 @@ static void _dev_add_history_item_ext(dt_develop_t *dev,
     {
       g_list_free_full(hist->forms, (void (*)(void *))dt_masks_free_form);
       hist->forms = dt_masks_dup_forms_deep(dev->forms, NULL);
+      hist->forms_history = TRUE;
     }
     if(!no_image)
     {
@@ -1529,18 +1531,25 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
     if(fpt) target = GINT_TO_POINTER(fpt->formid);
   }
 
-  dt_pthread_mutex_lock(&dev->history_mutex);
-
   // Forced-new mask snapshots are public undo boundaries, not just distinct
   // dev->history entries. Bypass target merging and bracket the one signal-
-  // backed undo record so common/undo.c cannot time-coalesce it with an
-  // adjacent forced snapshot. Avoid empty groups when the signal is gated.
+  // backed undo record with a hard, two-sided coalescing boundary. The scope
+  // commits lazily, so a gated signal leaves no empty undo entry.
+  dt_undo_t *undo = darktable.undo;
+  const gboolean record_undo =
+    undo && dev->gui_attached
+    && dt_view_get_current() == DT_VIEW_DARKROOM;
   const gboolean isolate_undo_record =
-    new_item && darktable.undo && dev->gui_attached
-    && dt_view_get_current() == DT_VIEW_DARKROOM
-    && dt_control_running();
+    new_item && record_undo && dt_control_running();
   if(isolate_undo_record)
-    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+    dt_undo_start_isolated_group(undo, DT_UNDO_HISTORY);
+  else if(record_undo)
+    dt_undo_start_recording(undo);
+
+  // Both recording scopes establish undo -> history order before the
+  // WILL_CHANGE subscriber duplicates the protected history state. Only the
+  // forced-new scope adds hard grouping/coalescing boundaries.
+  dt_pthread_mutex_lock(&dev->history_mutex);
 
   gboolean need_end_record = TRUE;
   if(new_item)
@@ -1554,12 +1563,14 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
   dt_dev_pipe_synch_all(dev);
   dt_dev_invalidate_all(dev);
 
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+
   if(need_end_record)
     dt_dev_undo_end_record(dev);
   if(isolate_undo_record)
-    dt_undo_end_group(darktable.undo);
-
-  dt_pthread_mutex_unlock(&dev->history_mutex);
+    dt_undo_end_isolated_group(undo);
+  else if(record_undo)
+    dt_undo_end_recording(undo);
 
   if(dev->gui_attached)
   {
@@ -1693,7 +1704,7 @@ void dt_dev_pop_history_items_ext(dt_develop_t *dev, const int32_t cnt)
     hist->module->iop_order = hist->iop_order;
     hist->module->enabled = hist->enabled;
     g_strlcpy(hist->module->multi_name, hist->multi_name, sizeof(hist->module->multi_name));
-    if(hist->forms) forms = hist->forms;
+    if(hist->forms_history) forms = hist->forms;
     hist->module->multi_name_hand_edited = hist->multi_name_hand_edited;
 
     history = g_list_next(history);
@@ -1720,7 +1731,7 @@ void dt_dev_pop_history_items_ext(dt_develop_t *dev, const int32_t cnt)
   {
     dt_dev_history_item_t *hist = history->data;
 
-    if(hist->forms != NULL)
+    if(hist->forms_history)
       masks_changed = TRUE;
 
     history = g_list_next(history);
@@ -2630,6 +2641,10 @@ void dt_dev_read_history_ext(dt_develop_t *dev,
 
     hist->multi_name_hand_edited = multi_name_hand_edited;
     g_strlcpy(hist->op_name, hist->module->op, sizeof(hist->op_name));
+    // masks_history has no row with which to represent an explicit empty
+    // snapshot. mask_manager history entries are the persisted sentinel for
+    // that state; entries with actual mask rows are marked by the mask loader.
+    hist->forms_history = dt_iop_module_is(hist->module, "mask_manager");
     if(multi_name) // multi_name can be NULL on DB
       g_strlcpy(hist->multi_name, multi_name, sizeof(hist->multi_name));
     hist->params = malloc(hist->module->params_size);

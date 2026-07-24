@@ -2472,6 +2472,624 @@ static void test_remote_create_attached_undo_has_two_real_boundaries(
   json_object_unref(geometry);
 }
 
+static uint64_t _remote_undo_headless(const uint64_t expected_revision)
+{
+  dt_remote_error_t *error = NULL;
+  uint64_t revision = 0;
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  const gboolean undone =
+    dt_remote_undo(expected_revision, &revision, &error);
+  darktable.gui = fake_gui;
+  assert_true(undone);
+  assert_null(error);
+  assert_int_equal(revision, expected_revision + 1);
+  return revision;
+}
+
+typedef struct test_counter_undo_t
+{
+  int *value;
+  int *free_count;
+} test_counter_undo_t;
+
+typedef struct test_undo_trylock_t
+{
+  dt_undo_t *undo;
+  int result;
+} test_undo_trylock_t;
+
+static void *_test_undo_trylock_worker(void *user_data)
+{
+  test_undo_trylock_t *attempt = user_data;
+  attempt->result = dt_pthread_mutex_trylock(&attempt->undo->mutex);
+  if(attempt->result == 0)
+    dt_pthread_mutex_unlock(&attempt->undo->mutex);
+  return NULL;
+}
+
+static int _test_undo_trylock_from_worker(dt_undo_t *undo)
+{
+  test_undo_trylock_t attempt = { .undo = undo, .result = 0 };
+  pthread_t worker;
+  assert_int_equal(dt_pthread_create(&worker,
+                                     _test_undo_trylock_worker,
+                                     &attempt), 0);
+  assert_int_equal(dt_pthread_join(worker), 0);
+  return attempt.result;
+}
+
+static void _test_counter_undo_pop(gpointer user_data,
+                                   dt_undo_type_t type,
+                                   dt_undo_data_t data,
+                                   dt_undo_action_t action,
+                                   GList **imgs)
+{
+  (void)user_data;
+  (void)imgs;
+  assert_int_equal(type, DT_UNDO_HISTORY);
+  test_counter_undo_t *record = data;
+  if(action == DT_ACTION_UNDO)
+    (*record->value)--;
+  else
+    (*record->value)++;
+}
+
+static void _test_counter_undo_free(gpointer data)
+{
+  test_counter_undo_t *record = data;
+  (*record->free_count)++;
+  g_free(record);
+}
+
+static void _record_counter_undo(int *value, int *free_count)
+{
+  test_counter_undo_t *record = g_new(test_counter_undo_t, 1);
+  record->value = value;
+  record->free_count = free_count;
+  (*value)++;
+  dt_undo_record(darktable.undo, NULL, DT_UNDO_HISTORY, record,
+                 _test_counter_undo_pop, _test_counter_undo_free);
+}
+
+static void test_isolated_undo_scope_has_no_empty_or_stale_state(
+  void **state)
+{
+  (void)state;
+  int value = 0;
+  int free_count = 0;
+
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_not_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  dt_undo_end_isolated_group(darktable.undo);
+  assert_int_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+  assert_int_equal(darktable.undo->coalesce_epoch, 0);
+  assert_false(darktable.undo->isolated_group_active);
+
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  dt_undo_disable_next(darktable.undo);
+  _record_counter_undo(&value, &free_count);
+  assert_int_not_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  dt_undo_end_isolated_group(darktable.undo);
+  assert_int_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  assert_int_equal(value, 1);
+  value = 0; // The deliberately suppressed mutation is caller-owned.
+  assert_int_equal(free_count, 1);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 0);
+  assert_int_equal(darktable.undo->coalesce_epoch, 0);
+  assert_false(darktable.undo->isolated_group_active);
+  assert_int_equal(darktable.undo->group, DT_UNDO_NONE);
+  assert_int_equal(darktable.undo->group_indent, 0);
+  assert_null(darktable.undo->group_start);
+
+  // Ordinary adjacent records keep their established time-coalescing
+  // behavior, and an empty isolated scope does not invalidate their redo.
+  _record_counter_undo(&value, &free_count);
+  _record_counter_undo(&value, &free_count);
+  assert_int_equal(value, 2);
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 0);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 2);
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  dt_undo_end_isolated_group(darktable.undo);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 2);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  darktable.gui = fake_gui;
+  assert_int_equal(value, 2);
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  assert_int_equal(free_count, 3);
+  value = 0;
+
+  // The older side is hard too: when redoing an ordinary record, time
+  // coalescing must stop before the following isolated group.
+  _record_counter_undo(&value, &free_count);
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  _record_counter_undo(&value, &free_count);
+  assert_int_not_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  dt_undo_end_isolated_group(darktable.undo);
+  assert_int_equal(_test_undo_trylock_from_worker(darktable.undo), 0);
+  fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 1);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 0);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 1);
+  assert_int_equal(g_list_length(darktable.undo->redo_list), 3);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  darktable.gui = fake_gui;
+  assert_int_equal(value, 2);
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  assert_int_equal(free_count, 5);
+  value = 0;
+
+  // A committed isolated scope closes a nonempty ambient prefix, and ending
+  // the ambient scope without a later record must not create an empty suffix.
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  _record_counter_undo(&value, &free_count);
+  dt_undo_start_isolated_group(darktable.undo, DT_UNDO_HISTORY);
+  _record_counter_undo(&value, &free_count);
+  dt_undo_end_isolated_group(darktable.undo);
+  dt_undo_end_group(darktable.undo);
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 6);
+  assert_false(darktable.undo->isolated_group_active);
+  assert_int_equal(darktable.undo->group, DT_UNDO_NONE);
+  assert_int_equal(darktable.undo->group_indent, 0);
+  assert_null(darktable.undo->group_start);
+
+  fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 1);
+  dt_undo_do_undo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 0);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  assert_int_equal(value, 1);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_HISTORY);
+  darktable.gui = fake_gui;
+  assert_int_equal(value, 2);
+  dt_undo_clear(darktable.undo, DT_UNDO_ALL);
+  assert_int_equal(free_count, 7);
+}
+
+static void test_remote_create_attached_undo_isolated_from_newer_history(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  fixture->module->blend_params->mask_id = NO_MASKID;
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_CONDITIONAL;
+  const uint32_t mode_before = fixture->module->blend_params->mask_mode;
+
+  fixture->fake_view_manager.current_view = NULL;
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+  const int history_before = fixture->dev.history_end;
+  fixture->fake_view_manager.current_view = &fixture->fake_view;
+  const uint64_t revision_before =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  JsonObject *geometry =
+    _geom("{\"center\":[0.35,0.45],\"radius\":0.12,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t new_id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "hard undo boundary",
+                                     fixture->module, &new_id, &error));
+  assert_null(error);
+  const dt_mask_id_t created_group_id =
+    fixture->module->blend_params->mask_id;
+  assert_true(dt_is_valid_maskid(created_group_id));
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+
+  // This ordinary record is deliberately adjacent to the two forced-new
+  // records. Its first undo must not cross the newer side of the hard
+  // forced-new boundary.
+  dt_dev_add_masks_history_item(&fixture->dev, NULL, FALSE);
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+  const uint64_t ordinary_revision =
+    dt_remote_revision_get(dt_remote_revision_current());
+  assert_int_equal(ordinary_revision, revision_before + 3);
+
+  const uint64_t attached_revision =
+    _remote_undo_headless(ordinary_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id,
+                   created_group_id);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   mode_before | DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   mode_before | DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_false(fixture->module->enabled);
+
+  const uint64_t unattached_revision =
+    _remote_undo_headless(attached_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  assert_false(fixture->module->enabled);
+
+  _remote_undo_headless(unattached_revision);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  assert_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->undo_snapshot_records, 3);
+  json_object_unref(geometry);
+}
+
+static void test_remote_create_attached_splits_active_undo_group(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  fixture->module->enabled = FALSE;
+  fixture->module->blend_params->mask_id = NO_MASKID;
+  fixture->module->blend_params->mask_mode = DEVELOP_MASK_CONDITIONAL;
+  const uint32_t mode_before = fixture->module->blend_params->mask_mode;
+
+  fixture->fake_view_manager.current_view = NULL;
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+  const int history_before = fixture->dev.history_end;
+  fixture->fake_view_manager.current_view = &fixture->fake_view;
+  const uint64_t revision_before =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+  const dt_mask_id_t prefix_id = 7621;
+  _fixture_add_form(fixture, DT_MASKS_ELLIPSE, prefix_id);
+  dt_dev_add_masks_history_item(&fixture->dev, NULL, FALSE);
+
+  JsonObject *geometry =
+    _geom("{\"center\":[0.35,0.45],\"radius\":0.12,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t new_id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE,
+                                     geometry, "split outer group",
+                                     fixture->module, &new_id, &error));
+  assert_null(error);
+  const dt_mask_id_t created_group_id =
+    fixture->module->blend_params->mask_id;
+  assert_true(dt_is_valid_maskid(created_group_id));
+
+  const dt_mask_id_t suffix_id = 7622;
+  _fixture_add_form(fixture, DT_MASKS_GRADIENT, suffix_id);
+  dt_dev_add_masks_history_item(&fixture->dev, NULL, FALSE);
+  dt_undo_end_group(darktable.undo);
+
+  assert_int_equal(fixture->dev.history_end, history_before + 4);
+  const uint64_t suffix_revision =
+    dt_remote_revision_get(dt_remote_revision_current());
+  assert_int_equal(suffix_revision, revision_before + 4);
+
+  const uint64_t attached_revision =
+    _remote_undo_headless(suffix_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id,
+                   created_group_id);
+
+  const uint64_t unattached_revision =
+    _remote_undo_headless(attached_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+
+  const uint64_t prefix_revision =
+    _remote_undo_headless(unattached_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+
+  _remote_undo_headless(prefix_revision);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  assert_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+
+  // The same hard boundaries must preserve order in the reverse direction.
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(fixture->module->blend_params->mask_mode, mode_before);
+  assert_false(fixture->module->enabled);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id,
+                   created_group_id);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   mode_before | DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_false(fixture->module->enabled);
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  darktable.gui = fake_gui;
+  assert_int_equal(fixture->dev.history_end, history_before + 4);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, prefix_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, new_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, created_group_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, suffix_id));
+  assert_int_equal(fixture->module->blend_params->mask_id,
+                   created_group_id);
+  assert_int_equal(fixture->module->blend_params->mask_mode,
+                   mode_before | DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK);
+  assert_false(fixture->module->enabled);
+  assert_int_equal(fixture->undo_snapshot_records, 4);
+  json_object_unref(geometry);
+}
+
+static void _assert_module_mask_reference_is_coherent(
+  const blend_fixture_t *fixture,
+  const dt_iop_module_t *module)
+{
+  const dt_mask_id_t mask_id = module->blend_params->mask_id;
+  if(dt_is_valid_maskid(mask_id))
+  {
+    assert_true(module->blend_params->mask_mode & DEVELOP_MASK_MASK);
+    assert_non_null(dt_masks_get_from_id(&fixture->dev, mask_id));
+  }
+  else
+    assert_false(module->blend_params->mask_mode & DEVELOP_MASK_MASK);
+}
+
+static void _assert_module_mask_state(
+  const blend_fixture_t *fixture,
+  const dt_iop_module_t *module,
+  const dt_mask_id_t mask_id,
+  const uint32_t mask_mode,
+  const gboolean enabled)
+{
+  assert_int_equal(module->blend_params->mask_id, mask_id);
+  assert_int_equal(module->blend_params->mask_mode, mask_mode);
+  assert_int_equal(module->enabled, enabled);
+  _assert_module_mask_reference_is_coherent(fixture, module);
+}
+
+static void test_remote_delete_two_modules_has_coherent_undo_prefixes(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_iop_module_t *second =
+    _blend_fixture_add_module(fixture, "exposure", 1);
+  fixture->module->enabled = FALSE;
+  second->enabled = TRUE;
+  fixture->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL;
+  second->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  const uint32_t first_mode =
+    fixture->module->blend_params->mask_mode;
+  const uint32_t second_mode = second->blend_params->mask_mode;
+  const uint32_t first_cleared_mode =
+    first_mode & ~DEVELOP_MASK_MASK;
+  const uint32_t second_cleared_mode =
+    second_mode & ~DEVELOP_MASK_MASK;
+
+  const dt_mask_id_t shape_id = 7631;
+  const dt_mask_id_t first_group_id = 7632;
+  const dt_mask_id_t second_group_id = 7633;
+  dt_masks_form_t *shape =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, shape_id);
+  dt_masks_form_t *first_group =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, first_group_id);
+  dt_masks_form_t *second_group =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, second_group_id);
+  _fixture_add_member(first_group, shape_id,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.6f);
+  _fixture_add_member(second_group, shape_id,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.8f);
+  fixture->module->blend_params->mask_id = first_group_id;
+  second->blend_params->mask_id = second_group_id;
+
+  fixture->fake_view_manager.current_view = NULL;
+  dt_dev_add_new_masks_history_item(&fixture->dev, fixture->module,
+                                    fixture->module->enabled);
+  dt_dev_add_new_masks_history_item(&fixture->dev, second,
+                                    second->enabled);
+  const int history_before = fixture->dev.history_end;
+  assert_int_equal(g_list_length(darktable.undo->undo_list), 0);
+  fixture->fake_view_manager.current_view = &fixture->fake_view;
+  const uint64_t revision_before =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  JsonArray *removed_from = json_array_new();
+  dt_remote_error_t *error = NULL;
+  assert_true(dt_remote_masks_delete(&fixture->dev, shape_id,
+                                     removed_from, &error));
+  assert_null(error);
+  assert_int_equal(json_array_get_length(removed_from), 2);
+  assert_int_equal(
+    json_object_get_int_member(
+      json_array_get_object_element(removed_from, 0), "instance"), 0);
+  assert_int_equal(
+    json_object_get_int_member(
+      json_array_get_object_element(removed_from, 1), "instance"), 1);
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+  const dt_dev_history_item_t *first_clear =
+    g_list_nth_data(fixture->dev.history, history_before);
+  const dt_dev_history_item_t *second_clear =
+    g_list_nth_data(fixture->dev.history, history_before + 1);
+  const dt_dev_history_item_t *final_delete =
+    g_list_nth_data(fixture->dev.history, history_before + 2);
+  assert_non_null(first_clear);
+  assert_non_null(second_clear);
+  assert_non_null(final_delete);
+  assert_true(first_clear->forms_history);
+  assert_true(second_clear->forms_history);
+  assert_true(final_delete->forms_history);
+  assert_ptr_equal(first_clear->module, fixture->module);
+  assert_ptr_equal(second_clear->module, second);
+  assert_false(first_clear->enabled);
+  assert_true(second_clear->enabled);
+  assert_int_equal(first_clear->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(first_clear->blend_params->mask_mode,
+                   first_cleared_mode);
+  assert_int_equal(second_clear->blend_params->mask_id, NO_MASKID);
+  assert_int_equal(second_clear->blend_params->mask_mode,
+                   second_cleared_mode);
+  assert_non_null(dt_masks_get_from_id_ext(first_clear->forms, shape_id));
+  assert_non_null(dt_masks_get_from_id_ext(second_clear->forms, shape_id));
+  const dt_masks_form_t *first_snapshot_first_group =
+    dt_masks_get_from_id_ext(first_clear->forms, first_group_id);
+  const dt_masks_form_t *first_snapshot_second_group =
+    dt_masks_get_from_id_ext(first_clear->forms, second_group_id);
+  const dt_masks_form_t *second_snapshot_first_group =
+    dt_masks_get_from_id_ext(second_clear->forms, first_group_id);
+  const dt_masks_form_t *second_snapshot_second_group =
+    dt_masks_get_from_id_ext(second_clear->forms, second_group_id);
+  assert_non_null(first_snapshot_first_group);
+  assert_non_null(first_snapshot_second_group);
+  assert_non_null(second_snapshot_first_group);
+  assert_non_null(second_snapshot_second_group);
+  assert_int_equal(g_list_length(first_snapshot_first_group->points), 0);
+  assert_int_equal(g_list_length(first_snapshot_second_group->points), 0);
+  assert_int_equal(g_list_length(second_snapshot_first_group->points), 0);
+  assert_int_equal(g_list_length(second_snapshot_second_group->points), 0);
+  assert_null(final_delete->forms);
+  assert_null(dt_masks_get_from_id_ext(final_delete->forms, shape_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, NO_MASKID,
+                            second_cleared_mode, TRUE);
+  const uint64_t deleted_revision =
+    dt_remote_revision_get(dt_remote_revision_current());
+  assert_int_equal(deleted_revision, revision_before + 3);
+
+  const uint64_t second_clear_revision =
+    _remote_undo_headless(deleted_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, NO_MASKID,
+                            second_cleared_mode, TRUE);
+  assert_int_equal(g_list_length(
+    dt_masks_get_from_id(&fixture->dev, first_group_id)->points), 0);
+  assert_int_equal(g_list_length(
+    dt_masks_get_from_id(&fixture->dev, second_group_id)->points), 0);
+
+  const uint64_t first_clear_revision =
+    _remote_undo_headless(second_clear_revision);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, second_group_id,
+                            second_mode, TRUE);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  assert_int_equal(g_list_length(
+    dt_masks_get_from_id(&fixture->dev, first_group_id)->points), 0);
+  assert_int_equal(g_list_length(
+    dt_masks_get_from_id(&fixture->dev, second_group_id)->points), 0);
+
+  _remote_undo_headless(first_clear_revision);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  _assert_module_mask_state(fixture, fixture->module, first_group_id,
+                            first_mode, FALSE);
+  _assert_module_mask_state(fixture, second, second_group_id,
+                            second_mode, TRUE);
+  first_group =
+    dt_masks_get_from_id(&fixture->dev, first_group_id);
+  second_group =
+    dt_masks_get_from_id(&fixture->dev, second_group_id);
+  assert_non_null(first_group);
+  assert_non_null(second_group);
+  assert_true(dt_masks_group_contains_form(&fixture->dev, first_group,
+                                           shape_id));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, second_group,
+                                           shape_id));
+  assert_int_equal(g_list_length(first_group->points), 1);
+  assert_int_equal(g_list_length(second_group->points), 1);
+
+  dt_gui_gtk_t *fake_gui = darktable.gui;
+  darktable.gui = NULL;
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, second_group_id,
+                            second_mode, TRUE);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  assert_int_equal(fixture->dev.history_end, history_before + 2);
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, NO_MASKID,
+                            second_cleared_mode, TRUE);
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  dt_undo_do_redo(darktable.undo, DT_UNDO_DEVELOP);
+  darktable.gui = fake_gui;
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+  assert_null(dt_masks_get_from_id(&fixture->dev, shape_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, first_group_id));
+  assert_null(dt_masks_get_from_id(&fixture->dev, second_group_id));
+  _assert_module_mask_state(fixture, fixture->module, NO_MASKID,
+                            first_cleared_mode, FALSE);
+  _assert_module_mask_state(fixture, second, NO_MASKID,
+                            second_cleared_mode, TRUE);
+  assert_int_equal(fixture->undo_snapshot_records, 3);
+
+  (void)shape;
+  json_array_unref(removed_from);
+}
+
 static void test_remote_create_unattached_has_one_history_item(void **state)
 {
   blend_fixture_t *fixture = *state;
@@ -2830,6 +3448,18 @@ int main(void)
       blend_history_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_remote_create_attached_undo_has_two_real_boundaries,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_isolated_undo_scope_has_no_empty_or_stale_state,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_remote_create_attached_undo_isolated_from_newer_history,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_remote_create_attached_splits_active_undo_group,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_remote_delete_two_modules_has_coherent_undo_prefixes,
       blend_undo_test_setup, blend_undo_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_remote_create_unattached_has_one_history_item,

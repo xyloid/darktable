@@ -977,7 +977,6 @@ dt_masks_form_t *dt_masks_get_from_id(const dt_develop_t *dev, const dt_mask_id_
 void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
 {
   dt_dev_history_item_t *hist_item = NULL;
-  const dt_dev_history_item_t *hist_item_last = NULL;
   int num_prev = -1;
 
   sqlite3_stmt *stmt;
@@ -1080,6 +1079,7 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
     // add the form to the history entry
     if(hist_item)
     {
+      hist_item->forms_history = TRUE;
       hist_item->forms = g_list_append(hist_item->forms, form);
     }
     else
@@ -1088,12 +1088,22 @@ void dt_masks_read_masks_history(dt_develop_t *dev, const dt_imgid_t imgid)
                " while adding mask %s(%i)",
                num, form->name, formid);
 
-    if(num < dev->history_end) hist_item_last = hist_item;
   }
   sqlite3_finalize(stmt);
 
-  // and we update the current forms snapshot
-  dt_masks_replace_current_forms(dev, (hist_item_last)?hist_item_last->forms:NULL);
+  // Update from the last explicit snapshot in the active prefix. In
+  // particular, a persisted mask_manager item with no masks_history rows is
+  // an explicit empty snapshot rather than "no masks information".
+  GList *forms = NULL;
+  int history_num = 0;
+  for(GList *history = dev->history;
+      history && history_num < dev->history_end;
+      history = g_list_next(history), history_num++)
+  {
+    const dt_dev_history_item_t *item = history->data;
+    if(item->forms_history) forms = item->forms;
+  }
+  dt_masks_replace_current_forms(dev, forms);
 }
 
 void dt_masks_write_masks_history_item(const dt_imgid_t imgid,
@@ -1903,6 +1913,7 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
   GPtrArray *owners =
     dt_masks_form_get_referencing_modules(dev, form->formid);
   GPtrArray *emptied_modules = g_ptr_array_new();
+  GPtrArray *forms_to_retire = g_ptr_array_new();
   GQueue empty_groups = G_QUEUE_INIT;
   GHashTable *queued =
     g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -1915,7 +1926,7 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
     if(_remove_id_from_group(group, form->formid))
       _queue_empty_group(&empty_groups, queued, group);
   }
-  _retire_form(dev, form);
+  g_ptr_array_add(forms_to_retire, form);
 
   while(!g_queue_is_empty(&empty_groups))
   {
@@ -1933,7 +1944,13 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
       module->blend_params->mask_id = NO_MASKID;
       module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
       if(!_ptr_array_contains(emptied_modules, module))
+      {
         g_ptr_array_add(emptied_modules, module);
+        // Snapshot each detach while every target/cascaded empty group is
+        // still active. A history prefix can therefore never leave a later
+        // module pointing at a group that its forms snapshot has retired.
+        dt_dev_add_new_masks_history_item(dev, module, module->enabled);
+      }
     }
 
     for(GList *forms = dev->forms;
@@ -1945,19 +1962,16 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
          && _remove_id_from_group(parent, empty->formid))
         _queue_empty_group(&empty_groups, queued, parent);
     }
-    _retire_form(dev, empty);
+    g_ptr_array_add(forms_to_retire, empty);
   }
 
-  for(guint i = 0; i < emptied_modules->len; i++)
-  {
-    dt_iop_module_t *module =
-      g_ptr_array_index(emptied_modules, i);
-    dt_dev_add_new_masks_history_item(dev, module, module->enabled);
-  }
+  for(guint i = 0; i < forms_to_retire->len; i++)
+    _retire_form(dev, g_ptr_array_index(forms_to_retire, i));
   dt_dev_add_new_masks_history_item(dev, NULL, FALSE);
   for(guint i = 0; i < owners->len; i++)
     dt_masks_iop_update(g_ptr_array_index(owners, i));
 
+  g_ptr_array_unref(forms_to_retire);
   g_ptr_array_unref(emptied_modules);
   g_hash_table_unref(queued);
   if(affected_modules)
@@ -2429,10 +2443,11 @@ void dt_masks_cleanup_unused_from_list(GList *history_list)
       history = g_list_previous(history))
   {
     dt_dev_history_item_t *hist = history->data;
-    if(hist->forms
+    if(hist->forms_history
        && strcmp(hist->op_name, "mask_manager") == 0)
     {
-      _masks_cleanup_unused(&hist->forms, history_list, history_end);
+      if(hist->forms)
+        _masks_cleanup_unused(&hist->forms, history_list, history_end);
       history_end = num - 1;
     }
     num--;
@@ -2456,7 +2471,7 @@ void dt_masks_cleanup_unused(dt_develop_t *dev)
   {
     const dt_dev_history_item_t *hist = history->data;
 
-    if(hist->forms) forms = hist->forms;
+    if(hist->forms_history) forms = hist->forms;
     if(hist->module
        && strcmp(hist->op_name, "mask_manager") != 0)
       module = hist->module;

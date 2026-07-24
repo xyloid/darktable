@@ -24,11 +24,13 @@
 // to remote_transform.h. Every function taking a dt_develop_t/dt_iop_module_t
 // runs on the GTK main thread.
 //
-// CAVEAT: the create/delete/detach paths reach dt_masks_gui_form_save_creation
-// (dev-parameterized, safe) and dt_masks_form_remove (HARDWIRED to
-// darktable.develop, ignores the passed dev). On the wire the darkroom dev IS
-// darktable.develop so this is correct; unit tests on a standalone fixture dev
-// must repoint darktable.develop at it around those calls (see Task 5/6 tests).
+// CAVEAT: remote creation and full deletion use the dev-parameterized
+// extended core APIs; this surface does not call legacy
+// dt_masks_form_remove(). Some underlying mask-core operations still consult
+// the live darkroom singleton (notably creation ID deconfliction and image-size
+// lookup), GUI edit cancellation only acts on that live context, and deletion
+// explicitly rejects any other dev. Standalone tests must therefore repoint
+// darktable.develop at their fixture.
 
 #pragma once
 

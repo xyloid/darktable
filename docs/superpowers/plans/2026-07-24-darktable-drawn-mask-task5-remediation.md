@@ -4,7 +4,7 @@
 
 **Goal:** Make Task 5 mask creation, update, deletion, reporting, history, ownership, and GUI-session cancellation correct for nested mask groups without changing legacy removal callers.
 
-**Architecture:** Add cycle-safe graph and ownership-aware full-delete primitives to the masks core while retaining `dt_masks_form_remove` unchanged. Add a forced-new masks-history primitive and an extended creation helper so remote mutations have coherent, distinct undo snapshots without enabling disabled modules; then migrate `remote_masks.c` and document every legacy removal caller for later review.
+**Architecture:** Add cycle-safe graph and ownership-aware full-delete primitives to the masks core while retaining `dt_masks_form_remove` unchanged. Add a forced-new masks-history primitive backed by the undo core's hard isolated scope, plus an extended creation helper, so remote mutations have coherent, distinct undo snapshots without enabling disabled modules; then migrate `remote_masks.c` and document every legacy removal caller for later review.
 
 **Tech Stack:** darktable C, GLib collections, JSON-GLib, CMocka, CMake, CTest, Git.
 
@@ -21,7 +21,8 @@
   production undo entries: unattached form first, coherent attachment
   second. Each forced-new entry bypasses target suppression and has an
   explicit no-coalesce undo boundary.
-- Full delete must produce one global masks-history entry plus one entry per module base group retired by its cascade.
+- Full delete must produce one global masks-history entry plus one entry
+  per unique module whose base group is retired by its cascade.
 - The only bit cleared when a module loses its final drawn-mask group is `DEVELOP_MASK_MASK`.
 - Test each behavior through a failing test before changing production code.
 - End every implementation task with the focused `test_remote_masks` target green and a separate commit.
@@ -263,14 +264,18 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
     if(fpt) target = GINT_TO_POINTER(fpt->formid);
   }
 
-  dt_pthread_mutex_lock(&dev->history_mutex);
-
+  dt_undo_t *undo = darktable.undo;
+  const gboolean record_undo =
+    undo && dev->gui_attached
+    && dt_view_get_current() == DT_VIEW_DARKROOM;
   const gboolean isolate_undo_record =
-    new_item && darktable.undo && dev->gui_attached
-    && dt_view_get_current() == DT_VIEW_DARKROOM
-    && dt_control_running();
+    new_item && record_undo && dt_control_running();
   if(isolate_undo_record)
-    dt_undo_start_group(darktable.undo, DT_UNDO_HISTORY);
+    dt_undo_start_isolated_group(undo, DT_UNDO_HISTORY);
+  else if(record_undo)
+    dt_undo_start_recording(undo);
+
+  dt_pthread_mutex_lock(&dev->history_mutex);
 
   gboolean need_end_record = TRUE;
   if(new_item)
@@ -284,12 +289,14 @@ static void _dev_add_masks_history_item(dt_develop_t *dev,
   dt_dev_pipe_synch_all(dev);
   dt_dev_invalidate_all(dev);
 
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+
   if(need_end_record)
     dt_dev_undo_end_record(dev);
   if(isolate_undo_record)
-    dt_undo_end_group(darktable.undo);
-
-  dt_pthread_mutex_unlock(&dev->history_mutex);
+    dt_undo_end_isolated_group(undo);
+  else if(record_undo)
+    dt_undo_end_recording(undo);
 
   if(dev->gui_attached)
   {
@@ -810,6 +817,7 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
   GPtrArray *owners =
     dt_masks_form_get_referencing_modules(dev, form->formid);
   GPtrArray *emptied_modules = g_ptr_array_new();
+  GPtrArray *forms_to_retire = g_ptr_array_new();
   GQueue empty_groups = G_QUEUE_INIT;
   GHashTable *queued =
     g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -822,7 +830,7 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
     if(_remove_id_from_group(group, form->formid))
       _queue_empty_group(&empty_groups, queued, group);
   }
-  _retire_form(dev, form);
+  g_ptr_array_add(forms_to_retire, form);
 
   while(!g_queue_is_empty(&empty_groups))
   {
@@ -840,7 +848,10 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
       module->blend_params->mask_id = NO_MASKID;
       module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
       if(!_ptr_array_contains(emptied_modules, module))
+      {
         g_ptr_array_add(emptied_modules, module);
+        dt_dev_add_new_masks_history_item(dev, module, module->enabled);
+      }
     }
 
     for(GList *forms = dev->forms;
@@ -852,19 +863,16 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
          && _remove_id_from_group(parent, empty->formid))
         _queue_empty_group(&empty_groups, queued, parent);
     }
-    _retire_form(dev, empty);
+    g_ptr_array_add(forms_to_retire, empty);
   }
 
-  for(guint i = 0; i < emptied_modules->len; i++)
-  {
-    dt_iop_module_t *module =
-      g_ptr_array_index(emptied_modules, i);
-    dt_dev_add_new_masks_history_item(dev, module, module->enabled);
-  }
+  for(guint i = 0; i < forms_to_retire->len; i++)
+    _retire_form(dev, g_ptr_array_index(forms_to_retire, i));
   dt_dev_add_new_masks_history_item(dev, NULL, FALSE);
   for(guint i = 0; i < owners->len; i++)
     dt_masks_iop_update(g_ptr_array_index(owners, i));
 
+  g_ptr_array_unref(forms_to_retire);
   g_ptr_array_unref(emptied_modules);
   g_hash_table_unref(queued);
   if(affected_modules)
@@ -874,6 +882,12 @@ gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
   return TRUE;
 }
 ```
+
+The module history call remains inside the queue loop, before any target
+or cascaded group is retired. Retirement is deferred until the queue
+drains, then the global snapshot records the pruned graph. This preserves
+the exact `1 + unique cleared modules` count while ensuring every valid
+module `mask_id` resolves in every undo/redo prefix.
 
 Keep `dt_masks_form_remove` byte-for-byte behaviorally unchanged.
 
@@ -2002,8 +2016,9 @@ the new full-delete call.
 Append these rows:
 
 ```markdown
-| `src/develop/develop.h` / `develop.c` | additive `dt_dev_add_new_masks_history_item`, sharing the existing masks-history wrapper while forcing a distinct masks snapshot | `test_new_mask_history_forces_distinct_snapshots` + create two-step undo tests |
-| `src/develop/masks.h` / `masks.c` | additive cycle-safe mask graph queries, ownership-aware non-group full deletion, explicit creation options, and extended creation helper; legacy removal API retained | nested/cycle/shared-owner/full-delete/allforms/history tests in `test_remote_masks` + `MASKS_REMOVE_CALLER_AUDIT` |
+| `src/common/undo.h` / `undo.c` | paired recording guard plus lazy mutex-held isolated groups with two-sided coalescing epochs and ambient split/resume | isolated-scope + public create undo/redo tests |
+| `src/develop/develop.h` / `develop.c` | additive `dt_dev_add_new_masks_history_item`, hard-isolated target-bypass records, and explicit in-memory empty-forms history sentinel; persisted empty replay is inferred only for `mask_manager`, while the pre-existing arbitrary non-manager limitation remains out of scope | forced-new + create two-step + empty-delete undo tests |
+| `src/develop/masks.h` / `masks.c` | additive cycle-safe graph queries, staged ownership-aware full deletion, explicit creation options, and extended creation helper; legacy removal retained | nested/cycle/shared-owner/full-delete prefix tests + `MASKS_REMOVE_CALLER_AUDIT` |
 ```
 
 - [ ] **Step 6: Verify documentation and caller coverage**
