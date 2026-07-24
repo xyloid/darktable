@@ -31,6 +31,7 @@
 
 #include "common/introspection.h"
 #include "control/settings.h"  // dt_dev_operation_t (mask render target)
+#include "develop/masks.h"     // dt_masks_type_t, dt_mask_id_t
 
 #include <gio/gio.h>   // GCancellable (dt_remote_render_preview_execute)
 #include <glib.h>
@@ -537,6 +538,40 @@ gboolean dt_remote_create_module_instance(const dt_remote_module_ref_t *ref,
  * thread only. */
 JsonNode *dt_remote_blend_schema_for_ref(const dt_remote_module_ref_t *ref);
 JsonNode *dt_remote_blend_read_for_ref(const dt_remote_module_ref_t *ref);
+
+/* Drawn-mask engine calls.  All run on the GTK main thread and own their
+ * expected_revision CAS and revision handling.  Create reveals its optional
+ * attachment module, update reveals a sole owner, and attachment reveals its
+ * module after a real mutation; list, delete, and an absent-edge detach do
+ * not reveal a module.  Returned JSON nodes/arrays are caller-owned. */
+gboolean dt_remote_masks_list_json(JsonNode **out, uint64_t *revision,
+                                   dt_remote_error_t **error);
+gboolean dt_remote_masks_create_call(
+  dt_masks_type_t type, JsonObject *geom, const char *name,
+  const dt_remote_module_ref_t *attach_ref_or_null,
+  const uint64_t *expected_revision, JsonNode **entry_out,
+  uint64_t *revision, dt_remote_error_t **error);
+gboolean dt_remote_masks_update_call(
+  dt_mask_id_t id, JsonObject *geom, const char *name,
+  const uint64_t *expected_revision, JsonNode **entry_out,
+  int *affects_out, uint64_t *revision, dt_remote_error_t **error);
+gboolean dt_remote_masks_delete_call(
+  dt_mask_id_t id, const uint64_t *expected_revision,
+  JsonArray **removed_from_out, uint64_t *revision,
+  dt_remote_error_t **error);
+gboolean dt_remote_masks_attachment_call(
+  const dt_remote_module_ref_t *ref, dt_mask_id_t shape_id,
+  gboolean attached, const char *state, int inverted,
+  const double *opacity, const uint64_t *expected_revision,
+  JsonNode **entry_out, uint64_t *revision,
+  dt_remote_error_t **error);
+
+/* Optional internal instrumentation for the module selected by the remote
+ * reveal helper.  It runs on the GTK main thread after selection and before
+ * GUI/headless guards.  The process-wide observer is not thread-safe; set
+ * it to %NULL when no instrumentation is needed. */
+typedef void (*dt_remote_reveal_observer_t)(struct dt_iop_module_t *module);
+void dt_remote_reveal_set_observer(dt_remote_reveal_observer_t observer);
 
 /** Reads the darkroom history stack as model-oriented metadata only: one
  * dt_remote_history_item_t per entry (seq = stack position, op, instance,

@@ -25,8 +25,10 @@
 #include "control/remote_band.h"
 #include "control/remote_blend.h"
 #include "control/remote_curve.h"
+#include "control/remote_masks.h"
 #include "control/remote_quantity.h"
 #include "control/remote_revision.h"
+#include "control/remote_transform.h"
 #include "control/remote_vector.h"
 #include "common/colorspaces.h"
 #include "develop/blend.h"
@@ -1412,9 +1414,18 @@ JsonNode *dt_remote_blend_read_for_ref(const dt_remote_module_ref_t *ref)
 // GUIs opt out. dt_iop_gui_set_expanded()'s collapse_others branch
 // *toggles* an already-expanded module when every other module is closed,
 // so it is only called for a collapsed module.
+static dt_remote_reveal_observer_t s_reveal_observer = NULL;
+
+void dt_remote_reveal_set_observer(dt_remote_reveal_observer_t observer)
+{
+  s_reveal_observer = observer;
+}
+
 static void _remote_reveal_module(dt_iop_module_t *module)
 {
-  if(!module || !module->expander) return;
+  if(!module) return;
+  if(s_reveal_observer) s_reveal_observer(module);
+  if(!module->expander) return;
   if(!dt_conf_get_bool("remote/follow_edited_module")) return;
 
   if(module->so->state == IOP_STATE_HIDDEN)
@@ -1748,6 +1759,164 @@ static uint64_t dt_remote_read_new_revision(uint64_t pre_revision)
   uint64_t new_revision = dt_remote_revision_get(dt_remote_revision_current());
   if(new_revision == pre_revision) new_revision = dt_remote_revision_force_bump();
   return new_revision;
+}
+
+// Builds an owned current list entry for one shape.  The caller has already
+// established transform freshness before a mutation; do not wait again here:
+// a mask edit dirties the preview render but does not alter the distortion
+// graph, so that proven mapping remains valid for this response.  A missing
+// entry after a successful create/update/attachment is an invariant breach,
+// not a recoverable post-commit error.
+static JsonNode *_masks_entry_for_id(dt_develop_t *dev, dt_mask_id_t id)
+{
+  JsonNode *list = dt_remote_masks_list(dev);
+  g_assert(list && JSON_NODE_HOLDS_OBJECT(list));
+  JsonArray *shapes =
+    json_object_get_array_member(json_node_get_object(list), "shapes");
+  g_assert(shapes);
+
+  JsonNode *out = NULL;
+  for(guint i = 0; i < json_array_get_length(shapes); i++)
+  {
+    JsonNode *shape = json_array_get_element(shapes, i);
+    if(json_object_get_int_member(json_node_get_object(shape), "id") == id)
+    {
+      out = json_node_copy(shape);
+      break;
+    }
+  }
+  json_node_unref(list);
+  g_assert(out);
+  return out;
+}
+
+gboolean dt_remote_masks_list_json(JsonNode **out, uint64_t *revision,
+                                   dt_remote_error_t **error)
+{
+  g_assert(!darktable.control || pthread_equal(darktable.control->gui_thread, pthread_self()));
+
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_require_darkroom_image(&dev, error)) return FALSE;
+  dt_remote_revision_observe_image(dev->image_storage.id);
+  if(!dt_remote_transform_ensure_fresh(dev, error)) return FALSE;
+
+  JsonNode *list = dt_remote_masks_list(dev);
+  if(out) *out = list;
+  else json_node_unref(list);
+  if(revision) *revision = dt_remote_revision_get(dt_remote_revision_current());
+  return TRUE;
+}
+
+gboolean dt_remote_masks_create_call(
+  dt_masks_type_t type, JsonObject *geom, const char *name,
+  const dt_remote_module_ref_t *attach_ref_or_null,
+  const uint64_t *expected_revision, JsonNode **entry_out,
+  uint64_t *revision, dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+  if(!dt_remote_transform_ensure_fresh(dev, error)) return FALSE;
+
+  dt_iop_module_t *module = NULL;
+  if(attach_ref_or_null)
+  {
+    module = dt_remote_find_module(dev, attach_ref_or_null, error);
+    if(!module) return FALSE;
+  }
+
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  dt_mask_id_t id = INVALID_MASKID;
+  if(!dt_remote_masks_create(dev, type, geom, name, module, &id, error)) return FALSE;
+
+  JsonNode *entry = entry_out ? _masks_entry_for_id(dev, id) : NULL;
+  if(module) _remote_reveal_module(module);
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+  if(entry_out) *entry_out = entry;
+  if(revision) *revision = new_revision;
+  return TRUE;
+}
+
+gboolean dt_remote_masks_update_call(
+  dt_mask_id_t id, JsonObject *geom, const char *name,
+  const uint64_t *expected_revision, JsonNode **entry_out,
+  int *affects_out, uint64_t *revision, dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+  if(!dt_remote_transform_ensure_fresh(dev, error)) return FALSE;
+
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  int affects = 0;
+  if(!dt_remote_masks_update(dev, id, geom, name, &affects, error)) return FALSE;
+
+  JsonNode *entry = entry_out ? _masks_entry_for_id(dev, id) : NULL;
+  // Geometry replacement preserves membership.  Re-walk the public helper
+  // after commit so reveal selection is based on the actual sole owner.
+  GPtrArray *owners = dt_masks_form_get_referencing_modules(dev, id);
+  if(owners->len == 1) _remote_reveal_module(g_ptr_array_index(owners, 0));
+  g_ptr_array_unref(owners);
+
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+  if(entry_out) *entry_out = entry;
+  if(affects_out) *affects_out = affects;
+  if(revision) *revision = new_revision;
+  return TRUE;
+}
+
+gboolean dt_remote_masks_delete_call(
+  dt_mask_id_t id, const uint64_t *expected_revision,
+  JsonArray **removed_from_out, uint64_t *revision,
+  dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  JsonArray *removed_from = json_array_new();
+  if(!dt_remote_masks_delete(dev, id, removed_from, error))
+  {
+    json_array_unref(removed_from);
+    return FALSE;
+  }
+
+  const uint64_t new_revision = dt_remote_read_new_revision(pre_revision);
+  if(removed_from_out) *removed_from_out = removed_from;
+  else json_array_unref(removed_from);
+  if(revision) *revision = new_revision;
+  return TRUE;
+}
+
+gboolean dt_remote_masks_attachment_call(
+  const dt_remote_module_ref_t *ref, dt_mask_id_t shape_id,
+  gboolean attached, const char *state, int inverted,
+  const double *opacity, const uint64_t *expected_revision,
+  JsonNode **entry_out, uint64_t *revision,
+  dt_remote_error_t **error)
+{
+  dt_develop_t *dev = NULL;
+  if(!dt_remote_mutation_precheck(expected_revision, &dev, error)) return FALSE;
+  if(!dt_remote_transform_ensure_fresh(dev, error)) return FALSE;
+
+  dt_iop_module_t *module = dt_remote_find_module(dev, ref, error);
+  if(!module) return FALSE;
+
+  dt_masks_form_t *group = module->blend_params
+    ? dt_masks_get_from_id(dev, module->blend_params->mask_id) : NULL;
+  const gboolean direct_edge_existed =
+    group && dt_masks_group_get_direct_member(group, shape_id);
+  const uint64_t pre_revision = dt_remote_revision_get(dt_remote_revision_current());
+  if(!dt_remote_masks_set_attachment(dev, module, shape_id, attached, state,
+                                     inverted, opacity, error)) return FALSE;
+
+  JsonNode *entry = entry_out ? _masks_entry_for_id(dev, shape_id) : NULL;
+  const gboolean real_mutation = attached || direct_edge_existed;
+  if(real_mutation) _remote_reveal_module(module);
+  const uint64_t new_revision = real_mutation
+                                  ? dt_remote_read_new_revision(pre_revision)
+                                  : pre_revision;
+  if(entry_out) *entry_out = entry;
+  if(revision) *revision = new_revision;
+  return TRUE;
 }
 
 gboolean dt_remote_set_module_enabled(const dt_remote_module_ref_t *ref,

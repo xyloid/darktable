@@ -54,6 +54,22 @@
 
 static char *s_confdir = NULL;
 
+static dt_iop_module_t *s_revealed_module = NULL;
+static guint s_reveal_count = 0;
+
+static void _observe_remote_reveal(dt_iop_module_t *module)
+{
+  s_revealed_module = module;
+  s_reveal_count++;
+}
+
+static void _begin_observing_remote_reveals(void)
+{
+  s_revealed_module = NULL;
+  s_reveal_count = 0;
+  dt_remote_reveal_set_observer(_observe_remote_reveal);
+}
+
 typedef struct masks_fixture_t
 {
   dt_dev_pixelpipe_t *preview_pipe;
@@ -411,6 +427,10 @@ static int blend_undo_test_teardown(void **state)
 {
   blend_fixture_t *fixture = *state;
   if(!fixture) return 0;
+
+  dt_remote_reveal_set_observer(NULL);
+  s_revealed_module = NULL;
+  s_reveal_count = 0;
 
   DT_CONTROL_SIGNAL_DISCONNECT(_test_history_will_change, fixture);
   dt_remote_revision_disconnect();
@@ -3823,6 +3843,351 @@ static void test_delete_rejects_engine_managed_group_id(void **state)
   json_object_unref(geometry);
 }
 
+static void test_live_mask_wrappers_list_create_update_delete(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_remote_error_t *error = NULL;
+  uint64_t revision = 0;
+  JsonNode *listed = NULL;
+  const uint64_t observed =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  _begin_observing_remote_reveals();
+  assert_true(dt_remote_masks_list_json(&listed, &revision, &error));
+  assert_null(error);
+  assert_non_null(listed);
+  assert_int_equal(revision, observed);
+  assert_int_equal(s_reveal_count, 0);
+  json_node_unref(listed);
+
+  JsonObject *initial =
+    _geom("{\"center\":[0.4,0.4],\"radius\":0.1,\"border\":0.02}");
+  JsonObject *replacement =
+    _geom("{\"center\":[0.6,0.6],\"radius\":0.2,\"border\":0.03}");
+  dt_remote_module_ref_t ref = { .op = "exposure", .instance = 0 };
+  JsonNode *entry = NULL;
+  const uint64_t create_expected = revision;
+  const int create_history_before = fixture->dev.history_end;
+  assert_true(dt_remote_masks_create_call(DT_MASKS_CIRCLE, initial, "live",
+                                          &ref, &create_expected, &entry,
+                                          &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  JsonObject *created_entry = json_node_get_object(entry);
+  const dt_mask_id_t id = json_object_get_int_member(created_entry, "id");
+  assert_true(dt_is_valid_maskid(id));
+  assert_string_equal(json_object_get_string_member(created_entry, "name"),
+                      "live");
+  assert_int_equal(json_array_get_length(
+    json_object_get_array_member(created_entry, "used_by")), 1);
+  assert_int_equal(s_reveal_count, 1);
+  assert_ptr_equal(s_revealed_module, fixture->module);
+  assert_int_equal(fixture->dev.history_end, create_history_before + 2);
+  assert_int_equal(revision, create_expected + 2);
+  json_node_unref(entry);
+
+  // The real create invalidates the preview render.  In this headless live
+  // fixture no worker reprocesses it, so model the completed reprocess that
+  // a subsequent geometry edit requires.
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  int affects = -1;
+  entry = NULL;
+  _begin_observing_remote_reveals();
+  const uint64_t update_expected = revision;
+  const int update_history_before = fixture->dev.history_end;
+  assert_true(dt_remote_masks_update_call(id, replacement, "updated",
+                                          &update_expected, &entry, &affects,
+                                          &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  JsonObject *updated_entry = json_node_get_object(entry);
+  assert_int_equal(json_object_get_int_member(updated_entry, "id"), id);
+  assert_string_equal(json_object_get_string_member(updated_entry, "name"),
+                      "updated");
+  JsonObject *updated_geometry =
+    json_object_get_object_member(updated_entry, "geometry");
+  JsonArray *updated_center =
+    json_object_get_array_member(updated_geometry, "center");
+  assert_float_equal(json_array_get_double_element(updated_center, 0), 0.6,
+                     1e-6);
+  assert_float_equal(json_array_get_double_element(updated_center, 1), 0.6,
+                     1e-6);
+  assert_float_equal(json_object_get_double_member(updated_geometry, "radius"),
+                     0.2, 1e-6);
+  assert_float_equal(json_object_get_double_member(updated_geometry, "border"),
+                     0.03, 1e-6);
+  JsonArray *updated_used_by =
+    json_object_get_array_member(updated_entry, "used_by");
+  assert_int_equal(json_array_get_length(updated_used_by), 1);
+  JsonObject *updated_usage =
+    json_array_get_object_element(updated_used_by, 0);
+  assert_string_equal(json_object_get_string_member(updated_usage, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(updated_usage, "instance"), 0);
+  assert_int_equal(affects, 1);
+  assert_int_equal(s_reveal_count, 1);
+  assert_ptr_equal(s_revealed_module, fixture->module);
+  assert_int_equal(fixture->dev.history_end, update_history_before + 1);
+  assert_int_equal(revision, update_expected + 1);
+  json_node_unref(entry);
+
+  JsonArray *removed_from = NULL;
+  _begin_observing_remote_reveals();
+  const uint64_t delete_expected = revision;
+  const int delete_history_before = fixture->dev.history_end;
+  assert_true(dt_remote_masks_delete_call(id, &delete_expected, &removed_from,
+                                          &revision, &error));
+  assert_null(error);
+  assert_non_null(removed_from);
+  assert_int_equal(json_array_get_length(removed_from), 1);
+  assert_int_equal(s_reveal_count, 0);
+  assert_int_equal(fixture->dev.history_end, delete_history_before + 2);
+  assert_int_equal(revision, delete_expected + 2);
+  json_array_unref(removed_from);
+  json_object_unref(replacement);
+  json_object_unref(initial);
+}
+
+static void test_live_mask_wrapper_cas_precedes_freshness(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  const int forms_before = g_list_length(fixture->dev.forms);
+  const uint64_t current =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+  const uint64_t stale = current - 1;
+  dt_remote_error_t *error = NULL;
+  JsonNode *entry = NULL;
+  uint64_t revision = 123;
+
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_INVALID;
+  assert_false(dt_remote_masks_create_call(DT_MASKS_CIRCLE, geometry, NULL,
+                                           NULL, &stale, &entry, &revision,
+                                           &error));
+  _assert_error(&error, DT_REMOTE_ERR_REVISION_CONFLICT, NULL, NULL);
+  assert_null(entry);
+  assert_int_equal(revision, 123);
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  json_object_unref(geometry);
+}
+
+static void test_live_mask_wrapper_freshness_rejects_before_create(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  const int forms_before = g_list_length(fixture->dev.forms);
+  const uint64_t expected =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+  dt_remote_error_t *error = NULL;
+  JsonNode *entry = NULL;
+  uint64_t revision = 321;
+
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_INVALID;
+  assert_false(dt_remote_masks_create_call(DT_MASKS_CIRCLE, geometry, NULL,
+                                           NULL, &expected, &entry, &revision,
+                                           &error));
+  _assert_error(&error, DT_REMOTE_ERR_PIPE_NOT_READY, NULL, NULL);
+  assert_null(entry);
+  assert_int_equal(revision, 321);
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  json_object_unref(geometry);
+}
+
+static void test_live_mask_wrapper_absent_detach_is_revision_noop(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.02}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_CIRCLE, geometry,
+                                     NULL, NULL, &id, &error));
+  assert_null(error);
+
+  dt_remote_module_ref_t ref = { .op = "exposure", .instance = 0 };
+  // The engine create above invalidates the pipe; complete that work before
+  // this attachment call, whose response serializes preview coordinates.
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  const uint64_t expected =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+  uint64_t revision = 0;
+  JsonNode *entry = NULL;
+  const int attach_history_before = fixture->dev.history_end;
+  _begin_observing_remote_reveals();
+  assert_true(dt_remote_masks_attachment_call(&ref, id, TRUE, "union", 0,
+                                              NULL, &expected, &entry,
+                                              &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  JsonObject *attached_entry = json_node_get_object(entry);
+  assert_int_equal(json_object_get_int_member(attached_entry, "id"), id);
+  JsonArray *attached_used_by =
+    json_object_get_array_member(attached_entry, "used_by");
+  assert_int_equal(json_array_get_length(attached_used_by), 1);
+  JsonObject *attached_usage =
+    json_array_get_object_element(attached_used_by, 0);
+  assert_string_equal(json_object_get_string_member(attached_usage, "op"),
+                      "exposure");
+  assert_int_equal(json_object_get_int_member(attached_usage, "instance"), 0);
+  assert_int_equal(s_reveal_count, 1);
+  assert_ptr_equal(s_revealed_module, fixture->module);
+  assert_int_equal(fixture->dev.history_end, attach_history_before + 1);
+  assert_int_equal(revision, expected + 1);
+  json_node_unref(entry);
+
+  // The real attach invalidates the pipe.  Make the next request fresh,
+  // then detach once to establish an absent direct edge for the no-op call.
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  const uint64_t detach_expected = revision;
+  const int detach_history_before = fixture->dev.history_end;
+  entry = NULL;
+  _begin_observing_remote_reveals();
+  assert_true(dt_remote_masks_attachment_call(&ref, id, FALSE, NULL, -1,
+                                              NULL, &detach_expected, &entry,
+                                              &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  JsonObject *detached_entry = json_node_get_object(entry);
+  assert_int_equal(json_object_get_int_member(detached_entry, "id"), id);
+  assert_int_equal(json_array_get_length(
+    json_object_get_array_member(detached_entry, "used_by")), 0);
+  assert_int_equal(s_reveal_count, 1);
+  assert_ptr_equal(s_revealed_module, fixture->module);
+  // The legacy detach snapshot coalesces into the just-created attachment
+  // target in this fixture.  The wrapper's forced revision fallback still
+  // makes this real mutation observable to CAS clients.
+  assert_int_equal(fixture->dev.history_end, detach_history_before);
+  assert_int_equal(revision, detach_expected + 1);
+  json_node_unref(entry);
+
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  const uint64_t absent_expected = revision;
+  const int absent_history_before = fixture->dev.history_end;
+  entry = NULL;
+  _begin_observing_remote_reveals();
+  assert_true(dt_remote_masks_attachment_call(&ref, id, FALSE, NULL, -1,
+                                              NULL, &absent_expected, &entry,
+                                              &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  JsonObject *absent_entry = json_node_get_object(entry);
+  assert_int_equal(json_object_get_int_member(absent_entry, "id"), id);
+  assert_int_equal(json_array_get_length(
+    json_object_get_array_member(absent_entry, "used_by")), 0);
+  assert_int_equal(s_reveal_count, 0);
+  assert_int_equal(revision, absent_expected);
+  assert_int_equal(fixture->dev.history_end, absent_history_before);
+  json_node_unref(entry);
+  json_object_unref(geometry);
+}
+
+static void test_live_mask_wrapper_update_reports_shared_owners(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_iop_module_t *other = _blend_fixture_add_module(fixture, "exposure", 1);
+  JsonObject *initial =
+    _geom("{\"center\":[0.4,0.4],\"radius\":0.1,\"border\":0.02}");
+  JsonObject *replacement =
+    _geom("{\"center\":[0.6,0.6],\"radius\":0.2,\"border\":0.03}");
+  dt_remote_error_t *error = NULL;
+  dt_remote_module_ref_t first_ref = { .op = "exposure", .instance = 0 };
+  dt_remote_module_ref_t second_ref = { .op = "exposure", .instance = 1 };
+  const uint64_t create_expected =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+  uint64_t revision = 0;
+  JsonNode *entry = NULL;
+
+  assert_true(dt_remote_masks_create_call(DT_MASKS_CIRCLE, initial, NULL,
+                                          &first_ref, &create_expected,
+                                          &entry, &revision, &error));
+  assert_null(error);
+  const dt_mask_id_t id =
+    json_object_get_int_member(json_node_get_object(entry), "id");
+  json_node_unref(entry);
+
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  const uint64_t attach_expected = revision;
+  entry = NULL;
+  assert_true(dt_remote_masks_attachment_call(&second_ref, id, TRUE, "union",
+                                              0, NULL, &attach_expected,
+                                              &entry, &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  json_node_unref(entry);
+  assert_true(dt_masks_group_contains_form(
+    &fixture->dev,
+    dt_masks_get_from_id(&fixture->dev, other->blend_params->mask_id), id));
+
+  fixture->dev.preview_pipe->status = DT_DEV_PIXELPIPE_VALID;
+  const uint64_t update_expected = revision;
+  const int history_before = fixture->dev.history_end;
+  entry = NULL;
+  int affects = -1;
+  _begin_observing_remote_reveals();
+  assert_true(dt_remote_masks_update_call(id, replacement, NULL,
+                                          &update_expected, &entry, &affects,
+                                          &revision, &error));
+  assert_null(error);
+  assert_non_null(entry);
+  assert_int_equal(json_object_get_int_member(json_node_get_object(entry), "id"),
+                   id);
+  assert_int_equal(json_array_get_length(json_object_get_array_member(
+                     json_node_get_object(entry), "used_by")), 2);
+  assert_int_equal(affects, 2);
+  assert_int_equal(s_reveal_count, 0);
+  assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_int_equal(revision, update_expected + 1);
+  json_node_unref(entry);
+  json_object_unref(replacement);
+  json_object_unref(initial);
+}
+
+static void test_live_mask_wrapper_delete_failure_keeps_outputs(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_remote_error_t *error = NULL;
+  JsonArray *sentinel = json_array_new();
+  json_array_add_string_element(sentinel, "untouched");
+  JsonArray *removed_from = sentinel;
+  uint64_t revision = 987;
+  const uint64_t expected =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+
+  assert_false(dt_remote_masks_delete_call(99999, &expected, &removed_from,
+                                           &revision, &error));
+  _assert_error(&error, DT_REMOTE_ERR_NOT_FOUND, "id", NULL);
+  assert_ptr_equal(removed_from, sentinel);
+  assert_int_equal(json_array_get_length(removed_from), 1);
+  assert_int_equal(revision, 987);
+  json_array_unref(sentinel);
+}
+
+static void test_live_mask_wrapper_attachment_missing_blend_is_error(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_remote_error_t *error = NULL;
+  dt_remote_module_ref_t ref = { .op = "exposure", .instance = 0 };
+  dt_develop_blend_params_t *saved_blend = fixture->module->blend_params;
+  fixture->module->blend_params = NULL;
+  const uint64_t expected =
+    dt_remote_revision_observe_image(fixture->dev.image_storage.id);
+  JsonNode *entry = NULL;
+  uint64_t revision = 456;
+
+  assert_false(dt_remote_masks_attachment_call(&ref, 99999, TRUE, "union", 0,
+                                               NULL, &expected, &entry,
+                                               &revision, &error));
+  fixture->module->blend_params = saved_blend;
+  _assert_error(&error, DT_REMOTE_ERR_UNSUPPORTED_FIELD, "op",
+                "masks_unsupported");
+  assert_null(entry);
+  assert_int_equal(revision, 456);
+}
+
 static void test_new_mask_history_forces_distinct_snapshots(void **state)
 {
   blend_fixture_t *fixture = *state;
@@ -4066,6 +4431,27 @@ int main(void)
     cmocka_unit_test_setup_teardown(
       test_delete_rejects_engine_managed_group_id,
       blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrappers_list_create_update_delete,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_cas_precedes_freshness,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_freshness_rejects_before_create,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_absent_detach_is_revision_noop,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_update_reports_shared_owners,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_delete_failure_keeps_outputs,
+      blend_undo_test_setup, blend_undo_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_live_mask_wrapper_attachment_missing_blend_is_error,
+      blend_undo_test_setup, blend_undo_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_new_mask_history_forces_distinct_snapshots,
       blend_test_setup, blend_test_teardown),

@@ -2577,6 +2577,8 @@ static const char *_error_code_to_wire(dt_remote_error_code_t code)
     case DT_REMOTE_ERR_REVISION_CONFLICT: return "revision_conflict";
     case DT_REMOTE_ERR_PREVIEW_FAILED: return "preview_failed";
     case DT_REMOTE_ERR_SCOPE_FAILED: return "scope_failed";
+    case DT_REMOTE_ERR_NOT_FOUND: return "not_found";
+    case DT_REMOTE_ERR_PIPE_NOT_READY: return "retry_later";
     case DT_REMOTE_ERR_INTERNAL:
     case DT_REMOTE_OK:
     default: return "internal";
@@ -2584,7 +2586,8 @@ static const char *_error_code_to_wire(dt_remote_error_code_t code)
 }
 
 // Per the protocol reference: retryable is true for revision_conflict,
-// busy, and *transient* preview_failed/scope_failed; false otherwise.
+// retry_later (a preview pipe that needs another render), busy, and
+// *transient* preview_failed/scope_failed; false otherwise.
 // busy is a transport-only code not reachable through dt_remote_error_t
 // (remote_edit never sees it). preview_failed's transient-vs-permanent
 // distinction needs a hint this error type does not carry, so ALL
@@ -2601,7 +2604,7 @@ static const char *_error_code_to_wire(dt_remote_error_code_t code)
 static gboolean _error_code_retryable(dt_remote_error_code_t code)
 {
   return code == DT_REMOTE_ERR_REVISION_CONFLICT || code == DT_REMOTE_ERR_PREVIEW_FAILED
-         || code == DT_REMOTE_ERR_SCOPE_FAILED;
+         || code == DT_REMOTE_ERR_SCOPE_FAILED || code == DT_REMOTE_ERR_PIPE_NOT_READY;
 }
 
 // The shared envelope body: `wire_code`/`retryable` given directly, for

@@ -3767,6 +3767,32 @@ static gboolean stub_set_module_enabled_conflict(const dt_remote_module_ref_t *r
   return FALSE;
 }
 
+static gboolean stub_set_module_enabled_not_found(const dt_remote_module_ref_t *ref, gboolean enabled,
+                                                  const uint64_t *expected_revision,
+                                                  dt_remote_mutation_result_t **out,
+                                                  dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)enabled;
+  (void)expected_revision;
+  (void)out;
+  if(error) *error = _make_error(DT_REMOTE_ERR_NOT_FOUND, g_strdup("mask shape is gone"));
+  return FALSE;
+}
+
+static gboolean stub_set_module_enabled_pipe_not_ready(const dt_remote_module_ref_t *ref, gboolean enabled,
+                                                       const uint64_t *expected_revision,
+                                                       dt_remote_mutation_result_t **out,
+                                                       dt_remote_error_t **error)
+{
+  (void)ref;
+  (void)enabled;
+  (void)expected_revision;
+  (void)out;
+  if(error) *error = _make_error(DT_REMOTE_ERR_PIPE_NOT_READY, g_strdup("preview pipe not ready"));
+  return FALSE;
+}
+
 static gboolean stub_set_module_enabled_must_not_be_called(const dt_remote_module_ref_t *ref,
                                                            gboolean enabled,
                                                            const uint64_t *expected_revision,
@@ -3804,6 +3830,32 @@ static void test_set_module_enabled_error_revision_conflict(void **state)
   assert_false(json_object_get_boolean_member(resp, "ok"));
   JsonObject *err = json_object_get_object_member(resp, "error");
   assert_string_equal(json_object_get_string_member(err, "code"), "revision_conflict");
+  assert_true(json_object_get_boolean_member(err, "retryable"));
+  json_node_unref(actual);
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_error_envelope_maps_not_found_and_retry_later(void **state)
+{
+  (void)state;
+  const char *request =
+    "{\"id\":66,\"method\":\"set_module_enabled\","
+    "\"params\":{\"module\":\"exposure\",\"enabled\":false}}";
+  dt_remote_protocol_calls_t calls = {
+    .set_module_enabled = stub_set_module_enabled_not_found
+  };
+  dt_remote_protocol_set_calls(&calls);
+  JsonNode *actual = _dispatch_inline(request);
+  JsonObject *err = json_object_get_object_member(json_node_get_object(actual), "error");
+  assert_string_equal(json_object_get_string_member(err, "code"), "not_found");
+  assert_false(json_object_get_boolean_member(err, "retryable"));
+  json_node_unref(actual);
+
+  calls.set_module_enabled = stub_set_module_enabled_pipe_not_ready;
+  dt_remote_protocol_set_calls(&calls);
+  actual = _dispatch_inline(request);
+  err = json_object_get_object_member(json_node_get_object(actual), "error");
+  assert_string_equal(json_object_get_string_member(err, "code"), "retry_later");
   assert_true(json_object_get_boolean_member(err, "retryable"));
   json_node_unref(actual);
   dt_remote_protocol_set_calls(NULL);
@@ -5693,6 +5745,7 @@ int main(int argc, char *argv[])
 
     cmocka_unit_test(test_set_module_enabled_success),
     cmocka_unit_test(test_set_module_enabled_error_revision_conflict),
+    cmocka_unit_test(test_error_envelope_maps_not_found_and_retry_later),
     cmocka_unit_test(test_set_module_enabled_error_bad_shapes),
     cmocka_unit_test(test_set_module_enabled_error_unknown_module),
 
