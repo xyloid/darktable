@@ -5790,6 +5790,36 @@ static gboolean stub_masks_attachment_sum_error(const dt_remote_module_ref_t *re
   return FALSE;
 }
 
+static gboolean stub_masks_detachment(const dt_remote_module_ref_t *ref,
+                                      dt_mask_id_t shape_id,
+                                      gboolean attached,
+                                      const char *state,
+                                      int inverted,
+                                      const double *opacity,
+                                      const uint64_t *expected,
+                                      JsonNode **entry,
+                                      uint64_t *revision,
+                                      dt_remote_error_t **error)
+{
+  (void)error;
+  assert_string_equal(ref->op, "exposure");
+  assert_int_equal(ref->instance, 0);
+  assert_int_equal(shape_id, 100);
+  assert_false(attached);
+  assert_null(state);
+  assert_int_equal(inverted, -1);
+  assert_null(opacity);
+  assert_non_null(expected);
+  assert_int_equal(*expected, 42);
+  assert_non_null(entry);
+  assert_null(*entry);
+  *entry = json_from_string(
+    "{\"id\":100,\"type\":\"circle\",\"name\":\"circle #1\","
+    "\"space\":\"preview\",\"editable\":true,\"used_by\":[]}", NULL);
+  *revision = 43;
+  return TRUE;
+}
+
 static void test_list_mask_shapes_round_trip(void **state)
 {
   (void)state;
@@ -5863,6 +5893,31 @@ static void test_set_mask_attachment_sum_error(void **state)
   dt_remote_protocol_set_calls(&calls);
   _assert_dispatch_matches("set_mask_attachment_error_sum_request.json",
                            "set_mask_attachment_error_sum_response.json");
+  dt_remote_protocol_set_calls(NULL);
+}
+
+static void test_set_mask_attachment_detach_ignores_attachment_options(void **state)
+{
+  (void)state;
+  dt_remote_protocol_calls_t calls = {
+    .masks_attachment = stub_masks_detachment
+  };
+  dt_remote_protocol_set_calls(&calls);
+
+  JsonNode *actual = _dispatch_inline(
+    "{\"id\":79,\"method\":\"set_mask_attachment\",\"params\":{"
+    "\"op\":\"exposure\",\"instance\":0,\"shape_id\":100,"
+    "\"attached\":false,\"state\":7,\"inverted\":\"ignored\","
+    "\"opacity\":{},\"expected_revision\":42}}");
+  JsonObject *response = json_node_get_object(actual);
+  assert_true(json_object_get_boolean_member(response, "ok"));
+  JsonObject *result = json_object_get_object_member(response, "result");
+  assert_int_equal(json_object_get_int_member(result, "revision"), 43);
+  JsonObject *shape = json_object_get_object_member(result, "shape");
+  assert_int_equal(json_array_get_length(
+                     json_object_get_array_member(shape, "used_by")), 0);
+  json_node_unref(actual);
+
   dt_remote_protocol_set_calls(NULL);
 }
 
@@ -5999,13 +6054,27 @@ static void test_allowlist_has_eighteen_methods_with_expected_flags(void **state
   assert_true(scopes->is_async);
   assert_non_null(scopes->handler);  // implemented in plan step 10
 
-  const dt_remote_method_t *list_masks = dt_remote_protocol_lookup_method("list_mask_shapes");
-  assert_true(list_masks->needs_darkroom);
-  assert_false(list_masks->is_mutation);
-
-  const dt_remote_method_t *create_mask = dt_remote_protocol_lookup_method("create_mask_shape");
-  assert_true(create_mask->is_mutation);
-  assert_false(create_mask->is_async);
+  static const struct
+  {
+    const char *name;
+    gboolean is_mutation;
+  } mask_methods[] = {
+    { "list_mask_shapes", FALSE },
+    { "create_mask_shape", TRUE },
+    { "update_mask_shape", TRUE },
+    { "delete_mask_shape", TRUE },
+    { "set_mask_attachment", TRUE },
+  };
+  for(size_t i = 0; i < G_N_ELEMENTS(mask_methods); i++)
+  {
+    const dt_remote_method_t *method =
+      dt_remote_protocol_lookup_method(mask_methods[i].name);
+    assert_non_null(method);
+    assert_true(method->needs_darkroom);
+    assert_int_equal(method->is_mutation, mask_methods[i].is_mutation);
+    assert_false(method->is_async);
+    assert_non_null(method->handler);
+  }
 }
 
 int main(int argc, char *argv[])
@@ -6167,6 +6236,7 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_delete_mask_shape_round_trip),
     cmocka_unit_test(test_set_mask_attachment_round_trip),
     cmocka_unit_test(test_set_mask_attachment_sum_error),
+    cmocka_unit_test(test_set_mask_attachment_detach_ignores_attachment_options),
     cmocka_unit_test(test_create_mask_shape_input_validation),
     cmocka_unit_test(test_create_mask_shape_rejects_unsupported_type_with_details),
     cmocka_unit_test(test_update_mask_shape_input_validation),
