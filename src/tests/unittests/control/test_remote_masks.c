@@ -2032,6 +2032,8 @@ static void test_remote_delete_history_count_and_ownership(void **state)
     &fixture->dev, fixture->module->blend_params->mask_id);
   assert_non_null(form);
   assert_non_null(group);
+  fixture->module->enabled = FALSE;
+  assert_false(fixture->module->enabled);
   const int history_before = fixture->dev.history_end;
   JsonArray *removed_from = json_array_new();
 
@@ -2041,6 +2043,7 @@ static void test_remote_delete_history_count_and_ownership(void **state)
   assert_int_equal(fixture->dev.history_end, history_before + 2);
   assert_int_equal(_list_pointer_count(fixture->dev.allforms, form), 1);
   assert_int_equal(_list_pointer_count(fixture->dev.allforms, group), 1);
+  assert_false(fixture->module->enabled);
   assert_false(fixture->module->blend_params->mask_mode
                & DEVELOP_MASK_MASK);
   assert_true(fixture->module->blend_params->mask_mode
@@ -2150,6 +2153,8 @@ static void test_remote_update_has_one_history_item(void **state)
                                      initial, "update history",
                                      fixture->module, &id, &error));
   assert_null(error);
+  fixture->module->enabled = FALSE;
+  assert_false(fixture->module->enabled);
   const int history_before = fixture->dev.history_end;
   int affects = -1;
 
@@ -2158,6 +2163,7 @@ static void test_remote_update_has_one_history_item(void **state)
   assert_null(error);
   assert_int_equal(affects, 1);
   assert_int_equal(fixture->dev.history_end, history_before + 1);
+  assert_false(fixture->module->enabled);
   json_object_unref(replacement);
   json_object_unref(initial);
 }
@@ -2175,6 +2181,8 @@ static void test_remote_delete_unattached_has_one_history_item(void **state)
   assert_null(error);
   dt_masks_form_t *form = dt_masks_get_from_id(&fixture->dev, id);
   assert_non_null(form);
+  fixture->module->enabled = FALSE;
+  assert_false(fixture->module->enabled);
   const int history_before = fixture->dev.history_end;
   JsonArray *removed_from = json_array_new();
 
@@ -2184,6 +2192,7 @@ static void test_remote_delete_unattached_has_one_history_item(void **state)
   assert_int_equal(json_array_get_length(removed_from), 0);
   assert_int_equal(fixture->dev.history_end, history_before + 1);
   assert_int_equal(_list_pointer_count(fixture->dev.allforms, form), 1);
+  assert_false(fixture->module->enabled);
   json_array_unref(removed_from);
   json_object_unref(geometry);
 }
