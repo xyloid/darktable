@@ -117,6 +117,7 @@ FILE(GLOB SOURCE_FILES
   "control/remote_discovery.c"
   "control/remote_edit.c"
   "control/remote_frame.c"
+  "control/remote_masks.c"
   "control/remote_parameters.c"
   "control/remote_protocol.c"
   "control/remote_quantity.c"

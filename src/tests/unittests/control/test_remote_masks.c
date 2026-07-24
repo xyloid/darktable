@@ -25,9 +25,167 @@
 #include <setjmp.h>
 #include <cmocka.h>
 
+#include "common/darktable.h"
+#include "control/remote_masks.h"
+#include "develop/develop.h"
 #include "develop/masks.h"
+#include "develop/pixelpipe_hb.h"
 
 #include <glib.h>
+#include <json-glib/json-glib.h>
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef DT_TEST_MODULEDIR
+#error "DT_TEST_MODULEDIR must be defined by the build (see CMakeLists.txt)"
+#endif
+
+static char *s_confdir = NULL;
+
+typedef struct masks_fixture_t
+{
+  dt_dev_pixelpipe_t *preview_pipe;
+  int processed_width;
+  int processed_height;
+  int iwidth;
+  int iheight;
+  float iscale;
+} masks_fixture_t;
+
+static int harness_group_setup(void **state)
+{
+  (void)state;
+  GError *gerror = NULL;
+  s_confdir = g_dir_make_tmp("test_remote_masks-XXXXXX", &gerror);
+  if(!s_confdir)
+  {
+    fprintf(stderr, "test_remote_masks: failed to create scratch config dir: %s\n",
+            gerror->message);
+    g_error_free(gerror);
+    return -1;
+  }
+
+  char *argv_override[] = {
+    "test_remote_masks",
+    "--configdir", s_confdir,
+    "--library", ":memory:",
+    "--moduledir", DT_TEST_MODULEDIR,
+    "--conf", "write_sidecar_files=never",
+    NULL
+  };
+  int argc_override = G_N_ELEMENTS(argv_override) - 1;
+  return dt_init(argc_override, argv_override, FALSE, FALSE, NULL) ? -1 : 0;
+}
+
+static int harness_group_teardown(void **state)
+{
+  (void)state;
+  dt_cleanup();
+  if(s_confdir)
+  {
+    gchar *cmd = g_strdup_printf("rm -rf '%s'", s_confdir);
+    if(system(cmd) != 0)
+      fprintf(stderr, "test_remote_masks: failed to remove scratch config dir %s\n",
+              s_confdir);
+    g_free(cmd);
+    g_clear_pointer(&s_confdir, g_free);
+  }
+  return 0;
+}
+
+static int masks_test_setup(void **state)
+{
+  assert_non_null(darktable.develop);
+  assert_non_null(darktable.develop->preview_pipe);
+
+  masks_fixture_t *fixture = g_new0(masks_fixture_t, 1);
+  fixture->preview_pipe = darktable.develop->preview_pipe;
+  fixture->processed_width = fixture->preview_pipe->processed_width;
+  fixture->processed_height = fixture->preview_pipe->processed_height;
+  fixture->iwidth = fixture->preview_pipe->iwidth;
+  fixture->iheight = fixture->preview_pipe->iheight;
+  fixture->iscale = fixture->preview_pipe->iscale;
+
+  fixture->preview_pipe->processed_width = 1000;
+  fixture->preview_pipe->processed_height = 1000;
+  fixture->preview_pipe->iwidth = 1000;
+  fixture->preview_pipe->iheight = 1000;
+  fixture->preview_pipe->iscale = 1.0f;
+
+  *state = fixture;
+  return 0;
+}
+
+static int masks_test_teardown(void **state)
+{
+  masks_fixture_t *fixture = *state;
+  if(!fixture) return 0;
+
+  fixture->preview_pipe->processed_width = fixture->processed_width;
+  fixture->preview_pipe->processed_height = fixture->processed_height;
+  fixture->preview_pipe->iwidth = fixture->iwidth;
+  fixture->preview_pipe->iheight = fixture->iheight;
+  fixture->preview_pipe->iscale = fixture->iscale;
+  g_free(fixture);
+  *state = NULL;
+  return 0;
+}
+
+static JsonObject *_geom(const char *json)
+{
+  JsonParser *parser = json_parser_new();
+  GError *error = NULL;
+  assert_true(json_parser_load_from_data(parser, json, -1, &error));
+  assert_null(error);
+  JsonObject *object =
+    json_object_ref(json_node_get_object(json_parser_get_root(parser)));
+  g_object_unref(parser);
+  return object;
+}
+
+static void _assert_error(dt_remote_error_t **error,
+                          dt_remote_error_code_t code,
+                          const char *parameter,
+                          const char *constraint)
+{
+  assert_non_null(*error);
+  assert_int_equal((*error)->code, code);
+  if(parameter || constraint)
+  {
+    assert_non_null((*error)->details_json);
+    JsonParser *parser = json_parser_new();
+    GError *parse_error = NULL;
+    assert_true(json_parser_load_from_data(parser, (*error)->details_json, -1,
+                                           &parse_error));
+    assert_null(parse_error);
+    JsonObject *details =
+      json_node_get_object(json_parser_get_root(parser));
+    if(parameter)
+      assert_string_equal(json_object_get_string_member(details, "parameter"),
+                          parameter);
+    if(constraint)
+      assert_string_equal(json_object_get_string_member(details, "constraint"),
+                          constraint);
+    g_object_unref(parser);
+  }
+  dt_remote_error_free(*error);
+  *error = NULL;
+}
+
+static void _assert_no_space(JsonObject *object)
+{
+  assert_false(json_object_has_member(object, "space"));
+}
+
+static JsonObject *_node_object(JsonNode *node)
+{
+  assert_non_null(node);
+  assert_int_equal(json_node_get_node_type(node), JSON_NODE_OBJECT);
+  return json_node_get_object(node);
+}
 
 // Task 1: the symbol must be linkable (public, non-static). We only assert
 // the declaration compiles and the pointer is non-NULL; behavioral tests
@@ -39,10 +197,587 @@ static void test_group_create_symbol_is_public(void **state)
   assert_non_null(p);
 }
 
+static void test_type_mapping_and_composite_precedence(void **state)
+{
+  (void)state;
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_CIRCLE),
+                   DT_REMOTE_SHAPE_CIRCLE);
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_ELLIPSE),
+                   DT_REMOTE_SHAPE_ELLIPSE);
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_GRADIENT),
+                   DT_REMOTE_SHAPE_GRADIENT);
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_PATH),
+                   DT_REMOTE_SHAPE_UNSUPPORTED);
+
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_CIRCLE), "circle");
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_ELLIPSE), "ellipse");
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_GRADIENT), "gradient");
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_PATH), "path");
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_BRUSH), "brush");
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_GROUP | DT_MASKS_CIRCLE),
+                      "group");
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_GROUP | DT_MASKS_CIRCLE),
+                   DT_REMOTE_SHAPE_UNSUPPORTED);
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_CLONE | DT_MASKS_CIRCLE),
+                      "clone");
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_CLONE | DT_MASKS_CIRCLE),
+                   DT_REMOTE_SHAPE_UNSUPPORTED);
+  assert_string_equal(
+    dt_remote_masks_type_string(DT_MASKS_NON_CLONE | DT_MASKS_ELLIPSE), "clone");
+  assert_int_equal(
+    dt_remote_masks_kind_from_type(DT_MASKS_NON_CLONE | DT_MASKS_ELLIPSE),
+    DT_REMOTE_SHAPE_UNSUPPORTED);
+  assert_string_equal(
+    dt_remote_masks_type_string(DT_MASKS_GROUP | DT_MASKS_CLONE | DT_MASKS_CIRCLE),
+    "group");
+#ifdef HAVE_AI
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_OBJECT), "object");
+  assert_int_equal(dt_remote_masks_kind_from_type(DT_MASKS_OBJECT | DT_MASKS_CIRCLE),
+                   DT_REMOTE_SHAPE_UNSUPPORTED);
+#endif
+  assert_string_equal(dt_remote_masks_type_string(DT_MASKS_NONE), "unsupported");
+
+  dt_masks_type_t type = DT_MASKS_NONE;
+  assert_true(dt_remote_masks_type_from_string("circle", &type));
+  assert_int_equal(type, DT_MASKS_CIRCLE);
+  assert_true(dt_remote_masks_type_from_string("ellipse", &type));
+  assert_int_equal(type, DT_MASKS_ELLIPSE);
+  assert_true(dt_remote_masks_type_from_string("gradient", &type));
+  assert_int_equal(type, DT_MASKS_GRADIENT);
+  assert_false(dt_remote_masks_type_from_string("path", &type));
+  assert_false(dt_remote_masks_type_from_string("nonsense", &type));
+  assert_false(dt_remote_masks_type_from_string(NULL, &type));
+  assert_false(dt_remote_masks_type_from_string("circle", NULL));
+}
+
+static void test_validate_circle_policy(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+
+  JsonObject *ok =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.03}");
+  assert_true(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, ok, &error));
+  assert_null(error);
+  json_object_unref(ok);
+
+  JsonObject *integers =
+    _geom("{\"center\":[0,1],\"radius\":1,\"border\":0}");
+  assert_true(
+    dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, integers, &error));
+  assert_null(error);
+  json_object_unref(integers);
+
+  JsonObject *missing = _geom("{\"center\":[0.5,0.5],\"radius\":0.1}");
+  assert_false(
+    dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, missing, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border", "missing_member");
+  json_object_unref(missing);
+
+  JsonObject *negative =
+    _geom("{\"center\":[0.5,0.5],\"radius\":-0.1,\"border\":0}");
+  assert_false(
+    dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, negative, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius",
+                "must_be_positive");
+  json_object_unref(negative);
+
+  JsonObject *off_canvas =
+    _geom("{\"center\":[1.500001,0.5],\"radius\":0.1,\"border\":0}");
+  assert_false(
+    dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, off_canvas, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "center", "out_of_canvas");
+  json_object_unref(off_canvas);
+
+  JsonObject *wrong =
+    _geom("{\"center\":[0.5,0.5],\"radius\":\"wide\",\"border\":0}");
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, wrong,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius", "not_a_number");
+  json_object_unref(wrong);
+}
+
+static void test_validate_ellipse_policy(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+
+  JsonObject *ok = _geom(
+    "{\"center\":[-0.5,1.5],\"radius\":[0.2,0.1],\"rotation\":-30,"
+    "\"border\":0,\"border_mode\":\"equidistant\"}");
+  assert_true(dt_remote_masks_geometry_validate(DT_MASKS_ELLIPSE, ok, &error));
+  assert_null(error);
+  json_object_unref(ok);
+
+  JsonObject *bad_radius = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.2,0],\"rotation\":0,"
+    "\"border\":0.1,\"border_mode\":\"proportional\"}");
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_ELLIPSE, bad_radius,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius",
+                "must_be_positive");
+  json_object_unref(bad_radius);
+
+  JsonObject *bad_mode = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.2,0.1],\"rotation\":0,"
+    "\"border\":0.1,\"border_mode\":17}");
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_ELLIPSE, bad_mode,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border_mode",
+                "not_a_string");
+  json_object_unref(bad_mode);
+
+  JsonObject *unknown_mode = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.2,0.1],\"rotation\":0,"
+    "\"border\":0.1,\"border_mode\":\"radial\"}");
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_ELLIPSE,
+                                                  unknown_mode, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border_mode",
+                "must_be_equidistant_or_proportional");
+  json_object_unref(unknown_mode);
+}
+
+static void test_validate_gradient_policy_and_integer_coercion(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+
+  JsonObject *integers =
+    _geom("{\"anchor\":[0,1],\"rotation\":0,\"compression\":0.5,"
+          "\"steepness\":0,\"curvature\":0}");
+  assert_true(
+    dt_remote_masks_geometry_validate(DT_MASKS_GRADIENT, integers, &error));
+  assert_null(error);
+  json_object_unref(integers);
+
+  JsonObject *curvature =
+    _geom("{\"anchor\":[0.5,0.5],\"rotation\":10,\"compression\":0.5,"
+          "\"steepness\":0,\"curvature\":3}");
+  assert_false(
+    dt_remote_masks_geometry_validate(DT_MASKS_GRADIENT, curvature, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "curvature", "abs_gt_2");
+  json_object_unref(curvature);
+
+  JsonObject *compression =
+    _geom("{\"anchor\":[0.5,0.5],\"rotation\":10,\"compression\":0,"
+          "\"steepness\":0,\"curvature\":0}");
+  assert_false(
+    dt_remote_masks_geometry_validate(DT_MASKS_GRADIENT, compression, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "compression",
+                "must_be_positive");
+  json_object_unref(compression);
+}
+
+static void test_validate_rejects_nonfinite_overflow_unknown_and_unsupported(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+
+  JsonObject *nonfinite =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.1}");
+  json_object_set_double_member(nonfinite, "radius", NAN);
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, nonfinite,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius", "not_finite");
+  json_object_unref(nonfinite);
+
+  JsonObject *overflow =
+    _geom("{\"anchor\":[0.5,0.5],\"rotation\":0,\"compression\":0.5,"
+          "\"steepness\":0,\"curvature\":0}");
+  json_object_set_double_member(overflow, "steepness", DBL_MAX);
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_GRADIENT, overflow,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "steepness",
+                "not_float_representable");
+  json_object_unref(overflow);
+
+  const char *hostile_name = "bad\"member\nname";
+  JsonObject *hostile =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.1}");
+  json_object_set_int_member(hostile, hostile_name, 1);
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, hostile,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, hostile_name,
+                "unknown_member");
+  json_object_unref(hostile);
+
+  JsonObject *valid =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.1}");
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_PATH, valid, &error));
+  _assert_error(&error, DT_REMOTE_ERR_UNSUPPORTED_FIELD, NULL, NULL);
+  assert_false(dt_remote_masks_geometry_validate(DT_MASKS_CIRCLE, NULL,
+                                                  &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "geometry",
+                "expected_object");
+  json_object_unref(valid);
+}
+
+static void test_circle_conversion_storage_bounds_and_atomic_output(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  dt_masks_point_circle_t point = { 0 };
+
+  JsonObject *minimum =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.0005,\"border\":0.0005}");
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, minimum, &point, &error));
+  assert_null(error);
+  assert_float_equal(point.radius, 0.0005, 1e-7);
+  assert_float_equal(point.border, 0.0005, 1e-7);
+  json_object_unref(minimum);
+
+  JsonObject *maximum =
+    _geom("{\"center\":[0.5,0.5],\"radius\":1,\"border\":1}");
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, maximum, &point, &error));
+  assert_null(error);
+  assert_float_equal(point.radius, 1.0, 1e-6);
+  assert_float_equal(point.border, 1.0, 1e-6);
+  json_object_unref(maximum);
+
+  memset(&point, 0x5a, sizeof(point));
+  dt_masks_point_circle_t before = point;
+  JsonObject *zero_border =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0}");
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, zero_border, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border", "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+  json_object_unref(zero_border);
+
+  JsonObject *too_large =
+    _geom("{\"center\":[0.5,0.5],\"radius\":1.0001,\"border\":0.1}");
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, too_large, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "radius", "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+  json_object_unref(too_large);
+}
+
+static void test_ellipse_conversion_storage_bounds_and_atomic_output(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  dt_masks_point_ellipse_t point = { 0 };
+
+  JsonObject *valid = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.0005,1],\"rotation\":30,"
+    "\"border\":0.0005,\"border_mode\":\"equidistant\"}");
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_ELLIPSE, valid, &point, &error));
+  assert_null(error);
+  assert_float_equal(point.radius[0], 0.0005, 1e-7);
+  assert_float_equal(point.radius[1], 1.0, 1e-6);
+  assert_float_equal(point.border, 0.0005, 1e-7);
+  assert_int_equal(point.flags, DT_MASKS_ELLIPSE_EQUIDISTANT);
+  json_object_unref(valid);
+
+  memset(&point, 0x3c, sizeof(point));
+  dt_masks_point_ellipse_t before = point;
+  JsonObject *bad_proportional = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.2,0.1],\"rotation\":0,"
+    "\"border\":0,\"border_mode\":\"proportional\"}");
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_ELLIPSE, bad_proportional, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border", "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+  json_object_unref(bad_proportional);
+
+  JsonObject *bad_equidistant = _geom(
+    "{\"center\":[0.5,0.5],\"radius\":[0.2,0.1],\"rotation\":0,"
+    "\"border\":1.0001,\"border_mode\":\"equidistant\"}");
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_ELLIPSE, bad_equidistant, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "border", "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+  json_object_unref(bad_equidistant);
+}
+
+static void test_gradient_conversion_uses_exclusive_zero_compression(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  dt_masks_point_gradient_t point = { 0 };
+
+  JsonObject *below_shape_minimum =
+    _geom("{\"anchor\":[0.5,0.5],\"rotation\":10,\"compression\":0.0001,"
+          "\"steepness\":-0.75,\"curvature\":2}");
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_GRADIENT, below_shape_minimum, &point, &error));
+  assert_null(error);
+  assert_float_equal(point.compression, 0.0001, 1e-7);
+  assert_float_equal(point.steepness, -0.75, 1e-6);
+  assert_float_equal(point.curvature, 2.0, 1e-6);
+  assert_int_equal(point.state, DT_MASKS_GRADIENT_STATE_SIGMOIDAL);
+  json_object_unref(below_shape_minimum);
+
+  memset(&point, 0x27, sizeof(point));
+  dt_masks_point_gradient_t before = point;
+  JsonObject *above_maximum =
+    _geom("{\"anchor\":[0.5,0.5],\"rotation\":0,\"compression\":1.0001,"
+          "\"steepness\":0,\"curvature\":0}");
+  assert_false(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_GRADIENT, above_maximum, &point, &error));
+  _assert_error(&error, DT_REMOTE_ERR_INVALID_VALUE, "compression",
+                "out_of_range");
+  assert_memory_equal(&point, &before, sizeof(point));
+  json_object_unref(above_maximum);
+}
+
+static void test_circle_roundtrip_identity(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  JsonObject *geometry =
+    _geom("{\"center\":[0.5,0.5],\"radius\":0.1,\"border\":0.03}");
+  dt_masks_point_circle_t point = { 0 };
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_CIRCLE, geometry, &point, &error));
+  assert_null(error);
+  json_object_unref(geometry);
+
+  dt_masks_form_t form = { 0 };
+  form.type = DT_MASKS_CIRCLE;
+  form.points = g_list_append(NULL, &point);
+  JsonNode *back =
+    dt_remote_masks_points_to_geometry(darktable.develop, &form);
+  JsonObject *object = _node_object(back);
+  _assert_no_space(object);
+  JsonArray *center = json_object_get_array_member(object, "center");
+  assert_float_equal(json_array_get_double_element(center, 0), 0.5, 1e-3);
+  assert_float_equal(json_array_get_double_element(center, 1), 0.5, 1e-3);
+  assert_float_equal(json_object_get_double_member(object, "radius"), 0.1,
+                     1e-3);
+  assert_float_equal(json_object_get_double_member(object, "border"), 0.03,
+                     1e-3);
+  assert_string_equal(json_object_get_string_member(object, "size_mapping"),
+                      "exact");
+  json_node_unref(back);
+  g_list_free(form.points);
+}
+
+static void test_ellipse_roundtrip_identity(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  JsonObject *geometry = _geom(
+    "{\"center\":[0.4,0.6],\"radius\":[0.2,0.1],\"rotation\":35,"
+    "\"border\":0.04,\"border_mode\":\"proportional\"}");
+  dt_masks_point_ellipse_t point = { 0 };
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_ELLIPSE, geometry, &point, &error));
+  assert_null(error);
+  json_object_unref(geometry);
+
+  dt_masks_form_t form = { 0 };
+  form.type = DT_MASKS_ELLIPSE;
+  form.points = g_list_append(NULL, &point);
+  JsonNode *back =
+    dt_remote_masks_points_to_geometry(darktable.develop, &form);
+  JsonObject *object = _node_object(back);
+  _assert_no_space(object);
+  JsonArray *center = json_object_get_array_member(object, "center");
+  JsonArray *radius = json_object_get_array_member(object, "radius");
+  assert_float_equal(json_array_get_double_element(center, 0), 0.4, 1e-3);
+  assert_float_equal(json_array_get_double_element(center, 1), 0.6, 1e-3);
+  assert_float_equal(json_array_get_double_element(radius, 0), 0.2, 1e-3);
+  assert_float_equal(json_array_get_double_element(radius, 1), 0.1, 1e-3);
+  assert_float_equal(json_object_get_double_member(object, "rotation"), 35,
+                     1e-3);
+  assert_float_equal(json_object_get_double_member(object, "border"), 0.04,
+                     1e-3);
+  assert_string_equal(json_object_get_string_member(object, "border_mode"),
+                      "proportional");
+  assert_string_equal(json_object_get_string_member(object, "size_mapping"),
+                      "exact");
+  json_node_unref(back);
+  g_list_free(form.points);
+}
+
+static void test_gradient_roundtrip_identity(void **state)
+{
+  (void)state;
+  dt_remote_error_t *error = NULL;
+  JsonObject *geometry =
+    _geom("{\"anchor\":[0.3,0.7],\"rotation\":-20,\"compression\":0.4,"
+          "\"steepness\":0.25,\"curvature\":-1.5}");
+  dt_masks_point_gradient_t point = { 0 };
+  assert_true(dt_remote_masks_geometry_to_points(
+    darktable.develop, DT_MASKS_GRADIENT, geometry, &point, &error));
+  assert_null(error);
+  json_object_unref(geometry);
+
+  dt_masks_form_t form = { 0 };
+  form.type = DT_MASKS_GRADIENT;
+  form.points = g_list_append(NULL, &point);
+  JsonNode *back =
+    dt_remote_masks_points_to_geometry(darktable.develop, &form);
+  JsonObject *object = _node_object(back);
+  _assert_no_space(object);
+  JsonArray *anchor = json_object_get_array_member(object, "anchor");
+  assert_float_equal(json_array_get_double_element(anchor, 0), 0.3, 1e-3);
+  assert_float_equal(json_array_get_double_element(anchor, 1), 0.7, 1e-3);
+  assert_float_equal(json_object_get_double_member(object, "rotation"), -20,
+                     1e-3);
+  assert_float_equal(json_object_get_double_member(object, "compression"), 0.4,
+                     1e-6);
+  assert_float_equal(json_object_get_double_member(object, "steepness"), 0.25,
+                     1e-6);
+  assert_float_equal(json_object_get_double_member(object, "curvature"), -1.5,
+                     1e-6);
+  assert_string_equal(json_object_get_string_member(object, "size_mapping"),
+                      "exact");
+  json_node_unref(back);
+  g_list_free(form.points);
+}
+
+static void test_raw_geometry_serializes_stored_values_verbatim(void **state)
+{
+  (void)state;
+  dt_masks_point_circle_t circle = {
+    .center = { -0.25f, 1.25f }, .radius = 0.2f, .border = 0.04f
+  };
+  dt_masks_form_t form = { .type = DT_MASKS_CIRCLE };
+  form.points = g_list_append(NULL, &circle);
+  JsonNode *node = dt_remote_masks_points_to_raw_geometry(&form);
+  JsonObject *object = _node_object(node);
+  _assert_no_space(object);
+  JsonArray *center = json_object_get_array_member(object, "center");
+  assert_float_equal(json_array_get_double_element(center, 0), -0.25, 1e-6);
+  assert_float_equal(json_array_get_double_element(center, 1), 1.25, 1e-6);
+  assert_float_equal(json_object_get_double_member(object, "radius"), 0.2,
+                     1e-6);
+  assert_false(json_object_has_member(object, "size_mapping"));
+  json_node_unref(node);
+  g_list_free(form.points);
+
+  dt_masks_point_ellipse_t ellipse = {
+    .center = { 0.2f, 0.3f },
+    .radius = { 0.4f, 0.15f },
+    .rotation = 72.0f,
+    .border = 0.07f,
+    .flags = DT_MASKS_ELLIPSE_PROPORTIONAL
+  };
+  form.type = DT_MASKS_ELLIPSE;
+  form.points = g_list_append(NULL, &ellipse);
+  node = dt_remote_masks_points_to_raw_geometry(&form);
+  object = _node_object(node);
+  JsonArray *radius = json_object_get_array_member(object, "radius");
+  assert_float_equal(json_array_get_double_element(radius, 0), 0.4, 1e-6);
+  assert_float_equal(json_array_get_double_element(radius, 1), 0.15, 1e-6);
+  assert_float_equal(json_object_get_double_member(object, "rotation"), 72,
+                     1e-6);
+  assert_string_equal(json_object_get_string_member(object, "border_mode"),
+                      "proportional");
+  json_node_unref(node);
+  g_list_free(form.points);
+
+  dt_masks_point_gradient_t gradient = {
+    .anchor = { 0.6f, 0.7f },
+    .rotation = -12.0f,
+    .compression = 0.3f,
+    .steepness = 0.8f,
+    .curvature = -0.9f,
+    .state = DT_MASKS_GRADIENT_STATE_SIGMOIDAL
+  };
+  form.type = DT_MASKS_GRADIENT;
+  form.points = g_list_append(NULL, &gradient);
+  node = dt_remote_masks_points_to_raw_geometry(&form);
+  object = _node_object(node);
+  JsonArray *anchor = json_object_get_array_member(object, "anchor");
+  assert_float_equal(json_array_get_double_element(anchor, 0), 0.6, 1e-6);
+  assert_float_equal(json_object_get_double_member(object, "compression"), 0.3,
+                     1e-6);
+  assert_float_equal(json_object_get_double_member(object, "curvature"), -0.9,
+                     1e-6);
+  json_node_unref(node);
+  g_list_free(form.points);
+}
+
+static void test_size_mapping_aggregates_border_probe(void **state)
+{
+  masks_fixture_t *fixture = *state;
+  fixture->preview_pipe->processed_height = 500;
+
+  // A zero radius has no directional spread and is exact. The nonzero border
+  // is the only approximate size probe, so this freezes border aggregation.
+  dt_masks_point_circle_t point = {
+    .center = { 0.5f, 0.5f }, .radius = 0.0f, .border = 0.1f
+  };
+  dt_masks_form_t form = { .type = DT_MASKS_CIRCLE };
+  form.points = g_list_append(NULL, &point);
+  JsonNode *node =
+    dt_remote_masks_points_to_geometry(darktable.develop, &form);
+  JsonObject *object = _node_object(node);
+  assert_string_equal(json_object_get_string_member(object, "size_mapping"),
+                      "approximate");
+  json_node_unref(node);
+  g_list_free(form.points);
+}
+
+static void test_read_serializer_rejects_invalid_transform_output(void **state)
+{
+  masks_fixture_t *fixture = *state;
+  fixture->preview_pipe->processed_width = 0;
+
+  dt_masks_point_circle_t point = {
+    .center = { 0.5f, 0.5f }, .radius = 0.1f, .border = 0.02f
+  };
+  dt_masks_form_t form = { .type = DT_MASKS_CIRCLE };
+  form.points = g_list_append(NULL, &point);
+  assert_null(dt_remote_masks_points_to_geometry(darktable.develop, &form));
+  g_list_free(form.points);
+}
+
+static void test_unsupported_and_empty_serializers(void **state)
+{
+  (void)state;
+  dt_masks_point_circle_t point = { 0 };
+  dt_masks_form_t form = { .type = DT_MASKS_PATH };
+  form.points = g_list_append(NULL, &point);
+  assert_null(dt_remote_masks_points_to_geometry(darktable.develop, &form));
+  assert_null(dt_remote_masks_points_to_raw_geometry(&form));
+  g_list_free(form.points);
+  form.points = NULL;
+  assert_null(dt_remote_masks_points_to_geometry(darktable.develop, &form));
+  assert_null(dt_remote_masks_points_to_raw_geometry(&form));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_group_create_symbol_is_public),
+    cmocka_unit_test(test_type_mapping_and_composite_precedence),
+    cmocka_unit_test(test_validate_circle_policy),
+    cmocka_unit_test(test_validate_ellipse_policy),
+    cmocka_unit_test(test_validate_gradient_policy_and_integer_coercion),
+    cmocka_unit_test(
+      test_validate_rejects_nonfinite_overflow_unknown_and_unsupported),
+    cmocka_unit_test_setup_teardown(
+      test_circle_conversion_storage_bounds_and_atomic_output,
+      masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_ellipse_conversion_storage_bounds_and_atomic_output,
+      masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_gradient_conversion_uses_exclusive_zero_compression,
+      masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(test_circle_roundtrip_identity,
+                                    masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(test_ellipse_roundtrip_identity,
+                                    masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(test_gradient_roundtrip_identity,
+                                    masks_test_setup, masks_test_teardown),
+    cmocka_unit_test(test_raw_geometry_serializes_stored_values_verbatim),
+    cmocka_unit_test_setup_teardown(test_size_mapping_aggregates_border_probe,
+                                    masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_read_serializer_rejects_invalid_transform_output,
+      masks_test_setup, masks_test_teardown),
+    cmocka_unit_test_setup_teardown(test_unsupported_and_empty_serializers,
+                                    masks_test_setup, masks_test_teardown),
   };
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return cmocka_run_group_tests(tests, harness_group_setup,
+                                harness_group_teardown);
 }

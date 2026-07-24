@@ -1,0 +1,85 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+// Tier-3 drawn-mask engine surface (mask_shapes capability). Geometry
+// (de)serialization treats all wire input as adversarial (first remote
+// surface feeding variable structures into pipeline-adjacent code): every
+// value is finiteness- and range-checked before any dt_masks_create call,
+// and never reaches dev->forms unvalidated. Coordinate mapping is delegated
+// to remote_transform.h. Every function taking a dt_develop_t/dt_iop_module_t
+// runs on the GTK main thread.
+//
+// CAVEAT: the create/delete/detach paths reach dt_masks_gui_form_save_creation
+// (dev-parameterized, safe) and dt_masks_form_remove (HARDWIRED to
+// darktable.develop, ignores the passed dev). On the wire the darkroom dev IS
+// darktable.develop so this is correct; unit tests on a standalone fixture dev
+// must repoint darktable.develop at it around those calls (see Task 5/6 tests).
+
+#pragma once
+
+#include "control/remote_edit.h"
+#include "control/remote_transform.h"
+#include "develop/masks.h"
+
+#include <glib.h>
+#include <json-glib/json-glib.h>
+
+G_BEGIN_DECLS
+
+struct dt_develop_t;
+struct dt_iop_module_t;
+
+typedef enum dt_remote_shape_kind_t
+{
+  DT_REMOTE_SHAPE_CIRCLE,
+  DT_REMOTE_SHAPE_ELLIPSE,
+  DT_REMOTE_SHAPE_GRADIENT,
+  DT_REMOTE_SHAPE_UNSUPPORTED,
+} dt_remote_shape_kind_t;
+
+dt_remote_shape_kind_t dt_remote_masks_kind_from_type(dt_masks_type_t t);
+const char *dt_remote_masks_type_string(dt_masks_type_t t);
+gboolean dt_remote_masks_type_from_string(const char *s, dt_masks_type_t *out);
+
+/** pure wire-space policy validation (Global Constraints "Validation
+ * policy"): required members present, finite, in wire range; unknown members
+ * rejected. No transform. FALSE + *error (DT_REMOTE_ERR_INVALID_VALUE, or
+ * DT_REMOTE_ERR_UNSUPPORTED_FIELD for a non-editable type) on failure. */
+gboolean dt_remote_masks_geometry_validate(dt_masks_type_t type, JsonObject *geom,
+                                           dt_remote_error_t **error);
+
+/** validate, back-transform (preview->raw), and fill `point_out` (a caller
+ * struct of the type's size). Enforces raw storage clamps after transform.
+ * Requires a fresh pipe — caller must have run ensure_fresh first. */
+gboolean dt_remote_masks_geometry_to_points(struct dt_develop_t *dev,
+                                            dt_masks_type_t type,
+                                            JsonObject *geom,
+                                            void *point_out,
+                                            dt_remote_error_t **error);
+
+/** stored raw points -> preview-normalized geometry object (with
+ * "size_mapping"); NULL for unsupported/non-editable types or transform
+ * failure. Caller owns. */
+JsonNode *dt_remote_masks_points_to_geometry(struct dt_develop_t *dev,
+                                             dt_masks_form_t *form);
+
+/** stored raw points verbatim as a "raw_geometry" object; NULL for
+ * unsupported types. Caller owns. */
+JsonNode *dt_remote_masks_points_to_raw_geometry(dt_masks_form_t *form);
+
+G_END_DECLS
