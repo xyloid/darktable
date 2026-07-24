@@ -430,6 +430,125 @@ static void test_core_referencing_modules_flattens_nested_and_shared_paths(
   g_ptr_array_unref(owners);
 }
 
+static void test_core_full_delete_keeps_nested_sibling_and_retires_leaf(
+  void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7301);
+  dt_masks_form_t *sibling =
+    _fixture_add_form(fixture, DT_MASKS_ELLIPSE, 7302);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7303);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 0.5f);
+  _fixture_add_member(inner, sibling->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW
+                        | DT_MASKS_STATE_UNION, 0.7f);
+  dt_masks_form_t *root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  _fixture_add_member(root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+
+  GPtrArray *affected = NULL;
+  assert_true(dt_masks_form_remove_shape_full(&fixture->dev, leaf,
+                                              &affected));
+  assert_non_null(affected);
+  assert_int_equal(affected->len, 1);
+  assert_ptr_equal(g_ptr_array_index(affected, 0), fixture->module);
+  assert_null(dt_masks_get_from_id(&fixture->dev, leaf->formid));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, sibling->formid));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, inner->formid));
+  assert_non_null(dt_masks_get_from_id(&fixture->dev, root->formid));
+  assert_false(dt_masks_group_contains_form(&fixture->dev, root,
+                                            leaf->formid));
+  assert_true(dt_masks_group_contains_form(&fixture->dev, root,
+                                           sibling->formid));
+  assert_int_equal(_list_pointer_count(fixture->dev.allforms, leaf), 1);
+  g_ptr_array_unref(affected);
+}
+
+static void test_core_full_delete_prunes_shared_empty_ancestors(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_iop_module_t *second =
+    _blend_fixture_add_module(fixture, "exposure", 3);
+  fixture->module->enabled = TRUE;
+  second->enabled = FALSE;
+  fixture->module->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL;
+  second->blend_params->mask_mode =
+    DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK | DEVELOP_MASK_CONDITIONAL;
+
+  dt_masks_form_t *leaf =
+    _fixture_add_form(fixture, DT_MASKS_CIRCLE, 7311);
+  dt_masks_form_t *inner =
+    _fixture_add_form(fixture, DT_MASKS_GROUP, 7312);
+  _fixture_add_member(inner, leaf->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  dt_masks_form_t *first_root = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  dt_masks_form_t *second_root = dt_masks_group_create_for_module(
+    &fixture->dev, second, DT_MASKS_GROUP);
+  _fixture_add_member(first_root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+  _fixture_add_member(second_root, inner->formid,
+                      DT_MASKS_STATE_USE | DT_MASKS_STATE_SHOW, 1.0f);
+
+  _blend_fixture_enable_history(fixture);
+  const int history_before = fixture->dev.history_end;
+  GPtrArray *affected = NULL;
+  assert_true(dt_masks_form_remove_shape_full(&fixture->dev, leaf,
+                                              &affected));
+
+  assert_int_equal(affected->len, 2);
+  assert_false(dt_is_valid_maskid(
+    fixture->module->blend_params->mask_id));
+  assert_false(dt_is_valid_maskid(second->blend_params->mask_id));
+  assert_false(fixture->module->blend_params->mask_mode
+               & DEVELOP_MASK_MASK);
+  assert_false(second->blend_params->mask_mode & DEVELOP_MASK_MASK);
+  assert_true(fixture->module->blend_params->mask_mode
+              & DEVELOP_MASK_CONDITIONAL);
+  assert_true(second->blend_params->mask_mode
+              & DEVELOP_MASK_CONDITIONAL);
+  assert_true(fixture->module->enabled);
+  assert_false(second->enabled);
+  assert_int_equal(fixture->dev.history_end, history_before + 3);
+
+  assert_int_equal(_list_pointer_count(fixture->dev.allforms, leaf), 1);
+  assert_int_equal(_list_pointer_count(fixture->dev.allforms, inner), 1);
+  assert_int_equal(
+    _list_pointer_count(fixture->dev.allforms, first_root), 1);
+  assert_int_equal(
+    _list_pointer_count(fixture->dev.allforms, second_root), 1);
+  g_ptr_array_unref(affected);
+}
+
+static void test_core_full_delete_rejects_group_without_mutation(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  dt_masks_form_t *group = dt_masks_group_create_for_module(
+    &fixture->dev, fixture->module, DT_MASKS_GROUP);
+  const guint forms_before = g_list_length(fixture->dev.forms);
+  const guint allforms_before = g_list_length(fixture->dev.allforms);
+  const dt_mask_id_t mask_id_before =
+    fixture->module->blend_params->mask_id;
+  const int history_before = fixture->dev.history_end;
+  GPtrArray *sentinel = g_ptr_array_new();
+  GPtrArray *affected = sentinel;
+
+  assert_false(dt_masks_form_remove_shape_full(&fixture->dev, group,
+                                               &affected));
+  assert_ptr_equal(affected, sentinel);
+  assert_int_equal(g_list_length(fixture->dev.forms), forms_before);
+  assert_int_equal(g_list_length(fixture->dev.allforms), allforms_before);
+  assert_int_equal(fixture->module->blend_params->mask_id,
+                   mask_id_before);
+  assert_int_equal(fixture->dev.history_end, history_before);
+  g_ptr_array_unref(sentinel);
+}
+
 // Task 1: the symbol must be linkable (public, non-static). We only assert
 // the declaration compiles and the pointer is non-NULL; behavioral tests
 // that need a live dev/module arrive in Task 3 with the dt_init harness.
@@ -1733,6 +1852,15 @@ int main(void)
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_core_referencing_modules_flattens_nested_and_shared_paths,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_core_full_delete_keeps_nested_sibling_and_retires_leaf,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_core_full_delete_prunes_shared_empty_ancestors,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_core_full_delete_rejects_group_without_mutation,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test(test_type_mapping_and_composite_precedence),
     cmocka_unit_test(test_validate_circle_policy),

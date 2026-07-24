@@ -645,6 +645,9 @@ gboolean dt_masks_group_contains_form(const dt_develop_t *dev,
                                       dt_mask_id_t formid);
 GPtrArray *dt_masks_form_get_referencing_modules(const dt_develop_t *dev,
                                                  dt_mask_id_t formid);
+gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
+                                         dt_masks_form_t *form,
+                                         GPtrArray **affected_modules);
 
 void dt_masks_iop_edit_toggle_callback(GtkToggleButton *togglebutton,
                                        struct dt_iop_module_t *module);

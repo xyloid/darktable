@@ -1820,6 +1820,127 @@ void dt_masks_iop_update(dt_iop_module_t *module)
   dt_iop_gui_update_masks(module);
 }
 
+static gboolean _ptr_array_contains(const GPtrArray *array,
+                                    const gpointer value)
+{
+  for(guint i = 0; array && i < array->len; i++)
+    if(g_ptr_array_index(array, i) == value) return TRUE;
+  return FALSE;
+}
+
+static gboolean _remove_id_from_group(dt_masks_form_t *group,
+                                      const dt_mask_id_t id)
+{
+  if(!group || !(group->type & DT_MASKS_GROUP)) return FALSE;
+  gboolean removed = FALSE;
+  for(GList *link = group->points; link;)
+  {
+    GList *next = g_list_next(link);
+    dt_masks_point_group_t *member = link->data;
+    if(member && member->formid == id)
+    {
+      group->points = g_list_delete_link(group->points, link);
+      free(member);
+      removed = TRUE;
+    }
+    link = next;
+  }
+  return removed;
+}
+
+static void _queue_empty_group(GQueue *queue,
+                               GHashTable *queued,
+                               dt_masks_form_t *group)
+{
+  if(!group || !(group->type & DT_MASKS_GROUP) || group->points) return;
+  if(g_hash_table_contains(queued, group)) return;
+  g_hash_table_add(queued, group);
+  g_queue_push_tail(queue, group);
+}
+
+static void _retire_form(dt_develop_t *dev, dt_masks_form_t *form)
+{
+  GList *link = g_list_find(dev->forms, form);
+  if(link) dev->forms = g_list_delete_link(dev->forms, link);
+  if(!g_list_find(dev->allforms, form))
+    dev->allforms = g_list_append(dev->allforms, form);
+}
+
+gboolean dt_masks_form_remove_shape_full(dt_develop_t *dev,
+                                         dt_masks_form_t *form,
+                                         GPtrArray **affected_modules)
+{
+  if(!dev || !form || (form->type & DT_MASKS_GROUP)
+     || !g_list_find(dev->forms, form))
+    return FALSE;
+
+  GPtrArray *owners =
+    dt_masks_form_get_referencing_modules(dev, form->formid);
+  GPtrArray *emptied_modules = g_ptr_array_new();
+  GQueue empty_groups = G_QUEUE_INIT;
+  GHashTable *queued =
+    g_hash_table_new(g_direct_hash, g_direct_equal);
+
+  for(GList *forms = dev->forms;
+      forms;
+      forms = g_list_next(forms))
+  {
+    dt_masks_form_t *group = forms->data;
+    if(_remove_id_from_group(group, form->formid))
+      _queue_empty_group(&empty_groups, queued, group);
+  }
+  _retire_form(dev, form);
+
+  while(!g_queue_is_empty(&empty_groups))
+  {
+    dt_masks_form_t *empty = g_queue_pop_head(&empty_groups);
+    if(!g_list_find(dev->forms, empty)) continue;
+
+    for(GList *modules = dev->iop;
+        modules;
+        modules = g_list_next(modules))
+    {
+      dt_iop_module_t *module = modules->data;
+      if(!module || !module->blend_params
+         || module->blend_params->mask_id != empty->formid)
+        continue;
+      module->blend_params->mask_id = NO_MASKID;
+      module->blend_params->mask_mode &= ~DEVELOP_MASK_MASK;
+      if(!_ptr_array_contains(emptied_modules, module))
+        g_ptr_array_add(emptied_modules, module);
+    }
+
+    for(GList *forms = dev->forms;
+        forms;
+        forms = g_list_next(forms))
+    {
+      dt_masks_form_t *parent = forms->data;
+      if(parent != empty
+         && _remove_id_from_group(parent, empty->formid))
+        _queue_empty_group(&empty_groups, queued, parent);
+    }
+    _retire_form(dev, empty);
+  }
+
+  for(guint i = 0; i < emptied_modules->len; i++)
+  {
+    dt_iop_module_t *module =
+      g_ptr_array_index(emptied_modules, i);
+    dt_dev_add_new_masks_history_item(dev, module, module->enabled);
+  }
+  dt_dev_add_new_masks_history_item(dev, NULL, FALSE);
+  for(guint i = 0; i < owners->len; i++)
+    dt_masks_iop_update(g_ptr_array_index(owners, i));
+
+  g_ptr_array_unref(emptied_modules);
+  g_hash_table_unref(queued);
+  if(affected_modules)
+    *affected_modules = owners;
+  else
+    g_ptr_array_unref(owners);
+  return TRUE;
+}
+
 void dt_masks_form_remove(dt_iop_module_t *module,
                           dt_masks_form_t *grp,
                           dt_masks_form_t *form)
