@@ -73,6 +73,7 @@ Result:
   "capabilities": ["params", "semantic_params", "curve_params",
                    "vector_params", "band_params", "quantity_params",
                    "blend_params", "parametric_mask_params", "mask_render",
+                   "mask_shapes",
                    "instances", "history", "preview", "scopes"]
 }
 ```
@@ -876,6 +877,144 @@ content**: a JSON text block carrying `mime_type`, dimensions, `revision`,
 and `mask_of`, immediately followed by the native JPEG image block (the
 same idiom as `get_scopes`). Ordinary previews remain image-only.
 
+### Drawn masks (`mask_shapes` capability)
+
+`mask_shapes` gates drawn-mask management. It is distinct from the hidden
+`mask_manager` *module*: that module remains unavailable through
+`list_modules` and `set_module_params`; these methods are the supported
+drawn-mask API. All five methods run on the GTK main thread. Mutations use
+the ordinary `expected_revision` compare-and-swap contract.
+
+**Coordinate contract.** Editable geometry is preview-normalized; raw wire
+`create_mask_shape` and `update_mask_shape` requests must carry top-level
+`"space": "preview"` (the sidecar supplies that default). The server
+back-transforms geometry through the current preview pipe before storing it.
+Every listed non-group shape includes top-level `space` and `editable`; only
+editable entries include preview `geometry` and verbatim stored
+`raw_geometry`. Points map exactly. Sizes are sampled with four probe arms;
+if their relative spread exceeds **1%**, `geometry.size_mapping` is
+`"approximate"`, otherwise it is `"exact"`. The angle probe arm is an
+isotropic pixel offset of **0.05 times the shorter image edge**, so angles
+are not distorted by normalized-space aspect ratio.
+
+Create and update require every member in the matching row and reject unknown
+members. All numeric members must be finite and float-representable.
+
+| type | required `geometry` members |
+|---|---|
+| `circle` | `center: [x,y]`, `radius`, `border` |
+| `ellipse` | `center: [x,y]`, `radius: [a,b]`, `rotation`, `border`, `border_mode: "equidistant"` or `"proportional"` |
+| `gradient` | `anchor: [x,y]`, `rotation`, `compression`, `steepness`, `curvature` |
+
+Preview `center`/`anchor` coordinates may lie in `[-0.5, 1.5]`. Circle and
+ellipse radii must be positive and borders nonnegative on input; after
+conversion, stored raw radii and borders must lie in `[0.0005, 1.0]`
+(`proportional` ellipse border is already stored-scale). Gradient
+`compression` is in `(0, 1.0]`, `curvature` in `[-2, 2]`, and rotations and
+`steepness` are otherwise finite.
+
+Only circle, ellipse, and gradient are editable. Every non-group form is
+listed; path, brush, clone, and other deferred forms have `editable: false`,
+retain `id`, `type`, `name`, and transitive `used_by`, but have no `geometry`
+or `raw_geometry`. Group forms are engine-managed and never listed. Deferred
+forms may still be attached. For each module, `used_by` reports the first
+depth-first membership edge's state, inversion, and opacity.
+
+**Pipe freshness.** Coordinate calls proceed immediately only when
+`dev->preview_pipe->status == DT_DEV_PIXELPIPE_VALID`. Otherwise the shared
+`dt_remote_transform_ensure_fresh` helper enqueues one preview reprocess and
+polls every 5 ms for `pixelpipe_synchronization_timeout` iterations; only a
+non-positive configuration uses the 2000-iteration fallback. `INVALID` or a
+timeout returns retryable `retry_later`. This polling occurs on the GTK main
+thread: the first coordinate call after a distortion-changing edit can stall
+a co-located user's UI until the preview pipe reprocesses.
+
+**GUI edit-session guard.** Before update or delete, before creation into an
+existing group, and before an attachment mutation, the engine cancels a live
+GUI edit targeting the form or affected group. If a user is dragging a form
+that is remotely deleted, the drag is discarded; the next motion sees no
+visible form and completes without a use-after-free or crash.
+
+#### `list_mask_shapes`
+
+No params. Returns `{ "shapes": [<shape entries>], "revision": <uint> }`.
+It is read-only; it may need the freshness wait described above.
+
+#### `create_mask_shape`
+
+```json
+{ "type": "circle", "space": "preview",
+  "geometry": { "center": [0.62, 0.41], "radius": 0.10, "border": 0.03 },
+  "name": null, "attach": { "op": "exposure", "instance": 1 },
+  "expected_revision": 41 }
+```
+
+`attach` is optional. Geometry is complete for its type; omitted members are
+`invalid_value` / `missing_member`. Returns `{ "shape": <entry>,
+"revision": <uint> }`. An unattached creation records one forced-new global
+masks-history item. Creation with `attach` records two: the unattached form,
+then membership/mask-mode. It preserves the target module's enabled state.
+
+#### `update_mask_shape`
+
+```json
+{ "id": 12, "space": "preview",
+  "geometry": { "center": [0.60, 0.45], "radius": 0.12, "border": 0.03 },
+  "name": "subject", "expected_revision": 42 }
+```
+
+Replaces the complete editable geometry (and optionally renames) without
+changing type. Returns `{ "shape": <entry>, "affects_instances": <int>,
+"revision": <uint> }`; shared-shape edits affect every listed user. It
+records one forced-new global masks-history item.
+
+#### `delete_mask_shape`
+
+```json
+{ "id": 12, "expected_revision": 43 }
+```
+
+Deletes a non-group shape transitively from all groups and returns
+`{ "removed_from": [<module refs>], "revision": <uint> }`. It records one
+final global masks-history item plus one forced-new module item for every
+unique module whose base group is retired by the cascade. Removed forms are
+retired to `dev->allforms`, preserving replay-safe ownership.
+
+#### `set_mask_attachment`
+
+```json
+{ "op": "exposure", "instance": 1, "shape_id": 12, "attached": true,
+  "state": "union", "inverted": false, "opacity": 0.8,
+  "expected_revision": 44 }
+```
+
+With `attached: true`, this creates or updates the membership and returns
+`{ "shape": <entry>, "revision": <uint> }`. With `attached: false`, it
+removes only the direct membership; the shape remains available to other
+modules. The allowed attachment states are `union`, `intersection`,
+`difference`, and `exclusion`; `sum` is reserved for a future brush-specific
+wire operation and unsupported in v1. The first member has no combine
+operation, so supplied `state` is accepted but ignored there, while
+`inverted` and `opacity` still apply. Opacity must be finite and is clamped to
+`[0,1]`. Each state-changing attachment call records one module history item.
+An idempotent detach with no direct edge records zero items and leaves the
+revision unchanged.
+
+One undo call reverts one history item. Consequently callers need N undo
+calls to revert an N-item operation; this is the accepted undo-granularity
+wart rather than hidden batching.
+
+| condition | code | details |
+|---|---|---|
+| missing shape on update/delete | `not_found` | `parameter: "id"` |
+| missing shape on attachment | `not_found` | `parameter: "shape_id"` |
+| missing module or instance | `unknown_module` / `unknown_instance` | `op` / `instance` |
+| non-editable or group mutation | `unsupported_field` | relevant parameter |
+| unsupported raster attachment target | `invalid_value` | `parameter: "op"`, `constraint: "raster_unsupported"` |
+| `state: "sum"` (reserved, unsupported in v1) | `invalid_value` | `constraint: "sum_is_brush_only"` |
+| invalid or timed-out preview pipe | `retry_later` | retryable |
+| revision mismatch | `revision_conflict` | existing CAS details |
+
 ### set_module_enabled
 
 Request params: `{"module", "instance"?, "enabled": true, "expected_revision"?}`.
@@ -1008,24 +1147,29 @@ Errors: `scope_failed`, `invalid_value`.
 call and are omitted from the rows. `busy` and `timeout`-adjacent handling
 live in the sidecar per the design spec.
 
-| method | not_in_darkroom | no_image_open | unknown_module | unknown_instance | unknown_field | unsupported_field | invalid_value | instance_not_supported | revision_conflict | preview_failed | scope_failed |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `hello` | | | | | | | ✓ | | | | |
-| `get_state` | | | | | | | | | | | |
-| `list_modules` | ✓ | ✓ | | | | | | | | | |
-| `get_module_schema` | | | ✓ | | | | ✓ | | | | |
-| `get_module_params` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | | | |
-| `set_module_params` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ | | |
-| `set_module_enabled` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | ✓ | | |
-| `reset_module` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | ✓ | | |
-| `create_module_instance` | ✓ | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | |
-| `get_history` | ✓ | ✓ | | | | | ✓ | | | | |
-| `undo` | ✓ | ✓ | | | | | ✓ | | ✓ | | |
-| `render_preview` | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | | | ✓ | |
-| `compute_scopes` | ✓ | ✓ | | | | | ✓ | | | | ✓ |
+| method | not_in_darkroom | no_image_open | unknown_module | unknown_instance | unknown_field | unsupported_field | invalid_value | instance_not_supported | revision_conflict | preview_failed | scope_failed | not_found | retry_later |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `hello` | | | | | | | ✓ | | | | | | |
+| `get_state` | | | | | | | | | | | | | |
+| `list_modules` | ✓ | ✓ | | | | | | | | | | | |
+| `get_module_schema` | | | ✓ | | | | ✓ | | | | | | |
+| `get_module_params` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | | | | | |
+| `set_module_params` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ | | | | |
+| `set_module_enabled` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | ✓ | | | | |
+| `reset_module` | ✓ | ✓ | ✓ | ✓ | | | ✓ | | ✓ | | | | |
+| `create_module_instance` | ✓ | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | | | |
+| `get_history` | ✓ | ✓ | | | | | ✓ | | | | | | |
+| `undo` | ✓ | ✓ | | | | | ✓ | | ✓ | | | | |
+| `render_preview` | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | | | ✓ | | | |
+| `compute_scopes` | ✓ | ✓ | | | | | ✓ | | | | ✓ | | |
+| `list_mask_shapes` | ✓ | ✓ | | | | | ✓ | | | | | | ✓ |
+| `create_mask_shape` | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | | ✓ | ✓ | | | ✓ |
+| `update_mask_shape` | ✓ | ✓ | | | | ✓ | ✓ | | ✓ | ✓ | | ✓ | ✓ |
+| `delete_mask_shape` | ✓ | ✓ | | | | ✓ | ✓ | | ✓ | | | ✓ | |
+| `set_mask_attachment` | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | | ✓ | | | ✓ | ✓ |
 
-`retryable` is `true` for `revision_conflict`, `busy`, and transient
-`preview_failed`/`scope_failed`; `false` otherwise.
+`retryable` is `true` for `revision_conflict`, `busy`, transient
+`preview_failed`/`scope_failed`, and `retry_later`; `false` otherwise.
 
 ## Resolved decisions recorded here
 

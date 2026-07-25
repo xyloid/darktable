@@ -57,8 +57,13 @@ one adapter layer on top.
 | `undo` | `undo` | compare-and-undo the last change (requires `expected_revision`) |
 | `render_preview` | `render_preview` | bounded JPEG preview of the current edit, as native image content |
 | `get_scopes` | `compute_scopes` | histogram summaries/bins plus waveform, parade, and vectorscope images |
+| `list_mask_shapes` | `list_mask_shapes` | list drawn shapes and their transitive module memberships |
+| `create_mask_shape` | `create_mask_shape` | create a circle, ellipse, or gradient, optionally attached to a module |
+| `update_mask_shape` | `update_mask_shape` | replace one editable shape's complete geometry or name |
+| `delete_mask_shape` | `delete_mask_shape` | delete one shape and its memberships transitively |
+| `set_mask_attachment` | `set_mask_attachment` | attach, update, or detach one shape from a module instance |
 
-All twelve require darktable to be running with
+All 17 require darktable to be running with
 `security/enable_remote_control` set to true. The darkroom-scoped tools
 (everything except `get_current_image`) fail with a `not_in_darkroom` or
 `no_image_open` error (surfaced as an MCP tool error with an actionable
@@ -70,7 +75,9 @@ and returns the JPEG as an MCP image content block -- never base64 text for
 the model; `max_px` is clamped to [64, 2048], `quality` to [50, 95], and a
 `request_too_large` error means retry with a smaller `max_px`. The
 mutating tools (`set_module_params`, `set_module_enabled`, `reset_module`,
-`create_module_instance`, `undo`) advance the session revision; each
+`create_module_instance`, `undo`, `create_mask_shape`, `update_mask_shape`,
+`delete_mask_shape`, and state-changing `set_mask_attachment`) advance the
+session revision; each
 mutating call may take an `expected_revision` for compare-and-swap so a
 stale client can't clobber a concurrent edit. `set_module_params` is atomic
 (any invalid field fails the whole patch, changing nothing) and never
@@ -322,9 +329,38 @@ XOR (combine is inclusive)`), which flips what the mask selects. Changing
 `combine` and an explicit `inverted` in the same patch is refused unless
 you also pass `"allow_inverted_combine": true` to confirm.
 
-`drawn ↔ drawn+parametric` transitions are owned by this parametric
-surface; creating or attaching drawn geometry itself is out of scope until
-M-C (drawn masks).
+`drawn ↔ drawn+parametric` transitions are owned by this parametric surface;
+the `mask_shapes` tools own drawn-form creation and attachment.
+
+### Drawn masks
+
+With the `mask_shapes` capability, create a circle on exposure, inspect its
+mask, adjust it, then detach it. Use the returned shape ID and latest revision
+at each placeholder:
+
+```text
+create_mask_shape
+{"type":"circle","space":"preview","geometry":{"center":[0.5,0.5],"radius":0.2,"border":0.03},"attach":{"op":"exposure","instance":0}}
+
+render_preview
+{"max_px":512,"show_mask":{"op":"exposure","instance":0}}
+
+update_mask_shape
+{"id":<shape_id>,"space":"preview","geometry":{"center":[0.55,0.5],"radius":0.18,"border":0.03},"expected_revision":<revision>}
+
+set_mask_attachment
+{"op":"exposure","instance":0,"shape_id":<shape_id>,"attached":false,"expected_revision":<revision>}
+```
+
+Coordinates are preview-normalized. Points map exactly, but perspective
+correction can make size and angle conversion `size_mapping: "approximate"`;
+check that result before treating a radius or rotation as exact. Shapes are
+shared objects: `update_mask_shape` changes every module using the form, and
+its `affects_instances` result tells you how many.
+
+Manual GUI-guard test: open the image in darkroom, start dragging a circle,
+issue a remote `delete_mask_shape` for it, and confirm that darktable does
+not crash and the drag ends cleanly.
 
 ### Seeing the mask
 
@@ -469,6 +505,8 @@ automatically (darktable may or may not have processed it); it raises
 `errors.RequestOutcomeUnknown` and drops the dead connection so the *next*
 call reconnects cleanly. For the read tools, replaying a failed call by
 hand is always safe; for the mutating tools (`set_module_enabled`,
-`reset_module`, `create_module_instance`, `undo`) this matters more, since
+`reset_module`, `create_module_instance`, `undo`, `create_mask_shape`,
+`update_mask_shape`, `delete_mask_shape`, and `set_mask_attachment`) this
+matters more, since
 a blind retry would risk double-applying an edit -- which is exactly why
 those methods take an `expected_revision` for compare-and-swap.

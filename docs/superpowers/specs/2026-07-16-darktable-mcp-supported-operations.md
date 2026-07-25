@@ -3,18 +3,18 @@
 Date: 2026-07-16
 Status: reference (supersedes `2026-07-05-darktable-mcp-supported-operations.md`;
 companion to `2026-07-05-darktable-mcp-design.md`)
-Source inventory: `src/iop/` and `src/control/remote_*` at milestone-6
-completion (`976409dc65`, branch `worktree-mcp-remote-edit`)
+Source inventory: `src/iop/` and `src/control/remote_*` at milestone-6 plus
+M-C / Tier 3 completion (branch `mask-support`)
 
 ## Purpose
 
 A complete inventory of darktable's darkroom operations (IOP modules) and how
 the MCP remote-edit surface supports each one, as implemented through
-milestone 5. The runtime source of truth is always `get_module_schema` — this
-document is the planning and review reference: which modules the model can
-usefully edit, which are partially editable, which are excluded and why, when
-each level of support arrived, and how often photographers typically reach
-for each module.
+milestone 6 and M-C / Tier 3. The runtime source of truth is always
+`get_module_schema` — this document is the planning and review reference:
+which modules the model can usefully edit, which are partially editable,
+which are excluded and why, when each level of support arrived, and how often
+photographers typically reach for each module.
 
 Parameter storage shapes, semantic coupling, and candidate future parameter
 classes are tracked in `2026-07-05-darktable-mcp-parameter-class-investigation.md`.
@@ -22,8 +22,9 @@ The wire contract lives in `2026-07-05-darktable-mcp-protocol-reference.md`.
 
 ## MCP tool surface
 
-The sidecar exposes twelve tools; all of them work uniformly across every
-listed module regardless of tier:
+The sidecar exposes 17 tools: the original 12 work uniformly across every
+listed module regardless of tier, while five `mask_shapes` tools operate on
+drawn-mask forms rather than module parameters:
 
 | Category | Tools |
 |---|---|
@@ -32,24 +33,26 @@ listed module regardless of tier:
 | module lifecycle | `set_module_enabled`, `reset_module`, `create_module_instance` |
 | history | `get_history`, `undo` |
 | visual feedback | `render_preview`, `get_scopes` |
+| drawn masks | `list_mask_shapes`, `create_mask_shape`, `update_mask_shape`, `delete_mask_shape`, `set_mask_attachment` |
 
 The tiers below describe only what `set_module_params` can usefully edit.
 
 ## Milestone progression
 
-Each milestone extended what `set_module_params` can write. The **since**
-column in the tier tables names the milestone that established each
-operation's current support level; `m1` means the baseline rules alone
-already covered it.
+Milestones m1–m6 extended what `set_module_params` can write; M-C adds a
+separate drawn-mask surface. The **since** column in the tier tables names
+the milestone that established each operation's current parameter-support
+level; `m1` means the baseline rules alone already covered it.
 
 | milestone | what it added | operations affected |
 |---|---|---|
-| **m1** | remote-edit protocol, the full twelve-tool sidecar surface, and scalar writes: finite `float`/`double`, integer, Boolean, and enum fields, including dotted scalar leaves inside plainly nested structs (`random.damping`, `center.x`). Tiering established. Design: `2026-07-05-darktable-mcp-design.md`; plan: `2026-07-05-darktable-mcp-implementation-plan.md`. | every module (baseline) |
+| **m1** | remote-edit protocol, the original twelve-tool sidecar surface, and scalar writes: finite `float`/`double`, integer, Boolean, and enum fields, including dotted scalar leaves inside plainly nested structs (`random.damping`, `center.x`). Tiering established. Design: `2026-07-05-darktable-mcp-design.md`; plan: `2026-07-05-darktable-mcp-implementation-plan.md`. | every module (baseline) |
 | **m2** | semantic parameter classes and the curve engine (`src/control/remote_curve.c`): whole-curve replacement of named control-point curves, gated by the `curve_params` hello capability; per-module internal-field denylist (appendix). Design: `2026-07-11-darktable-mcp-milestone2-denylist-rgbcurve-design.md`. | `rgbcurve` → Tier 1 |
 | **m3** | curve adapters for the remaining control-point-curve modules, including periodic (hue) curves and multi-channel Lab modes. Plan: `2026-07-11-darktable-mcp-milestone3-curve-adapters.md`. | `tonecurve`, `colorzones`, `basecurve` → Tier 1 |
 | **m4** | the vector semantic class (`src/control/remote_vector.c`): named fixed-length vectors in three subtypes (plain `vector`, `color` with `display_rgb`, ordered `levels` triples), gated by the `vector_params` capability; 19 semantic names across five adapters. Design: `2026-07-12-darktable-mcp-milestone4-vector-class-design.md`. | `colorbalance`, `channelmixerrgb`, `rgblevels`, `borders` → Tier 1; `watermark` color writable (stays Tier 2 for its strings) |
 | **m5** | the sampled-response (bands) semantic class (`src/control/remote_band.c`): whole-set replacement of fixed-count band arrays, with fixed or interior x policy and twin-channel x sharing, gated by the `band_params` capability; 16 semantic names across four adapters. Ride-alongs: the class-ops dispatch table in `remote_edit.c` replacing the per-class seams, and the sidecar unifying all caller-input errors on ToolError. Design: `2026-07-16-darktable-mcp-milestone5-bands-class-design.md`. | `atrous`, `denoiseprofile`, `rawdenoise`, `lowlight` → Tier 1 |
 | **m6** | the quantity semantic class (`src/control/remote_quantity.c`): named component groups whose stored units differ from their presentation units, converted by an optional iop API hook pair (`remote_quantity_read`/`remote_quantity_write` — the first time a remote engine calls module code instead of reading blobs through introspection offsets), gated by the `quantity_params` capability; `wb.temperature` (Kelvin + tint) on `temperature`, whose native coefficient scalars deliberately stay writable alongside it (coexistence exception). Ride-alongs: `negadoctor` and `colorharmonizer` vector adapters on the unchanged milestone-4 engine. Design: `2026-07-17-darktable-mcp-milestone6-quantity-class-design.md`. | `temperature`, `negadoctor`, `colorharmonizer` → Tier 1 |
+| **M-C / Tier 3** | drawn-mask engine and the five-tool `mask_shapes` surface: list/create/update/delete circle, ellipse, and gradient forms; attach or detach forms with combine state and per-member inversion/opacity. `remote_transform.c` supplies preview↔raw mapping and the bounded freshness contract. | drawn masks on blending modules |
 
 ## How support is determined
 
@@ -112,8 +115,11 @@ Blend settings (opacity, mode, colorspace, refinement controls,
 off/uniform mask mode) are supported for every module with
 `IOP_FLAGS_SUPPORTS_BLENDING` via the `blend_params` capability.
 Parametric (blendif) masks and read-only mask rendering are supported via
-`parametric_mask_params` and `mask_render`; creating/attaching drawn
-geometry remains out of scope (M-C).
+`parametric_mask_params` and `mask_render`. Drawn masks (circle, ellipse,
+gradient create/edit/attach) are supported via the `mask_shapes` capability;
+path/brush/clone/AI forms are visible and attachable but not editable; raster
+masks remain out of scope. `mask_manager` stays unsupported as a *module* —
+the drawn-mask methods replace it.
 
 ## Usage vocabulary
 

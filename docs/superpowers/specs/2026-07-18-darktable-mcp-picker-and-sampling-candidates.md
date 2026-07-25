@@ -75,16 +75,18 @@ themselves are nearly free.
 
 ### Open questions for the eventual design
 
-- Coordinate space on the wire (preview-relative? full-image normalized?
-  who performs the back-transform?). Note: the drawn-masks design
-  (`2026-07-19-darktable-mcp-drawn-masks-design.md`) has since answered
-  this for its own case (preview-normalized, engine back-transforms) and
-  the two efforts share one transform helper — align with it.
-- **Pipe-freshness contract** (added 2026-07-19, shared with the
-  drawn-masks milestone): a transform/sample issued between a mutation
-  and pipe reprocess must not silently use stale geometry — define
-  block-until-clean vs `retry_later` semantics once; whichever effort is
-  planned first writes the contract, the other inherits it.
+- **Coordinate space — answered.** `src/control/remote_transform.c` owns the
+  shared preview-normalized point transform and back-transform; the future
+  sampling wire contract aligns with the drawn-mask surface rather than
+  creating a second coordinate convention.
+- **Pipe-freshness contract — answered.** The drawn-masks Tier-3 plan
+  (`2026-07-19-darktable-mcp-drawn-masks-tier3.md`, Design amendment 1)
+  requires block-until-clean only at `dev->preview_pipe->status ==
+  DT_DEV_PIXELPIPE_VALID`: otherwise enqueue one reprocess and poll 5 ms ×
+  `pixelpipe_synchronization_timeout` iterations, using 2000 only when the
+  configuration is non-positive; then return `retry_later`. `sample_region`
+  inherits `dt_remote_transform_ensure_fresh` verbatim from
+  `remote_transform.c`.
 - Which pipeline point and colorspace the response reports — per-module
   input space is what the write side needs, but it must be explicit wire
   vocabulary, not implicit.

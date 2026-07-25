@@ -1,13 +1,13 @@
 # darktable MCP — drawn masks (mask Tier 3) low-level design
 
 Date: 2026-07-19
-Status: **planned** (see `docs/superpowers/plans/2026-07-19-darktable-mcp-drawn-masks-tier3.md`; depends on Tier 1 / M-A and Tier 2 / M-B).
-The two planning-prerequisite contracts are now resolved and written into
-the plan as normative amendments: the pipe-freshness contract for
+Status: **implemented** (see `docs/superpowers/plans/2026-07-19-darktable-mcp-drawn-masks-tier3.md`).
+The two implementation contracts are written into the plan and protocol
+reference as normative amendments: the pipe-freshness contract for
 coordinate transforms (Amendment 1, shared verbatim with `sample_region`)
 and the GUI-edit-session guard (Amendment 2 / decision 8). All items in
 "Explicitly unresolved" below are closed — see the **Amendments
-(planning)** section for the resolutions. The cross-tier `mask_mode`
+(implementation record)** section for the resolutions. The cross-tier `mask_mode`
 transition appendix in the candidates doc is authoritative over this
 document's per-operation mode effects.
 Companions: `2026-07-19-darktable-mcp-blend-settings-design.md` (Tier 1),
@@ -16,14 +16,11 @@ Companions: `2026-07-19-darktable-mcp-blend-settings-design.md` (Tier 1),
 coordinate/back-transform problem this design inherits),
 `2026-07-19-darktable-mcp-mask-support-design-candidates.md` (tier split).
 
-This design goes as far as the current unknowns allow. Two areas are
-deliberately specified as *policies with implementation-time pinning*
-rather than final numbers: the per-shape geometry ranges (to be pinned
-from the GUI interaction clamps during planning) and the scalar-size
-coordinate conversion (specified as a concrete probe algorithm, flagged
-as the highest-risk component). Everything else — wire methods, engine
-sequences, group semantics, validation policy, history/undo behavior,
-testing — is designed to plan-ready depth.
+This design records the implemented surface. Geometry ranges are pinned to
+the GUI storage clamps, and scalar-size conversion uses the fixed probe
+algorithm described in Amendment 5. The wire methods, engine sequences,
+group semantics, validation policy, history/undo behavior, and tests are
+implemented as specified below.
 
 ## Goal
 
@@ -114,22 +111,21 @@ to interpret (they are *reported* for debugging, see below).
   the response carries `"size_mapping": "exact" | "approximate"`
   computed by comparing the 4 probe distances (spread > 1% ⇒
   approximate).
-- Every request and response geometry object carries `"space":
+- Every create/update request and listed shape carries top-level `"space":
   "preview"`; an explicit field so a raw-space escape hatch can be added
-  later without ambiguity. Responses additionally include
-  `"raw_geometry"` — the stored values verbatim — for round-trip
-  debugging and as the stable representation that survives geometry
-  changes elsewhere in the pipe.
-- **Shared contract note:** this is the same transform exposure
-  `sample_region` needs. Whichever ships first implements the
-  preview↔raw point mapping as a small shared engine helper
-  (`remote_transform.c`); the other reuses it.
+  later without ambiguity. Editable responses additionally include
+  `"raw_geometry"` — the stored values verbatim — for round-trip debugging
+  and as the stable representation that survives geometry changes elsewhere
+  in the pipe.
+- **Shared contract note:** `remote_transform.c` owns the implemented
+  preview↔raw point mapping and freshness contract. The future
+  `sample_region` surface reuses those helpers verbatim.
 
 ## Wire contract
 
 ### Capability
 
-`hello` advertises `mask_shapes`. All six methods below require it; the
+`hello` advertises `mask_shapes`. All five methods below require it; the
 sidecar hides/refuses the tools without it.
 
 ### `list_mask_shapes` (read-only)
@@ -178,15 +174,17 @@ Response:
   attached creation adds `ENABLED|MASK` only in the second forced-new
   snapshot, while unattached creation adds no mode bits. Both paths
   preserve `module->enabled`; group + membership + `mask_id` remain
-  handled by darktable.
+  handled by darktable. Unattached creation records one forced-new global
+  masks-history item; attached creation records two (form, then
+  membership/mask mode).
 - `name: null` → darktable's auto-numbering; a string requests that
   name (uniquified with a suffix if taken, actual name returned).
 - Result: the new shape's `list_mask_shapes` entry + new revision.
 
-Geometry members per type (all floats finite; ranges pinned at planning
-from the GUI clamps, with the *policy*: positive sizes, borders ≥ 0,
-centers/anchors permitted moderately outside [0,1] exactly as the GUI
-allows placing shapes partly off-canvas, everything else rejected):
+Geometry members per type (all floats finite; implemented ranges are pinned
+to the GUI storage clamps: positive sizes, borders ≥ 0, centers/anchors
+permitted moderately outside [0,1] exactly as the GUI allows placing shapes
+partly off-canvas, everything else rejected):
 
 | type | members |
 |---|---|
@@ -204,8 +202,8 @@ allows placing shapes partly off-canvas, everything else rejected):
 
 - Full-geometry replacement of one shape (same members as create; type
   cannot change). Engine: back-transform, overwrite the point struct,
-  one masks history item, reveal each referencing module? No — reveal
-  the single module when exactly one references it, none otherwise.
+  one forced-new global masks-history item, reveal each referencing module?
+  No — reveal the single module when exactly one references it, none otherwise.
 - The response repeats `used_by` and carries
   `"affects_instances": <count>` — an update to a shared shape edits
   every module using it; the count makes that visible (decision 5).
@@ -225,36 +223,39 @@ instances + revision. Each affected module is cleared and snapshotted
 while its now-empty base group remains active. Only after every module
 snapshot does the engine retire the target/cascaded groups and record the
 global snapshot. Consequently every undo/redo history prefix is coherent:
-any valid `mask_id` resolves in that prefix's forms graph.
+any valid `mask_id` resolves in that prefix's forms graph. Deletion records
+one final global masks-history item plus one forced-new module item for each
+unique module whose base group is retired by the cascade.
 
-### `attach_mask` / `detach_mask`
+### `set_mask_attachment`
 
-> **Superseded by Amendment 3:** these two are merged into a single
-> `set_mask_attachment { …, attached: true|false }` method. The payload
-> below is unchanged for the attach case (`attached: true`); `attached:
-> false` detaches and reads none of `state`/`inverted`/`opacity`. Per
-> Amendment 6, `state` is ignored when the shape lands as the group's
-> first member.
+This one method attaches or detaches with `attached: true|false`. When
+`attached: false`, it removes the direct edge and reads none of
+`state`/`inverted`/`opacity`. The first group member has no combine operation,
+so `state` is ignored when a shape lands there.
 
 ```json
-{ "op": "exposure", "instance": 1, "shape_id": 12,
+{ "op": "exposure", "instance": 1, "shape_id": 12, "attached": true,
   "state": "union", "inverted": false, "opacity": 0.8,
   "expected_revision": 44 }
 ```
 
-- `attach_mask` **upserts**: creates the module's group + `mask_id` if
+- With `attached: true`, the method **upserts**: creates the module's group + `mask_id` if
   missing (same `_group_create` path via a small exported helper — see
   Engine), appends or updates the membership (`state` → the
   `DT_MASKS_STATE_*` op bit plus `USE|SHOW`, `inverted` →
   `INVERSE`, `opacity` clamped to [0,1]), ORs `ENABLED|MASK` into
   `mask_mode`, one masks history item. Defaults: `union`, not inverted,
-  conf opacity.
+  conf opacity. Each state-changing attachment call records one ordinary
+  module history item.
 - `state` vocabulary: `"union" | "intersection" | "difference" |
-  "exclusion"` (`"sum"` reserved for brush, refused in v1).
-- `detach_mask` removes the membership via `dt_masks_form_remove(module,
-  grp, form)` — the shape itself survives if unreferenced elsewhere
-  (unlike `delete_mask_shape`), clearing `MASK` from `mask_mode` when
-  the group empties.
+  "exclusion"` (`"sum"` is reserved for a future brush-specific wire
+  operation and refused in v1).
+- With `attached: false`, the method removes the membership via
+  `dt_masks_module_remove_direct_mask_member` — the shape itself survives if
+  unreferenced elsewhere (unlike `delete_mask_shape`), clearing `MASK` from
+  `mask_mode` when the group empties. An idempotent detach with no direct edge
+  records zero history items and leaves the revision unchanged.
 - Attaching deferred-type shapes (an existing brush, say) is allowed —
   membership is type-agnostic — which lets an agent reuse hand-drawn
   brushes on other modules without being able to edit them.
@@ -263,15 +264,19 @@ any valid `mask_id` resolves in that prefix's forms graph.
 
 | condition | error |
 |---|---|
-| unknown shape id | `not_found`, `parameter: "id"` |
+| unknown shape on update/delete | `not_found`, `parameter: "id"` |
+| unknown shape on attachment | `not_found`, `parameter: "shape_id"` |
 | `type` not in v1 set (create) or shape not editable (update) | `unsupported_field`, `parameter: "type"` |
 | non-finite / out-of-policy geometry member | `invalid_value` with `{parameter, constraint}` |
-| `state: "sum"` on non-brush | `invalid_value`, `constraint: "sum_is_brush_only"` |
+| `state: "sum"` (reserved, unsupported in v1) | `invalid_value`, `constraint: "sum_is_brush_only"` |
 | attach to module without blending/mask support (`IOP_FLAGS_NO_MASKS`, missing `SUPPORTS_BLENDING`) | `unsupported_field`, `parameter: "op"` |
+| attach to a module with a raster mask | `invalid_value`, `parameter: "op"`, `constraint: "raster_unsupported"` |
+| create/update coordinate transform fails | retryable `preview_failed`, `constraint: "transform_failed"` |
+| preview pipe invalid or not clean before its bounded wait | retryable `retry_later` |
 | revision mismatch | `revision_conflict` (existing CAS semantics) |
-| module ref not found | existing `not_found` vocabulary |
+| unknown attachment/create target | `unknown_module` / `unknown_instance` |
 
-All six methods run on the GTK main thread via the existing dispatch;
+All five methods run on the GTK main thread via the existing dispatch;
 all mutating ones take `expected_revision` CAS like every mutation.
 
 ## Engine design
@@ -350,12 +355,15 @@ explicit creation options and `dt_masks_gui_form_save_creation_ext`, plus
 
 ### Reveal behavior
 
-Mutations reveal the affected module (Tier 0 behavior shipped 2026-07-18)
-when exactly one module is affected; `list_mask_shapes` reveals nothing.
+An attached create and every real attachment mutation reveal their target
+module (Tier 0 behavior shipped 2026-07-18). Update reveals only when the
+shape has exactly one owner. `list_mask_shapes` and `delete_mask_shape`
+reveal nothing; an idempotent detach is not a real mutation and reveals
+nothing.
 
 ## Sidecar changes
 
-Six new tools mapping 1:1 to the methods, gated on `mask_shapes`;
+Five new tools mapping 1:1 to the methods, gated on `mask_shapes`;
 `space` defaults to `"preview"` client-side. Docstrings carry the two
 model-facing warnings: shared-shape edits affect every user
 (`affects_instances`), and size mapping may be approximate under
@@ -366,7 +374,7 @@ detach.
 ## Protocol reference impact
 
 New top-level "Drawn masks (`mask_shapes`)" section: the coordinate
-contract (including the probe algorithm and `size_mapping`), all six
+contract (including the probe algorithm and `size_mapping`), all five
 method shapes, the state vocabulary, per-method history-item counts, the
 deferred-type visibility rules, and the error table. Supported-operations
 doc: the Tier 3 sentence updates; `mask_manager` stays unsupported as a
@@ -388,7 +396,7 @@ Unit (`test_remote_masks.c`, headless with real modules via `dt_init`):
   preview↔raw conversion is exact and `size_mapping == "exact"`.
 - history-item counts per operation (revision tracker deltas).
 
-Protocol: fixtures for all six methods, shared with `test_protocol.py`.
+Protocol: fixtures for all five methods, shared with `test_protocol.py`.
 
 Integration (using M-B's `show_mask` render as the primary observable —
 direct assertions on the mask image; preview-diffs remain as
@@ -431,7 +439,7 @@ end-to-end confirmation):
    deterministic; the count keeps the agent informed.
 6. **Undo granularity matches history items** (N calls to fully revert
    an N-item operation), documented per method; no batching in v1.
-7. Per-member `opacity` and `inverted` live on `attach_mask`, not on
+7. Per-member `opacity` and `inverted` live on `set_mask_attachment`, not on
    the shape — mirroring storage (`dt_masks_point_group_t`), so the
    same shape can be inverted on one module and not another.
 8. **Live GUI edit sessions are cancelled, not raced** (2026-07-19 scope
@@ -441,7 +449,7 @@ end-to-end confirmation):
    alternative (refusing with a retryable error) was rejected as worse
    for unattended agent operation but is cheap to revisit.
 
-## Amendments (planning — 2026-07-20)
+## Amendments (implementation record — 2026-07-20)
 
 Recorded when the implementation plan
 (`2026-07-19-darktable-mcp-drawn-masks-tier3.md`) was written and
@@ -474,7 +482,7 @@ full normative text.
    discarded cleanly (no use-after-free). Implemented as
    `dt_remote_masks_cancel_gui_edit_if_targeting`.
 
-3. **H7 tool merge.** `attach_mask` + `detach_mask` merged into one
+3. **H7 tool merge.** Attachment and detachment are merged into
    `set_mask_attachment { op, instance, shape_id, attached, state?,
    inverted?, opacity?, expected_revision }` (18→17 tools);
    `create`/`update`/`delete`/`list` stay separate. Docstring token
