@@ -13,8 +13,8 @@ This document is for **users** enabling the feature and **host authors**
 wiring the sidecar up. It is not the protocol spec; the wire contract lives
 in `docs/superpowers/specs/` in the darktable source tree.
 
-For a complete source-build and Claude Code walkthrough on Ubuntu, see
-[`ubuntu-claude-code-setup.md`](ubuntu-claude-code-setup.md).
+For a complete source-build and Claude Code or Codex walkthrough on
+Ubuntu, see [`ubuntu-mcp-client-setup.md`](ubuntu-mcp-client-setup.md).
 
 > **Remote control is off by default and must be explicitly enabled.** When
 > off, darktable opens no port and writes no discovery record — there is

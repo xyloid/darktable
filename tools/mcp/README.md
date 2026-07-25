@@ -15,8 +15,9 @@ the current edit state as native MCP image content.
 control, how to point an MCP host at darktable (with a `mcpServers` config
 snippet), where discovery records live on each platform, how multiple
 instances are selected, the security model, and the versioning policy.
-For a command-by-command source build and Claude Code setup on Ubuntu, use
-[`docs/ubuntu-claude-code-setup.md`](docs/ubuntu-claude-code-setup.md).
+For a command-by-command source build and Claude Code or Codex setup on
+Ubuntu, use
+[`docs/ubuntu-mcp-client-setup.md`](docs/ubuntu-mcp-client-setup.md).
 Once it is connected, [Agent skill](#agent-skill) below installs the
 skill that teaches an agent to actually edit well with these tools.
 
