@@ -352,11 +352,13 @@ set_mask_attachment
 {"op":"exposure","instance":0,"shape_id":<shape_id>,"attached":false,"expected_revision":<revision>}
 ```
 
-Coordinates are preview-normalized. Points map exactly, but perspective
+Coordinates are preview-normalized; scalar radii and borders are fractions
+of the shorter rendered-image edge. Points map exactly, but perspective
 correction can make size and angle conversion `size_mapping: "approximate"`;
 check that result before treating a radius or rotation as exact. Shapes are
 shared objects: `update_mask_shape` changes every module using the form, and
-its `affects_instances` result tells you how many.
+its `affects_instances` result tells you how many. Gradient updates preserve
+the GUI's existing linear or sigmoidal transition mode.
 
 Manual GUI-guard test: open the image in darkroom, start dragging a circle,
 issue a remote `delete_mask_shape` for it, and confirm that darktable does

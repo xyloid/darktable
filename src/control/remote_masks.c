@@ -1128,6 +1128,9 @@ gboolean dt_remote_masks_update(dt_develop_t *dev,
     free(scratch);
     return FALSE;
   }
+  if(dt_remote_masks_kind_from_type(form->type) == DT_REMOTE_SHAPE_GRADIENT)
+    ((dt_masks_point_gradient_t *)scratch)->state =
+      ((const dt_masks_point_gradient_t *)form->points->data)->state;
 
   dt_remote_masks_cancel_gui_edit_if_targeting(dev, form);
   memcpy(form->points->data, scratch, point_size);

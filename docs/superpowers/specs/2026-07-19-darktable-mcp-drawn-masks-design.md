@@ -100,13 +100,14 @@ to interpret (they are *reported* for debugging, see below).
 - **Scalar sizes and angles — probe-based, documented as approximate
   under non-uniform distortion.** A stored radius is a length in raw
   space; under crop/rotate/perspective there is no single correct
-  preview-space equivalent. v1 algorithm: back-transform a probe cross —
-  the center plus 4 points at the requested preview-space radius (up,
-  down, left, right); the stored radius is the mean raw-space distance
-  from the transformed center to the 4 transformed probe points
-  (normalized per storage convention). Angles (ellipse/gradient
-  rotation): back-transform a short direction probe and take the raw
-  angle delta. Reads use the forward equivalent. Under pure
+  preview-space equivalent. Wire radii and borders are fractions of the
+  shorter rendered-image edge. v1 algorithm: back-transform a probe cross —
+  the center plus 4 isotropic-pixel points at that shorter-edge-scaled
+  radius (up, down, left, right); the stored radius is the mean raw-space
+  distance from the transformed center to the 4 transformed probe points
+  (normalized by the shorter raw edge). Angles (ellipse/gradient rotation):
+  back-transform a short direction probe and take the raw angle delta.
+  Reads use the forward equivalent. Under pure
   crop/flip/scale this is exact; under perspective it is a local mean —
   the response carries `"size_mapping": "exact" | "approximate"`
   computed by comparing the 4 probe distances (spread > 1% ⇒
@@ -204,6 +205,9 @@ partly off-canvas, everything else rejected):
   cannot change). Engine: back-transform, overwrite the point struct,
   one forced-new global masks-history item, reveal each referencing module?
   No — reveal the single module when exactly one references it, none otherwise.
+- Gradient creation defaults the internal transition mode to sigmoidal.
+  Because that GUI-controlled mode is not part of the wire geometry, update
+  preserves the form's existing linear or sigmoidal mode.
 - The response repeats `used_by` and carries
   `"affects_instances": <count>` — an update to a shared shape edits
   every module using it; the count makes that visible (decision 5).
@@ -495,6 +499,8 @@ full normative text.
 
 5. **Probe constants pinned + angle space corrected.** `size_mapping`
    spread threshold = **1 % relative** across the 4 probe-arm distances;
+   size-probe arms use the requested scalar times the shorter rendered-image
+   edge as an isotropic pixel offset in both directions;
    angle-probe arm = **0.05 of the shorter image edge, applied as an
    isotropic pixel offset**. The angle handling is isotropic-pixel, **not
    normalized**, because darktable stores mask rotation as a geometric

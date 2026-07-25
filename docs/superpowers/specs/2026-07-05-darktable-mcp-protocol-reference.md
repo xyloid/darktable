@@ -891,11 +891,13 @@ the ordinary `expected_revision` compare-and-swap contract.
 back-transforms geometry through the current preview pipe before storing it.
 Every listed non-group shape includes top-level `space` and `editable`; only
 editable entries include preview `geometry` and verbatim stored
-`raw_geometry`. Points map exactly. Sizes are sampled with four probe arms;
-if their relative spread exceeds **1%**, `geometry.size_mapping` is
-`"approximate"`, otherwise it is `"exact"`. The angle probe arm is an
-isotropic pixel offset of **0.05 times the shorter image edge**, so angles
-are not distorted by normalized-space aspect ratio.
+`raw_geometry`. Points map exactly. Scalar radii and borders are fractions
+of the shorter rendered-image edge and are sampled with four isotropic pixel
+probe arms; if their transformed-distance spread exceeds **1%**,
+`geometry.size_mapping` is `"approximate"`, otherwise it is `"exact"`. The
+angle probe arm is an isotropic pixel offset of **0.05 times the shorter
+image edge**, so neither size nor angle is distorted merely by a non-square
+image's normalized-coordinate aspect ratio.
 
 Create and update require every member in the matching row and reject unknown
 members. All numeric members must be finite and float-representable.
@@ -964,9 +966,11 @@ then membership/mask-mode. It preserves the target module's enabled state.
 ```
 
 Replaces the complete editable geometry (and optionally renames) without
-changing type. Returns `{ "shape": <entry>, "affects_instances": <int>,
-"revision": <uint> }`; shared-shape edits affect every listed user. It
-records one forced-new global masks-history item.
+changing type. A gradient creation defaults its internal transition mode to
+sigmoidal; because that mode is not part of wire geometry, updates preserve
+the existing linear or sigmoidal mode. Returns `{ "shape": <entry>,
+"affects_instances": <int>, "revision": <uint> }`; shared-shape edits affect
+every listed user. It records one forced-new global masks-history item.
 
 #### `delete_mask_shape`
 

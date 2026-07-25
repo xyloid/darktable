@@ -110,13 +110,14 @@ static gboolean _probe_raw_distance(dt_develop_t *dev,
   float pw, ph, iw, ih;
   _sizes(&pw, &ph, &iw, &ih);
   const double denominator = fmin(iw, ih);
+  const double preview_radius = r_prev * fmin(pw, ph);
 
   float points[10] = {
     (float)(cx_prev * pw),            (float)(cy_prev * ph),
-    (float)(cx_prev * pw),            (float)((cy_prev - r_prev) * ph),
-    (float)(cx_prev * pw),            (float)((cy_prev + r_prev) * ph),
-    (float)((cx_prev - r_prev) * pw), (float)(cy_prev * ph),
-    (float)((cx_prev + r_prev) * pw), (float)(cy_prev * ph),
+    (float)(cx_prev * pw),            (float)(cy_prev * ph - preview_radius),
+    (float)(cx_prev * pw),            (float)(cy_prev * ph + preview_radius),
+    (float)(cx_prev * pw - preview_radius), (float)(cy_prev * ph),
+    (float)(cx_prev * pw + preview_radius), (float)(cy_prev * ph),
   };
   if(!dt_dev_distort_backtransform(dev, points, 5))
     return FALSE;
@@ -179,13 +180,14 @@ gboolean dt_remote_transform_raw_to_preview_size(dt_develop_t *dev,
 
   const double center_x = points[0];
   const double center_y = points[1];
+  const double denominator = fmin(pw, ph);
   double sum = 0.0;
   double minimum = INFINITY;
   double maximum = 0.0;
   for(int k = 0; k < 4; k++)
   {
-    const double dx = (points[2 + k * 2] - center_x) / pw;
-    const double dy = (points[3 + k * 2] - center_y) / ph;
+    const double dx = points[2 + k * 2] - center_x;
+    const double dy = points[3 + k * 2] - center_y;
     const double distance = hypot(dx, dy);
     sum += distance;
     minimum = fmin(minimum, distance);
@@ -193,7 +195,7 @@ gboolean dt_remote_transform_raw_to_preview_size(dt_develop_t *dev,
   }
 
   const double mean = sum / 4.0;
-  *r_prev_out = mean;
+  *r_prev_out = denominator > 0.0 ? mean / denominator : 0.0;
   if(exact_out)
     *exact_out = mean > 0.0
                    ? (maximum - minimum) / mean <= DT_REMOTE_TRANSFORM_SPREAD

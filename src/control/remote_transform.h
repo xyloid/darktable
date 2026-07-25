@@ -55,10 +55,12 @@ void dt_remote_transform_raw_to_preview_point(struct dt_develop_t *dev,
                                               double *px,
                                               double *py);
 
-/** preview-normalized radius at (cx_prev,cy_prev) -> raw-normalized length
- * (raw pixel distance / MIN(iwidth,iheight)). *exact_out is FALSE when the
- * four probe-arm raw distances spread by more than DT_REMOTE_TRANSFORM_SPREAD
- * (relative). Returns FALSE only if the underlying distort call fails. */
+/** Preview radius, expressed as a fraction of MIN(processed_width,
+ * processed_height), at (cx_prev,cy_prev) -> raw-normalized length (raw pixel
+ * distance / MIN(iwidth,iheight)). Probe arms are isotropic pixel offsets.
+ * *exact_out is FALSE when the four transformed arm distances spread by more
+ * than DT_REMOTE_TRANSFORM_SPREAD (relative). Returns FALSE only if the
+ * underlying distort call fails. */
 gboolean dt_remote_transform_preview_to_raw_size(struct dt_develop_t *dev,
                                                  double cx_prev,
                                                  double cy_prev,

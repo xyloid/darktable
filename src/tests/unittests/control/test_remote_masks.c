@@ -78,7 +78,50 @@ typedef struct masks_fixture_t
   int iwidth;
   int iheight;
   float iscale;
+  dt_iop_module_t anisotropic_module;
+  dt_dev_pixelpipe_iop_t anisotropic_piece;
+  gboolean anisotropic_installed;
 } masks_fixture_t;
+
+static gboolean _anisotropic_forward(dt_iop_module_t *self,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     float *points,
+                                     const size_t points_count)
+{
+  (void)self;
+  (void)piece;
+  for(size_t k = 0; k < points_count; k++)
+    points[2 * k] *= 2.0f;
+  return TRUE;
+}
+
+static gboolean _anisotropic_back(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  float *points,
+                                  const size_t points_count)
+{
+  (void)self;
+  (void)piece;
+  for(size_t k = 0; k < points_count; k++)
+    points[2 * k] *= 0.5f;
+  return TRUE;
+}
+
+static void _install_anisotropic_transform(masks_fixture_t *fixture)
+{
+  fixture->anisotropic_module.dev = darktable.develop;
+  fixture->anisotropic_module.distort_transform = _anisotropic_forward;
+  fixture->anisotropic_module.distort_backtransform = _anisotropic_back;
+  fixture->anisotropic_piece.module = &fixture->anisotropic_module;
+  fixture->anisotropic_piece.pipe = fixture->preview_pipe;
+  fixture->anisotropic_piece.data = &fixture->anisotropic_piece;
+  fixture->anisotropic_piece.enabled = TRUE;
+  fixture->preview_pipe->iop =
+    g_list_prepend(fixture->preview_pipe->iop, &fixture->anisotropic_module);
+  fixture->preview_pipe->nodes =
+    g_list_prepend(fixture->preview_pipe->nodes, &fixture->anisotropic_piece);
+  fixture->anisotropic_installed = TRUE;
+}
 
 static int harness_group_setup(void **state)
 {
@@ -149,6 +192,13 @@ static int masks_test_teardown(void **state)
   masks_fixture_t *fixture = *state;
   if(!fixture) return 0;
 
+  if(fixture->anisotropic_installed)
+  {
+    fixture->preview_pipe->iop =
+      g_list_remove(fixture->preview_pipe->iop, &fixture->anisotropic_module);
+    fixture->preview_pipe->nodes =
+      g_list_remove(fixture->preview_pipe->nodes, &fixture->anisotropic_piece);
+  }
   fixture->preview_pipe->processed_width = fixture->processed_width;
   fixture->preview_pipe->processed_height = fixture->processed_height;
   fixture->preview_pipe->iwidth = fixture->iwidth;
@@ -1288,7 +1338,7 @@ static void test_raw_geometry_serializes_stored_values_verbatim(void **state)
 static void test_size_mapping_aggregates_border_probe(void **state)
 {
   masks_fixture_t *fixture = *state;
-  fixture->preview_pipe->processed_height = 500;
+  _install_anisotropic_transform(fixture);
 
   // A zero radius has no directional spread and is exact. The nonzero border
   // is the only approximate size probe, so this freezes border aggregation.
@@ -2186,6 +2236,46 @@ static void test_update_replaces_atomically_and_reports_users(void **state)
   assert_int_equal(affects, 999);
 
   json_object_unref(invalid);
+  json_object_unref(replacement);
+  json_object_unref(initial);
+}
+
+static void test_update_gradient_preserves_transition_state(void **state)
+{
+  blend_fixture_t *fixture = *state;
+  JsonObject *initial =
+    _geom("{\"anchor\":[0.4,0.6],\"rotation\":10,\"compression\":0.3,"
+          "\"steepness\":0.2,\"curvature\":-0.5}");
+  JsonObject *replacement =
+    _geom("{\"anchor\":[0.2,0.8],\"rotation\":25,\"compression\":0.6,"
+          "\"steepness\":0.7,\"curvature\":1.25}");
+  dt_remote_error_t *error = NULL;
+  dt_mask_id_t id = INVALID_MASKID;
+  assert_true(dt_remote_masks_create(&fixture->dev, DT_MASKS_GRADIENT,
+                                     initial, "linear gradient", NULL,
+                                     &id, &error));
+  assert_null(error);
+
+  dt_masks_form_t *form = dt_masks_get_from_id(&fixture->dev, id);
+  assert_non_null(form);
+  dt_masks_point_gradient_t *point = form->points->data;
+  assert_non_null(point);
+  point->state = DT_MASKS_GRADIENT_STATE_LINEAR;
+
+  int affects = -1;
+  assert_true(dt_remote_masks_update(&fixture->dev, id, replacement,
+                                     NULL, &affects, &error));
+  assert_null(error);
+  assert_int_equal(affects, 0);
+  point = form->points->data;
+  assert_float_equal(point->anchor[0], 0.2, 1e-6);
+  assert_float_equal(point->anchor[1], 0.8, 1e-6);
+  assert_float_equal(point->rotation, 25.0, 1e-3);
+  assert_float_equal(point->compression, 0.6, 1e-6);
+  assert_float_equal(point->steepness, 0.7, 1e-6);
+  assert_float_equal(point->curvature, 1.25, 1e-6);
+  assert_int_equal(point->state, DT_MASKS_GRADIENT_STATE_LINEAR);
+
   json_object_unref(replacement);
   json_object_unref(initial);
 }
@@ -4376,6 +4466,9 @@ int main(void)
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_update_replaces_atomically_and_reports_users,
+      blend_test_setup, blend_test_teardown),
+    cmocka_unit_test_setup_teardown(
+      test_update_gradient_preserves_transition_state,
       blend_test_setup, blend_test_teardown),
     cmocka_unit_test_setup_teardown(
       test_update_unknown_id_is_not_found,

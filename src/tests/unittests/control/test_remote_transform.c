@@ -26,6 +26,7 @@
 #include "control/remote_edit.h"
 #include "control/remote_transform.h"
 #include "develop/develop.h"
+#include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/pixelpipe_hb.h"
 
@@ -50,7 +51,50 @@ typedef struct transform_fixture_t
   dt_dev_pixelpipe_status_t status;
   gboolean gui_attached;
   int synchronization_timeout;
+  dt_iop_module_t anisotropic_module;
+  dt_dev_pixelpipe_iop_t anisotropic_piece;
+  gboolean anisotropic_installed;
 } transform_fixture_t;
+
+static gboolean _anisotropic_forward(dt_iop_module_t *self,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     float *points,
+                                     const size_t points_count)
+{
+  (void)self;
+  (void)piece;
+  for(size_t k = 0; k < points_count; k++)
+    points[2 * k] *= 2.0f;
+  return TRUE;
+}
+
+static gboolean _anisotropic_back(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  float *points,
+                                  const size_t points_count)
+{
+  (void)self;
+  (void)piece;
+  for(size_t k = 0; k < points_count; k++)
+    points[2 * k] *= 0.5f;
+  return TRUE;
+}
+
+static void _install_anisotropic_transform(transform_fixture_t *fixture)
+{
+  fixture->anisotropic_module.dev = darktable.develop;
+  fixture->anisotropic_module.distort_transform = _anisotropic_forward;
+  fixture->anisotropic_module.distort_backtransform = _anisotropic_back;
+  fixture->anisotropic_piece.module = &fixture->anisotropic_module;
+  fixture->anisotropic_piece.pipe = fixture->preview_pipe;
+  fixture->anisotropic_piece.data = &fixture->anisotropic_piece;
+  fixture->anisotropic_piece.enabled = TRUE;
+  fixture->preview_pipe->iop =
+    g_list_prepend(fixture->preview_pipe->iop, &fixture->anisotropic_module);
+  fixture->preview_pipe->nodes =
+    g_list_prepend(fixture->preview_pipe->nodes, &fixture->anisotropic_piece);
+  fixture->anisotropic_installed = TRUE;
+}
 
 static int harness_group_setup(void **state)
 {
@@ -130,6 +174,13 @@ static int transform_test_teardown(void **state)
   // The null-pipe test deliberately clears this pointer. Restore it before
   // restoring the pipe fields and before the group-level dt_cleanup().
   darktable.develop->preview_pipe = fixture->preview_pipe;
+  if(fixture->anisotropic_installed)
+  {
+    fixture->preview_pipe->iop =
+      g_list_remove(fixture->preview_pipe->iop, &fixture->anisotropic_module);
+    fixture->preview_pipe->nodes =
+      g_list_remove(fixture->preview_pipe->nodes, &fixture->anisotropic_piece);
+  }
   fixture->preview_pipe->processed_width = fixture->processed_width;
   fixture->preview_pipe->processed_height = fixture->processed_height;
   fixture->preview_pipe->iwidth = fixture->iwidth;
@@ -198,10 +249,33 @@ static void test_raw_to_preview_size_identity_is_exact(void **state)
   assert_true(exact);
 }
 
+static void test_size_non_square_identity_roundtrips_exactly(void **state)
+{
+  transform_fixture_t *fixture = *state;
+  fixture->preview_pipe->processed_width = 1200;
+  fixture->preview_pipe->processed_height = 800;
+  fixture->preview_pipe->iwidth = 1200;
+  fixture->preview_pipe->iheight = 800;
+
+  double r_raw = 0.0;
+  gboolean exact = FALSE;
+  assert_true(dt_remote_transform_preview_to_raw_size(
+    darktable.develop, 0.5, 0.5, 0.1, &r_raw, &exact));
+  assert_float_equal(r_raw, 0.1, 1e-4);
+  assert_true(exact);
+
+  double r_preview = 0.0;
+  exact = FALSE;
+  assert_true(dt_remote_transform_raw_to_preview_size(
+    darktable.develop, 0.5, 0.5, r_raw, &r_preview, &exact));
+  assert_float_equal(r_preview, 0.1, 1e-4);
+  assert_true(exact);
+}
+
 static void test_preview_to_raw_size_marks_anisotropy_approximate(void **state)
 {
   transform_fixture_t *fixture = *state;
-  fixture->preview_pipe->processed_height = 500;
+  _install_anisotropic_transform(fixture);
 
   double r_raw = 0.0;
   gboolean exact = TRUE;
@@ -214,7 +288,7 @@ static void test_preview_to_raw_size_marks_anisotropy_approximate(void **state)
 static void test_raw_to_preview_size_marks_anisotropy_approximate(void **state)
 {
   transform_fixture_t *fixture = *state;
-  fixture->preview_pipe->processed_height = 500;
+  _install_anisotropic_transform(fixture);
 
   double r_preview = 0.0;
   gboolean exact = TRUE;
@@ -305,6 +379,8 @@ int main(void)
     cmocka_unit_test_setup_teardown(test_preview_to_raw_size_identity_is_exact,
                                     transform_test_setup, transform_test_teardown),
     cmocka_unit_test_setup_teardown(test_raw_to_preview_size_identity_is_exact,
+                                    transform_test_setup, transform_test_teardown),
+    cmocka_unit_test_setup_teardown(test_size_non_square_identity_roundtrips_exactly,
                                     transform_test_setup, transform_test_teardown),
     cmocka_unit_test_setup_teardown(test_preview_to_raw_size_marks_anisotropy_approximate,
                                     transform_test_setup, transform_test_teardown),

@@ -573,8 +573,9 @@ def build_server(
         `name` omitted means darktable chooses a name, and `attach` may
         create it already attached to a module. Coordinates are
         preview-normalized `[0,1]` over the rendered image (`space` defaults
-        to `"preview"`): point centers/anchors map exactly, while sizes and
-        angles may be reported `approximate` under perspective correction in
+        to `"preview"`): point centers/anchors map exactly; radii and borders
+        are fractions of the shorter rendered edge; sizes and angles may be
+        reported `approximate` under perspective correction in
         `size_mapping`. Editing a shared shape with `update_mask_shape`
         changes every module using it; that update's `affects_instances`
         reports how many. Requires `mask_shapes`."""
@@ -610,7 +611,8 @@ def build_server(
         `create_mask_shape` (preview-normalized `[0,1]`). A shared-shape
         update edits every module using it, reported as `affects_instances`;
         sizes/angles can be `approximate` under perspective in
-        `size_mapping`. Requires `mask_shapes`."""
+        `size_mapping`. A gradient update preserves its existing GUI
+        linear/sigmoidal transition mode. Requires `mask_shapes`."""
         params: dict[str, Any] = {"id": id, "geometry": geometry, "space": space}
         if name is not None:
             params["name"] = name
