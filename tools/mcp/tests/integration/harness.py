@@ -353,6 +353,9 @@ class DarktableInstance:
             # Keep the run hermetic and deterministic.
             "--conf", "write_sidecar_files=never",
             "--conf", "opencl=FALSE",
+            # Live drawn-mask coordinate gates need up to 10s for preview-pipe
+            # freshness on long shared histories; unit tests cover retry_later/default policy.
+            "--conf", "pixelpipe_synchronization_timeout=2000",
             str(image),
         ]
         log = open(self.log_path, "wb")

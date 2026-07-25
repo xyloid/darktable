@@ -243,21 +243,21 @@ static void _channel_display_false_color(const float *const restrict in,
   }
 }
 
-DT_OMP_DECLARE_SIMD(aligned(in, out: 64) uniform(buffsize, alpha))
+DT_OMP_DECLARE_SIMD(aligned(in, out: 64) uniform(buffsize, mix, overlay))
 static void _mask_display(const float *const restrict in,
                           uint8_t *const restrict out,
                           const size_t buffsize,
-                          const float alpha)
+                          const float mix,
+                          const float overlay)
 {
   // yellow, "unused" element aids vectorization
   const dt_aligned_pixel_t mask_color = { 1.0f, 1.0f, 0.0f };
-  const float mix = CLIP(dt_conf_get_float("darkroom/ui/develop_mask_mix"));
   DT_OMP_FOR_SIMD(aligned(in, out: 64) aligned(mask_color: 16))
   for(size_t j = 0; j < buffsize; j+= 4)
   {
     const float gray = interpolatef(mix, in[j + 3], 0.3f * in[j + 0] + 0.59f * in[j + 1] + 0.11f * in[j + 2]);
     const dt_aligned_pixel_t pixel = { gray, gray, gray, gray };
-    _write_pixel(pixel, out + j, mask_color, in[j + 3] * alpha);
+    _write_pixel(pixel, out + j, mask_color, in[j + 3] * overlay);
   }
 }
 
@@ -316,7 +316,13 @@ void process(dt_iop_module_t *self,
   }
   else if(mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK)
   {
-    _mask_display((const float *const restrict)i, (uint8_t *const restrict)o, buffsize, 1.0f);
+    const gboolean remote_mask_export = piece->pipe->mask_display_request;
+    const float mix = remote_mask_export
+      ? 1.0f
+      : CLIP(dt_conf_get_float("darkroom/ui/develop_mask_mix"));
+    const float overlay = remote_mask_export ? 0.0f : 1.0f;
+    _mask_display((const float *const restrict)i, (uint8_t *const restrict)o, buffsize,
+                  mix, overlay);
   }
   else
   {
