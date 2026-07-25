@@ -17,6 +17,8 @@ snippet), where discovery records live on each platform, how multiple
 instances are selected, the security model, and the versioning policy.
 For a command-by-command source build and Claude Code setup on Ubuntu, use
 [`docs/ubuntu-claude-code-setup.md`](docs/ubuntu-claude-code-setup.md).
+Once it is connected, [Agent skill](#agent-skill) below installs the
+skill that teaches an agent to actually edit well with these tools.
 
 This is the sidecar for plan step 5 of
 `docs/superpowers/plans/2026-07-05-darktable-mcp-implementation-plan.md`.
@@ -35,6 +37,9 @@ src/darktable_mcp/
   errors.py      wire error codes + MCP-facing hints; no SDK dependency
   server.py      MCP tool definitions (the only file that imports `mcp`)
   __main__.py    `python -m darktable_mcp` / `darktable-mcp` stdio entry point
+skills/
+  darktable-editing/  agent skill teaching an agent to drive these tools
+                      well (see Agent skill below)
 ```
 
 `discovery.py`, `protocol.py`, and `errors.py` have no dependency on the
@@ -412,6 +417,48 @@ pip install -e '.[dev]'
 ```
 
 </details>
+
+## Agent skill
+
+Connecting the MCP gives an agent 17 tools; it does not teach it to use
+them well. `skills/darktable-editing/` is an [Agent
+Skill](https://agentskills.io/specification) that supplies the missing
+half: the orient/inspect/change/verify loop, the rule that
+`get_module_schema` is read before any first write, revision
+compare-and-swap discipline, a natural-language intent → module table,
+the four semantic parameter classes, the mask surfaces, and error
+recovery. It is plain markdown — usable by any host implementing the
+Agent Skills spec, not just Claude Code.
+
+Install it for yourself (available in every project — the usual choice,
+since you edit photos from wherever, not from this repo):
+
+```sh
+mkdir -p ~/.claude/skills
+ln -s "$PWD/tools/mcp/skills/darktable-editing" ~/.claude/skills/
+```
+
+Run that from the repository root. A symlink means `git pull` keeps the
+skill current; copy the directory instead if you would rather pin it.
+
+Or install it for one project only, so a photo-editing workspace picks
+it up and nothing else does:
+
+```sh
+mkdir -p /path/to/project/.claude/skills
+ln -s "$PWD/tools/mcp/skills/darktable-editing" /path/to/project/.claude/skills/
+```
+
+Verify with `/skills` (or ask the agent to list its skills) — you should
+see `darktable-editing`. It loads on its own when you ask for a photo
+edit; the four files under `references/` are pulled in only when that
+part of the surface is reached, so an ordinary exposure tweak does not
+pay for the mask documentation.
+
+Nothing about the MCP requires the skill, and nothing about the skill
+requires you to install it from here — it reads the live
+`get_module_schema` for anything version-specific, so it degrades to
+"slightly out of date prose" rather than breaking when darktable moves.
 
 ## Running the tests
 
