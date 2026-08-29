@@ -27,8 +27,8 @@ vector gates in one session.
 Historical note: these gates originally exposed a class-scoping dispatch
 bug in ``dt_remote_curve_apply_patch()`` (``src/control/remote_curve.c``)
 that rejected vector-only writes before the vector engine was ever
-reached; that bug was fixed on this branch (commits ``2148bec6ed`` and
-``193154ae9e``), and all gates below now pass.
+reached; that bug was fixed on this branch (commits ``e5f2b6df82`` and
+``571a9fc582``), and all gates below now pass.
 """
 
 from __future__ import annotations

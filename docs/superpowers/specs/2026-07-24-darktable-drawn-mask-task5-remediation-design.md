@@ -6,7 +6,7 @@ Companions:
 
 - `docs/superpowers/specs/2026-07-19-darktable-mcp-drawn-masks-design.md`
 - `docs/superpowers/plans/2026-07-19-darktable-mcp-drawn-masks-tier3.md`
-- Task 5 implementation commit `635ba962af`
+- Task 5 implementation commit `19bf79ea71`
 
 ## Problem
 

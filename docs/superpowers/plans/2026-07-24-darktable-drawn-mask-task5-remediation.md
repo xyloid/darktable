@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Execute in the existing isolated worktree `<REPO>/.claude/worktrees/mask-support`, starting from design commit `d78948208d`.
+- Execute in the existing isolated worktree `<REPO>/.claude/worktrees/mask-support`, starting from design commit `2b8a915a0d`.
 - Treat `docs/superpowers/specs/2026-07-24-darktable-drawn-mask-task5-remediation-design.md` as authoritative.
 - Do not change the wire protocol, error slugs, supported shape types, or group-ID rejection behavior.
 - Keep `dt_masks_form_remove(dt_iop_module_t *, dt_masks_form_t *, dt_masks_form_t *)` behavior unchanged.
@@ -2092,9 +2092,9 @@ Expected: all configured tests pass; the baseline at plan creation is
 - [ ] **Step 4: Check patch hygiene and worktree scope**
 
 ```bash
-git diff --check d78948208d..HEAD
+git diff --check 2b8a915a0d..HEAD
 git status --short
-git log --oneline d78948208d..HEAD
+git log --oneline 2b8a915a0d..HEAD
 ```
 
 Expected: `git diff --check` and `git status --short` are silent. The log
@@ -2116,7 +2116,7 @@ definition carry `MASKS_REMOVE_CALLER_AUDIT`.
 Review range:
 
 ```text
-BASE=d78948208d
+BASE=2b8a915a0d
 HEAD=$(git rev-parse HEAD)
 ```
 

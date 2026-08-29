@@ -3,8 +3,8 @@
 - **Status:** Closed — remediated and re-reviewed before Milestone 4 Task 4
 - **Reviewed:** 2026-07-12
 - **Audited plan:** `docs/superpowers/plans/2026-07-12-darktable-mcp-milestone4-vector-class.md`, Task 3
-- **Audited range:** `ffd00e2d8a..edb40b6a2e`
-- **Implementation commit:** `edb40b6a2e` (`remote_vector: vector-class engine and registry core`)
+- **Audited range:** `a29b8a2e76..be783ce97c`
+- **Implementation commit:** `be783ce97c` (`remote_vector: vector-class engine and registry core`)
 - **Companion fix plan:** `docs/superpowers/plans/2026-07-12-darktable-mcp-milestone4-task3-vector-core-review-fixes.md`
 
 ## Purpose
@@ -385,12 +385,12 @@ the per-descriptor loops are not independently proven.
 
 ## Verification evidence
 
-The review ran the following commands against `edb40b6a2e`:
+The review ran the following commands against `be783ce97c`:
 
 ```bash
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
-git diff --check ffd00e2d8a..edb40b6a2e
+git diff --check a29b8a2e76..be783ce97c
 git status --short
 ```
 
@@ -407,7 +407,7 @@ inputs and override sequences absent from the current suite.
 ### Remediation and re-review
 
 The complete remediation range is
-`edb40b6a2e..e53abacc13ae50fd35f6f845b74e381b4c18a9aa`.
+`be783ce97c..7302377694abdf111488cf1df9eb239f4b43b619`.
 
 Closure verification results:
 
@@ -416,10 +416,10 @@ Closure verification results:
 - the focused vector/curve/curve-registry/edit/protocol CTest selection passed
   5/5 targets;
 - the full configured CTest suite passed 14/14 targets;
-- `git diff --check edb40b6a2e..e53abacc13ae50fd35f6f845b74e381b4c18a9aa`
+- `git diff --check be783ce97c..7302377694abdf111488cf1df9eb239f4b43b619`
   completed cleanly;
 - the fresh broad review at exact head
-  `e53abacc13ae50fd35f6f845b74e381b4c18a9aa` closed VEC3-001 through
+  `7302377694abdf111488cf1df9eb239f4b43b619` closed VEC3-001 through
   VEC3-010, reported no Critical, Important, or Minor findings, and concluded
   **Ready to merge: Yes**.
 
