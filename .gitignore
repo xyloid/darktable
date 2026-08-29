@@ -27,3 +27,8 @@ CMakeLists.txt.user
 workspace/
 cmake-build-debug/
 .idea/
+
+# Claude Code local install artifacts: the per-machine tool allowlist and
+# the skill symlink the MCP README tells you to create (absolute path).
+.claude/settings.local.json
+.claude/skills/
