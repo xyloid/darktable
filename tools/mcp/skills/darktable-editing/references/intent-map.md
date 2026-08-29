@@ -13,7 +13,7 @@ Everything here is Tier 1 (fully editable) unless marked **T2**
 (partial) — see the bottom section for what T2 costs you.
 
 Source: `docs/superpowers/specs/2026-07-16-darktable-mcp-supported-operations.md`
-at commit `7537128c55`.
+at commit `3a70e83775`.
 
 ## Tone and exposure
 

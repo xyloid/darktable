@@ -6,7 +6,7 @@
 and five module adapters — colorbalance, channelmixerrgb, rgblevels, borders,
 watermark — per the approved design
 `docs/superpowers/specs/2026-07-12-darktable-mcp-milestone4-vector-class-design.md`
-(revision `9e43982b3f`). That spec is normative; where this plan says "per
+(revision `89291ae3e6`). That spec is normative; where this plan says "per
 spec §X" the implementer must read that section.
 
 **Architecture:** Milestone 2/3 built a curve-only pipeline: parser

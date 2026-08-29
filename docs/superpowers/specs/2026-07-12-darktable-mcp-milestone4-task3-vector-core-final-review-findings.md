@@ -2,7 +2,7 @@
 
 - **Status:** Open — request changes before merge
 - **Reviewed:** 2026-07-12
-- **Reviewed range:** `ffd00e2d8a..19219bb28745e7c264fae7ac384d1ed140bb012d`
+- **Reviewed range:** `a29b8a2e76..a045d39e8c42e167240cc88df836965d89fd6050`
 - **Final reviewer verdict:** **Ready to merge? No**
 - **Follow-up scope:** The user requested findings documentation only. No
   production or test remediation was implemented in this follow-up.
@@ -16,7 +16,7 @@ items remain historically remediated: this review does not reopen or rewrite
 their closure evidence.
 
 The later review examined the complete Task 3 range through exact head
-`19219bb28745e7c264fae7ac384d1ed140bb012d` and found five additional issues.
+`a045d39e8c42e167240cc88df836965d89fd6050` and found five additional issues.
 Its whole-range result therefore supersedes the earlier record's overall
 **Ready to merge: Yes** conclusion. The earlier record remains the audit trail
 for VEC3-001 through VEC3-010; this document is the open findings record for
@@ -202,8 +202,8 @@ verdict.
 ## Verification context and disposition
 
 The review was anchored to exact head
-`19219bb28745e7c264fae7ac384d1ed140bb012d`, with a clean worktree and a clean
-`git diff --check ffd00e2d8a..19219bb28745e7c264fae7ac384d1ed140bb012d`
+`a045d39e8c42e167240cc88df836965d89fd6050`, with a clean worktree and a clean
+`git diff --check a29b8a2e76..a045d39e8c42e167240cc88df836965d89fd6050`
 range check before this documentation-only closure commit.
 
 Historical verification recorded before this documentation-only commit was:

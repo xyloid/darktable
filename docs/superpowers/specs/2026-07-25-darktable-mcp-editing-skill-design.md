@@ -6,7 +6,7 @@ Branch: `mcp-skills` (cut from `mask-support`)
 Source grounding: `tools/mcp/src/darktable_mcp/server.py`,
 `src/control/remote_masks.c`, and
 `docs/superpowers/specs/2026-07-05-darktable-mcp-protocol-reference.md`
-at commit `7537128c55`
+at commit `3a70e83775`
 
 ## Purpose
 

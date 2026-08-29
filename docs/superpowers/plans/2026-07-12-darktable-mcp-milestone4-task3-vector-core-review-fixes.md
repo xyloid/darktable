@@ -1604,16 +1604,16 @@ Expected: 100% pass, zero failed tests.
 - [ ] **Step 4: Check formatting and worktree scope**
 
 ```bash
-git diff --check ffd00e2d8a..HEAD
+git diff --check a29b8a2e76..HEAD
 git status --short
-git diff --stat ffd00e2d8a..HEAD
+git diff --stat a29b8a2e76..HEAD
 ```
 
 Expected: no whitespace errors; only vector-core production/tests and the two approved Milestone 4 Task 3 review documents are changed by this remediation.
 
 - [ ] **Step 5: Request a fresh code review**
 
-Use `superpowers:requesting-code-review` with base `edb40b6a2e`, head `HEAD`, the approved findings document, and this plan. Require the reviewer to verify every `VEC3-*` closure test and report Critical/Important/Minor findings. Do not mark the review record closed while any Critical or Important finding remains.
+Use `superpowers:requesting-code-review` with base `be783ce97c`, head `HEAD`, the approved findings document, and this plan. Require the reviewer to verify every `VEC3-*` closure test and report Critical/Important/Minor findings. Do not mark the review record closed while any Critical or Important finding remains.
 
 - [ ] **Step 6: Update the review record after the review gate passes**
 

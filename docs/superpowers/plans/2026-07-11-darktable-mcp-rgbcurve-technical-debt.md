@@ -2,7 +2,7 @@
 
 - **Status:** Open
 - **Recorded:** 2026-07-11
-- **Audited tree:** `ce60861d74c35b3d10138154d339b949991438eb`
+- **Audited tree:** `24aae7fab4c105cfd99f300b5a6cb982e27af392`
 - **Origin:** Review of `d709834d2c` (`remote_curve: rgbcurve adapter
   callbacks and atomic apply path`) and the subsequent Milestone 2
   reconciliation.

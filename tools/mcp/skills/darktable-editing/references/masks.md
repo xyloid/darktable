@@ -6,7 +6,7 @@ region, a tonal range, or a color rather than the whole frame.
 Source: `tools/mcp/src/darktable_mcp/server.py`,
 `src/control/remote_masks.c`,
 `docs/superpowers/specs/2026-07-05-darktable-mcp-protocol-reference.md`
-at commit `7537128c55`.
+at commit `3a70e83775`.
 
 ## Pick the mask type first
 

@@ -13,7 +13,7 @@ current state.
 
 Source: `tools/mcp/src/darktable_mcp/server.py`,
 `docs/superpowers/specs/2026-07-16-darktable-mcp-supported-operations.md`
-at commit `7537128c55`.
+at commit `3a70e83775`.
 
 ## Shared rules
 

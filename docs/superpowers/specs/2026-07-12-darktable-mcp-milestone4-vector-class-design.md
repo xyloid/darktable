@@ -6,7 +6,7 @@ reviews (all findings verified against the code; each delta below traces to
 one).
 **Builds on:** milestone 2 (`rgbcurve` semantic curves) and milestone 3
 (`tonecurve`, `colorzones`, `basecurve` adapters), both merged on
-`worktree-mcp-remote-edit` at `52b892a1cf`.
+`worktree-mcp-remote-edit` at `61d5f07991`.
 
 ## Goal
 
