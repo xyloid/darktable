@@ -87,7 +87,16 @@ Use an absolute path for `REPO`. Later MCP client configuration stores the
 sidecar executable path, so moving the checkout invalidates that entry.
 The commands below assume the variables remain in the same shell; define
 `REPO`, `DARKTABLE_BIN`, `MCP_BIN`, `DT_CONFIG`, and `DT_CACHE` again after
-opening a new terminal.
+opening a new terminal. Sourcing `. "$REPO/tools/mcp/env.sh"` exports all
+five with exactly the values this guide uses, which is the shortest way to
+restore them in a fresh shell; it also activates the sidecar venv, so use
+it only if an activated shell is acceptable to you.
+
+None of the five is an environment variable that darktable or the sidecar
+reads. They are shell variables this guide interpolates into flags
+(`--configdir`, `--library`, `--config-dir`). The one exception is
+`DARKTABLE_BIN`, which the integration suite does read from the
+environment (§11).
 
 ## 4. Build the darktable GUI
 

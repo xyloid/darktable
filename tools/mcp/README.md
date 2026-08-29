@@ -402,10 +402,33 @@ then just activates on subsequent uses:
 * creates `tools/mcp/.venv` and installs this package with its `[dev]`
   extras (repairing a half-made venv if the install was interrupted);
 * activates the venv in your current shell;
-* exports `DARKTABLE_BIN` pointing at the in-tree `build/bin/darktable`
-  when one exists (a value you exported beforehand always wins);
+* exports the variables below;
 * defines `dt-mcp-darktable`, a helper that launches darktable with remote
   control enabled in a scratch config dir (see below).
+
+The exported set is the one [the Ubuntu setup
+guide](docs/ubuntu-mcp-client-setup.md) otherwise asks you to redefine in
+every new terminal:
+
+| Variable | Value |
+| --- | --- |
+| `REPO` | repository root of the checkout you sourced from |
+| `DARKTABLE_BIN` | in-tree GUI build: `build/bin/darktable`, else `build-mcp/bin/darktable` |
+| `MCP_BIN` | `$REPO/tools/mcp/.venv/bin/darktable-mcp`, the sidecar launcher |
+| `DT_CONFIG` | persistent dev profile, default `~/.config/darktable-mcp-dev` |
+| `DT_CACHE` | its cache, default `~/.cache/darktable-mcp-dev` |
+
+Each keeps a value you exported before sourcing. No directories are
+created for `DT_CONFIG`/`DT_CACHE` — the guide's `mkdir -p` still does
+that.
+
+None of these is read by darktable or the sidecar; they are shell
+variables you interpolate into flags (`--configdir`, `--library`,
+`--config-dir`). The exception is `DARKTABLE_BIN`, which the integration
+harness does read from the environment. In particular there is no
+environment fallback for the config directory: whatever you pass to
+darktable's `--configdir` must be passed to the sidecar's `--config-dir`
+too, since discovery matches on that directory.
 
 <details>
 <summary>Manual equivalent, if you prefer explicit steps</summary>
@@ -500,7 +523,7 @@ an installed copy of this package.
    one command:
 
    ```sh
-   dt-mcp-darktable /tmp/dt-mcp-check
+   dt-mcp-darktable /tmp/dt-mcp-check   # defaults to /tmp/dt-mcp-scratch
    ```
 
    which is shorthand for:
