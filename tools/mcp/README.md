@@ -18,6 +18,10 @@ instances are selected, the security model, and the versioning policy.
 For a command-by-command source build and Claude Code or Codex setup on
 Ubuntu, use
 [`docs/ubuntu-mcp-client-setup.md`](docs/ubuntu-mcp-client-setup.md).
+That guide builds with `--disable-ai`; if you drop that flag to use the
+AI modules, [`docs/ai-build-tree-notes.md`](docs/ai-build-tree-notes.md)
+covers the two things a build tree lacks that an install would have set
+up, both of which fail at runtime with the same unhelpful message.
 Once it is connected, [Agent skill](#agent-skill) below installs the
 skill that teaches an agent to actually edit well with these tools.
 
@@ -425,10 +429,14 @@ that.
 None of these is read by darktable or the sidecar; they are shell
 variables you interpolate into flags (`--configdir`, `--library`,
 `--config-dir`). The exception is `DARKTABLE_BIN`, which the integration
-harness does read from the environment. In particular there is no
-environment fallback for the config directory: whatever you pass to
-darktable's `--configdir` must be passed to the sidecar's `--config-dir`
-too, since discovery matches on that directory.
+harness does read from the environment. `DT_CONFIG` in particular is
+consulted by nothing: whatever you pass to darktable's `--configdir`
+must be passed to the sidecar's `--config-dir` too, since discovery
+matches on that directory. The sidecar does consult the environment
+when you pass no `--config-dir` at all, but it reads
+`$XDG_CONFIG_HOME/darktable` (`default_darktable_config_dir()` in
+`discovery.py`) -- not the dev profile this guide sets up, and a path
+a snap-confined terminal silently redirects.
 
 <details>
 <summary>Manual equivalent, if you prefer explicit steps</summary>
